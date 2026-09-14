@@ -244,18 +244,25 @@ drops the FFI entirely).
 
 ## M7: PE/COFF (MinGW flavor)
 
-- [x] COFF object and archive parsing, `.drectve` linker directives (reading; resolution is part of the linker work below)
-- [ ] Short import libraries (MSVC/LLVM style) and long import libraries
+- [x] COFF object and archive parsing, `.drectve` linker directives
+- [x] Short import libraries (MSVC/LLVM style) and long import libraries
       (GNU dlltool `.idata$N` objects); linking directly against `.dll` files
-- [ ] PE32+ (x86-64) then PE32 (i386), then ARM64
-- [ ] EXE and DLL output, `--out-implib`, `.def` files, `--export-all-symbols`,
+- [~] PE32+ (x86-64) done; PE32 (i386) and ARM64 not started
+- [x] EXE and DLL output, `--out-implib`, `.def` files, `--export-all-symbols`,
       export and import tables, base relocations, TLS directory
-- [ ] x86-64 SEH: `.pdata`/`.xdata` handling. i386 SafeSEH.
-- [ ] Auto-import and runtime pseudo-relocations (`--enable-auto-import`,
+- [~] x86-64 SEH: `.pdata`/`.xdata` handling (sorted). i386 SafeSEH not started.
+- [x] Auto-import and runtime pseudo-relocations (`--enable-auto-import`,
       `__RUNTIME_PSEUDO_RELOC_LIST__`)
-- [ ] Resources (`.rsrc` from windres objects), subsystem and OS version fields,
+- [x] Resources (`.rsrc` from windres objects), subsystem and OS version fields,
       `--dynamicbase`, `--nxcompat`, `--high-entropy-va`, deterministic timestamps
-- [ ] DWARF in PE for MinGW debugging
+- [x] DWARF in PE for MinGW debugging
+
+**Status:** qld links MinGW x86-64 console executables and DLLs end to end; a
+`-B` shim through `x86_64-w64-mingw32-gcc` produces a PE32+ image whose
+sections, data directories and relocated code match GNU ld's. Nothing has been
+executed yet: Wine is not installed here, so the `pe-windows` CI job runs the
+images on a Windows runner. The PE command-line options are being implemented
+(W22); until then only the plain console link works through the driver.
 
 **Exit criteria:** A MinGW-w64 GCC and a clang cross toolchain can use qld to
 build and run a C/C++ test suite under Wine and on a Windows CI runner. qld

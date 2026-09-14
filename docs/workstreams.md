@@ -59,7 +59,8 @@ can work at the same time without colliding.
 | W18 | LTO in the ELF driver (M6) | `src/elf/{inputs,resolve,object,lto}*`, `tests/lto*` | W17 | merged (M6) |
 | W19 | Linker-script layout and raw outputs (M3) | `src/elf/{rules,place,layout,write,defined,script_layout,rawout}*`, `tests/script_link*` | W3, W16 | merged (M3) |
 | W20 | AArch64 ELF (M4) | `src/elf/arch/**`, `src/arch/**`, thunk/relaxation hooks in `src/elf/{layout,write,scan,synth}.rs`, `tests/aarch64*` | W16 | in progress |
-| W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | in progress |
+| W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | merged |
+| W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -453,6 +454,10 @@ that cross workstream boundaries. The integrator does these between merges.
 | W17 | Integrate `plugin::Session` into the ELF driver: claim IR inputs in `RoundHook::after_load` (deterministic order), feed claimed symbols to resolution (arena-owned names), settle `LDPR_*` resolutions after the fixpoint, re-resolve with `LtoOutput::files`/`libraries`, `finish` after writing (sketch in W17's report) | done (W18) |
 | W17 | `Error::Plugin(String)` variant; a "referenced from a non-IR file" symbol flag for `PREVAILING_DEF` vs `_IRONLY` | `Error::Plugin` done; the symbol flag is open |
 | W18 | `-r` with a shared-library input writes `R_X86_64_NONE` for references bound to it (GNU ld's `-r` implies `-Bstatic`) — `src/elf/relocatable.rs` | open |
+| W21 | Wire `coff::link` into `crate::link` | done |
+| W21 | Run qld-built PE images on a Windows CI runner | done (`pe-windows` job) |
+| W21 | i386 (PE32) and ARM64 PE output; i386 SafeSEH; delay-load imports; `-r`, `--gc-sections`, `--icf`, `--wrap`, `--defsym` and linker scripts for PE | open |
+| W21 | Local symbols in the PE output symbol table; auto-import of PC-relative references; `--enable-stdcall-fixup`; `--add-stdcall-alias` | open |
 | W19 | `-r` with `-T`, and `--defsym` expressions beyond `symbol+offset` | open |
 | W19 | `-r` output of the kernel's `vmlinux.o` makes objtool fail ("can't find starting instruction") — `src/elf/relocatable.rs` | open |
 | W19 | GLOBAL HIDDEN inputs emitted LOCAL in static links; no `FILE` symbols; `sym = othersym` script assignments do not copy type/size | open |

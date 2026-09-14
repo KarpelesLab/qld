@@ -310,6 +310,21 @@ Diagnostics, map files and `--print-*` output demangle names unless
 - Not yet demangled (left as-is): C++20 `requires` clauses and a few other
   recent Itanium extensions that `llvm-cxxfilt` handles.
 
+### PE/COFF output (MinGW flavor)
+
+- Input sections are ordered inside an output section by archive-member
+  position; GNU ld uses extraction order. Addresses stay self-consistent.
+- `IMAGE_COMDAT_SELECT_LARGEST` picks the largest copy within one resolution
+  round; an earlier round's claim is final.
+- The output symbol table carries globals and section symbols, not locals.
+- MSVC import-library helper objects (`__IMPORT_DESCRIPTOR_*`,
+  `__NULL_IMPORT_DESCRIPTOR`, `*_NULL_THUNK_DATA`) are dropped and the import
+  directory is synthesized instead.
+- `.pdata` is always sorted by address.
+- `.drectve` `-defaultlib:`/`-include:` are honoured from command-line objects
+  but not from archive members extracted later.
+- `--out-implib` writes the long `dlltool` form of an import library.
+
 ### PE/COFF inputs (MinGW flavor)
 
 The readers exist; linking PE output is M7. Behaviour already fixed by them:
