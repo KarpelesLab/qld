@@ -10,7 +10,7 @@ scope of each, and the order in which they arrive. Milestone numbers refer to
 | --- | --- | --- |
 | ELF relocatable (`ET_REL`) | `\x7fELF` | M1 |
 | ELF shared object (`ET_DYN`) | `\x7fELF` | M2 |
-| `ar` archives: GNU, BSD, thin; with and without symbol index | `!<arch>\n`, `!<thin>\n` | M0 |
+| `ar` archives: GNU, BSD, COFF, thin; with and without symbol index | `!<arch>\n`, `!<thin>\n` | M0 |
 | GNU linker scripts as inputs (`GROUP`, `INPUT`, `AS_NEEDED`) | text | M2 |
 | Raw binary (`-b binary`) | option | M3 |
 | LLVM bitcode (`.o` / archive members) | `BC\xC0\xDE`, bitcode wrapper | M6 |
@@ -22,6 +22,16 @@ scope of each, and the order in which they arrive. Milestone numbers refer to
 | Mach-O objects and dylibs | `MH_MAGIC_64` etc. | M8 |
 | Apple text-based stubs (`.tbd` v3–v5) | text (YAML / JSON) | M8 |
 | Universal (fat) inputs: select a slice | `FAT_MAGIC`, `FAT_MAGIC_64` | M8 |
+
+Archive variant notes:
+
+- **BSD/Darwin** archives (`__.SYMDEF`, `#1/<len>` names) pad member data to
+  8 bytes with `\n` and count the padding in the member size. A member's
+  byte range can therefore run past the object's real end; parsers take the
+  size from the object's own headers.
+- **COFF** archives (MSVC, `llvm-ar --format=coff`) have a second `/` linker
+  member with a sorted index, and NUL-terminated long names.
+- **Thin** archives store member paths relative to the archive's directory.
 
 Compressed input sections (`SHF_COMPRESSED` with zlib or zstd, and the legacy
 `.zdebug_*`) are decompressed on demand, in parallel, only for sections that

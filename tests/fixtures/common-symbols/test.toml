@@ -1,0 +1,21 @@
+# Common symbols (-fcommon): tentative definitions of the same name in several
+# objects merge into one, with the largest size and alignment.
+description = "common symbols merge to the largest definition"
+compile = [
+  "cc -O2 -fcommon -c a.c",
+  "cc -O2 -fcommon -c b.c",
+  "cc -O2 -fcommon -c main.c",
+]
+driver = "cc"
+link = "-o out a.o b.o main.o"
+run = "./out"
+expect.stdout = """
+shared_counter=5
+big_common[63]=x
+same object: yes
+"""
+expect.readelf = [
+  "   64 OBJECT  GLOBAL DEFAULT",
+  "big_common",
+  "shared_counter",
+]

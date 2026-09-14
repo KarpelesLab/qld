@@ -1,0 +1,24 @@
+# --as-needed: a library given after --as-needed gets a DT_NEEDED entry only
+# if it satisfies a reference; --no-as-needed restores the default for the
+# libraries that follow it.
+description = "--as-needed drops unused DT_NEEDED entries"
+compile = [
+  "cc -O2 -fPIC -c used.c",
+  "cc -O2 -fPIC -c unused.c",
+  "cc -O2 -fPIC -c kept.c",
+  "cc -O2 -c main.c",
+]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libused.so -o libused.so used.o",
+  "-shared -Wl,-soname,libunused.so -o libunused.so unused.o",
+  "-shared -Wl,-soname,libkept.so -o libkept.so kept.o",
+  "-o out main.o -L. -Wl,--as-needed -lunused -lused -Wl,--no-as-needed -lkept -Wl,-rpath,$ORIGIN",
+]
+run = "./out"
+expect.stdout = "used: 5\n"
+expect.readelf = [
+  "Shared library: [libused.so]",
+  "Shared library: [libkept.so]",
+  "!libunused.so",
+]

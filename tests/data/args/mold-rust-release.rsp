@@ -1,0 +1,43 @@
+--color-diagnostics
+--threads=8
+--hash-style=both
+--build-id=0xdeadbeef
+-pie
+-dynamic-linker /lib/ld-musl-x86_64.so.1
+--gc-sections
+--icf=all
+--print-gc-sections
+--strip-all
+-z relro
+-z now
+-z pack-relative-relocs
+-z separate-loadable-segments
+-z x86-64-v3
+-z ibt
+-z shstk
+-z cet-report=warning
+-z execstack-if-needed
+--rosegment
+-O2
+--as-needed
+--quick-exit
+--no-fork
+--defsym=__rust_probestack=__probestack
+--wrap=malloc
+-u __rust_alloc
+--export-dynamic-symbol=plugin_*
+--version-script=exports.map
+--undefined-version
+-Bsymbolic-functions
+--Map=out.map
+--why-live=main
+-rpath $ORIGIN/../lib
+--enable-new-dtags
+-o app
+app.o
+--whole-archive
+libstatic.a
+--no-whole-archive
+-lssl
+--
+-weird-name.o

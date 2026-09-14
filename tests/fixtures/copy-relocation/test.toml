@@ -1,0 +1,17 @@
+# M2: a non-PIC executable referencing data defined in a shared library gets a
+# copy relocation. The library, compiled -fPIC, goes through its GOT, so both
+# see the single copy in the executable's .bss.
+description = "copy relocation for library data used by a non-PIE executable"
+compile = ["cc -O2 -fPIC -c lib.c", "cc -O2 -fno-pie -c main.c"]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libdata.so -o libdata.so lib.o",
+  "-no-pie -o out main.o -L. -ldata -Wl,-rpath,$ORIGIN",
+]
+run = "./out"
+expect.stdout = """
+lib_counter=100 lib_message=initialized in the library
+after lib_increment: 101
+after exe write: lib sees 500
+"""
+expect.readelf = ["R_X86_64_COPY", "lib_counter", "EXEC (Executable file)"]

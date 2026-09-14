@@ -1,0 +1,16 @@
+# M1: the docs/testing.md example. tls.o is compiled -fPIC, so it uses
+# general-dynamic TLS access; a static link must relax it to local-exec and
+# leave no dynamic TLS relocations or __tls_get_addr calls behind.
+description = "general-dynamic TLS relaxed to local-exec in a static link"
+compile = ["cc -O2 -fPIC -c tls.c", "cc -O2 -c main.c"]
+driver = "cc"
+link = "-static -o out main.o tls.o"
+run = "./out"
+expect.stdout = "42\n"
+expect.readelf = [
+  "TLS ",
+  "!R_X86_64_TPOFF64",
+  "!R_X86_64_DTPMOD64",
+  "!R_X86_64_DTPOFF64",
+]
+determinism = true

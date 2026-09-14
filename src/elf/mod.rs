@@ -15,3 +15,13 @@
 //!   `arch/`, starting with x86-64.
 //!
 //! See `ROADMAP.md` M1 and M2, and `docs/formats.md`.
+//!
+//! Submodules:
+//!
+//! - [`read`]: zero-copy parsing of objects and shared objects (W7).
+//! - [`link`](mod@link): the ELF link driver (W8).
+
+pub mod link;
+pub mod read;
+
+pub use link::link;
