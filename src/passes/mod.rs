@@ -25,8 +25,14 @@ pub mod bitset;
 pub mod csr;
 pub mod gc;
 pub mod graph;
+mod hash;
+pub mod icf;
 
 pub use bitset::{AtomicBitSet, BitSet};
 pub use csr::{Csr, CsrBuilder, InputError};
 pub use gc::{GcMarker, LiveSet, ReferenceTree, collect_garbage, why_live};
 pub use graph::{GraphBuilder, SectionGraph};
+pub use icf::{
+    IcfGroup, IcfInput, IcfMode, IcfReloc, IcfReport, IcfResult, IcfSection, IcfTarget,
+    fold_identical,
+};
