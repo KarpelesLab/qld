@@ -195,6 +195,13 @@ knows its size, or at least an upper bound.
 - **Output section assignment** uses the default rules, or the linker script
   when one is given. For ELF the default layout matches GNU ld's built-in
   script semantics, for example `.text.hot.*` grouping and `.rodata` placement.
+  A script (or a command-line address option such as `-Ttext`) switches layout
+  to `elf::script_layout`, which follows GNU ld's own algorithms: plan
+  (flatten the script, expand `OVERLAY`, apply `INSERT`) → placement (match
+  input sections, place orphans) → engine (the size and assignment fixpoint
+  with `MEMORY` regions and `DATA_SEGMENT_*`) → segments. Plain links keep the
+  simpler `elf::layout` path, and the default script is expressed in the same
+  engine.
 - **Sorting**: `SORT_BY_*`, init priorities, and `--symbol-ordering-file`.
 - **Address assignment**, then segment construction (`PT_LOAD` and friends,
   PE sections, Mach-O segments).

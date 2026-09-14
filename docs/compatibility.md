@@ -281,6 +281,18 @@ a file `a.o,`). Deliberate differences:
 
 Errors are reported GNU-style as `file:line:column: message`.
 
+Layout from scripts follows GNU ld's algorithms, including orphan placement
+and the address fixpoint ("address assignment did not converge after 12
+passes" when it cannot settle). Known differences:
+
+- `-r` together with `-T` is not supported yet (relocatable output has its own
+  layout path).
+- `--verbose` does not dump the effective default script.
+- `--defsym` expressions beyond `symbol+offset` are not supported.
+- GLOBAL HIDDEN input symbols are written LOCAL in static links (17 `__pi_*`
+  symbols differ this way in a kernel build); GNU ld keeps them GLOBAL.
+- qld does not emit `FILE` symbols.
+
 ### Demangled names
 
 Diagnostics, map files and `--print-*` output demangle names unless

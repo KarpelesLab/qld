@@ -99,6 +99,10 @@ every output format:
   their load addresses (LMA), relative to the lowest LMA, and fills gaps with
   the `FILL` value or zeros.
 - `--oformat ihex`, `--oformat srec`: Intel HEX and Motorola S-record.
+- All three are byte-identical to GNU ld's output for the bare-metal images in
+  `tests/projects/baremetal.sh` and the `raw-*` fixtures.
+- `-b binary` inputs become a `.data` section with `_binary_<name>_start`,
+  `_end` and `_size` symbols, using GNU's path mangling.
 - Linker scripts with `MEMORY` regions, `AT>` load regions and
   `ASSERT` checks.
 - An ELF file can be written next to the raw image (as `objcopy -O binary`

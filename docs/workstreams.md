@@ -57,7 +57,7 @@ can work at the same time without colliding.
 | W14 | PE/COFF reading | `src/coff/**` | — | merged |
 | W17 | LTO plugin host | `src/plugin/**` | — | merged |
 | W18 | LTO in the ELF driver (M6) | `src/elf/{inputs,resolve,object,lto}*`, `tests/lto*` | W17 | merged (M6) |
-| W19 | Linker-script layout and raw outputs (M3) | `src/elf/{rules,place,layout,write,defined,script_layout,rawout}*`, `tests/script_link*` | W3, W16 | in progress |
+| W19 | Linker-script layout and raw outputs (M3) | `src/elf/{rules,place,layout,write,defined,script_layout,rawout}*`, `tests/script_link*` | W3, W16 | merged (M3) |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -411,7 +411,7 @@ that cross workstream boundaries. The integrator does these between merges.
 | W1 | Emit `LinkOptions::warnings` to the diagnostic sink, honoring `--no-warnings` / `--fatal-warnings` | done (`main.rs`) |
 | W1 | Re-export `parse_gnu_with` from the crate root | done |
 | W3 | `Error` variant for script errors with line and column | done: `Error::Script` |
-| W3 | Layout-side script semantics: `DATA_SEGMENT_*` relro adjustment, `PROVIDE` only-if-referenced, `NEXT_SECTION`, section-relative symbols from `.` | open, for W8 / M3 |
+| W3 | Layout-side script semantics: `DATA_SEGMENT_*` relro adjustment, `PROVIDE` only-if-referenced, `NEXT_SECTION`, section-relative symbols from `.` | done (W19) |
 | W1 | Let `ParseOutcome` grow print-and-exit variants (`--print-sysroot`, `--print-output-format`); `main.rs` must handle them | open |
 | W1 | `target.rs`: more operating systems (FreeBSD, …) and architectures (MIPS, PowerPC32, …) for their `-m` emulations | open, when needed |
 | W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | done: `split_section` + `merge_split_sections` |
@@ -427,6 +427,11 @@ that cross workstream boundaries. The integrator does these between merges.
 | W17 | Integrate `plugin::Session` into the ELF driver: claim IR inputs in `RoundHook::after_load` (deterministic order), feed claimed symbols to resolution (arena-owned names), settle `LDPR_*` resolutions after the fixpoint, re-resolve with `LtoOutput::files`/`libraries`, `finish` after writing (sketch in W17's report) | done (W18) |
 | W17 | `Error::Plugin(String)` variant; a "referenced from a non-IR file" symbol flag for `PREVAILING_DEF` vs `_IRONLY` | `Error::Plugin` done; the symbol flag is open |
 | W18 | `-r` with a shared-library input writes `R_X86_64_NONE` for references bound to it (GNU ld's `-r` implies `-Bstatic`) — `src/elf/relocatable.rs` | open |
+| W19 | `-r` with `-T`, and `--defsym` expressions beyond `symbol+offset` | open |
+| W19 | `-r` output of the kernel's `vmlinux.o` makes objtool fail ("can't find starting instruction") — `src/elf/relocatable.rs` | open |
+| W19 | GLOBAL HIDDEN inputs emitted LOCAL in static links; no `FILE` symbols; `sym = othersym` script assignments do not copy type/size | open |
+| W19 | vdso64 differs from GNU ld in `.hash` alignment/size, `.dynstr`, `.dynamic` and an empty `.got.plt` | open |
+| W19 | A hook in `src/elf/inputs.rs` for script-provided input lists and `-b binary`, to drop the workaround in `script_layout/load.rs` | open |
 | W18 | clang's `.eh_frame` keeps `SHT_X86_64_UNWIND` where GNU ld writes `PROGBITS` — `src/elf/write.rs`/layout | open, for W19 |
 | W12 | Adopt `RoundHook` + `GroupClaims` for COMDAT in `src/elf/` (claim before insertion; delete `redirect_discarded`) | done (W11) |
 | W10 | Fill `Location::source` for undefined-symbol diagnostics with `debug::dwarf::LineLookup` | done (W11) |
