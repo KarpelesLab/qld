@@ -1,0 +1,33 @@
+# M2: relocatable output. Two C++ objects with COMDAT groups (an inline
+# function with a static local, a template, a vtable), exceptions, TLS,
+# same-named static functions and debug information are combined with -r;
+# the combined object must keep one copy of each group, rewrite relocations
+# against section symbols, and then link and run like the original objects.
+description = "ld -r combines C++ objects with COMDAT groups, then links"
+compile = [
+  "c++ -O1 -g -ffunction-sections -fdata-sections -c part1.cpp",
+  "c++ -O1 -g -ffunction-sections -fdata-sections -c part2.cpp",
+  "c++ -O1 -c main.cpp",
+]
+driver = "c++"
+link = [
+  "-r -nostdlib -o combined.o part1.o part2.o",
+  "-o out combined.o main.o",
+]
+run = "./out"
+expect.stdout = """
+part1=17 part2=107
+counter=3
+sides=4 4
+same vtable type: yes
+"""
+expect.readelf_files."combined.o" = [
+  "REL (Relocatable file)",
+  "COMDAT group section",
+  "[_ZZ11counter_qldvE5count]",
+  ".rela.debug_info",
+  ".rela.eh_frame",
+  "_ZL14private_helperi",
+  "!Program Headers:",
+]
+determinism = true

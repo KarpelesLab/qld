@@ -36,15 +36,15 @@
 //! | [`values`] | Symbol, section, GOT and PLT addresses after layout |
 //! | [`write`](mod@write) | 11: parallel chunked writing, relocation in place, `.rela.dyn`, `.eh_frame_hdr` |
 //! | [`map`] | `-Map` and `-M` |
+//! | [`relocatable`] | 10–11 for `-r`: combined sections, groups, symbol table and rewritten relocations |
 //! | [`arch`] | Per-architecture relocation classification, relaxation and PLT encodings (x86-64) |
 //!
 //! # Scope
 //!
 //! x86-64 static executables (roadmap M1), and dynamic executables, PIEs,
-//! static PIEs and shared objects linked against shared libraries (M2).
-//! Relocatable output (`-r`) still returns
-//! [`Error::Unimplemented`](crate::Error::Unimplemented) naming M2; other
-//! architectures name M4.
+//! static PIEs, shared objects linked against shared libraries, and
+//! relocatable output (M2). Other architectures return
+//! [`Error::Unimplemented`](crate::Error::Unimplemented) naming M4.
 //!
 //! GOT and PLT entries are owned by global symbols or local (file, symbol)
 //! pairs and planned from the [`SymbolFlags`](crate::symbols::SymbolFlags)
@@ -76,6 +76,7 @@ pub mod place;
 pub mod read;
 pub mod refs;
 pub mod reloc;
+pub mod relocatable;
 pub mod resolve;
 pub mod rules;
 pub mod scan;

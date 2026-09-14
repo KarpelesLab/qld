@@ -16,6 +16,9 @@
 //! 8. synthetic sections and the symbol table plan;
 //! 9. [`layout`], symbol addresses, [`write`](mod@write), and the link map
 //!    ([`map`]).
+//!
+//! Relocatable output (`-r`) leaves after step 2: optional `--gc-sections`
+//! (which then needs `-e` or `-u` roots), then [`relocatable`].
 
 use std::time::Instant;
 
@@ -39,10 +42,11 @@ use super::inputs::{self, InternalNames, parse_number};
 use super::layout::{self, LayoutInput, TrailerSizes};
 use super::map;
 use super::merge;
-use super::object::{ParseConfig, WrapTable};
+use super::object::{ParseConfig, SectionKind, WrapTable};
 use super::place;
 use super::refs::{Def, Refs};
 use super::reloc;
+use super::relocatable;
 use super::resolve::{self, ElfRules};
 use super::rules::RuleSet;
 use super::scan::{self, UndefinedRef};
@@ -65,11 +69,6 @@ const MAX_REFERENCES: usize = 3;
 /// [`Error::Reported`] when errors were reported to `diagnostics`, and any
 /// I/O or parse error.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
-    if options.kind == OutputKind::Relocatable {
-        return Err(Error::Unimplemented(
-            "relocatable output (roadmap M2: dynamic ELF)".into(),
-        ));
-    }
     // `-plugin` needs no check here: compiler drivers always pass it, and
     // an IR input is reported as Unimplemented (M6) when it is loaded.
     check_supported(options)?;
@@ -199,10 +198,30 @@ fn link_inputs<'a>(
     lap("resolution");
 
     let mut sections = Sections::new(files, &resolution)?;
+    let relocatable = options.kind == OutputKind::Relocatable;
+    if relocatable {
+        relocatable::revive_sections(files, &mut sections, options);
+    }
     resolve::deduplicate_comdat(files, &mut sections);
     resolve::redirect_discarded(&symbols, &rules, files, &resolution, &sections);
     let mut errors = resolve::report_duplicates(files, &resolution, &sections, diagnostics);
     report_gnu_warnings(files, &symbols, diagnostics);
+
+    if relocatable {
+        if errors > 0 && !options.noinhibit_exec {
+            return Err(Error::Reported { errors });
+        }
+        return link_relocatable(
+            options,
+            diagnostics,
+            files,
+            &symbols,
+            &resolution,
+            sections,
+            internal,
+            lap,
+        );
+    }
 
     let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
     let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
@@ -482,6 +501,72 @@ fn link_inputs<'a>(
         diagnostics,
     })?;
     map::write(options, &addresses, &plan)?;
+    lap("write");
+    Ok(())
+}
+
+/// The rest of a relocatable (`-r`) link: `--gc-sections` when asked (GNU
+/// ld requires `-e` or `-u` roots for it), then [`relocatable::write`].
+#[allow(clippy::too_many_arguments)]
+fn link_relocatable<'a>(
+    options: &LinkOptions,
+    diagnostics: &dyn DiagnosticSink,
+    files: &[inputs::ElfInput<'a>],
+    symbols: &SymbolTable<'a>,
+    resolution: &crate::symbols::Resolution<'a>,
+    mut sections: Sections,
+    internal: &InternalNames,
+    lap: &(dyn Fn(&str) + Sync),
+) -> Result<()> {
+    if options.gc_sections {
+        if options.entry.is_none() && options.undefined.is_empty() {
+            return Err(Error::Option(
+                "--gc-sections requires a defined symbol root specified by -e or -u".into(),
+            ));
+        }
+        let rule_set = RuleSet::default_rules();
+        let placement = place::place(&rule_set, files, &sections);
+        let eh_frames = ehframe::split(files, &sections)?;
+        let refs = Refs {
+            files,
+            symbols,
+            resolution,
+            sections: &sections,
+        };
+        let linker = defined::LinkerSymbols::default();
+        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
+        if options.print_gc_sections {
+            gc::print_removed(&refs, &removed, diagnostics);
+        }
+        if !options.why_live.is_empty() {
+            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
+        }
+        for &id in &removed {
+            // Sections only relocatable output copies (`.note.GNU-stack`,
+            // non-allocated `SHF_EXCLUDE` sections) are not layout rules'
+            // roots, but GNU ld keeps them.
+            let consumed = sections
+                .locate(id)
+                .and_then(|(file, index)| files.get(file)?.object.as_ref()?.section(index))
+                .is_some_and(|s| s.kind == SectionKind::Ignored && !s.is_alloc());
+            if !consumed && let Some(slot) = sections.live.get_mut(id.index()) {
+                *slot = false;
+            }
+        }
+        lap("gc");
+    }
+    let refs = Refs {
+        files,
+        symbols,
+        resolution,
+        sections: &sections,
+    };
+    let commons = options.define_common.then(|| common::allocate(&refs));
+    relocatable::write(&relocatable::RelocatableInput {
+        options,
+        refs,
+        commons: commons.as_ref(),
+    })?;
     lap("write");
     Ok(())
 }

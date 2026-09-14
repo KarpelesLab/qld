@@ -225,8 +225,12 @@ impl InternalNames {
                 names.push((entry.as_bytes().to_vec(), reference));
             }
             Some(_) => {}
-            // A shared object has no entry point unless one is named.
-            None if options.kind == crate::args::OutputKind::Shared => {}
+            // Shared objects and relocatable output have no entry point
+            // unless one is named.
+            None if matches!(
+                options.kind,
+                crate::args::OutputKind::Shared | crate::args::OutputKind::Relocatable
+            ) => {}
             None => names.push((b"_start".to_vec(), reference)),
         }
         for name in options.undefined.iter().chain(&options.require_defined) {

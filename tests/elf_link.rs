@@ -652,9 +652,16 @@ int _start(void) { return helper((int)(size_t)table[1][0]); }
             }
         }
         let mut options = LinkOptions::new();
-        options.kind = OutputKind::StaticExecutable;
+        options.kind = if round % 5 == 4 {
+            OutputKind::Relocatable
+        } else {
+            OutputKind::StaticExecutable
+        };
         options.output = Some(dir.join("out"));
         options.gc_sections = round % 2 == 0;
+        if options.kind == OutputKind::Relocatable {
+            options.undefined.push("_start".into());
+        }
         options.push_input(
             InputKind::Bytes {
                 name: format!("corrupt{round}.o"),
@@ -1296,4 +1303,125 @@ fn corrupted_shared_objects_never_panic() {
         }));
         assert!(result.is_ok(), "panic on corruption round {round}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Relocatable output.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn relocatable_output_combines_objects() {
+    require!("cc", "readelf");
+    let dir = scratch("relocatable");
+    compile_with(
+        &dir,
+        "one",
+        "
+int comm_qld;
+extern int weak_missing_qld(void) __attribute__((weak));
+__attribute__((noinline)) static int helper(int x) { return x + 1; }
+__attribute__((visibility(\"hidden\"))) int hidden_qld(void) { return 2; }
+int one_qld(void) { return helper(comm_qld) + hidden_qld() + (weak_missing_qld ? 100 : 0); }
+",
+        &["-fcommon", "-ffunction-sections", "-fPIE"],
+    );
+    compile_with(
+        &dir,
+        "two",
+        "
+#include <stdio.h>
+__attribute__((noinline)) static int helper(int x) { return x * 10; }
+int one_qld(void);
+int main(void) { printf(\"%d %d\\n\", one_qld(), helper(4)); return 0; }
+",
+        &["-fPIE"],
+    );
+    qld_ok(
+        &dir,
+        &[
+            "-r",
+            "-o",
+            "combined.o",
+            "--defsym",
+            "abs_qld=0x1234",
+            "one.o",
+            "two.o",
+        ],
+    );
+    let header = readelf(&dir, &["-h", "-S", "-s", "-r", "combined.o"]);
+    assert!(header.contains("REL (Relocatable file)"), "{header}");
+    assert!(header.contains("There are no program headers") || !header.contains("LOAD"));
+    assert!(header.contains("COM comm_qld"), "{header}");
+    assert!(
+        header.contains("WEAK   DEFAULT  UND weak_missing_qld"),
+        "{header}"
+    );
+    assert!(header.contains("HIDDEN     "), "{header}");
+    assert!(header.contains("ABS abs_qld"), "{header}");
+    assert_eq!(header.matches(" helper").count(), 2, "{header}");
+    assert!(header.contains(".rela.text.one_qld"), "{header}");
+    cc_link_ok(&dir, &["-o", "out", "combined.o"]);
+    assert_eq!(stdout_of(&dir, "out"), "3 40\n");
+
+    // -d allocates the common symbol; -x drops the unreferenced locals.
+    qld_ok(
+        &dir,
+        &["-r", "-d", "-x", "-o", "defined.o", "one.o", "two.o"],
+    );
+    let symbols = readelf(&dir, &["-s", "defined.o"]);
+    assert!(!symbols.contains("COM comm_qld"), "{symbols}");
+    assert!(symbols.contains("OBJECT  GLOBAL DEFAULT    "), "{symbols}");
+    assert!(!symbols.contains("FILE"), "{symbols}");
+    cc_link_ok(&dir, &["-o", "out2", "defined.o"]);
+    assert_eq!(stdout_of(&dir, "out2"), "3 40\n");
+
+    // --gc-sections needs roots with -r, as in GNU ld.
+    let output = qld(&dir, &["-r", "--gc-sections", "-o", "gc.o", "one.o"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires a defined symbol root"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    qld_ok(
+        &dir,
+        &[
+            "-r",
+            "--gc-sections",
+            "-u",
+            "hidden_qld",
+            "-o",
+            "gc.o",
+            "one.o",
+        ],
+    );
+    let kept = readelf(&dir, &["-S", "gc.o"]);
+    assert!(kept.contains(".text.hidden_qld"), "{kept}");
+    assert!(!kept.contains(".text.one_qld"), "{kept}");
+}
+
+#[test]
+fn relocatable_output_uses_extended_section_numbering() {
+    require!("as", "readelf");
+    let dir = scratch("relocatable-many-sections");
+    let mut source = String::from(
+        ".globl _start\n.text\n_start:\n call f65999\n mov %eax, %edi\n mov $60, %eax\n syscall\n",
+    );
+    for i in 0..66000 {
+        source.push_str(&format!(
+            ".section .text.f{i},\"ax\",@progbits\n.globl f{i}\nf{i}:\n mov ${}, %eax\n ret\n",
+            i % 100
+        ));
+    }
+    assemble(&dir, "many", &source);
+    qld_ok(&dir, &["-r", "-o", "combined.o", "many.o"]);
+    let header = readelf(&dir, &["-h", "combined.o"]);
+    assert!(
+        header.contains("Number of section headers:         0 ("),
+        "{header}"
+    );
+    let symbols = readelf(&dir, &["-s", "combined.o"]);
+    assert!(symbols.contains("GLOBAL DEFAULT 66004 f65999"), "{symbols}");
+    qld_ok(&dir, &["-o", "out", "combined.o"]);
+    assert_eq!(exit_code(&dir, "out"), 99);
 }

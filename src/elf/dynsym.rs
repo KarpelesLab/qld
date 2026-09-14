@@ -1019,8 +1019,9 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
                 return;
             }
             let (binding, kind, size, shndx) = match target.def {
+                // A copy keeps the library definition's binding, as in GNU ld.
                 _ if copy => (
-                    STB_GLOBAL,
+                    raw.binding(),
                     raw.kind(),
                     raw.st_size,
                     shndx_of_address(addresses, value),
