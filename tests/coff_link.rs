@@ -544,7 +544,7 @@ fn dll_with_import_library() {
 /// `42`, and exit 0.
 #[test]
 fn command_line_builds_a_dll_and_an_executable() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
