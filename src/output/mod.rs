@@ -15,7 +15,9 @@
 //! `unsafe`, for mapping. Every block needs a `SAFETY` comment.
 //! See `docs/architecture.md` ("Output writing").
 
+pub mod build_id;
 mod chunks;
 pub mod hash;
+mod random;
 
 pub use chunks::{ChunkRange, LayoutError, split_chunks, validate_layout, write_chunks};
