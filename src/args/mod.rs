@@ -24,7 +24,7 @@ pub mod table;
 
 pub use options::{
     BuildId, ColorChoice, DiscardMode, DynamicFlags, ExecStack, Flavor, HashStyle, InputAttrs,
-    InputFormat, InputKind, InputSpec, LinkOptions, MagicMode, OutputKind, ReportLevel,
+    InputFormat, InputKind, InputSpec, LinkOptions, MagicMode, OutputKind, PeArgs, ReportLevel,
     SeparateCode, StripMode, SymbolicMode, UnresolvedSymbols, X86Features,
 };
 pub use parse::{ParseOutcome, parse_darwin, parse_gnu, parse_gnu_with, select_flavor, usage};

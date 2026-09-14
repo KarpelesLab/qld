@@ -307,6 +307,147 @@ pub struct InputSpec {
     pub position: usize,
 }
 
+/// The PE/COFF options of GNU ld's MinGW emulations (`i386pep`, `i386pe`,
+/// `arm64pe`).
+///
+/// Every field starts at the `i386pep` default, so a command line that names
+/// none of these options still describes the image
+/// `x86_64-w64-mingw32-gcc` expects. The PE backend reads them through
+/// [`PeOptions::from_link_options`](crate::coff::PeOptions::from_link_options);
+/// ELF and Mach-O links ignore them, which is why GNU ld's per-emulation
+/// options are accepted whatever the target is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeArgs {
+    /// `--subsystem NAME[,MAJOR[.MINOR]]`, as an `IMAGE_SUBSYSTEM_*` value.
+    /// `None` infers it from the entry point.
+    pub subsystem: Option<u16>,
+    /// `--section-alignment`.
+    pub section_alignment: u32,
+    /// `--file-alignment`.
+    pub file_alignment: u32,
+    /// `--stack RESERVE[,COMMIT]`. `-z stack-size` also sets the reserve.
+    pub stack: (u64, u64),
+    /// `--heap RESERVE[,COMMIT]`.
+    pub heap: (u64, u64),
+    /// `--major-image-version`.
+    pub major_image_version: u16,
+    /// `--minor-image-version`.
+    pub minor_image_version: u16,
+    /// `--major-os-version`.
+    pub major_os_version: u16,
+    /// `--minor-os-version`.
+    pub minor_os_version: u16,
+    /// `--major-subsystem-version`, which `--subsystem NAME,MAJOR` also sets.
+    pub major_subsystem_version: u16,
+    /// `--minor-subsystem-version`, which `--subsystem NAME,MAJOR.MINOR`
+    /// also sets.
+    pub minor_subsystem_version: u16,
+    /// `--dynamicbase` (default) / `--disable-dynamicbase`.
+    pub dynamicbase: bool,
+    /// `--nxcompat` (default) / `--disable-nxcompat`.
+    pub nxcompat: bool,
+    /// `--high-entropy-va` (default) / `--disable-high-entropy-va`.
+    pub high_entropy_va: bool,
+    /// `--tsaware` / `--disable-tsaware` (default).
+    pub tsaware: bool,
+    /// `--no-seh` / `--disable-no-seh` (default).
+    pub no_seh: bool,
+    /// `--forceinteg` / `--disable-forceinteg` (default).
+    pub forceinteg: bool,
+    /// `--no-isolation` / `--disable-no-isolation` (default).
+    pub no_isolation: bool,
+    /// `--no-bind` / `--disable-no-bind` (default).
+    pub no_bind: bool,
+    /// `--wdmdriver` / `--disable-wdmdriver` (default).
+    pub wdmdriver: bool,
+    /// `--large-address-aware` (default) / `--disable-large-address-aware`.
+    pub large_address_aware: bool,
+    /// `--enable-reloc-section` (default) / `--disable-reloc-section`.
+    pub reloc_section: bool,
+    /// `--insert-timestamp` / `--no-insert-timestamp` (default, so that the
+    /// output is reproducible).
+    pub insert_timestamp: bool,
+    /// `--out-implib FILE`: write an import library for the exports.
+    pub out_implib: Option<PathBuf>,
+    /// `--output-def FILE`: write a module-definition file for the exports.
+    pub output_def: Option<PathBuf>,
+    /// A module-definition file named as a positional input, as GNU ld's PE
+    /// emulations accept it.
+    pub def_file: Option<PathBuf>,
+    /// `--export-all-symbols`.
+    pub export_all_symbols: bool,
+    /// `--exclude-all-symbols`.
+    pub exclude_all_symbols: bool,
+    /// `--exclude-symbols SYM,SYM,…`: names `--export-all-symbols` skips.
+    pub exclude_symbols: Vec<String>,
+    /// `--exclude-modules-for-implib MOD,MOD,…`: objects and archives whose
+    /// symbols the import library omits.
+    pub exclude_modules_for_implib: Vec<String>,
+    /// `--kill-at`: drop the `@N` suffix of stdcall names in exports.
+    pub kill_at: bool,
+    /// `--add-stdcall-alias`: also export the undecorated name.
+    pub add_stdcall_alias: bool,
+    /// `--enable-stdcall-fixup` (`Some(true)`) / `--disable-stdcall-fixup`
+    /// (`Some(false)`). `None` means the linker decides.
+    pub stdcall_fixup: Option<bool>,
+    /// `--enable-auto-import` (default) / `--disable-auto-import`.
+    pub auto_import: bool,
+    /// `--enable-runtime-pseudo-reloc` (default) /
+    /// `--disable-runtime-pseudo-reloc`.
+    pub runtime_pseudo_reloc: bool,
+    /// `--export SPEC`: an export specification in `.drectve` `-export:`
+    /// syntax. This spelling is a qld extension; GNU ld takes exports from
+    /// `.def` files, `.drectve` sections and `--export-all-symbols`.
+    pub exports: Vec<String>,
+    /// `--warn-duplicate-exports`.
+    pub warn_duplicate_exports: bool,
+}
+
+impl Default for PeArgs {
+    fn default() -> Self {
+        use crate::coff::options as pe;
+        Self {
+            subsystem: None,
+            section_alignment: pe::DEFAULT_SECTION_ALIGNMENT,
+            file_alignment: pe::DEFAULT_FILE_ALIGNMENT,
+            stack: (pe::DEFAULT_STACK_RESERVE, pe::DEFAULT_STACK_COMMIT),
+            heap: (pe::DEFAULT_HEAP_RESERVE, pe::DEFAULT_HEAP_COMMIT),
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_os_version: 4,
+            minor_os_version: 0,
+            major_subsystem_version: 5,
+            minor_subsystem_version: 2,
+            dynamicbase: true,
+            nxcompat: true,
+            high_entropy_va: true,
+            tsaware: false,
+            no_seh: false,
+            forceinteg: false,
+            no_isolation: false,
+            no_bind: false,
+            wdmdriver: false,
+            large_address_aware: true,
+            reloc_section: true,
+            insert_timestamp: false,
+            out_implib: None,
+            output_def: None,
+            def_file: None,
+            export_all_symbols: false,
+            exclude_all_symbols: false,
+            exclude_symbols: Vec::new(),
+            exclude_modules_for_implib: Vec::new(),
+            kill_at: false,
+            add_stdcall_alias: false,
+            stdcall_fixup: None,
+            auto_import: true,
+            runtime_pseudo_reloc: true,
+            exports: Vec::new(),
+            warn_duplicate_exports: false,
+        }
+    }
+}
+
 /// Everything a link is configured by.
 ///
 /// Construct one with [`LinkOptions::new`] and the builder methods, or parse
@@ -564,6 +705,9 @@ pub struct LinkOptions {
     pub color: ColorChoice,
     /// `--noinhibit-exec`: write the output even after errors.
     pub noinhibit_exec: bool,
+    /// The PE/COFF options of GNU ld's MinGW emulations. Only PE links read
+    /// them.
+    pub pe: PeArgs,
     /// LTO plugin paths (`-plugin`) and their options (`-plugin-opt`).
     pub plugins: Vec<(PathBuf, Vec<String>)>,
     /// `-plugin-save-temps`: keep the files an LTO plugin generates.

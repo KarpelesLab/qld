@@ -106,6 +106,17 @@ fn sample(name: &str) -> &'static str {
         "z" => "now",
         "rsp-quoting" => "posix",
         "demangle" => "auto",
+        "subsystem" => "windows",
+        "stack" => "0x100000,0x1000",
+        "heap" => "0x200000,0x2000",
+        "section-alignment" => "0x2000",
+        "file-alignment" => "0x400",
+        "major-image-version"
+        | "minor-image-version"
+        | "major-os-version"
+        | "minor-os-version"
+        | "major-subsystem-version"
+        | "minor-subsystem-version" => "3",
         _ => "value",
     }
 }
@@ -154,6 +165,22 @@ const SETS_DEFAULT: &[&str] = &[
     "no-fatal-warnings",
     "demangle",
     "dependent-libraries",
+    // PE/COFF options whose value is the GNU ld `i386pep` default.
+    "dynamicbase",
+    "nxcompat",
+    "high-entropy-va",
+    "large-address-aware",
+    "disable-tsaware",
+    "disable-no-seh",
+    "disable-forceinteg",
+    "disable-no-isolation",
+    "disable-no-bind",
+    "disable-wdmdriver",
+    "enable-reloc-section",
+    "no-insert-timestamp",
+    "enable-auto-import",
+    "enable-runtime-pseudo-reloc",
+    "enable-runtime-pseudo-reloc-v2",
 ];
 
 /// Every way an option can be written, each as a list of argv entries.
@@ -508,7 +535,7 @@ fn unsupported_options_name_themselves() {
         message,
         "unsupported option: --incremental (incremental linking is not supported)"
     );
-    assert!(error(&["-subsystem", "windows", "a.o"]).starts_with("unsupported option: -subsystem"));
+    assert!(error(&["-base-file", "x.base", "a.o"]).starts_with("unsupported option: -base-file"));
     assert!(
         error(&["-z", "retpolineplt", "a.o"]).starts_with("unsupported option: -z retpolineplt")
     );
@@ -1258,13 +1285,289 @@ fn mold_rust_release() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// PE/COFF (MinGW) options
+// ---------------------------------------------------------------------------
+
+/// The link line `x86_64-w64-mingw32-gcc` passes for a console executable.
 #[test]
-fn mingw_command_line_is_rejected_by_name() {
-    let message = error(&["-m", "i386pep", "--subsystem", "console", "a.o"]);
-    assert!(
-        message.contains("--subsystem") && message.contains("M7"),
-        "{message}"
+fn mingw_console_command_line() {
+    let o = link(&[
+        "--sysroot=/usr/lib/mingw64-toolchain",
+        "-m",
+        "i386pep",
+        "-Bdynamic",
+        "-o",
+        "t.exe",
+        "crt2.o",
+        "-L/usr/lib/mingw64-toolchain/mingw/lib",
+        "hello.o",
+        "-lmingw32",
+        "-lgcc",
+        "-lmsvcrt",
+        "-lkernel32",
+    ]);
+    assert_eq!(o.target.map(|target| target.format), Some(BinaryFormat::Pe));
+    assert_eq!(o.kind, OutputKind::Executable);
+    assert_eq!(o.output, Some(PathBuf::from("t.exe")));
+    assert!(o.warnings.is_empty() && o.ignored.is_empty());
+    // Nothing on that line touches the PE options, so they are all defaults.
+    assert_eq!(o.pe, qld::args::PeArgs::default());
+}
+
+/// `-mwindows` adds `--subsystem windows`, and `-shared` adds `--shared`,
+/// `--enable-auto-image-base` and `--out-implib`.
+#[test]
+fn mingw_windows_and_shared_command_lines() {
+    let o = link(&[
+        "-m",
+        "i386pep",
+        "--subsystem",
+        "windows",
+        "-Bdynamic",
+        "a.o",
+    ]);
+    assert_eq!(o.pe.subsystem, Some(2)); // IMAGE_SUBSYSTEM_WINDOWS_GUI
+    assert!(o.warnings.is_empty() && o.ignored.is_empty());
+
+    let o = link(&[
+        "-m",
+        "i386pep",
+        "--shared",
+        "-Bdynamic",
+        "-e",
+        "DllMainCRTStartup",
+        "--enable-auto-image-base",
+        "-o",
+        "d.dll",
+        "d.o",
+        "--out-implib",
+        "libd.dll.a",
+    ]);
+    assert_eq!(o.kind, OutputKind::Shared);
+    assert_eq!(o.entry.as_deref(), Some("DllMainCRTStartup"));
+    assert_eq!(o.pe.out_implib, Some(PathBuf::from("libd.dll.a")));
+    assert_eq!(o.ignored, [OsString::from("--enable-auto-image-base")]);
+    assert!(o.warnings.is_empty());
+
+    let pe = qld::coff::PeOptions::from_link_options(&o);
+    assert!(pe.dll);
+    assert_eq!(pe.out_implib, Some(PathBuf::from("libd.dll.a")));
+}
+
+/// `--dll` is GNU ld's PE spelling of `-shared`.
+#[test]
+fn dll_is_shared() {
+    for flag in ["-shared", "--shared", "--dll", "-dll"] {
+        let o = link(&[flag, "a.o"]);
+        assert_eq!(o.kind, OutputKind::Shared, "{flag}");
+        assert!(qld::coff::PeOptions::from_link_options(&o).dll, "{flag}");
+    }
+    assert!(!qld::coff::PeOptions::from_link_options(&link(&["a.o"])).dll);
+}
+
+/// The value formats of the PE options that take one.
+#[test]
+fn pe_option_values() {
+    let o = link(&[
+        "--subsystem",
+        "windows,6.1",
+        "--stack",
+        "0x100000,0x1000",
+        "--heap",
+        "2097152",
+        "--image-base=0x1c0000000",
+        "--section-alignment",
+        "0x2000",
+        "--file-alignment=0x400",
+        "--major-image-version",
+        "2",
+        "--minor-image-version=11",
+        "--major-os-version",
+        "6",
+        "--minor-os-version",
+        "1",
+        "--major-subsystem-version=6",
+        "--minor-subsystem-version",
+        "2",
+        "a.o",
+    ]);
+    assert_eq!(o.pe.subsystem, Some(2));
+    assert_eq!(o.pe.major_subsystem_version, 6);
+    assert_eq!(o.pe.minor_subsystem_version, 2);
+    assert_eq!(o.pe.stack, (0x10_0000, 0x1000));
+    // Only a reserve: the commit size keeps its default.
+    assert_eq!(o.pe.heap, (0x20_0000, 0x1000));
+    assert_eq!(o.image_base, Some(0x1_c000_0000));
+    assert_eq!(o.pe.section_alignment, 0x2000);
+    assert_eq!(o.pe.file_alignment, 0x400);
+    assert_eq!(
+        (o.pe.major_image_version, o.pe.minor_image_version),
+        (2, 11)
     );
+    assert_eq!((o.pe.major_os_version, o.pe.minor_os_version), (6, 1));
+
+    // `--subsystem NAME,MAJOR.MINOR` also sets the subsystem version, and
+    // `--subsystem N` takes a raw number.
+    let o = link(&["--subsystem", "console,6.1", "a.o"]);
+    assert_eq!(o.pe.subsystem, Some(3));
+    assert_eq!(
+        (o.pe.major_subsystem_version, o.pe.minor_subsystem_version),
+        (6, 1)
+    );
+    assert_eq!(link(&["--subsystem=native", "a.o"]).pe.subsystem, Some(1));
+    assert_eq!(link(&["--subsystem=10", "a.o"]).pe.subsystem, Some(10));
+    assert_eq!(
+        link(&["--subsystem", "efi-app", "a.o"]).pe.subsystem,
+        Some(10)
+    );
+
+    // `--stack` and `-z stack-size` set the same field; the last one wins.
+    let o = link(&["-z", "stack-size=0x40000", "a.o"]);
+    assert_eq!(o.pe.stack.0, 0x4_0000);
+    assert_eq!(o.stack_size, Some(0x4_0000));
+    assert_eq!(
+        link(&["-z", "stack-size=0x40000", "--stack", "0x80000", "a.o"])
+            .pe
+            .stack
+            .0,
+        0x8_0000
+    );
+
+    assert!(error(&["--subsystem", "bogus", "a.o"]).contains("bogus"));
+    assert!(error(&["--stack", "x", "a.o"]).contains("--stack"));
+    assert!(error(&["--stack", "0x1000,x", "a.o"]).contains("--stack"));
+    assert!(error(&["--major-os-version", "70000", "a.o"]).contains("--major-os-version"));
+    assert!(error(&["--section-alignment", "0x100000000", "a.o"]).contains("--section-alignment"));
+}
+
+/// The image flags, their `--disable-*` forms, and the lists.
+#[test]
+fn pe_flags_and_lists() {
+    let defaults = qld::args::PeArgs::default();
+    assert!(defaults.dynamicbase && defaults.nxcompat && defaults.high_entropy_va);
+    assert!(defaults.large_address_aware && defaults.reloc_section);
+    assert!(defaults.auto_import && defaults.runtime_pseudo_reloc);
+    assert!(!defaults.insert_timestamp && !defaults.tsaware);
+
+    let o = link(&[
+        "--disable-dynamicbase",
+        "--disable-nxcompat",
+        "--disable-high-entropy-va",
+        "--disable-large-address-aware",
+        "--disable-reloc-section",
+        "--disable-auto-import",
+        "--disable-runtime-pseudo-reloc",
+        "--tsaware",
+        "--no-seh",
+        "--forceinteg",
+        "--no-isolation",
+        "--no-bind",
+        "--wdmdriver",
+        "--insert-timestamp",
+        "--kill-at",
+        "--add-stdcall-alias",
+        "--enable-stdcall-fixup",
+        "--export-all-symbols",
+        "--exclude-all-symbols",
+        "--warn-duplicate-exports",
+        "--exclude-symbols",
+        "secret,_hidden@4",
+        "--exclude-modules-for-implib=libfoo.a,bar.o",
+        "--export=add_one",
+        "--export",
+        "alias=real,@7,NONAME",
+        "--out-implib",
+        "libx.dll.a",
+        "--output-def=x.def",
+        "a.o",
+    ]);
+    let pe = &o.pe;
+    assert!(!pe.dynamicbase && !pe.nxcompat && !pe.high_entropy_va);
+    assert!(!pe.large_address_aware && !pe.reloc_section);
+    assert!(!pe.auto_import && !pe.runtime_pseudo_reloc);
+    assert!(pe.tsaware && pe.no_seh && pe.forceinteg && pe.no_isolation);
+    assert!(pe.no_bind && pe.wdmdriver && pe.insert_timestamp);
+    assert!(pe.kill_at && pe.add_stdcall_alias && pe.export_all_symbols);
+    assert!(pe.exclude_all_symbols && pe.warn_duplicate_exports);
+    assert_eq!(pe.stdcall_fixup, Some(true));
+    assert_eq!(pe.exclude_symbols, ["secret", "_hidden@4"]);
+    assert_eq!(pe.exclude_modules_for_implib, ["libfoo.a", "bar.o"]);
+    assert_eq!(pe.exports, ["add_one", "alias=real,@7,NONAME"]);
+    assert_eq!(pe.out_implib, Some(PathBuf::from("libx.dll.a")));
+    assert_eq!(pe.output_def, Some(PathBuf::from("x.def")));
+
+    // Everything reaches the PE backend's options.
+    let backend = qld::coff::PeOptions::from_link_options(&o);
+    assert!(!backend.dynamicbase && !backend.nxcompat && !backend.high_entropy_va);
+    assert!(backend.disable_reloc_section && backend.insert_timestamp);
+    assert_eq!(
+        backend.auto_import,
+        qld::coff::options::AutoImport::Disabled
+    );
+    assert!(!backend.runtime_pseudo_reloc);
+    assert_eq!(backend.enable_stdcall_fixup, Some(true));
+    assert_eq!(
+        backend.exclude_symbols,
+        [b"secret".to_vec(), b"_hidden@4".to_vec()]
+    );
+    assert_eq!(backend.exports.len(), 2);
+    assert_eq!(backend.output_def, Some(PathBuf::from("x.def")));
+
+    // The `--no-*` spellings of the flags GNU ld also accepts that way.
+    assert!(!link(&["--no-dynamicbase", "a.o"]).pe.dynamicbase);
+    assert_eq!(
+        link(&["--disable-stdcall-fixup", "a.o"]).pe.stdcall_fixup,
+        Some(false)
+    );
+    assert!(!link(&["--no-insert-timestamp", "a.o"]).pe.insert_timestamp);
+}
+
+/// A bare `.def` file is a module-definition file, not an object.
+#[test]
+fn def_file_is_a_positional_input() {
+    let o = link(&["a.o", "exports.def"]);
+    assert_eq!(o.pe.def_file, Some(PathBuf::from("exports.def")));
+    let kinds: Vec<_> = o.inputs.iter().map(|i| i.kind.clone()).collect();
+    assert_eq!(kinds, [file("a.o")]);
+    assert_eq!(
+        qld::coff::PeOptions::from_link_options(&o).def_file,
+        Some(PathBuf::from("exports.def"))
+    );
+    // The extension match is case-insensitive, and works after `--` too.
+    assert_eq!(
+        link(&["a.o", "--", "EXPORTS.DEF"]).pe.def_file,
+        Some(PathBuf::from("EXPORTS.DEF"))
+    );
+    // A name that only contains `.def` is an ordinary input.
+    assert_eq!(link(&["a.def.o"]).inputs[0].kind, file("a.def.o"));
+    assert!(link(&["a.o"]).pe.def_file.is_none());
+    assert!(error(&["a.o", "one.def", "two.def"]).contains("only one .def file"));
+}
+
+/// PE options parse whatever the target is, and change nothing about an ELF
+/// link.
+#[test]
+fn pe_options_do_not_disturb_an_elf_link() {
+    let elf = link(&["-m", "elf_x86_64", "a.o"]);
+    let with_pe = link(&[
+        "-m",
+        "elf_x86_64",
+        "--subsystem",
+        "windows",
+        "--dynamicbase",
+        "--major-image-version",
+        "3",
+        "--out-implib",
+        "x.a",
+        "a.o",
+    ]);
+    let strip_pe = |options: &LinkOptions| {
+        let mut options = options.clone();
+        options.pe = qld::args::PeArgs::default();
+        format!("{options:?}")
+    };
+    assert_eq!(strip_pe(&elf), strip_pe(&with_pe));
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,4 +1654,7 @@ fn help_names_supported_targets_for_libtool() {
         .expect("supported targets line");
     assert!(line.contains(" elf"), "{line}");
     assert!(help.contains(": supported emulations: elf_x86_64"));
+    // The MinGW emulation qld links too.
+    assert!(line.contains("pei-x86-64"), "{line}");
+    assert!(help.contains("i386pep"));
 }
