@@ -1,0 +1,57 @@
+[package]
+name = "qld"
+description = "A fast, parallel linker compatible with GNU ld, gold, lld and mold"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/KarpelesLab/qld"
+authors = ["Karpelès Lab Inc."]
+keywords = ["linker", "elf", "macho", "pe", "lto"]
+categories = ["development-tools::build-utils"]
+exclude = ["/tests/scratch", "/benches/corpus", "/.github"]
+
+[lib]
+name = "qld"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qld"
+path = "src/main.rs"
+
+[features]
+default = ["plugin"]
+# LTO through the GNU linker plugin API. The only part of qld that uses FFI:
+# it dlopen()s the plugin the compiler toolchain provides.
+plugin = []
+
+[dependencies]
+# Kept deliberately small; see docs/development.md for the policy. Pure Rust
+# only: no -sys crates, no C build steps.
+foldhash = "0.2"
+hashbrown = "0.16"
+memmap2 = "0.9"
+rayon = "1.11"
+
+[dev-dependencies]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Parsers handle untrusted input: arithmetic on offsets must be checked.
+arithmetic_side_effects = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+# Used by the benchmark drivers: release code plus full debug info.
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false

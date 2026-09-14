@@ -16,9 +16,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 Set up the project skeleton and the infrastructure every later milestone needs.
 
-- [ ] Cargo workspace (see [architecture.md](docs/architecture.md#crate-layout)),
-      `rust-version = "1.89"`, edition 2024
-- [ ] CI: build and test on stable and 1.89, `clippy -D warnings`, `rustfmt --check`,
+- [x] Crate skeleton: one crate, module per pipeline stage (see
+      [architecture.md](docs/architecture.md#module-layout)), `rust-version = "1.89"`,
+      edition 2024, shared types (IDs, errors, diagnostics, target) in place
+- [x] Work split into parallel workstreams ([workstreams.md](docs/workstreams.md))
+- [x] CI: build and test on stable and 1.89, `clippy -D warnings`, `rustfmt --check`,
       `cargo doc`, `cargo deny` (licenses/advisories), Linux/macOS/Windows hosts
 - [ ] Diagnostics framework: error/warning/note with input location, GNU-style
       `qld: error: ...` rendering, and structured form for library users

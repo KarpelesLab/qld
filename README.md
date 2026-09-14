@@ -52,7 +52,8 @@ can link programs in-process.
 | Document | Contents |
 | --- | --- |
 | [ROADMAP.md](ROADMAP.md) | Milestones, scope and exit criteria |
-| [docs/architecture.md](docs/architecture.md) | Link pipeline, crate layout, data model, parallelism |
+| [docs/workstreams.md](docs/workstreams.md) | Parallel work areas, file ownership, how to launch work |
+| [docs/architecture.md](docs/architecture.md) | Link pipeline, module layout, data model, parallelism |
 | [docs/compatibility.md](docs/compatibility.md) | Command-line flavors, option parsing rules, behavioral differences |
 | [docs/formats.md](docs/formats.md) | Input/output formats and architectures, per-format scope |
 | [docs/optimizations.md](docs/optimizations.md) | GC, ICF, merging, relaxation, LTO, symbol matching |

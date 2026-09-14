@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Test and benchmark scratch output
+/tests/scratch/
+/benches/corpus/
+perf.data*

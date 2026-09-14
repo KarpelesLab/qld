@@ -106,9 +106,8 @@ of the IR.
 
 **Pure Rust note:** building qld needs no C code. The plugin itself is native
 code that the compiler toolchain provides, and it is loaded with `dlopen` at
-run time, only when `-plugin` is given. This lives in the `qld-plugin` crate
-behind the `plugin` cargo feature. That feature is the only place qld uses
-FFI.
+run time, only when `-plugin` is given. This lives in `src/plugin/` behind the
+`plugin` cargo feature. That feature is the only place qld uses FFI.
 
 The ld64 flavor uses `libLTO` (`-lto_library`) through a thin adapter in the
 same crate.

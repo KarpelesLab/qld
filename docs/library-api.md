@@ -22,38 +22,47 @@ design choices don't close it off.
 
 ## Sketch
 
+The types below exist today in `src/args/options.rs` and `src/diag.rs`; the
+parts marked *planned* do not.
+
 ```rust
-use qld::{Config, Input, Output, OutputKind, Target};
+use qld::args::{InputAttrs, InputKind, LinkOptions, OutputKind};
+use qld::diag::Collect;
 
 // Parse a GNU-style command line, exactly as the `qld` binary does.
-let config = Config::from_gnu_args(["-o", "hello", "crt1.o", "hello.o", "-lc"])?;
+let outcome = qld::parse_gnu(&["qld", "-o", "hello", "crt1.o", "hello.o", "-lc"])?;
 
-// Or build the configuration programmatically.
-let mut config = Config::new(Target::X86_64_LINUX_GNU);
-config
-    .kind(OutputKind::Pie)
-    .output(Output::path("hello"))
-    .library_path("/usr/lib64")
-    .input(Input::path("crt1.o"))
-    .input(Input::bytes("hello.o", object_bytes)) // in-memory input
-    .library("c")
-    .gc_sections(true)
-    .build_id(qld::BuildId::Fast);
+// Or build the options programmatically.
+let mut options = LinkOptions::new();
+options.kind = OutputKind::Pie;
+options.output = Some("hello".into());
+options.search_paths.push("/usr/lib64".into());
+options.gc_sections = true;
+options.push_input(InputKind::File("crt1.o".into()), InputAttrs::default());
+options.push_input(
+    InputKind::Bytes { name: "hello.o".into(), data: object_bytes }, // in-memory input
+    InputAttrs::default(),
+);
+options.push_input(InputKind::Library("c".into()), InputAttrs::default());
 
-let report = qld::link(&config, &mut qld::diag::Collect::default())?;
+let diagnostics = Collect::new();
+qld::link(&options, &diagnostics)?;
 ```
 
 ### Main types
 
 | Type | Role |
 | --- | --- |
-| `Config` | All link options. Plain data; builder methods; `from_gnu_args` / `from_darwin_args` |
-| `Target` | Format + architecture + OS/ABI (e.g. `X86_64_LINUX_GNU`, `AARCH64_APPLE_DARWIN`, `X86_64_WINDOWS_GNU`) |
-| `Input` | `path`, `bytes` (`Arc<[u8]>`), `library`, `script`, with positional attributes (whole-archive, as-needed, static) |
-| `Output` | `path`, or `memory` (returns `Vec<u8>` in the report) |
-| `DiagnosticSink` | Trait receiving `Diagnostic { severity, code, message, locations, notes }` |
-| `LinkReport` | Output bytes (when in memory), timing per stage, statistics, optional map file data |
+| `LinkOptions` | All link options. Plain data, no I/O; built by hand or by an argv front end |
+| `Target` | Format + architecture + endianness + pointer width + OS |
+| `InputKind` | `File`, `Library`, `LibraryExact`, `Script`, or `Bytes` (`Arc<[u8]>`) for in-memory inputs |
+| `InputAttrs` | Positional state per input: whole-archive, as-needed, static-only, in-group |
+| `DiagnosticSink` | Trait receiving `Diagnostic { severity, message, locations, notes, order }`; `Collect` and `Stderr` implement it |
 | `Error` | Non-exhaustive enum. Fatal errors only; warnings go to the sink |
+| `LinkReport` *(planned)* | Output bytes when writing to memory, per-stage timing, statistics, map data |
+
+*Planned:* an in-memory `Output`, a cancellation token, and a builder API that
+does not require setting public fields directly.
 
 ### Extension points (post-1.0 candidates)
 

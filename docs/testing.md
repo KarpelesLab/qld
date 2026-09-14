@@ -4,8 +4,8 @@
 
 | Tier | What | Where | Runs |
 | --- | --- | --- | --- |
-| Unit | Parsers, expression evaluator, relocation math, hash tables | `#[cfg(test)]` in each crate | every commit |
-| Option corpus | Real argv captured from gcc/clang/rustc/cargo/meson/cmake builds, parsed and checked against the expected `LinkOptions` | `crates/qld-args/tests/corpus/` | every commit |
+| Unit | Parsers, expression evaluator, relocation math, hash tables | `#[cfg(test)]` beside the code | every commit |
+| Option corpus | Real argv captured from gcc/clang/rustc/cargo/meson/cmake builds, parsed and checked against the expected `LinkOptions` | `tests/corpus/` | every commit |
 | Fixtures | Small C/C++/asm/Rust programs compiled with the host toolchain, linked by qld, **executed**, and their output checked | `tests/fixtures/` | every commit |
 | Differential | The same link done by qld and GNU ld (and lld where available); normalized `readelf`/`objdump` output compared | `tests/diff/` | every commit |
 | Cross-arch | Fixtures cross-compiled and run under `qemu-user` | `tests/fixtures/` + CI matrix | every commit (x86-64, aarch64, riscv64); nightly (others) |
@@ -61,7 +61,7 @@ the comparison looks at:
 | macOS arm64 / x86-64 | Mach-O fixtures (M8), host build of qld |
 | Windows x86-64 | PE fixtures (M7), host build of qld |
 
-MSRV (Rust 1.89) CI builds the workspace and runs the unit tests.
+MSRV (Rust 1.89) CI builds the crate and runs the unit tests.
 Integration tiers run on current stable.
 
 ## Benchmarks

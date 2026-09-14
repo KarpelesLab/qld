@@ -32,8 +32,8 @@ disagree, fix one of them.
    showed that forcing one format-neutral symbol model on all of them costs
    more than it saves. qld shares the machinery (arenas, interning, a
    concurrent symbol table, the GC and ICF engines, merging, output writing,
-   archives, diagnostics). Each format backend owns its own resolution rules
-   and layout.
+   archives, diagnostics) in modules that know nothing about any format. Each
+   format backend owns its own resolution rules and layout.
 7. **Malformed input is an error, not a panic.** Input files are untrusted.
    Every offset and size is bounds-checked, and a parse failure becomes a
    diagnostic that names the file and offset.
@@ -194,38 +194,46 @@ The final file size is known before any byte is written. The writer then:
 Removing a large old output file can run on a background thread so that it
 doesn't hold up the link.
 
-## Crate layout
+## Module layout
+
+qld is a **single crate**. It builds as one library plus one binary, and the
+modules follow the pipeline above.
 
 ```
 qld/
-├── Cargo.toml                 # workspace; rust-version = "1.89", edition = "2024"
-├── crates/
-│   ├── qld/                   # public facade crate + `qld` binary
-│   ├── qld-core/              # IDs, arenas, interning, concurrent symbol table,
-│   │                          # GC engine, ICF engine, merge sections, output writer,
-│   │                          # diagnostics, thread pool integration
-│   ├── qld-args/              # LinkOptions + GNU and ld64 argv front ends
-│   ├── qld-archive/           # ar reader (GNU/BSD/thin, symbol index), shared by all formats
-│   ├── qld-script/            # GNU linker script lexer, parser, expression evaluator
-│   ├── qld-arch/              # instruction-level helpers shared across formats
-│   │                          # (branch ranges, thunk encodings, ADRP math, ...)
-│   ├── qld-elf/               # ELF backend: parsing, resolution rules, layout,
-│   │                          # synthetic sections, per-arch relocation code
-│   ├── qld-coff/              # PE/COFF backend
-│   ├── qld-macho/             # Mach-O backend, .tbd reader, fat binaries, code signing
-│   ├── qld-debug/             # DWARF helpers: section compression, gdb-index,
-│   │                          # line-table lookup for diagnostics
-│   └── qld-plugin/            # GNU linker plugin API host (feature `plugin`)
-├── tests/                     # cross-crate integration tests and fixtures
-├── fuzz/                      # cargo-fuzz targets
-├── benches/                   # benchmark drivers (see testing.md)
+├── Cargo.toml              # rust-version = "1.89", edition = "2024"
+├── src/
+│   ├── lib.rs              # public API, module tree, `link()`
+│   ├── main.rs             # the `qld` binary: a thin wrapper over the library
+│   ├── error.rs            # fatal errors
+│   ├── diag.rs             # diagnostics and sinks
+│   ├── ids.rs              # FileId / SectionId / SymbolId
+│   ├── target.rs           # format + architecture + ABI
+│   ├── args/               # LinkOptions and the GNU / ld64 argv front ends
+│   ├── input/              # mmap, format identification, ar archives
+│   ├── symbols/            # interning and the concurrent symbol table
+│   ├── passes/             # GC, ICF, merge sections (format-neutral)
+│   ├── script/             # GNU linker script lexer, parser, evaluator
+│   ├── output/             # output file writer, build-id, post-write steps
+│   ├── elf/                # ELF backend (read, layout, synth, arch/)
+│   ├── coff/               # PE/COFF backend
+│   ├── macho/              # Mach-O backend, .tbd, fat binaries, code signing
+│   ├── arch/               # instruction-level helpers shared across formats
+│   ├── debug/              # DWARF: compression, indexes, line lookup
+│   └── plugin/             # LTO plugin host (feature `plugin`)
+├── tests/                  # integration tests and fixtures
+├── fuzz/                   # cargo-fuzz targets
+├── benches/                # benchmark drivers (see testing.md)
 └── docs/
 ```
 
-Splitting into crates keeps build times reasonable and enforces boundaries.
-For example, `qld-core` cannot depend on any format backend. Only the `qld`
-facade is a public, semver-stable API. The inner crates are published because
-cargo requires it, but they are documented as internal.
+Boundaries are enforced by review rather than by the compiler: the shared
+modules (`input`, `symbols`, `passes`, `output`) must not reference a format
+backend. Only the root re-exports in `lib.rs` are a public, semver-stable API;
+everything else is `pub` for convenience and may change.
+
+Who works where, and which files each task owns, is in
+[workstreams.md](workstreams.md).
 
 ## Memory model
 

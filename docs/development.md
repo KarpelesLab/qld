@@ -2,10 +2,9 @@
 
 ## Toolchain
 
-- **MSRV: Rust 1.89**, **edition 2024**. Every crate sets
-  `rust-version = "1.89"` and `edition = "2024"` through workspace inheritance.
+- **MSRV: Rust 1.89**, **edition 2024**, set in `Cargo.toml`.
 - Do not use language or standard library features stabilized after 1.89.
-  Check with `cargo +1.89 check --workspace --all-targets`.
+  Check with `cargo +1.89 check --all-targets --all-features`.
 - Edition 2024 features that 1.89 supports and that we use freely: let chains
   (`if let Some(x) = a && cond`), `unsafe extern` blocks, and the new RPIT
   lifetime capture rules.
@@ -15,27 +14,33 @@
 ## Common commands
 
 ```sh
-cargo build --release                         # release build of qld
-cargo test --workspace                        # unit + integration tests
-cargo +1.89 check --workspace --all-targets   # MSRV check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release                        # release build of qld
+cargo test --all-features                    # unit + integration tests
+cargo +1.89 check --all-targets --all-features   # MSRV check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
-cargo fuzz run elf_object                     # fuzz a parser (nightly)
+cargo fuzz run elf_object                    # fuzz a parser (nightly)
 ```
+
+qld is a **single crate**: one library, one binary, modules per pipeline stage.
+See [architecture.md](architecture.md#module-layout) for the layout and
+[workstreams.md](workstreams.md) for who owns which directory.
 
 ## Dependency policy
 
 - **Pure Rust only.** No `build.rs` that compiles C, and no `-sys` crates.
-  The `qld-plugin` crate's `dlopen` of compiler-provided LTO plugins is the
-  one exception, and it is behind the `plugin` feature.
+  The `plugin` module's `dlopen` of compiler-provided LTO plugins is the one
+  exception, and it is behind the `plugin` feature.
 - Keep the dependency set small. Every new dependency needs a reason in the PR.
-  Expected core dependencies:
+  Current dependencies:
   - `rayon` (parallelism)
   - `memmap2` (file mapping)
   - `hashbrown` + `foldhash` (hash tables)
-  - `rustix` (pure-Rust syscalls: `fallocate`, `ftruncate`, file cloning)
+  Expected later, when the feature that needs them lands:
   - `flate2` with the `miniz_oxide` backend, and a pure-Rust zstd (`ruzstd`), for compressed debug sections
   - `libloading` (plugin feature only)
+  Small algorithms we need in one place — MD5 and SHA-1 for `--build-id`, CRC32
+  for PE — are implemented in-crate rather than pulled in as dependencies.
 - **Object parsing is written in-house**, not taken from the `object` crate. The
   hot paths need zero-copy, monomorphized, parallel-friendly access that fits
   qld's ID-based data model. `object`, `gimli` and similar crates may still be
@@ -46,9 +51,9 @@ cargo fuzz run elf_object                     # fuzz a parser (nightly)
 
 ## `unsafe` policy
 
-- `#![forbid(unsafe_code)]` in every crate except `qld-core` (mmap, output
-  writer), `qld-plugin` (FFI), and the format crates' typed views, if
-  benchmarks show the safe alternative costs too much.
+- The crate sets `#![deny(unsafe_code)]`. Only `src/input/` (mapping),
+  `src/output/` (mapping) and `src/plugin/` (FFI) may lift it, module by
+  module, with a comment saying why.
 - Every `unsafe` block has a `// SAFETY:` comment stating the invariant.
 - Typed views over input bytes use `from_le_bytes`/`from_be_bytes` on slices,
   or `#[repr(C)]` structs with alignment-1 integer wrappers. Never cast a
@@ -73,14 +78,14 @@ cargo fuzz run elf_object                     # fuzz a parser (nightly)
   parallel stages. Preallocate from counts gathered in an earlier pass.
 - **Byte strings.** Symbol and section names are `&[u8]`. Convert them to
   strings only for display (`String::from_utf8_lossy` or a demangler).
-- **Documentation.** Every `pub` item in the `qld` crate has rustdoc. Inner
-  crates document module-level design. A change to the pipeline updates
-  `docs/architecture.md` in the same PR.
+- **Documentation.** Every `pub` item has rustdoc (`missing_docs` is a
+  warning), and every module has a module-level comment saying what it owns.
+  A change to the pipeline updates `docs/architecture.md` in the same PR.
 
 ## Commit and PR conventions
 
 - Keep commits focused, with a message in the imperative mood (`elf: add GOTPCRELX relaxation`),
-  prefixed with the crate or area.
+  prefixed with the module or area.
 - Tests come with the change: a fixture for any new behavior, and a regression
   fixture for any bug fix.
 - A PR that intentionally diverges from GNU ld behavior updates the list of
