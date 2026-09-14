@@ -50,11 +50,12 @@ fn skip(reason: &str) {
     println!("SKIPPED: {reason}");
 }
 
-/// Finds `name` in `PATH`.
+/// Finds `name` in `PATH`, trying the `.exe` spelling on Windows.
 fn tool(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let names = [name.to_owned(), format!("{name}.exe")];
     std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
+        .flat_map(|dir| names.clone().map(|name| dir.join(name)))
         .find(|candidate| candidate.is_file())
 }
 

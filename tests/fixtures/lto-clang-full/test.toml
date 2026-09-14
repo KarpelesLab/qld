@@ -29,3 +29,7 @@ requires_files = [
   "/usr/lib*/LLVMgold.so",              # Fedora, Arch
   "/usr/local/lib*/LLVMgold.so",
 ]
+# On AArch64 qld routes a preemptible function that also has a GOT entry
+# through .plt.got, which GNU ld's AArch64 port does not have (see
+# docs/compatibility.md); on x86-64 both linkers agree.
+diff.ignore = [".plt.got", "R_AARCH64_JUMP_SLOT"]

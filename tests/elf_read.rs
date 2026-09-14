@@ -1139,7 +1139,14 @@ fn check_shared(inv: &Inventory) {
             .iter()
             .any(|s| s.name == "puts" && s.version.starts_with("@GLIBC_"))
     );
-    assert!(inv.relr.iter().any(|(_, n)| *n > 0), "{:?}", inv.relr);
+    // Whether the link emits `.relr.dyn` depends on the toolchain's default
+    // for -z pack-relative-relocs (on by default with binutils 2.46 here, off
+    // with 2.42 on Ubuntu), so only check the contents when one is present.
+    if inv.relr.is_empty() {
+        println!("SKIPPED: this toolchain does not emit .relr.dyn");
+    } else {
+        assert!(inv.relr.iter().any(|(_, n)| *n > 0), "{:?}", inv.relr);
+    }
 }
 
 #[test]
