@@ -72,9 +72,15 @@ every output format:
 - `.debug_*` sections are concatenated and relocated in parallel, split by
   input file. Debug sections are usually the largest part of a big link, so
   this path is heavily optimized. Relocations that point into GC'ed code
-  resolve to the same tombstone values GNU ld and lld use (special-cased for
-  `.debug_ranges`/`.debug_loc`, where `0` would end a list). The values can be
-  overridden with `-z dead-reloc-in-nonalloc=`.
+  resolve to tombstone values, following lld: `1` in `.debug_ranges` and
+  `.debug_loc` (where `0` would end a list), `-1` in `.debug_names`, and `0`
+  elsewhere. GNU ld differs for `.debug_loc`; see
+  [compatibility.md](compatibility.md). Rules can be overridden with
+  `-z dead-reloc-in-nonalloc=<glob>=<value>`.
+- Compressed inputs (`SHF_COMPRESSED` zlib/zstd and legacy `.zdebug_*`) and
+  compressed outputs (`--compress-debug-sections=zlib|zlib-gnu|zstd`) use
+  codecs implemented in-crate. Compression splits a section into chunks
+  compressed in parallel; the output is identical for any thread count.
 - `.debug_str` and `.debug_line_str` go through the parallel string merger.
 - Output compression: `--compress-debug-sections=none|zlib|zstd`.
 - Index generation: `--gdb-index`, `--debug-names`.

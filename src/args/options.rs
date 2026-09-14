@@ -493,6 +493,11 @@ pub struct LinkOptions {
     pub section_header: bool,
     /// `-z memory-seal`.
     pub memory_seal: bool,
+    /// `-z dead-reloc-in-nonalloc=<glob>=<value>` rules, in command-line
+    /// order: the value written for a relocation in a non-allocated section
+    /// whose name matches the glob, when its target section was discarded.
+    /// Later rules take precedence.
+    pub dead_reloc_in_nonalloc: Vec<(String, u64)>,
     /// x86 CET and ISA-level options.
     pub x86: X86Features,
     /// `--fix-cortex-a53-843419`.

@@ -254,6 +254,7 @@ pub(crate) enum ZAction {
     MarkPlt(bool),
     SectionHeader(bool),
     MemorySeal(bool),
+    DeadRelocInNonalloc,
 }
 
 /// A `DT_FLAGS_1` bit set by a `-z` keyword.
@@ -2072,7 +2073,12 @@ pub static Z_KEYWORDS: &[ZKeyword] = &[
     zuns("rodynamic", ZF, NOT_PLANNED),
     zuns("wxneeded", ZF, NOT_PLANNED),
     zuns("lrodata-after-bss", ZF, NOT_PLANNED),
-    zuns("dead-reloc-in-nonalloc", ZV, NOT_PLANNED),
+    zimp(
+        "dead-reloc-in-nonalloc",
+        ZV,
+        Z::DeadRelocInNonalloc,
+        "Value for relocations to discarded sections in non-alloc sections: <glob>=<value>",
+    ),
     zuns("zicfilp", ZV, M4_OTHER),
     zuns("zicfiss", ZV, M4_OTHER),
     zuns("gcs", ZV, M4_ARM),
