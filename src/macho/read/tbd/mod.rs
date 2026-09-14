@@ -113,6 +113,25 @@ impl StubTarget {
     pub fn arch(&self) -> Option<Arch> {
         Arch::from_name(&self.arch_name)
     }
+
+    /// Whether a library built for `self` can satisfy a link for `wanted`:
+    /// the same platform and the same CPU type, whatever the subtype. This
+    /// is lld's rule (`isArchABICompatible`): current SDK stubs often list
+    /// only `arm64e`, and `arm64` links use them; `x86_64h` stubs serve
+    /// `x86_64` links the same way.
+    #[must_use]
+    pub fn is_compatible_with(&self, wanted: &StubTarget) -> bool {
+        if self.platform != wanted.platform {
+            return false;
+        }
+        if self.arch_name == wanted.arch_name {
+            return true;
+        }
+        match (self.arch(), wanted.arch()) {
+            (Some(have), Some(want)) => have.cpu_type == want.cpu_type,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for StubTarget {
@@ -241,10 +260,33 @@ pub struct StubSymbol {
 }
 
 impl StubLibrary {
-    /// Whether the library supports `target`.
+    /// Whether the library lists exactly `target`.
     #[must_use]
     pub fn has_target(&self, target: &StubTarget) -> bool {
         self.targets.contains(target)
+    }
+
+    /// The target of this library to use for a link for `wanted`: `wanted`
+    /// itself when listed, otherwise the first listed target that
+    /// [`is_compatible_with`](StubTarget::is_compatible_with) it (in file
+    /// order, so the choice is deterministic). `None` when the library
+    /// cannot be used for `wanted`.
+    #[must_use]
+    pub fn select_target(&self, wanted: &StubTarget) -> Option<&StubTarget> {
+        self.targets
+            .iter()
+            .find(|t| *t == wanted)
+            .or_else(|| self.targets.iter().find(|t| t.is_compatible_with(wanted)))
+    }
+
+    /// The symbols a link for `wanted` gets from this library:
+    /// [`exports_for`](Self::exports_for) the [selected](Self::select_target)
+    /// target, or nothing when no listed target is compatible.
+    #[must_use]
+    pub fn exports_for_link(&self, wanted: &StubTarget) -> Vec<StubSymbol> {
+        self.select_target(wanted)
+            .map(|target| self.exports_for(target))
+            .unwrap_or_default()
     }
 
     /// The symbols exported for `target`, sorted by name and kind, with
@@ -1019,6 +1061,49 @@ mod tests {
         assert!(
             lib.exports_for(&StubTarget::parse("i386-macos").unwrap())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn arm64_links_use_arm64e_stubs() {
+        // Current macOS SDKs list only arm64e for most of libSystem.
+        let text = concat!(
+            "--- !tapi-tbd\n",
+            "tbd-version: 4\n",
+            "targets: [ x86_64-macos, arm64e-macos ]\n",
+            "install-name: /usr/lib/system/libsystem_c.dylib\n",
+            "exports:\n",
+            "  - targets: [ x86_64-macos, arm64e-macos ]\n",
+            "    symbols: [ _malloc ]\n",
+            "...\n",
+        );
+        let stub = TextStub::parse(text.as_bytes(), Source::new(Path::new("c.tbd"))).unwrap();
+        let lib = stub.main().unwrap();
+        let arm64 = StubTarget::parse("arm64-macos").unwrap();
+        assert!(!lib.has_target(&arm64));
+        assert_eq!(
+            lib.select_target(&arm64)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("arm64e-macos")
+        );
+        assert!(lib.exports_for(&arm64).is_empty());
+        assert_eq!(lib.exports_for_link(&arm64).len(), 1);
+        // Same CPU type is required, and the platform must match.
+        assert!(
+            lib.select_target(&StubTarget::parse("arm64_32-watchos").unwrap())
+                .is_none()
+        );
+        assert!(
+            lib.select_target(&StubTarget::parse("arm64-ios").unwrap())
+                .is_none()
+        );
+        let x86_64h = StubTarget::parse("x86_64h-macos").unwrap();
+        assert_eq!(
+            lib.select_target(&x86_64h)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("x86_64-macos")
         );
     }
 }

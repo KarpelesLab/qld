@@ -1901,19 +1901,24 @@ fn tbd_macos_sdk() {
     let arm64 = target("arm64-macos");
     let main = stub.main().unwrap();
     assert!(main.install_name.starts_with("/usr/lib/libSystem"));
-    assert!(
-        main.has_target(&arm64),
-        "arm64-macos missing; main targets: {:?}; libraries: {:?}",
-        main.targets,
-        stub.libraries
-            .iter()
-            .map(|lib| (&lib.install_name, &lib.targets))
-            .collect::<Vec<_>>()
+    // Current SDKs list only arm64e for most of libSystem; arm64 links use
+    // those stubs (same CPU type).
+    assert_eq!(
+        main.select_target(&arm64).map(|t| t.arch_name.as_str()),
+        Some(if main.has_target(&arm64) {
+            "arm64"
+        } else {
+            "arm64e"
+        }),
+        "main targets: {:?}",
+        main.targets
     );
     let exported = |symbol: &str| {
-        stub.libraries
-            .iter()
-            .any(|lib| lib.exports_for(&arm64).iter().any(|s| s.name == symbol))
+        stub.libraries.iter().any(|lib| {
+            lib.exports_for_link(&arm64)
+                .iter()
+                .any(|s| s.name == symbol)
+        })
     };
     assert!(exported("_malloc"), "libSystem exports _malloc");
     assert!(exported("_dlopen"));
