@@ -15,3 +15,4 @@ _GLOBAL__sub_I_foo.cpp	global constructors keyed to foo.cpp
 _GLOBAL__sub_I__ZN3fooEv	global constructors keyed to foo()
 __RNvCs1234_7mycrate3foo	mycrate[3c1c0]::foo
 _ZGR1x_	reference temporary #0 for x
+_ZL10parseFieldIhTnMN4llvm6AMDGPU19AMDGPUMCKernelCodeTET_XadL_ZNS2_14wavefront_sizeEEEEbRS2_RNS0_11MCAsmParserERNS0_11raw_ostreamE	bool parseField<unsigned char, &llvm::AMDGPU::AMDGPUMCKernelCodeT::wavefront_size>(llvm::AMDGPU::AMDGPUMCKernelCodeT&, llvm::MCAsmParser&, llvm::raw_ostream&)

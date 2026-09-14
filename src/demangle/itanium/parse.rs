@@ -336,6 +336,11 @@ impl<'a> Parser<'a> {
                 return self.add(Node::RefTemp(name, number));
             }
             (b'G', b'A') => ("hidden alias for ", self.encoding(false)?),
+            (b'G', b'I') => {
+                let mut module = None;
+                self.module_name(&mut module)?;
+                ("initializer for module ", module?)
+            }
             (b'G', b'T') => match self.next()? {
                 b'n' => ("non-transaction clone for ", self.encoding(false)?),
                 _ => ("transaction clone for ", self.encoding(false)?),
@@ -1161,6 +1166,12 @@ impl<'a> Parser<'a> {
             }
             b'L' => self.expr_primary(),
             b'I' | b'J' => self.template_args(),
+            // `<template-param-decl> <template-arg>` (Clang 17 and later):
+            // the declaration only disambiguates; the argument is printed.
+            b'T' if matches!(self.peek_next(), Some(b'y' | b'n' | b't' | b'p')) => {
+                self.template_param_decl()?;
+                self.nested(Self::template_arg)
+            }
             _ => self.ty(),
         }
     }

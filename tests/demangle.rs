@@ -10,7 +10,9 @@
 //! - `sweep_system_libraries` (ignored, run with `--ignored`): demangles every
 //!   mangled symbol of the host's libraries and compares with `c++filt`.
 //!   `QLD_DEMANGLE_TSV=<file>` uses a precomputed `mangled<TAB>c++filt` file
-//!   instead; `QLD_DEMANGLE_MISMATCHES=<file>` writes the differences.
+//!   instead, `QLD_DEMANGLE_SAVE=<file>` saves one, and
+//!   `QLD_DEMANGLE_MISMATCHES=<file>` writes the differences. When
+//!   `llvm-cxxfilt` is installed, the names only it demangles are counted.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -266,11 +268,7 @@ fn glob_dir(dir: &Path, pred: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(&pred)
-        })
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(&pred))
         .collect();
     out.sort();
     out
@@ -363,7 +361,19 @@ fn corpus() -> Option<Vec<(String, String)>> {
         files.len(),
         symbols.len()
     );
-    let mut child = Command::new("c++filt")
+    let lines = filter_through("c++filt", &symbols)?;
+    let corpus: Vec<(String, String)> = symbols.into_iter().zip(lines).collect();
+    if let Some(path) = std::env::var_os("QLD_DEMANGLE_SAVE") {
+        let text: String = corpus.iter().map(|(m, d)| format!("{m}\t{d}\n")).collect();
+        std::fs::write(path, text).ok()?;
+    }
+    Some(corpus)
+}
+
+/// Runs `symbols`, one per line, through a demangler tool; one output line
+/// per symbol.
+fn filter_through(tool: &str, symbols: &[String]) -> Option<Vec<String>> {
+    let mut child = Command::new(tool)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -374,21 +384,16 @@ fn corpus() -> Option<Vec<(String, String)>> {
     let output = child.wait_with_output().ok()?;
     writer.join().ok()?.ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
     if lines.len() != symbols.len() {
         eprintln!(
-            "c++filt output has {} lines for {} symbols",
+            "{tool} output has {} lines for {} symbols",
             lines.len(),
             symbols.len()
         );
         return None;
     }
-    Some(
-        symbols
-            .into_iter()
-            .zip(lines.into_iter().map(str::to_string))
-            .collect(),
-    )
+    Some(lines)
 }
 
 #[test]
@@ -458,6 +463,30 @@ fn sweep_system_libraries() {
             "{scheme:>10}: {} symbols, c++filt accepts {}, qld matches {} ({rate:.4}%), qld also demangles {} that c++filt rejects",
             t.total, t.accepted, t.matched, t.extra
         );
+    }
+    // Names only LLVM's demangler accepts, if it is installed.
+    if tool("llvm-cxxfilt") {
+        let rejected: Vec<String> = corpus
+            .iter()
+            .zip(&results)
+            .filter(|((mangled, expected), (_, _, _, extra, _))| mangled == expected && !extra)
+            .map(|((mangled, _), _)| mangled.clone())
+            .collect();
+        if let Some(lines) = filter_through("llvm-cxxfilt", &rejected) {
+            let llvm_only: Vec<(&String, &String)> = rejected
+                .iter()
+                .zip(&lines)
+                .filter(|(mangled, out)| mangled != out)
+                .collect();
+            eprintln!(
+                "llvm-cxxfilt demangles {} of the {} names both c++filt and qld reject",
+                llvm_only.len(),
+                rejected.len()
+            );
+            for (mangled, out) in llvm_only.iter().take(10) {
+                eprintln!("  {mangled}\n    llvm-cxxfilt: {out}");
+            }
+        }
     }
     if let Some(path) = std::env::var_os("QLD_DEMANGLE_MISMATCHES") {
         std::fs::write(

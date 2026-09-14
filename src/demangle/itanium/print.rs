@@ -1396,6 +1396,8 @@ impl<'n, 'a> Printer<'n, 'a> {
         }
         let node = self.node(id)?;
         let children: Vec<Id> = match *node {
+            // A lambda's `auto` parameters are not template arguments.
+            Node::TemplateParam(_) if self.lambda_arg > 0 => return None,
             Node::TemplateParam(index) => {
                 let arg = self.lookup_template_argument(index)?;
                 return matches!(self.node(arg), Some(Node::TemplateArgs(_))).then_some(arg);
