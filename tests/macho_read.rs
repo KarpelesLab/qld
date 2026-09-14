@@ -20,6 +20,7 @@ use qld::macho::read::consts::{
     DICE_KIND_JUMP_TABLE32, GENERIC_RELOC_PAIR, MH_DYLIB, PLATFORM_MACOS, S_ATTR_NO_DEAD_STRIP,
     S_THREAD_LOCAL_REGULAR, S_THREAD_LOCAL_VARIABLES, S_THREAD_LOCAL_ZEROFILL, X86_64_RELOC_TLV,
 };
+use qld::macho::read::tbd::{StubLibrary, StubSymbolKind, StubTarget, TextStub};
 use qld::macho::read::{
     Arch, AtomKind, Atomization, Dylib, DylibLoadKind, EhFrame, EhFrameKind, ExportTarget, FatFile,
     LinkerOptionHint, ObjectFile, PackedVersion, RelocationTarget, Source, compact_unwind_entries,
@@ -1447,5 +1448,473 @@ fn truncated_and_corrupted_inputs_never_panic() {
             }
             exercise(&copy, 0);
         }
+    }
+}
+
+#[test]
+fn export_trie_and_chained_fixups_corruption_never_panics() {
+    let mut rng = Rng(0x7e1e_0001_0002_0003);
+    for name in ["libqld-arm64.dylib", "libchained-x86_64.dylib"] {
+        let data = fixture(name);
+        let path = data_dir().join(name);
+        let dylib = Dylib::parse(&data, src(&path)).unwrap();
+        let trie = dylib.exports_trie().to_vec();
+        let fixups = dylib
+            .chained_fixups()
+            .unwrap()
+            .map(|f| data[f.file_offset() as usize..][..f.size() as usize].to_vec());
+        for round in 0..3000 {
+            let mut copy = trie.clone();
+            if round % 3 == 0 {
+                copy.truncate(rng.below(copy.len() + 1));
+            }
+            for _ in 0..1 + rng.below(4) {
+                if !copy.is_empty() {
+                    let at = rng.below(copy.len());
+                    copy[at] = rng.next() as u8;
+                }
+            }
+            let _ = qld::macho::read::ExportTrieIter::new(&copy, 0, src(&path)).count();
+            if let Some(blob) = &fixups {
+                let mut copy = blob.clone();
+                let at = rng.below(copy.len());
+                copy[at] = rng.next() as u8;
+                if round % 5 == 0 {
+                    copy.truncate(rng.below(copy.len() + 1));
+                }
+                if let Ok(f) = qld::macho::read::ChainedFixups::parse(
+                    &copy,
+                    0,
+                    qld::macho::read::Endian::LITTLE,
+                    src(&path),
+                ) {
+                    let _ = f.imports().take(100_000).count();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text-based stubs
+// ---------------------------------------------------------------------------
+
+fn stub(name: &str) -> TextStub {
+    let path = data_dir().join(name);
+    TextStub::parse(&fixture(name), src(&path)).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+fn target(text: &str) -> StubTarget {
+    StubTarget::parse(text).unwrap()
+}
+
+/// Everything a link needs from one library, for every target, in a form
+/// that does not depend on how the file grouped it.
+fn stub_view(lib: &StubLibrary) -> Vec<String> {
+    let mut targets = lib.targets.clone();
+    targets.sort();
+    let mut out = vec![
+        format!("install-name {}", lib.install_name),
+        format!("current {}", lib.current_version),
+        format!("compatibility {}", lib.compatibility_version),
+        format!("swift {}", lib.swift_abi_version),
+        format!("flags {:?}", lib.flags),
+        format!(
+            "targets {}",
+            targets
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    ];
+    for t in &targets {
+        let mut exports: Vec<_> = lib
+            .exports_for(t)
+            .iter()
+            .map(|s| format!("{:?}{}", s.kind, s.name))
+            .collect();
+        exports.sort();
+        out.push(format!("{t} exports {}", exports.join(" ")));
+        // Undefineds are left out: llvm-readtapi's v5 writer drops them and
+        // its v4 writer loses weak references, so they cannot round-trip.
+        let mut reexports = lib.reexported_libraries_for(t);
+        reexports.sort_unstable();
+        out.push(format!("{t} reexports {}", reexports.join(" ")));
+        let mut clients = lib.allowable_clients_for(t);
+        clients.sort_unstable();
+        out.push(format!("{t} clients {}", clients.join(" ")));
+        out.push(format!("{t} umbrella {:?}", lib.parent_umbrella_for(t)));
+    }
+    out
+}
+
+fn stub_views(stub: &TextStub) -> BTreeMap<String, Vec<String>> {
+    stub.libraries
+        .iter()
+        .map(|lib| (lib.install_name.clone(), stub_view(lib)))
+        .collect()
+}
+
+#[test]
+fn tbd_v4_libsystem() {
+    let stub = stub("libSystem-v4.tbd");
+    assert_eq!(stub.libraries.len(), 5);
+    let main = stub.main().unwrap();
+    assert_eq!(main.tbd_version, 4);
+    assert_eq!(main.install_name, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(main.current_version, PackedVersion::new(1336, 0, 0));
+    assert_eq!(main.targets.len(), 6);
+    let arm64 = target("arm64-macos");
+    let x86 = target("x86_64-macos");
+    assert!(main.has_target(&target("arm64e-maccatalyst")));
+    assert!(!main.has_target(&target("arm64-ios")));
+    assert_eq!(
+        main.reexported_libraries_for(&arm64),
+        [
+            "/usr/lib/system/libcache.dylib",
+            "/usr/lib/system/libdyld.dylib",
+            "/usr/lib/system/libsystem_c.dylib",
+            "/usr/lib/system/libsystem_malloc.dylib"
+        ]
+    );
+    assert_eq!(main.reexported_libraries_for(&x86).len(), 5);
+    let exports = main.exports_for(&arm64);
+    let names: Vec<_> = exports.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "__ZdlPv",
+            "___crashreporter_info__",
+            "_libSystem_atfork_child",
+            "_libSystem_atfork_parent",
+            "_libSystem_atfork_prepare"
+        ]
+    );
+    assert_eq!(exports[0].kind, StubSymbolKind::Weak);
+    assert!(
+        main.exports_for(&x86)
+            .iter()
+            .any(|s| s.name == "R8289209$_close")
+    );
+
+    // Inlined libraries.
+    let dyld = stub.library("/usr/lib/system/libdyld.dylib").unwrap();
+    assert_eq!(dyld.current_version, PackedVersion::new(1122, 1, 0));
+    assert_eq!(dyld.parent_umbrella_for(&arm64), Some("System"));
+    assert_eq!(
+        dyld.allowable_clients_for(&arm64),
+        ["libSystem_debug", "System"]
+    );
+    let dyld_exports = dyld.exports_for(&arm64);
+    assert!(dyld_exports.iter().any(|s| s.name == "dyld_stub_binder"));
+    assert!(
+        !dyld_exports
+            .iter()
+            .any(|s| s.name == "_dyld_stub_binder_x86")
+    );
+    assert!(
+        dyld_exports
+            .iter()
+            .any(|s| s.name == "__tlv_bootstrap_marker" && s.kind == StubSymbolKind::ThreadLocal)
+    );
+    let libc = stub.library("/usr/lib/system/libsystem_c.dylib").unwrap();
+    assert_eq!(libc.current_version, PackedVersion::new(1534, 40, 2));
+    assert!(
+        libc.exports_for(&arm64)
+            .iter()
+            .any(|s| s.name == "__setjmp_arm64")
+    );
+    assert!(
+        !libc
+            .exports_for(&x86)
+            .iter()
+            .any(|s| s.name == "__setjmp_arm64")
+    );
+}
+
+#[test]
+fn tbd_v4_objc_framework() {
+    let stub = stub("Foundation-v4.tbd");
+    let lib = stub.main().unwrap();
+    assert_eq!(lib.swift_abi_version, 5);
+    assert!(lib.flags.not_app_extension_safe && !lib.flags.flat_namespace);
+    assert_eq!(lib.compatibility_version, PackedVersion::new(300, 0, 0));
+    let macos = lib.exports_for(&target("arm64-macos"));
+    let names: Vec<_> = macos
+        .iter()
+        .map(|s| (s.name.as_str(), s.reexported))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("_CFRelease", true),
+            ("_CFRetain", true),
+            ("_NSLog", false),
+            ("_NSStringFromClass", false),
+            ("_OBJC_CLASS_$_NSException", false),
+            ("_OBJC_CLASS_$_NSObject", false),
+            ("_OBJC_CLASS_$_NSString", false),
+            ("_OBJC_EHTYPE_$_NSException", false),
+            ("_OBJC_IVAR_$_NSString._length", false),
+            ("_OBJC_METACLASS_$_NSException", false),
+            ("_OBJC_METACLASS_$_NSObject", false),
+            ("_OBJC_METACLASS_$_NSString", false),
+        ]
+    );
+    let sim = lib.exports_for(&target("x86_64-ios-simulator"));
+    assert_eq!(sim.len(), 3);
+    assert!(lib.exports_for(&target("arm64-tvos")).is_empty());
+}
+
+#[test]
+fn tbd_v3_multiple_documents() {
+    let stub = stub("libobjc-v3.tbd");
+    assert_eq!(stub.libraries.len(), 2);
+    let lib = stub.main().unwrap();
+    assert_eq!(lib.tbd_version, 3);
+    assert!(lib.flags.flat_namespace);
+    let names: Vec<_> = lib.targets.iter().map(ToString::to_string).collect();
+    assert_eq!(names, ["i386-macos", "x86_64-macos", "x86_64h-macos"]);
+    let x86 = target("x86_64-macos");
+    assert_eq!(lib.parent_umbrella_for(&x86), Some("System"));
+    assert_eq!(lib.allowable_clients_for(&x86), ["QldRuntimeClient"]);
+    assert!(lib.allowable_clients_for(&target("i386-macos")).is_empty());
+    assert_eq!(
+        lib.reexported_libraries_for(&x86),
+        ["/usr/lib/libqldobjc-trampolines.dylib"]
+    );
+    let exports = lib.exports_for(&x86);
+    assert!(
+        exports
+            .iter()
+            .any(|s| s.name == "_objc_weak_default" && s.kind == StubSymbolKind::Weak)
+    );
+    assert!(
+        exports
+            .iter()
+            .any(|s| s.name == "_OBJC_IVAR_$_NSObject.isa")
+    );
+    assert_eq!(lib.exports_for(&target("i386-macos")).len(), 2);
+    let trampolines = stub
+        .library("/usr/lib/libqldobjc-trampolines.dylib")
+        .unwrap();
+    assert_eq!(trampolines.exports_for(&target("x86_64h-macos")).len(), 1);
+}
+
+#[test]
+fn tbd_v5_matches_v4() {
+    for (v4, v5) in [
+        ("libSystem-v4.tbd", "libSystem-v5.tbd"),
+        ("Foundation-v4.tbd", "Foundation-v5.tbd"),
+    ] {
+        let a = stub(v4);
+        let b = stub(v5);
+        assert_eq!(b.main().unwrap().tbd_version, 5);
+        assert_eq!(
+            a.main().unwrap().install_name,
+            b.main().unwrap().install_name
+        );
+        assert_eq!(stub_views(&a), stub_views(&b), "{v4} vs {v5}");
+        let undefined = |stub: &TextStub| {
+            let lib = stub.main().unwrap();
+            let mut out: Vec<_> = lib
+                .targets
+                .iter()
+                .flat_map(|t| {
+                    lib.undefineds
+                        .iter()
+                        .filter(|s| s.applies_to(t))
+                        .flat_map(|s| {
+                            s.symbols
+                                .iter()
+                                .map(|n| format!("{t} {n}"))
+                                .chain(s.weak_symbols.iter().map(|n| format!("{t} weak {n}")))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(undefined(&a), undefined(&b), "{v4} vs {v5}");
+    }
+    let foundation = stub("Foundation-v5.tbd");
+    let lib = foundation.main().unwrap();
+    assert_eq!(lib.undefineds[0].weak_symbols, ["_swift_task_alloc"]);
+}
+
+/// Converts the `.tbd` fixtures to other versions with `llvm-readtapi` and
+/// checks that qld reads the same libraries from each.
+#[test]
+fn tbd_conversions_with_llvm_readtapi() {
+    if !tool_works("llvm-readtapi") {
+        println!("SKIPPED: llvm-readtapi is not installed");
+        return;
+    }
+    for name in ["libSystem-v4.tbd", "Foundation-v4.tbd", "libobjc-v3.tbd"] {
+        let original = stub(name);
+        for filetype in ["tbd-v4", "tbd-v5"] {
+            let out = scratch_dir().join(format!("{name}.{filetype}"));
+            let output = Command::new("llvm-readtapi")
+                .arg(data_dir().join(name))
+                .arg(format!("--filetype={filetype}"))
+                .arg("-o")
+                .arg(&out)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let data = std::fs::read(&out).unwrap();
+            let converted = TextStub::parse(&data, src(&out)).unwrap();
+            assert_eq!(
+                stub_views(&original),
+                stub_views(&converted),
+                "{name} as {filetype}"
+            );
+        }
+    }
+    // llvm-readtapi agrees that the committed v4 and v5 fixtures describe
+    // the same libraries.
+    for (a, b) in [
+        ("libSystem-v4.tbd", "libSystem-v5.tbd"),
+        ("Foundation-v4.tbd", "Foundation-v5.tbd"),
+    ] {
+        let output = Command::new("llvm-readtapi")
+            .arg("-compare")
+            .arg(data_dir().join(a))
+            .arg(data_dir().join(b))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+/// Reads the `.tbd` files of an installed macOS SDK, when there is one.
+#[test]
+fn tbd_macos_sdk() {
+    let Ok(output) = Command::new("xcrun").args(["--show-sdk-path"]).output() else {
+        println!("SKIPPED: xcrun is not available");
+        return;
+    };
+    if !output.status.success() {
+        println!("SKIPPED: no macOS SDK");
+        return;
+    }
+    let sdk = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let libsystem = sdk.join("usr/lib/libSystem.tbd");
+    let Ok(data) = std::fs::read(&libsystem) else {
+        println!("SKIPPED: {} not found", libsystem.display());
+        return;
+    };
+    let stub = TextStub::parse(&data, src(&libsystem)).unwrap();
+    let arm64 = target("arm64-macos");
+    let main = stub.main().unwrap();
+    assert!(main.install_name.starts_with("/usr/lib/libSystem"));
+    assert!(main.has_target(&arm64));
+    let exported = |symbol: &str| {
+        stub.libraries
+            .iter()
+            .any(|lib| lib.exports_for(&arm64).iter().any(|s| s.name == symbol))
+    };
+    assert!(exported("_malloc"), "libSystem exports _malloc");
+    assert!(exported("_dlopen"));
+
+    let mut parsed = 0;
+    for dir in ["usr/lib", "usr/lib/swift"] {
+        let Ok(entries) = std::fs::read_dir(sdk.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "tbd") {
+                let data = std::fs::read(&path).unwrap();
+                TextStub::parse(&data, src(&path))
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                parsed += 1;
+            }
+        }
+    }
+    let frameworks = sdk.join("System/Library/Frameworks");
+    for framework in ["Foundation", "CoreFoundation", "AppKit", "Security"] {
+        let path = frameworks.join(format!("{framework}.framework/{framework}.tbd"));
+        if let Ok(data) = std::fs::read(&path) {
+            TextStub::parse(&data, src(&path))
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            parsed += 1;
+        }
+    }
+    println!("parsed {parsed} SDK text stubs");
+}
+
+#[test]
+fn tbd_corruption_never_panics() {
+    const NASTY: &[u8] = b"-:[]{},'\"\\\n #|>!&*~ \t\r0x";
+    let mut rng = Rng(0x7bd0_7bd0_7bd0_7bd1);
+    let path = Path::new("fuzz.tbd");
+    let use_stub = |stub: &TextStub| {
+        for lib in &stub.libraries {
+            for t in &lib.targets {
+                let _ = lib.exports_for(t);
+                let _ = lib.reexported_libraries_for(t);
+            }
+        }
+    };
+    for name in [
+        "libSystem-v4.tbd",
+        "Foundation-v4.tbd",
+        "libobjc-v3.tbd",
+        "libSystem-v5.tbd",
+        "Foundation-v5.tbd",
+    ] {
+        let data = fixture(name);
+        let step = (data.len() / 300).max(1);
+        for len in (0..data.len()).step_by(step) {
+            if let Ok(stub) = TextStub::parse(&data[..len], src(path)) {
+                use_stub(&stub);
+            }
+        }
+        for _ in 0..1500 {
+            let mut copy = data.clone();
+            for _ in 0..1 + rng.below(6) {
+                let at = rng.below(copy.len());
+                match rng.below(4) {
+                    0 => copy[at] = NASTY[rng.below(NASTY.len())],
+                    1 => {
+                        copy.remove(at);
+                    }
+                    2 => copy.insert(at, NASTY[rng.below(NASTY.len())]),
+                    _ => copy[at] = rng.next() as u8,
+                }
+            }
+            if let Ok(stub) = TextStub::parse(&copy, src(path)) {
+                use_stub(&stub);
+            }
+        }
+    }
+    // Deep nesting in both syntaxes.
+    let deep = [
+        format!(
+            "--- !tapi-tbd\ntbd-version: 4\ntargets: {}\n",
+            "[".repeat(100_000)
+        ),
+        format!(
+            "{{\"tapi_tbd_version\": 5, \"main_library\": {}}}",
+            "[".repeat(100_000)
+        ),
+        format!("--- !tapi-tbd\n{}", "- ".repeat(50_000)),
+        (0..5_000)
+            .map(|i| format!("{}- \n", " ".repeat(i)))
+            .collect(),
+    ];
+    for text in deep {
+        assert!(TextStub::parse(text.as_bytes(), src(path)).is_err());
     }
 }

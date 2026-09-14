@@ -1,0 +1,112 @@
+{
+  "main_library": {
+    "compatibility_versions": [
+      {
+        "version": "300"
+      }
+    ],
+    "current_versions": [
+      {
+        "version": "2048.1.101"
+      }
+    ],
+    "exported_symbols": [
+      {
+        "data": {
+          "global": [
+            "_NSLog"
+          ],
+          "objc_class": [
+            "NSObject"
+          ]
+        }
+      },
+      {
+        "data": {
+          "global": [
+            "_NSStringFromClass"
+          ],
+          "objc_class": [
+            "NSException",
+            "NSString"
+          ],
+          "objc_eh_type": [
+            "NSException"
+          ],
+          "objc_ivar": [
+            "NSString._length"
+          ]
+        },
+        "targets": [
+          "x86_64-macos",
+          "arm64-macos"
+        ]
+      }
+    ],
+    "flags": [
+      {
+        "attributes": [
+          "not_app_extension_safe"
+        ]
+      }
+    ],
+    "install_names": [
+      {
+        "name": "/System/Library/Frameworks/QldFoundation.framework/Versions/C/QldFoundation"
+      }
+    ],
+    "reexported_symbols": [
+      {
+        "data": {
+          "global": [
+            "_CFRelease",
+            "_CFRetain"
+          ]
+        },
+        "targets": [
+          "x86_64-macos",
+          "arm64-macos"
+        ]
+      }
+    ],
+    "swift_abi": [
+      {
+        "abi": 5
+      }
+    ],
+    "undefined_symbols": [
+      {
+        "data": {
+          "global": [
+            "_objc_msgSend"
+          ],
+          "weak": [
+            "_swift_task_alloc"
+          ]
+        },
+        "targets": [
+          "x86_64-macos",
+          "arm64-macos"
+        ]
+      }
+    ],
+    "target_info": [
+      {
+        "target": "x86_64-macos"
+      },
+      {
+        "target": "x86_64-ios-simulator"
+      },
+      {
+        "target": "arm64-macos"
+      },
+      {
+        "target": "arm64-ios"
+      },
+      {
+        "target": "arm64-ios-simulator"
+      }
+    ]
+  },
+  "tapi_tbd_version": 5
+}

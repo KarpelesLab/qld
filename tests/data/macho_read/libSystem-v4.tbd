@@ -1,0 +1,97 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                   arm64e-macos, arm64e-maccatalyst ]
+uuids:
+  - target:          x86_64-macos
+    value:           2F4B4F3A-1D8C-3C5E-9C1B-000000000001
+  - target:          arm64-macos
+    value:           2F4B4F3A-1D8C-3C5E-9C1B-000000000002
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1336
+compatibility-version: 1
+reexported-libraries:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    libraries:       [ '/usr/lib/system/libcache.dylib', '/usr/lib/system/libdyld.dylib',
+                       '/usr/lib/system/libsystem_c.dylib', '/usr/lib/system/libsystem_malloc.dylib' ]
+  - targets:         [ x86_64-macos ]
+    libraries:       [ '/usr/lib/system/libsystem_sim_legacy.dylib' ]
+exports:
+  - targets:         [ x86_64-maccatalyst, x86_64-macos ]
+    symbols:         [ 'R8289209$_close', 'R8289209$_fork', _mach_init_routine ]
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    symbols:         [ ___crashreporter_info__, _libSystem_atfork_child, _libSystem_atfork_parent,
+                       _libSystem_atfork_prepare ]
+    weak-symbols:    [ __ZdlPv ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                   arm64e-macos, arm64e-maccatalyst ]
+install-name:    '/usr/lib/system/libcache.dylib'
+current-version: 92
+parent-umbrella:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    symbols:         [ _cache_create, _cache_destroy, _cache_get, _cache_set_and_retain ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                   arm64e-macos, arm64e-maccatalyst ]
+install-name:    '/usr/lib/system/libdyld.dylib'
+current-version: 1122.1
+parent-umbrella:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    umbrella:        System
+allowable-clients:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    clients:         [ libSystem_debug, System ]
+exports:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst ]
+    symbols:         [ _dyld_stub_binder_x86 ]
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    symbols:         [ __NSGetExecutablePath, __dyld_get_image_name, _dlopen, _dlsym,
+                       dyld_stub_binder ]
+    thread-local-symbols: [ __tlv_bootstrap_marker ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                   arm64e-macos, arm64e-maccatalyst ]
+install-name:    '/usr/lib/system/libsystem_c.dylib'
+current-version: 1534.40.2
+parent-umbrella:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    umbrella:        System
+exports:
+  - targets:         [ arm64-macos, arm64e-macos, arm64-maccatalyst, arm64e-maccatalyst ]
+    symbols:         [ __setjmp_arm64 ]
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    symbols:         [ ___stack_chk_fail, ___stack_chk_guard, _exit, _printf, _puts,
+                       _strlen ]
+    thread-local-symbols: [ __tls_errno_slot ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                   arm64e-macos, arm64e-maccatalyst ]
+install-name:    '/usr/lib/system/libsystem_malloc.dylib'
+current-version: 474.0.13
+parent-umbrella:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
+                       arm64e-macos, arm64e-maccatalyst ]
+    symbols:         [ _calloc, _free, _malloc, _realloc ]
+    weak-symbols:    [ _malloc_zone_weak_hook ]
+...

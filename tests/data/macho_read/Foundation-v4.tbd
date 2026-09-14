@@ -1,0 +1,28 @@
+--- !tapi-tbd
+# A framework stub with Objective-C metadata, flags, a Swift ABI version,
+# re-exported symbols and undefineds.
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64-ios, arm64-ios-simulator,
+                   x86_64-ios-simulator ]
+flags:           [ not_app_extension_safe ]
+install-name:    /System/Library/Frameworks/QldFoundation.framework/Versions/C/QldFoundation
+current-version: 2048.1.101
+compatibility-version: 300
+swift-abi-version: 5
+exports:
+  - targets:         [ x86_64-macos, arm64-macos ]
+    symbols:         [ _NSLog, "_NSStringFromClass" ]
+    objc-classes:    [ NSException, NSObject, NSString ]
+    objc-eh-types:   [ NSException ]
+    objc-ivars:      [ NSString._length ]
+  - targets:         [ arm64-ios, arm64-ios-simulator, x86_64-ios-simulator ]
+    symbols:         [ _NSLog ]
+    objc-classes:    [ NSObject ]
+reexports:
+  - targets:         [ x86_64-macos, arm64-macos ]
+    symbols:         [ _CFRelease, _CFRetain ]
+undefineds:
+  - targets:         [ x86_64-macos, arm64-macos ]
+    symbols:         [ _objc_msgSend ]
+    weak-symbols:    [ _swift_task_alloc ]
+...
