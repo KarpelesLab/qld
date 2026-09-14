@@ -53,6 +53,8 @@ can work at the same time without colliding.
 | W11 | Dynamic ELF on x86-64 (M2) | `src/elf/**` | W8 | in progress |
 | W12 | Symbol resolution follow-ups | `src/symbols/**` | W4 | merged |
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | merged |
+| W14 | PE/COFF reading | `src/coff/**` | — | in progress |
+| W15 | Mach-O reading | `src/macho/**` | — | in progress |
 
 W1–W7 and W9 can all run at once. They share no files.
 
@@ -317,6 +319,26 @@ groups before insertion.
 
 **Owns:** `src/hints/**`, `src/demangle/**`, `tests/hints.rs`,
 `tests/demangle.rs`. Wiring into the ELF driver is a later integration step.
+
+---
+
+## W14: PE/COFF reading
+
+**Goal:** the input side of M7, like W7 for ELF: zero-copy readers for COFF
+objects (including bigobj), short and long import libraries, PE images
+(exports of DLLs linked directly), `.drectve` directives and `.def` files.
+
+**Owns:** `src/coff/**`, `tests/coff_read.rs`, `tests/data/coff_read/`.
+
+---
+
+## W15: Mach-O reading
+
+**Goal:** the input side of M8: zero-copy readers for Mach-O objects and
+dylibs (arm64, x86_64), fat slice selection, `.tbd` text stubs (v3–v5), and
+the per-atom information dead stripping needs (`.subsections_via_symbols`).
+
+**Owns:** `src/macho/**`, `tests/macho_read.rs`, `tests/data/macho_read/`.
 
 ---
 
