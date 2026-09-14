@@ -64,6 +64,9 @@ pub struct DynSection {
     pub relative: u32,
     /// How many symbolic dynamic relocations it needs.
     pub symbolic: u32,
+    /// How many of the relative relocations `-z pack-relative-relocs` can
+    /// move to `.relr.dyn` ([`reloc::packable`]).
+    pub packable: u32,
 }
 
 /// What the scan of one file found.
@@ -140,6 +143,16 @@ impl ScanResult {
                     s.saturating_add(u64::from(d.symbolic)),
                 )
             })
+    }
+
+    /// Total relative relocations of input sections that `.relr.dyn` can
+    /// hold.
+    #[must_use]
+    pub fn section_packable(&self) -> u64 {
+        self.files
+            .iter()
+            .flat_map(|f| &f.dyn_sections)
+            .fold(0u64, |n, d| n.saturating_add(u64::from(d.packable)))
     }
 }
 
@@ -235,6 +248,7 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             section: section_index,
             relative: 0,
             symbolic: 0,
+            packable: 0,
         };
         let mut skip = false;
         for rel in relas.iter() {
@@ -327,6 +341,9 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
                 Dynamic::None => {}
                 Dynamic::Relative => {
                     dyn_section.relative = dyn_section.relative.saturating_add(1);
+                    if reloc::packable(section.header.sh_addralign, rel.offset) {
+                        dyn_section.packable = dyn_section.packable.saturating_add(1);
+                    }
                 }
                 Dynamic::Symbolic(_) => {
                     dyn_section.symbolic = dyn_section.symbolic.saturating_add(1);

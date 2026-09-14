@@ -152,6 +152,9 @@ pub struct Synth {
     pub plt_got: EntryList,
     /// Copy relocations, sorted by symbol.
     pub copies: Vec<CopyReloc>,
+    /// Symbols that share a copy relocation (an index into `copies`),
+    /// sorted by symbol.
+    pub copy_aliases: Vec<(SymbolId, usize)>,
     /// Size and alignment of the copy relocation block in `.bss`.
     pub dynbss: (u64, u64),
     /// Size and alignment of the copy relocation block in `.data.rel.ro`.
@@ -165,6 +168,13 @@ pub struct Synth {
     pub got_dyn_relocs: (u64, u64),
     /// Dynamic relocations of input sections, `(relative, symbolic)`.
     pub section_dyn_relocs: (u64, u64),
+    /// Relative relocations of input sections that `.relr.dyn` can hold.
+    pub section_packable: u64,
+    /// Relative relocations go to `.relr.dyn` (`-z pack-relative-relocs`
+    /// in position-independent output).
+    pub relr: bool,
+    /// The planned size of `.relr.dyn`, fixed by the layout loop.
+    pub relr_size: u64,
     /// Size of the build-id, if one is written.
     pub build_id: Option<u64>,
     /// The `.note.gnu.property` contents, if any.
@@ -290,21 +300,48 @@ impl Synth {
         // `.got.plt` words.
         self.got_plt_reserved = if dynamic && has_got_plt { 3 } else { 0 };
         self.section_dyn_relocs = scan.section_dyn_relocs();
+        self.section_packable = scan.section_packable();
         self.got_dyn_relocs = self.count_got_relocs(refs);
     }
 
     /// Allocates space for copy relocations, in symbol order.
+    ///
+    /// Symbols that share a definition (the same section and value in the
+    /// same shared library, such as glibc's `environ` and `__environ`) share
+    /// one copy: every alias the library defines becomes an alias of the
+    /// copy and is exported, so the library binds all of them to it, as lld
+    /// does.
     fn plan_copies(&mut self, refs: &Refs<'_, '_>, symbols: Vec<SymbolId>) {
+        // (file, shndx, value) of each symbol's definition.
+        let key = |id: SymbolId| -> Option<(usize, u16, u64)> {
+            let def = refs.symbols.definition(id);
+            let shared = refs.files.get(def.file.index())?.shared.as_ref()?;
+            let index = *shared.symbols.get(def.index as usize)?;
+            let raw = shared.elf.symbols().get_raw(index as usize)?;
+            Some((def.file.index(), raw.st_shndx, raw.st_value))
+        };
         let mut bss = (0u64, 1u64);
         let mut relro = (0u64, 1u64);
-        let mut copies = Vec::with_capacity(symbols.len());
+        let mut copies: Vec<CopyReloc> = Vec::with_capacity(symbols.len());
+        let mut keys: Vec<((usize, u16, u64), usize)> = Vec::with_capacity(symbols.len());
+        let mut aliases: Vec<(SymbolId, usize)> = Vec::new();
         for id in symbols {
+            let symbol_key = key(id);
+            if let Some(symbol_key) = symbol_key
+                && let Some(&(_, copy)) = keys.iter().find(|(k, _)| *k == symbol_key)
+            {
+                aliases.push((id, copy));
+                continue;
+            }
             let (size, align, read_only) = copy_shape(refs, id);
             let block = if read_only { &mut relro } else { &mut bss };
             let mask = align.wrapping_sub(1);
             let offset = block.0.checked_add(mask).map_or(block.0, |v| v & !mask);
             block.0 = offset.saturating_add(size);
             block.1 = block.1.max(align);
+            if let Some(symbol_key) = symbol_key {
+                keys.push((symbol_key, copies.len()));
+            }
             copies.push(CopyReloc {
                 symbol: id,
                 offset,
@@ -312,16 +349,59 @@ impl Synth {
                 relro: read_only,
             });
         }
+        // Other symbols the libraries define at the copied addresses.
+        keys.sort_unstable();
+        let mut files: Vec<usize> = keys.iter().map(|((file, _, _), _)| *file).collect();
+        files.dedup();
+        for file in files {
+            let Some(shared) = refs.files.get(file).and_then(|f| f.shared.as_ref()) else {
+                continue;
+            };
+            let ids = refs.resolution.symbol_ids(crate::ids::FileId::new(file));
+            for (local, (&index, &id)) in shared.symbols.iter().zip(ids).enumerate() {
+                // The versioned names of the same definitions add nothing.
+                if !matches!(
+                    shared.uses.get(local),
+                    Some(crate::symbols::SymbolUse::Definition { .. })
+                ) || refs.symbols.name(id).version().is_some()
+                {
+                    continue;
+                }
+                let Some(raw) = shared.elf.symbols().get_raw(index as usize) else {
+                    continue;
+                };
+                let Ok(at) =
+                    keys.binary_search_by_key(&(file, raw.st_shndx, raw.st_value), |(k, _)| *k)
+                else {
+                    continue;
+                };
+                let def = refs.symbols.definition(id);
+                let copy = keys.get(at).map_or(0, |(_, copy)| *copy);
+                if def.file.index() == file && copies.get(copy).is_some_and(|c| c.symbol != id) {
+                    aliases.push((id, copy));
+                }
+            }
+        }
+        aliases.sort_unstable();
+        aliases.dedup_by_key(|(id, _)| *id);
         self.copies = copies;
+        self.copy_aliases = aliases;
         self.dynbss = bss;
         self.dynrelro = relro;
     }
 
-    /// The copy relocation of `id`, if it has one.
+    /// The copy relocation `id` has or shares, if any.
     #[must_use]
     pub fn copy_of(&self, id: SymbolId) -> Option<&CopyReloc> {
-        let at = self.copies.binary_search_by_key(&id, |c| c.symbol).ok()?;
-        self.copies.get(at)
+        if let Ok(at) = self.copies.binary_search_by_key(&id, |c| c.symbol) {
+            return self.copies.get(at);
+        }
+        let at = self
+            .copy_aliases
+            .binary_search_by_key(&id, |(alias, _)| *alias)
+            .ok()?;
+        let &(_, copy) = self.copy_aliases.get(at)?;
+        self.copies.get(copy)
     }
 
     /// Counts the `.rela.dyn` relocations of GOT entries and copies:
@@ -364,6 +444,7 @@ impl Synth {
             .saturating_add(self.got_dyn_relocs.1)
             .saturating_add(self.section_dyn_relocs.0)
             .saturating_add(self.section_dyn_relocs.1)
+            .saturating_sub(self.relr_count())
     }
 
     /// Number of `R_X86_64_RELATIVE` relocations in `.rela.dyn`.
@@ -372,6 +453,19 @@ impl Synth {
         self.got_dyn_relocs
             .0
             .saturating_add(self.section_dyn_relocs.0)
+            .saturating_sub(self.relr_count())
+    }
+
+    /// Number of relative relocations packed into `.relr.dyn`: the GOT's
+    /// (whose entries are all word-aligned) and the packable ones of input
+    /// sections, when `-z pack-relative-relocs` applies.
+    #[must_use]
+    pub fn relr_count(&self) -> u64 {
+        if self.relr {
+            self.got_dyn_relocs.0.saturating_add(self.section_packable)
+        } else {
+            0
+        }
     }
 
     /// Number of words the GOT occupies.
@@ -455,13 +549,19 @@ impl Synth {
             | Synthetic::VerSym
             | Synthetic::VerDef
             | Synthetic::VerNeed
-            | Synthetic::RelrDyn
             | Synthetic::Dynamic => self
                 .dynamic_sizes
                 .iter()
                 .find(|(k, ..)| *k == kind)
                 .map_or((0, 1), |&(_, size, align)| (size, align)),
             Synthetic::RelaDyn => (self.rela_dyn_count().saturating_mul(24), 8),
+            Synthetic::RelrDyn => {
+                if self.relr_count() > 0 {
+                    (self.relr_size, 8)
+                } else {
+                    (0, 8)
+                }
+            }
             Synthetic::RelaPlt => {
                 let entries = if dynamic {
                     self.plt_entries()
@@ -617,7 +717,8 @@ pub fn got_slot_relocs(
         .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
     let preemptible = target.global.is_some() && flags.contains(PREEMPTIBLE);
     let defined = !matches!(target.def, Def::Undefined { .. } | Def::Shared(_));
-    let absolute = matches!(target.def, Def::Absolute(_));
+    let absolute =
+        matches!(target.def, Def::Absolute(_)) || flags.contains(super::defined::ABSOLUTE);
     match kind {
         GotKind::Address => {
             if preemptible {

@@ -225,15 +225,23 @@ pub fn register(
     result.start_stop_outputs.dedup();
 
     // --defsym: resolution already made the internal file the definition.
-    for (index, (name, _)) in options.defsym.iter().enumerate() {
+    for (index, (name, expr)) in options.defsym.iter().enumerate() {
         if let Some(id) = symbols.lookup(&SymbolName::new(name.as_bytes()))
             && symbols.definition(id).file.index() == 0
         {
+            if let Some(DefsymExpr::Absolute(_)) = parse_defsym(expr) {
+                symbols.set_flags(id, ABSOLUTE);
+            }
             result.entries.push((id, Value::Defsym(index)));
         }
     }
     result
 }
+
+/// Backend flag: the symbol's value is an absolute number, not an address
+/// in the image (`--defsym name=0x1234`), so position-independent output
+/// does not relocate it.
+pub const ABSOLUTE: SymbolFlags = SymbolFlags::backend(7);
 
 /// The parsed `--defsym` expression for slot value `Defsym(index)`.
 #[must_use]

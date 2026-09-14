@@ -77,6 +77,8 @@ pub struct WriteInput<'w, 'x, 'a> {
     pub context: Context,
     /// Tombstone values for debug relocations to discarded code.
     pub tombstones: &'w Tombstones,
+    /// The encoded `.relr.dyn` words ([`encode_relr`]).
+    pub relr: &'w [u64],
     /// The entry address.
     pub entry: u64,
     /// Diagnostics.
@@ -157,6 +159,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         scan: input.scan,
         context: input.context,
         tombstones: input.tombstones,
+        relr: input.relr,
         entry: input.entry,
         diagnostics: &collected,
     };
@@ -359,7 +362,14 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
         Synthetic::DynSym => dynsym::write_dynsym(plan, addresses, out),
         Synthetic::Dynamic => dynsym::write_dynamic(plan, addresses, out),
         Synthetic::RelaDyn => write_rela_dyn(input, out)?,
-        Synthetic::RelrDyn => {}
+        Synthetic::RelrDyn => {
+            // Words past the encoding (the section keeps the size layout
+            // planned) are empty bitmaps, which the dynamic linker skips.
+            let mut words = input.relr.iter().copied();
+            for slot in out.as_chunks_mut::<8>().0.iter_mut() {
+                *slot = words.next().unwrap_or(1).to_le_bytes();
+            }
+        }
         Synthetic::Got => write_got(input, out),
         Synthetic::GotPlt => write_got_plt(input, out),
         Synthetic::Plt => write_plt(input, out)?,
@@ -631,6 +641,8 @@ struct DynReloc {
     offset: u64,
     r_type: u32,
     addend: i64,
+    /// A relative relocation that `.relr.dyn` can hold.
+    packable: bool,
 }
 
 fn dyn_reloc(offset: u64, symbol: u32, r_type: u32, addend: i64) -> DynReloc {
@@ -645,19 +657,25 @@ fn dyn_reloc(offset: u64, symbol: u32, r_type: u32, addend: i64) -> DynReloc {
         offset,
         r_type,
         addend,
+        packable: false,
     }
 }
 
-fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
-    let addresses = input.addresses;
+/// Every dynamic relocation of the output except `.rela.plt`'s, unsorted:
+/// GOT entries, copy relocations, and input sections (in parallel).
+fn collect_dyn_relocs(
+    addresses: &Addresses<'_, '_>,
+    context: &Context,
+    plan: &DynamicPlan,
+    scan: &ScanResult,
+) -> Vec<DynReloc> {
     let synth = addresses.synth;
     let refs = &addresses.refs;
     let Some(mode) = synth.mode else {
-        return Ok(());
+        return Vec::new();
     };
     let tls = addresses.layout.tls.unwrap_or_default();
-    let mut relocs: Vec<DynReloc> =
-        Vec::with_capacity(usize::try_from(synth.rela_dyn_count()).unwrap_or(0));
+    let mut relocs: Vec<DynReloc> = Vec::new();
     for (list, kind) in [
         (&synth.got, GotKind::Address),
         (&synth.tlsgd, GotKind::TlsGd),
@@ -669,7 +687,7 @@ fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> 
                 continue;
             };
             let symbol = match owner {
-                Owner::Global(id) => input.dynamic.index_of(id),
+                Owner::Global(id) => plan.index_of(id),
                 Owner::Local { .. } => 0,
             };
             let value = owner_value(addresses, owner);
@@ -681,7 +699,9 @@ fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> 
                 match reloc {
                     SlotReloc::None => {}
                     SlotReloc::Relative => {
-                        relocs.push(dyn_reloc(at, 0, R_X86_64_RELATIVE, value as i64));
+                        let mut reloc = dyn_reloc(at, 0, R_X86_64_RELATIVE, value as i64);
+                        reloc.packable = true;
+                        relocs.push(reloc);
                     }
                     SlotReloc::Symbolic(r_type) => relocs.push(dyn_reloc(at, symbol, r_type, 0)),
                     SlotReloc::Module(r_type) => {
@@ -710,14 +730,12 @@ fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> 
             .unwrap_or(0);
         relocs.push(dyn_reloc(
             address,
-            input.dynamic.index_of(copy.symbol),
+            plan.index_of(copy.symbol),
             R_X86_64_COPY,
             0,
         ));
     }
-    // Input sections, in parallel.
-    let sections: Vec<(usize, u32)> = input
-        .scan
+    let sections: Vec<(usize, u32)> = scan
         .files
         .iter()
         .enumerate()
@@ -725,10 +743,19 @@ fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> 
         .collect();
     let from_sections: Vec<Vec<DynReloc>> = sections
         .par_iter()
-        .map(|&(file, section)| section_dyn_relocs(input, file, section))
+        .map(|&(file, section)| section_dyn_relocs(addresses, context, plan, file, section))
         .collect();
     for list in from_sections {
         relocs.extend(list);
+    }
+    relocs
+}
+
+fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+    let synth = input.addresses.synth;
+    let mut relocs = collect_dyn_relocs(input.addresses, &input.context, input.dynamic, input.scan);
+    if synth.relr {
+        relocs.retain(|r| !r.packable);
     }
     let expected = usize::try_from(synth.rela_dyn_count()).unwrap_or(usize::MAX);
     if relocs.len() != expected {
@@ -750,14 +777,64 @@ fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> 
     Ok(())
 }
 
+/// The addresses of the relative relocations `.relr.dyn` holds, sorted.
+#[must_use]
+pub fn relr_addresses(
+    addresses: &Addresses<'_, '_>,
+    context: &Context,
+    plan: &DynamicPlan,
+    scan: &ScanResult,
+) -> Vec<u64> {
+    let mut places: Vec<u64> = collect_dyn_relocs(addresses, context, plan, scan)
+        .into_iter()
+        .filter(|r| r.packable)
+        .map(|r| r.offset)
+        .collect();
+    places.par_sort_unstable();
+    places.dedup();
+    places
+}
+
+/// Encodes sorted, even relocation addresses as `SHT_RELR` words: an
+/// address entry, then bitmaps of the following 63 words, repeatedly.
+#[must_use]
+pub fn encode_relr(places: &[u64]) -> Vec<u64> {
+    const BITS: u64 = 63;
+    let mut words = Vec::new();
+    let mut i = 0usize;
+    while let Some(&start) = places.get(i) {
+        words.push(start);
+        let mut base = start.wrapping_add(8);
+        i = i.saturating_add(1);
+        loop {
+            let mut bitmap = 0u64;
+            while let Some(&place) = places.get(i) {
+                let delta = place.wrapping_sub(base);
+                if place < base || delta >= BITS * 8 || delta % 8 != 0 {
+                    break;
+                }
+                bitmap |= 1u64 << (delta / 8);
+                i = i.saturating_add(1);
+            }
+            if bitmap == 0 {
+                break;
+            }
+            words.push((bitmap << 1) | 1);
+            base = base.wrapping_add(BITS * 8);
+        }
+    }
+    words
+}
+
 /// The dynamic relocations of section `section` of `file`, by re-running
 /// the scan's decisions.
 fn section_dyn_relocs(
-    input: &WriteInput<'_, '_, '_>,
+    addresses: &Addresses<'_, '_>,
+    context: &Context,
+    plan: &DynamicPlan,
     file_index: usize,
     section_index: u32,
 ) -> Vec<DynReloc> {
-    let addresses = input.addresses;
     let refs = &addresses.refs;
     let mut out = Vec::new();
     let Some(object) = refs.files.get(file_index).and_then(|f| f.object.as_ref()) else {
@@ -772,7 +849,7 @@ fn section_dyn_relocs(
     let data = if section.kind == SectionKind::Merge || section.is_nobits() {
         &[][..]
     } else {
-        object.elf.section_data(&section.header).unwrap_or_default()
+        object.section_data(section).unwrap_or_default()
     };
     let Some(Ok(Some(relocations))) = object
         .section(section.relocs)
@@ -796,14 +873,9 @@ fn section_dyn_relocs(
         let flags = target
             .global
             .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
-        let Ok(decision) = reloc::decide(
-            &input.context,
-            &rel,
-            data,
-            &target,
-            flags,
-            section.header.sh_flags,
-        ) else {
+        let Ok(decision) =
+            reloc::decide(context, &rel, data, &target, flags, section.header.sh_flags)
+        else {
             continue;
         };
         skip = decision.class.kind.skips_next();
@@ -816,15 +888,13 @@ fn section_dyn_relocs(
             Dynamic::Relative => {
                 let owner = Addresses::owner(&target, file_index, rel.symbol);
                 let (s, a) = target_value(addresses, &target, owner, rel.addend);
-                out.push(dyn_reloc(
-                    place,
-                    0,
-                    R_X86_64_RELATIVE,
-                    s.wrapping_add_signed(a) as i64,
-                ));
+                let mut reloc =
+                    dyn_reloc(place, 0, R_X86_64_RELATIVE, s.wrapping_add_signed(a) as i64);
+                reloc.packable = reloc::packable(section.header.sh_addralign, rel.offset);
+                out.push(reloc);
             }
             Dynamic::Symbolic(r_type) => {
-                let symbol = target.global.map_or(0, |id| input.dynamic.index_of(id));
+                let symbol = target.global.map_or(0, |id| plan.index_of(id));
                 out.push(dyn_reloc(place, symbol, r_type, rel.addend));
             }
         }

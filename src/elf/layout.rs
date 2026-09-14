@@ -696,6 +696,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     }];
     let mut tls: Option<Tls> = None;
     let mut relro: Option<(u64, u64)> = None;
+    let mut relro_end: Option<u64> = None;
     let mut etext = dot;
     let mut edata = dot;
     let mut bss_start: Option<u64> = None;
@@ -724,13 +725,15 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             if p & PF_W != 0 {
                 vaddr = add(vaddr, dot & page.wrapping_sub(1))?;
                 if starts_relro {
-                    vaddr = relro_start(
+                    let (start, end) = relro_start(
                         &out_sections,
                         alloc.get(position..).unwrap_or_default(),
                         vaddr,
                         page,
                         &is_relro,
                     )?;
+                    vaddr = start;
+                    relro_end = Some(end);
                 }
             }
             // The smallest offset at or after the file end that is
@@ -754,6 +757,13 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         let Some(section) = out_sections.get_mut(i) else {
             continue;
         };
+        if !starts_relro && let Some(end) = relro_end.take() {
+            // The RELRO region ends on its page boundary.
+            dot = dot.max(end);
+            if let Some(region) = &mut relro {
+                region.1 = end;
+            }
+        }
         place_empty_until(section.output, dot, &mut output_places);
         let address = align_up(dot, section.align)?;
         section.addr = address;
@@ -1059,41 +1069,50 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     })
 }
 
-/// The address a writable segment starting at `start` must start at so that
-/// its leading RELRO sections (`alloc`, in order) end on a page boundary.
+/// Where a writable segment that can start at `start` begins, and where its
+/// leading RELRO sections (`alloc`, in order) end, so that the end is on a
+/// page boundary: as GNU ld's `DATA_SEGMENT_RELRO_END`, the sections are
+/// placed backwards from the first page boundary after their forward
+/// layout, and the following sections start at that boundary.
 fn relro_start<F: Fn(&OutSection<'_>) -> bool>(
     sections: &[OutSection<'_>],
     alloc: &[usize],
     start: u64,
     page: u64,
     is_relro: &F,
-) -> Result<u64> {
-    let mask = page.wrapping_sub(1);
-    let mut vaddr = start;
-    // Alignments are at most a page in practice, so this settles at once;
-    // the bound only guards against pathological inputs.
-    for _ in 0..16 {
-        let mut dot = vaddr;
-        for &i in alloc {
-            let Some(section) = sections.get(i) else {
-                break;
-            };
-            if !is_relro(section) {
-                break;
-            }
-            let address = align_up(dot, section.align)?;
-            let tbss = section.flags & SHF_TLS != 0 && section.sh_type == SHT_NOBITS;
-            if !tbss {
-                dot = add(address, section.size)?;
-            }
+) -> Result<(u64, u64)> {
+    let relro: Vec<&OutSection<'_>> = alloc
+        .iter()
+        .map_while(|&i| sections.get(i).filter(|s| is_relro(s)))
+        .collect();
+    let tbss = |s: &OutSection<'_>| s.flags & SHF_TLS != 0 && s.sh_type == SHT_NOBITS;
+    let mut dot = start;
+    for section in &relro {
+        let address = align_up(dot, section.align)?;
+        if !tbss(section) {
+            dot = add(address, section.size)?;
         }
-        let remainder = dot & mask;
-        if remainder == 0 {
-            break;
-        }
-        vaddr = add(vaddr, page.wrapping_sub(remainder))?;
     }
-    Ok(vaddr)
+    let mut end = align_up(dot, page)?;
+    // Backwards from the end; one more page if that would start too early.
+    for _ in 0..2 {
+        let mut position = end;
+        for section in relro.iter().rev() {
+            if tbss(section) {
+                continue;
+            }
+            let align = section.align.max(1);
+            position = position
+                .checked_sub(section.size)
+                .map(|p| p & !align.wrapping_sub(1))
+                .ok_or_else(|| Error::Internal("RELRO region below address 0".into()))?;
+        }
+        if position >= start {
+            return Ok((position, end));
+        }
+        end = add(end, page)?;
+    }
+    Ok((start, align_up(dot, page)?))
 }
 
 /// Sets `sh_link`, `sh_info` and `sh_entsize` of the dynamic linking

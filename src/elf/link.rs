@@ -333,6 +333,14 @@ fn link_inputs<'a>(
 
     let mut synth = Synth::default();
     synth.plan_entries(&refs, &scan, mode);
+    // DT_RELR is for position-independent output; GNU ld ignores the
+    // option otherwise.
+    synth.relr = options.pack_relative_relocs && mode.pic;
+    synth.relr_size = synth
+        .relr_count()
+        .div_ceil(32)
+        .saturating_add(8)
+        .saturating_mul(8);
     synth.ibt = synth::plan_ibt(files, options);
     synth.build_id = synth::plan_build_id(options);
     synth.property_note = synth::plan_property_note(files, options);
@@ -390,7 +398,7 @@ fn link_inputs<'a>(
         .iter()
         .filter_map(|f| f.object.as_ref())
         .any(|o| o.exec_stack);
-    let layout = layout::layout(&LayoutInput {
+    let mut layout = layout::layout(&LayoutInput {
         options,
         rules: &rule_set,
         files,
@@ -403,6 +411,49 @@ fn link_inputs<'a>(
         exec_stack,
         mode,
     })?;
+    // `.relr.dyn`'s size depends on the addresses it encodes: lay out with an
+    // estimate, and again with the real size while it does not fit (growth
+    // rarely moves anything, as the next segment starts on a page boundary).
+    let mut relr = Vec::new();
+    if synth.relr_count() > 0 {
+        // Shrinking to the exact size is tried once; after that a smaller
+        // encoding is padded with empty bitmaps.
+        let mut shrunk = false;
+        for attempt in 0..8 {
+            let addresses = Addresses::new(
+                refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
+            );
+            let places = write::relr_addresses(&addresses, &context, &dynamic, &scan);
+            relr = write::encode_relr(&places);
+            let size = u64::try_from(relr.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(8);
+            if size == synth.relr_size || (size < synth.relr_size && shrunk) {
+                break;
+            }
+            if attempt == 7 {
+                if size <= synth.relr_size {
+                    break;
+                }
+                return Err(Error::Internal(".relr.dyn size did not converge".into()));
+            }
+            shrunk |= size < synth.relr_size;
+            synth.relr_size = size;
+            layout = layout::layout(&LayoutInput {
+                options,
+                rules: &rule_set,
+                files,
+                sections: &sections,
+                placement: &placement,
+                merged: &merged,
+                eh_frames: &eh_frames,
+                synth: &synth,
+                trailers,
+                exec_stack,
+                mode,
+            })?;
+        }
+    }
     lap("layout");
 
     let addresses = Addresses::new(
@@ -426,6 +477,7 @@ fn link_inputs<'a>(
         scan: &scan,
         context,
         tombstones: &tombstones,
+        relr: &relr,
         entry,
         diagnostics,
     })?;

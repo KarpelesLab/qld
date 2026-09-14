@@ -272,6 +272,24 @@ fn import_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<(usize, &'a [
         .then_some((file, info.name))
 }
 
+/// The version glibc requires of objects that use `DT_RELR`.
+pub const GLIBC_ABI_DT_RELR: &[u8] = b"GLIBC_ABI_DT_RELR";
+
+/// The needed shared library that defines the `GLIBC_ABI_DT_RELR` version.
+fn relr_version_provider(refs: &Refs<'_, '_>, needed: &Needed) -> Option<usize> {
+    refs.files.iter().enumerate().find_map(|(index, file)| {
+        let shared = file.shared.as_ref()?;
+        (needed.is_needed(index)
+            && shared
+                .elf
+                .versions()
+                .iter()
+                .flatten()
+                .any(|v| v.name == GLIBC_ABI_DT_RELR && v.kind == VersionKind::Defined))
+        .then_some(index)
+    })
+}
+
 /// Whether a defined symbol's section made it into the output.
 fn present(refs: &Refs<'_, '_>, id: SymbolId) -> bool {
     match refs.global_target(id, true).def {
@@ -311,7 +329,9 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
             let id = SymbolId::new(index);
             let flags = symbols.flags(id);
             let kind = symbols.definition_kind(id);
-            if flags.contains(SymbolFlags::NEEDS_COPY_RELOC) {
+            if flags.contains(SymbolFlags::NEEDS_COPY_RELOC)
+                || (kind == DefinitionKind::Shared && input.synth.copy_of(id).is_some())
+            {
                 return Some((id, true));
             }
             match kind {
@@ -416,6 +436,14 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
         .iter()
         .map(|&(file, name, _)| (file, name))
         .collect();
+    // glibc refuses DT_RELR without this version need, which its libc.so
+    // defines for that purpose.
+    if input.synth.relr_count() > 0
+        && let Some(libc) = relr_version_provider(refs, input.needed)
+    {
+        need_list.push((libc, GLIBC_ABI_DT_RELR));
+        need_list.sort_unstable();
+    }
     need_list.dedup();
     let verdef_count = version_script.map_or(0, |s| s.defs.len());
     let has_verdef = verdef_count > 0;
@@ -817,7 +845,7 @@ fn dynamic_entries(
         entries.push((DT_RELASZ, Size(Synthetic::RelaDyn)));
         entries.push((DT_RELAENT, Value(24)));
     }
-    if options.pack_relative_relocs && synth.relative_count() > 0 {
+    if synth.relr_count() > 0 {
         entries.push((DT_RELR, Address(Synthetic::RelrDyn)));
         entries.push((DT_RELRSZ, Size(Synthetic::RelrDyn)));
         entries.push((DT_RELRENT, Value(8)));
@@ -884,7 +912,7 @@ fn dynamic_entries(
         entries.push((DT_VERSYM, Address(Synthetic::VerSym)));
     }
     let relative = synth.relative_count();
-    if options.combine_relocs && relative > 0 && !options.pack_relative_relocs {
+    if options.combine_relocs && relative > 0 {
         entries.push((DT_RELACOUNT, Value(relative)));
     }
     for _ in 0..options.spare_dynamic_tags.unwrap_or(0).min(64) {
@@ -1006,7 +1034,7 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
                     shndx_of_address(addresses, value),
                 ),
                 Def::Linker(_) => {
-                    let absolute = symbols.definition(id).file.index() == 0
+                    let absolute = flags.contains(super::defined::ABSOLUTE)
                         && symbols.definition(id).file != LINKER_FILE;
                     (
                         STB_GLOBAL,

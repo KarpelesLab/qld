@@ -102,6 +102,15 @@ pub struct Context {
     pub copy_relocs: bool,
 }
 
+/// Whether a relative relocation at `offset` of a section aligned to
+/// `align` can go to `.relr.dyn`: its final address is certainly even, as
+/// the format needs, only when the section's alignment makes the offset's
+/// parity carry over (lld's rule).
+#[must_use]
+pub fn packable(align: u64, offset: u64) -> bool {
+    align >= 2 && offset & 1 == 0
+}
+
 /// Properties of a relocation target that decisions depend on.
 #[derive(Clone, Copy, Debug)]
 struct Props {
@@ -126,7 +135,8 @@ fn props(target: &Target, flags: SymbolFlags) -> Props {
             target.def,
             Def::Section { .. } | Def::Absolute(_) | Def::Common(_) | Def::Linker(_)
         ),
-        absolute: matches!(target.def, Def::Absolute(_)),
+        absolute: matches!(target.def, Def::Absolute(_))
+            || flags.contains(super::defined::ABSOLUTE),
         function: kind == STT_FUNC || kind == STT_GNU_IFUNC,
         local_ifunc: target.is_ifunc() && !preemptible,
         undefined_weak: matches!(target.def, Def::Undefined { weak: true }),

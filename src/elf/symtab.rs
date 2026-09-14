@@ -377,7 +377,7 @@ pub fn write_symtab(
                 }
                 Def::Linker(_) => {
                     let visibility = global_visibility(refs, linker, id);
-                    let absolute = refs.symbols.definition(id).file.index() == 0;
+                    let absolute = refs.symbols.flags(id).contains(super::defined::ABSOLUTE);
                     (
                         STB_GLOBAL,
                         STT_NOTYPE,
