@@ -36,6 +36,14 @@ pub enum Error {
     },
     /// A command-line option was not recognized, or its value was invalid.
     Option(String),
+    /// A library or linker script named on the command line was not found in
+    /// any search directory. The message is GNU-style: `cannot find -lfoo`.
+    NotFound(String),
+    /// A hard limit was exceeded (more than 2^32 input files, symbols, …).
+    Limit(String),
+    /// An internal invariant was violated: a bug in qld, such as a backend
+    /// handing a pass an inconsistent layout. Never caused by input files.
+    Internal(String),
     /// The link failed because of errors already reported to the diagnostic
     /// sink (for example undefined symbols).
     Reported {
@@ -88,7 +96,9 @@ impl fmt::Display for Error {
                 source,
             } => write!(f, "{}: {source}", path.display()),
             Self::Io { path: None, source } => write!(f, "{source}"),
-            Self::Option(message) => write!(f, "{message}"),
+            Self::Option(message) | Self::NotFound(message) => write!(f, "{message}"),
+            Self::Limit(message) => write!(f, "limit exceeded: {message}"),
+            Self::Internal(message) => write!(f, "internal error: {message}"),
             Self::Reported { errors } if *errors == 1 => write!(f, "1 error"),
             Self::Reported { errors } => write!(f, "{errors} errors"),
             Self::Unimplemented(what) => write!(f, "not implemented yet: {what}"),

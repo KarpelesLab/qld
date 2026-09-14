@@ -210,14 +210,10 @@ impl SearchContext<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] with [`std::io::ErrorKind::NotFound`] and a
-    /// GNU-style message (`cannot find -lfoo`) when a library or script is not
-    /// found.
+    /// Returns [`Error::NotFound`] with a GNU-style message
+    /// (`cannot find -lfoo`) when a library or script is not found.
     pub fn resolve(&self, spec: &InputSpec) -> Result<Source> {
-        let not_found = |what: String| Error::Io {
-            path: None,
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, what),
-        };
+        let not_found = Error::NotFound;
         match &spec.kind {
             InputKind::File(path) => Ok(Source::Path(path.clone())),
             InputKind::Library(name) => self

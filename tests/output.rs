@@ -282,12 +282,8 @@ fn invalid_layouts_are_errors() {
     for layout in bad {
         let ranges: Vec<ChunkRange> = layout.iter().copied().map(ChunkRange::from).collect();
         match out.split_chunks(&ranges) {
-            Err(Error::Io {
-                path: Some(p),
-                source,
-            }) => {
-                assert_eq!(p, path);
-                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+            Err(Error::Internal(message)) => {
+                assert!(message.contains(&path.display().to_string()), "{message}");
             }
             other => panic!("{layout:?}: expected a layout error, got {other:?}"),
         }
@@ -494,7 +490,7 @@ fn build_id_is_patched_into_the_file() {
     let mut out = OutputFile::in_memory(16).unwrap();
     assert!(matches!(
         out.apply_build_id(&BuildId::Md5, 1),
-        Err(Error::Io { .. })
+        Err(Error::Internal(_))
     ));
 }
 

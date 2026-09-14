@@ -383,8 +383,8 @@ impl OutputFile {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] (kind `InvalidInput`, wrapping a
-    /// [`LayoutError`]) if the layout is invalid.
+    /// Returns [`Error::Internal`] describing the [`LayoutError`] if the
+    /// layout is invalid.
     pub fn split_chunks(&mut self, ranges: &[ChunkRange]) -> Result<Vec<&mut [u8]>> {
         let path = self.path.clone();
         chunks::split_chunks(self.storage.as_mut_slice(), ranges)
@@ -573,10 +573,12 @@ fn too_large() -> io::Error {
 }
 
 fn layout_error(path: Option<&Path>, error: LayoutError) -> Error {
-    let source = io::Error::new(io::ErrorKind::InvalidInput, error);
-    Error::Io {
-        path: path.map(Path::to_path_buf),
-        source,
+    match path {
+        Some(path) => Error::Internal(format!(
+            "{}: invalid output layout: {error}",
+            path.display()
+        )),
+        None => Error::Internal(format!("invalid output layout: {error}")),
     }
 }
 

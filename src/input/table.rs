@@ -125,7 +125,7 @@ pub struct FileTable {
 }
 
 fn too_many_files(path: &Path) -> Error {
-    Error::io(path, std::io::Error::other("too many input files"))
+    Error::Limit(format!("too many input files (at {})", path.display()))
 }
 
 impl FileTable {

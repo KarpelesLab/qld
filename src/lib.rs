@@ -47,7 +47,7 @@ pub mod script;
 pub mod symbols;
 pub mod target;
 
-pub use args::{LinkOptions, ParseOutcome, parse_gnu};
+pub use args::{LinkOptions, ParseOutcome, parse_gnu, parse_gnu_with};
 pub use diag::{Diagnostic, DiagnosticSink, Severity};
 pub use error::{Error, Result};
 pub use ids::{FileId, SectionId, SymbolId};
