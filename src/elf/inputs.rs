@@ -127,7 +127,7 @@ pub struct ElfInput<'a> {
     /// For shared objects, the parsed library.
     pub shared: Option<SharedInput<'a>>,
     /// For IR inputs an LTO plugin claimed, the symbols it reported.
-    pub ir: Option<IrSymbols<'a>>,
+    pub ir: Option<Box<IrSymbols<'a>>>,
     thin: Option<ThinMember<'a>>,
     table: &'a FileTable,
     config: ParseConfig<'a>,

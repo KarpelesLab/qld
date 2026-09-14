@@ -577,7 +577,7 @@ mod plugin_link {
                 }
                 match self.driver.claim(file, round_file.id.index(), true)? {
                     Some(symbols) => {
-                        file.ir = Some(symbols);
+                        file.ir = Some(Box::new(symbols));
                         // A fat object's native code is replaced by LTO's.
                         file.object = None;
                     }
