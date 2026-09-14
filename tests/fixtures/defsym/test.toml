@@ -1,0 +1,13 @@
+# --defsym: an absolute symbol, an alias of a function, and an expression
+# relative to another symbol.
+description = "--defsym absolute values, aliases and expressions"
+compile = ["cc -O2 -fno-pie -c main.c"]
+driver = "cc"
+link = "-no-pie -o out main.o -Wl,--defsym=magic_marker=0x1234 -Wl,--defsym=alias_function=real_function -Wl,--defsym=second_entry=table+8"
+run = "./out"
+expect.stdout = """
+magic_marker=0x1234
+alias_function()=7
+second_entry=22
+"""
+expect.readelf = ["ABS magic_marker", "alias_function", "second_entry"]

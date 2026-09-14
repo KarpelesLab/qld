@@ -1,0 +1,15 @@
+# M1: GNU indirect functions in a static executable. The linker emits
+# R_X86_64_IRELATIVE relocations (applied by libc at startup) and a canonical
+# address so that function pointers compare equal across objects.
+description = "IFUNC resolved through IRELATIVE in a static binary"
+compile = ["cc -O2 -fno-pic -c main.c", "cc -O2 -fno-pic -c other.c"]
+driver = "cc"
+link = "-static -o out main.o other.o"
+run = "./out"
+expect.stdout = """
+direct: 2
+via pointer: 2
+from other object: 2
+same address: yes
+"""
+expect.readelf = ["R_X86_64_IRELATIVE", "IFUNC", "!INTERP"]

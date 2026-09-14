@@ -1,0 +1,30 @@
+# M2: symbol versioning with a version script and .symver.
+# old_app is linked against a library that only has foo@VERS_1, then run
+# against the new library, where foo@VERS_1 is the compatibility version and
+# foo@@VERS_2 the default. app is linked against the new library.
+description = "versioned symbols: version script, .symver, old and new binaries"
+compile = [
+  "mkdir -p old",
+  "cc -O2 -fPIC -c old.c",
+  "cc -O2 -fPIC -c lib.c",
+  "cc -O2 -DOLD_APP -c main.c -o main_old.o",
+  "cc -O2 -c main.c",
+]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libvers.so -Wl,--version-script=old.map -o old/libvers.so old.o",
+  "-o old_app main_old.o -Lold -lvers -Wl,-rpath,$ORIGIN",
+  "-shared -Wl,-soname,libvers.so -Wl,--version-script=lib.map -o libvers.so lib.o",
+  "-o app main.o -L. -lvers -Wl,-rpath,$ORIGIN",
+]
+output = "app"
+run = "./old_app && ./app"
+expect.stdout = "foo=1\nfoo=2 bar=3\n"
+expect.readelf = ["foo@VERS_2", "bar@VERS_2", "Version needs section", "VERS_2"]
+expect.readelf_files."libvers.so" = [
+  "foo@@VERS_2",
+  "foo@VERS_1",
+  "bar@@VERS_2",
+  "Version definition section",
+]
+expect.readelf_files."old_app" = ["foo@VERS_1", "!foo@VERS_2"]

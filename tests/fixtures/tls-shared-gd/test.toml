@@ -1,0 +1,25 @@
+# M2: a shared library that defines and exports TLS variables (general-dynamic
+# access, DTPMOD64/DTPOFF64), used from a PIE through its own GOT entries.
+description = "TLS in a shared library, general-dynamic model"
+compile = [
+  "cc -O2 -fPIC -ftls-model=global-dynamic -c tls.c",
+  "cc -O2 -fPIE -ftls-model=global-dynamic -pthread -c main.c",
+]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libtls.so -o libtls.so tls.o",
+  "-pie -pthread -o out main.o -L. -ltls -Wl,-rpath,$ORIGIN",
+]
+run = "./out"
+expect.stdout = """
+lib: 11
+thread: 11 101
+main: 12 12
+"""
+expect.readelf = ["Shared library: [libtls.so]", "TLS "]
+expect.readelf_files."libtls.so" = [
+  "Library soname: [libtls.so]",
+  "R_X86_64_DTPMOD64",
+  "TLS ",
+  "!R_X86_64_TPOFF64",
+]

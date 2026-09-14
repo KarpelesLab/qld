@@ -1,0 +1,16 @@
+# COMDAT groups: inline functions, their static locals, template
+# instantiations and vtables emitted in several objects must be deduplicated
+# to a single copy, so both objects share one `counter()` state.
+description = "C++ COMDAT deduplication of inline functions, templates, vtables"
+compile = ["c++ -O0 -c a.cpp", "c++ -O0 -c b.cpp", "c++ -O0 -c main.cpp"]
+driver = "c++"
+link = "-o out main.o a.o b.o"
+run = "./out"
+expect.stdout = """
+from_a=15 from_b=31
+counter=2
+same counter: yes
+same vtable: yes
+same template: yes
+"""
+determinism = true

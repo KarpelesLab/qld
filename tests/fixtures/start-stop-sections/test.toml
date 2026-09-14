@@ -1,0 +1,19 @@
+# __start_SECNAME / __stop_SECNAME for a C-identifier section name. The linker
+# defines them; referencing them keeps the section alive under --gc-sections
+# (GNU ld's default -z nostart-stop-gc behavior).
+description = "__start_/__stop_ symbols for a custom section, under --gc-sections"
+compile = [
+  "cc -O2 -ffunction-sections -fdata-sections -c main.c",
+  "cc -O2 -ffunction-sections -fdata-sections -c items.c",
+]
+driver = "cc"
+link = "-o out main.o items.o -Wl,--gc-sections"
+run = "./out"
+expect.stdout = """
+count=4 sum=1234
+alpha=1
+beta=200
+delta=30
+gamma=1003
+"""
+expect.readelf = ["qld_items", "__start_qld_items", "__stop_qld_items"]
