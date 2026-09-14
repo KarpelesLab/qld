@@ -19,9 +19,9 @@ scope of each, and the order in which they arrive. Milestone numbers refer to
 | COFF short import libraries | `IMPORT_OBJECT_HEADER` sig `0000 FFFF` | M7 (reader done) |
 | PE DLLs (link directly against `.dll`) | `MZ` … `PE\0\0` | M7 (export reader done) |
 | Module-definition files (`.def`) | extension / text | M7 (parser done) |
-| Mach-O objects and dylibs | `MH_MAGIC_64` etc. | M8 |
-| Apple text-based stubs (`.tbd` v3–v5) | text (YAML / JSON) | M8 |
-| Universal (fat) inputs: select a slice | `FAT_MAGIC`, `FAT_MAGIC_64` | M8 |
+| Mach-O objects and dylibs | `MH_MAGIC_64` etc. | M8 (reader done) |
+| Apple text-based stubs (`.tbd` v1–v5) | text (YAML / JSON) | M8 (reader done) |
+| Universal (fat) inputs: select a slice | `FAT_MAGIC`, `FAT_MAGIC_64` | M8 (reader done) |
 
 Archive variant notes:
 

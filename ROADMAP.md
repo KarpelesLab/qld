@@ -232,8 +232,8 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 
 - [ ] ld64 argv flavor: `-arch`, `-platform_version`, `-syslibroot`,
       `-framework`, `-dylib`, `-bundle`, `-dead_strip`, `-undefined`, `-exported_symbols_list`
-- [ ] Mach-O object parsing including `.subsections_via_symbols` atomization
-- [ ] `.tbd` text stubs (v3/v4/v5) and dylib inputs, two-level namespace, re-exports
+- [x] Mach-O object parsing including `.subsections_via_symbols` atomization (reader)
+- [~] `.tbd` text stubs (v1–v5) and dylib inputs read; two-level namespace and re-export resolution pending
 - [ ] arm64 and x86_64: stubs, GOT, thunks (arm64), TLV
 - [ ] `LC_DYLD_CHAINED_FIXUPS` and legacy `LC_DYLD_INFO_ONLY` output
 - [ ] Compact unwind (`__unwind_info`) synthesis, `__eh_frame`

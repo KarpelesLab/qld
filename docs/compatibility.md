@@ -294,5 +294,10 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - `-arch` may be given several times. qld then links each architecture
   (in parallel) and writes a universal binary. This is an extension:
   ld-prime requires `lipo` for this.
+- **Atomization** for `-dead_strip` follows lld: `N_ALT_ENTRY` symbols don't
+  start atoms, and ld64's special handling of `L`/`l` labels is not
+  reproduced (clang does not put those labels in the symbol table).
+- Selecting `x86_64` from a universal input also accepts a lone `x86_64h`
+  slice.
 - `-lto_library` is accepted. Mach-O LTO uses `libLTO` through the plugin
   layer, not the GNU plugin API. See [optimizations.md](optimizations.md#lto).

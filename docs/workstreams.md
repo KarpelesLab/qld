@@ -55,7 +55,7 @@ can work at the same time without colliding.
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | merged |
 | W16 | M2 exit criteria: real-world builds | `src/elf/**`, `tests/projects/**` | W11 | in progress |
 | W14 | PE/COFF reading | `src/coff/**` | — | merged |
-| W15 | Mach-O reading | `src/macho/**` | — | in progress |
+| W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
 
@@ -385,7 +385,7 @@ that cross workstream boundaries. The integrator does these between merges.
 | W12 | Adopt `RoundHook` + `GroupClaims` for COMDAT in `src/elf/` (claim before insertion; delete `redirect_discarded`) | done (W11) |
 | W10 | Fill `Location::source` for undefined-symbol diagnostics with `debug::dwarf::LineLookup` | done (W11) |
 | W8 | `ifunc-static` fixture prints "same address: no" when built with clang, under GNU ld too: fixture/toolchain issue | open |
-| W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | open, investigate |
+| W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | done: two tests raced on the shared `basic.o`; it is now built once |
 | W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |
 
 ## Launching an agent

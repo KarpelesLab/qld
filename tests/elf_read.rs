@@ -913,23 +913,31 @@ fn fixture_source(name: &str) -> String {
     data_dir().join(name).to_str().unwrap().to_owned()
 }
 
+/// Compiles `basic.c` once per test process. Several tests use the object;
+/// building it separately in each raced on the shared `basic.o` path (one
+/// test could read the file while another was rewriting it).
 fn build_basic() -> Option<PathBuf> {
-    let src = fixture_source("basic.c");
-    build(
-        "gcc",
-        &[
-            "-c",
-            "-O1",
-            "-fcommon",
-            "-ffunction-sections",
-            "-fdata-sections",
-            "-g",
-            "-gz=zlib",
-            "-fcf-protection=full",
-            &src,
-        ],
-        &scratch_dir().join("basic.o"),
-    )
+    static BASIC: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    BASIC
+        .get_or_init(|| {
+            let src = fixture_source("basic.c");
+            build(
+                "gcc",
+                &[
+                    "-c",
+                    "-O1",
+                    "-fcommon",
+                    "-ffunction-sections",
+                    "-fdata-sections",
+                    "-g",
+                    "-gz=zlib",
+                    "-fcf-protection=full",
+                    &src,
+                ],
+                &scratch_dir().join("basic.o"),
+            )
+        })
+        .clone()
 }
 
 fn find_symbol<'a>(inv: &'a Inventory, table: &str, name: &str) -> &'a Sym {
