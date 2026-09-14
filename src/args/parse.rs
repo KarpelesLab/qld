@@ -218,6 +218,11 @@ pub fn usage() -> String {
         push_help_line(&mut text, &left, keyword.help);
     }
     text.push_str("\n  @FILE                       Read options from FILE\n");
+    // libtool decides whether the linker can build shared libraries by
+    // looking for ": supported targets:.* elf" in `ld --help`. List only what
+    // qld links today; later milestones extend these lines.
+    text.push_str("qld: supported targets: elf64-x86-64\n");
+    text.push_str("qld: supported emulations: elf_x86_64\n");
     text
 }
 

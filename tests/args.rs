@@ -1340,3 +1340,15 @@ fn dead_reloc_in_nonalloc_rules_accumulate() {
             .contains("dead-reloc-in-nonalloc")
     );
 }
+
+#[test]
+fn help_names_supported_targets_for_libtool() {
+    // libtool: `$LD --help 2>&1 | $EGREP ': supported targets:.* elf'`.
+    let help = qld::args::usage();
+    let line = help
+        .lines()
+        .find(|l| l.contains(": supported targets:"))
+        .expect("supported targets line");
+    assert!(line.contains(" elf"), "{line}");
+    assert!(help.contains(": supported emulations: elf_x86_64"));
+}

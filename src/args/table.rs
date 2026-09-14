@@ -1260,7 +1260,7 @@ pub static GNU_OPTIONS: &[OptionDef] = &[
     uns("fix-cortex-a53-835769", F, M4_ARM),
     uns("fix-arm1176", F, M4_ARM),
     uns("pic-veneer", F, M4_ARM),
-    ign("long-plt", F),
+    uns("long-plt", F, M4_ARM),
     ign("merge-exidx-entries", F),
     uns("no-merge-exidx-entries", F, M4_ARM),
     ign("target1-abs", F),
