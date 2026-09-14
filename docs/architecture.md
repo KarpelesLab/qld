@@ -106,13 +106,21 @@ The global symbol table is a sharded concurrent hash map, keyed by interned
 name plus version where the format has versions, with the precomputed hash
 selecting the shard. Each symbol records its current best definition. Each
 format backend supplies a precedence function for "which definition wins"
-(ELF: strong > weak > common > lazy > shared, with COMDAT groups deduplicated
-by first occurrence in input order).
+(ELF: strong > common > weak > shared > lazy, where the larger of two common
+symbols wins; COMDAT groups are deduplicated by first occurrence in input
+order before their definitions are inserted).
+
+Symbol IDs never depend on thread scheduling. Names are interned in batches:
+new names are collected in parallel, then numbered in order of first
+occurrence (input position, then symbol index), so a parallel run assigns the
+same IDs as a single-threaded one.
 
 Archive extraction proceeds in rounds until nothing changes:
 
 1. Insert the definitions of all live objects, in parallel.
-2. Collect the undefined symbols that some archive's lazy index can satisfy.
+2. Collect the symbols that became referenced in this round (or whose best
+   definition only just became lazy) and that some archive's lazy index can
+   satisfy. Symbols handled in earlier rounds are not examined again.
 3. Extract the chosen members. When several archives can satisfy a symbol,
    the one earliest on the command line wins. Parse the members in parallel
    and go back to step 1.

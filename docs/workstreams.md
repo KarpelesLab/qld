@@ -40,10 +40,10 @@ can work at the same time without colliding.
 
 | ID | Area | Owns | Depends on | Ready |
 | --- | --- | --- | --- | --- |
-| W1 | Command-line parsing | `src/args/**` | — | yes |
+| W1 | Command-line parsing | `src/args/**` | — | merged |
 | W2 | Input files and archives | `src/input/**` | — | merged |
 | W3 | Linker scripts | `src/script/**` | — | yes |
-| W4 | Symbol table and interning | `src/symbols/**` | — | yes |
+| W4 | Symbol table and interning | `src/symbols/**` | — | merged |
 | W5 | Output writer | `src/output/**` | — | merged |
 | W6 | GC / ICF / merge passes | `src/passes/**` | — | merged |
 | W7 | ELF reading | `src/elf/read/**` | — | yes |
@@ -287,9 +287,15 @@ that cross workstream boundaries. The integrator does these between merges.
 
 | From | Change | Status |
 | --- | --- | --- |
-| W2 | `Error` variant for "library not found" (`cannot find -lfoo`), currently `Error::Io` with `NotFound` | open |
-| W5 | `Error` variant for internal/layout errors, currently `Error::Io` with `InvalidInput` | open |
-| W6 | `Error::Internal` so backend-bug `InputError`s convert into `crate::Error` (same variant as W5's) | open |
+| W2 | `Error` variant for "library not found" (`cannot find -lfoo`) | done: `Error::NotFound` |
+| W2 | `Error` variant for "too many input files" | done: `Error::Limit` |
+| W5 | `Error` variant for internal/layout errors | done: `Error::Internal` |
+| W6 | `Error::Internal` so backend-bug `InputError`s convert into `crate::Error` | variant added; `From` impl in `passes` still to write |
+| W4 | `const fn` ID accessors and `Default` on IDs | done |
+| W1 | Emit `LinkOptions::warnings` to the diagnostic sink, honoring `--no-warnings` / `--fatal-warnings` | done (`main.rs`) |
+| W1 | Re-export `parse_gnu_with` from the crate root | done |
+| W1 | Let `ParseOutcome` grow print-and-exit variants (`--print-sysroot`, `--print-output-format`); `main.rs` must handle them | open |
+| W1 | `target.rs`: more operating systems (FreeBSD, …) and architectures (MIPS, PowerPC32, …) for their `-m` emulations | open, when needed |
 | W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | open |
 | W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |
 

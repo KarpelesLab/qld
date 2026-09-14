@@ -44,9 +44,21 @@ These rules follow GNU ld's parser:
   warning (as in GNU ld), not an error.
 - `@file` response files are expanded recursively, with GNU quoting rules.
   On Windows hosts, and for the `msvc` flavor, Windows quoting rules apply.
-- Paths given to `-L`, `-T`, `--sysroot` and `-rpath-link` that start with `=`
-  or `$SYSROOT` are resolved relative to `--sysroot`.
+- Paths given to `-L`, `-T` and `-rpath-link` whose *value* starts with `=`
+  or `$SYSROOT` are resolved relative to `--sysroot` (`-L=/usr/lib`,
+  `-L =/usr/lib`, `-rpath-link =/x`). In `--rpath-link=/x` the `=` is the
+  value separator, not a sysroot prefix. With no `--sysroot`, the prefix is
+  simply removed. The parser records the prefix; resolution is a pure string
+  step before any file is opened.
 - `--` ends option parsing; everything after it is an input file.
+- **Single-dash long names win over short options with joined values**, as in
+  lld: `-export-dynamic` is `--export-dynamic`, not `-e xport-dynamic` as GNU
+  ld's getopt would read it.
+- **Not supported:** GNU's unique-prefix abbreviations (`--whole-arch` for
+  `--whole-archive`) and clustered short options (`-sS`). Both are
+  error-prone and no compiler driver emits them.
+- **A missing response file is an error.** GNU ld keeps `@file` as a literal
+  file name when it doesn't exist.
 
 ### Positional options
 
@@ -56,7 +68,20 @@ on the command line. qld records them as attributes on each input.
 `--whole-archive`/`--no-whole-archive`, `--as-needed`/`--no-as-needed`,
 `-Bstatic` (aliases `-dn`, `-non_shared`, `-static`) / `-Bdynamic` (aliases
 `-dy`, `-call_shared`), `--start-group`/`--end-group` (`-(`/`-)`),
-`--push-state`/`--pop-state`, `--copy-dt-needed-entries`, `-b`/`--format`.
+`--push-state`/`--pop-state`, `--copy-dt-needed-entries`, `-b`/`--format`,
+`--start-lib`/`--end-lib` (lld). Unbalanced groups, lib markers and
+`--pop-state` are errors.
+
+### Output kind
+
+- The last of `-shared` and `-pie`/`-no-pie` wins, as in GNU ld. `-r`
+  combined with either is an error.
+- Whether the output is static is decided by the `-Bstatic`/`-Bdynamic` state
+  at the **end** of the command line, as in mold. rustc's
+  `-Bstatic … -Bdynamic` sequence therefore still produces a dynamic PIE, and
+  gcc's `-static -pie --no-dynamic-linker` produces a static PIE.
+- With several of `-s` and `-S`, the strongest wins (strip all). GNU ld uses
+  the last one given.
 
 ### Option handling policy
 
@@ -66,8 +91,11 @@ each one a status:
 | Status | Behavior |
 | --- | --- |
 | **implemented** | Works as documented upstream |
-| **accepted-ignored** | Parsed and ignored with no diagnostic. Only for options that have no observable effect for qld (e.g. `--no-keep-memory`, `--reduce-memory-overheads`, `-O0`, `--threads` in some forms) |
-| **unsupported** | An error that names the option. Used when silently ignoring it could produce a wrong binary |
+| **accepted-ignored** | Parsed and ignored with no diagnostic. Only for options that have no observable effect for qld (e.g. `--no-keep-memory`, `--reduce-memory-overheads`, `--hash-size`) |
+| **unsupported** | An error that names the option and, when support is planned, the roadmap milestone (`unsupported option: --subsystem (not implemented yet (roadmap M7: PE/COFF))`). Used when silently ignoring it could produce a wrong binary |
+
+The table lives in `src/args/table.rs` (about 600 options and 100 `-z`
+keywords), and `qld --help` is generated from it.
 
 An option that appears in no table is an error (`qld: error: unknown option: --foo`),
 as in GNU ld.
@@ -117,6 +145,12 @@ one that appears *first on the command line* wins, which is the same choice
 GNU ld makes in all of the links it accepts. A future
 `--warn-backrefs` option (as in lld) will report links that GNU ld would
 reject.
+
+**Shared library versus archive member:** a definition in a shared library
+always beats a lazy archive member, wherever each appears. GNU ld and lld
+extract the member when its archive comes first on the command line. qld
+does not, because deciding by position would make whether a member is pulled
+in depend on command-line order again.
 
 ### Default library search paths
 
