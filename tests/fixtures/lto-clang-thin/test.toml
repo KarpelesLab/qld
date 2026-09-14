@@ -33,7 +33,15 @@ determinism = true
 timeout = 120
 # LLVM gives .eh_frame the type SHT_X86_64_UNWIND; qld keeps the input type
 # where GNU ld writes PROGBITS (not specific to LTO).
-diff.ignore = ["section: .eh_frame X86_64_UNWIND", "section: .eh_frame PROGBITS"]
+# On AArch64 qld routes a preemptible function that also has a GOT entry
+# through .plt.got, which GNU ld's AArch64 port does not have (see
+# docs/compatibility.md); on x86-64 both linkers agree.
+diff.ignore = [
+  "section: .eh_frame X86_64_UNWIND",
+  "section: .eh_frame PROGBITS",
+  ".plt.got",
+  "R_AARCH64_JUMP_SLOT",
+]
 # clang can be installed without LLVMgold.so, which -flto needs.
 requires_files = [
   "/usr/lib/llvm/*/lib*/LLVMgold.so",   # Gentoo
