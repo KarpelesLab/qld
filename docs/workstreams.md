@@ -30,8 +30,9 @@ can work at the same time without colliding.
    cargo test --all-features
    cargo +1.89 check --all-targets --all-features
    ```
-7. **Tests come with the code.** Unit tests go beside the code; anything
-   needing real object files goes in `tests/`.
+7. **Tests come with the code.** Unit tests go beside the code. A workstream
+   may also add one integration test file, `tests/<area>.rs`, and data under
+   `tests/data/<area>/`. The rest of `tests/` belongs to W9.
 8. **Report** what you built, what you had to stub, and any shared-file change
    you need.
 
@@ -47,7 +48,7 @@ can work at the same time without colliding.
 | W6 | GC / ICF / merge passes | `src/passes/**` | — | yes |
 | W7 | ELF reading | `src/elf/read/**` | — | yes |
 | W8 | ELF layout and writing | `src/elf/{layout,synth,arch}/**` | W7 | after W7 |
-| W9 | Test harness and fixtures | `tests/**`, `fuzz/**` | — | yes |
+| W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | yes |
 | W10 | DWARF | `src/debug/**` | W7 | after W7 |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -105,7 +106,8 @@ every table entry has a test, and `qld --help` lists what works.
 
 **Done when:** archives produced by GNU `ar`, LLVM `llvm-ar` and macOS `libtool`
 all parse, symbol indexes are read, malformed archives produce
-`Error::Malformed` instead of panicking, and a fuzz target runs clean.
+`Error::Malformed` instead of panicking, and truncated or corrupted archives
+never panic in randomized tests.
 
 ---
 
@@ -125,7 +127,8 @@ line.
 
 **Done when:** the scripts shipped by glibc and musl parse; a `SECTIONS`
 script for a bare-metal target parses and evaluates to the same addresses GNU
-ld computes (compare with `ld --verbose` output); fuzzing the parser is clean.
+ld computes (compare with `ld --verbose` output); corrupted scripts never
+panic in randomized tests.
 
 ---
 
@@ -218,7 +221,7 @@ tie-break), and micro-benchmarks on graphs of a million sections.
 
 **Done when:** parsing every `.o` and `.so` on the test machine (a sweep of
 `/usr/lib`) produces the same symbol and section inventory as `readelf`, with
-no panics, and fuzzing is clean.
+no panics, and truncated or corrupted objects never panic in randomized tests.
 
 ---
 
@@ -241,18 +244,22 @@ inspection.
 
 **Goal:** the infrastructure every other workstream tests against.
 
-**Owns:** `tests/**`, `fuzz/**`.
+**Owns:** `tests/**`, except the per-area files other workstreams add.
 
 **Build:**
 
 - The `test.toml` fixture runner described in `docs/testing.md`: compile with
   the host toolchain, link with qld, run, compare stdout and `readelf`
   patterns. It must skip cleanly (not fail) while linking is unimplemented.
+  No new dependencies: parse the small TOML subset fixtures use by hand.
 - A differential runner that links the same inputs with GNU ld and compares
   the normalized properties listed in `docs/testing.md`.
 - The captured-argv corpus for W1: real command lines from gcc, clang, rustc,
   meson and cmake builds, with the expected parse results.
-- `cargo fuzz` targets for each parser, with seed corpora.
+- Fuzzing is deferred: `cargo fuzz` needs a separate crate, and qld is kept
+  to one crate. Until that is decided, parsers get randomized
+  malformed-input tests (truncation and byte-flipping of valid inputs) in
+  their unit tests.
 - A determinism harness: link with 1, 2 and N threads, compare bytes.
 
 **Done when:** `cargo test` runs the fixture and differential suites, and the
