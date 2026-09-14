@@ -24,15 +24,20 @@ Set up the project skeleton and the infrastructure every later milestone needs.
       `cargo doc`, `cargo deny` (licenses/advisories), Linux/macOS/Windows hosts
 - [ ] Diagnostics framework: error/warning/note with input location, GNU-style
       `qld: error: ...` rendering, and structured form for library users
-- [ ] GNU flavor argument parser
-  - [ ] Complete option table covering every GNU ld 2.4x, gold, lld and mold
+- [x] GNU flavor argument parser
+  - [x] Complete option table covering every GNU ld 2.4x, gold, lld and mold
         option, each marked *implemented*, *accepted-ignored* or *unsupported*
-  - [ ] Single- and double-dash long options, joined/separate values, `-z` keywords
-  - [ ] Positional state: `--whole-archive`, `--as-needed`, `-Bstatic/-Bdynamic`,
+  - [x] Single- and double-dash long options, joined/separate values, `-z` keywords
+  - [x] Positional state: `--whole-archive`, `--as-needed`, `-Bstatic/-Bdynamic`,
         `--push-state/--pop-state`, `--start-group/--end-group`
-  - [ ] Response files (`@file`), `--sysroot` and `=`-prefixed paths
-  - [ ] `-v`/`--version` output that autoconf/libtool recognize as GNU-compatible
-- [ ] Flavor selection from `argv[0]` (`ld`, `ld.qld`, `ld64`, …) and `-flavor`
+  - [x] Response files (`@file`), `--sysroot` and `=`-prefixed paths
+  - [x] `-v`/`--version` output that autoconf/libtool recognize as GNU-compatible
+- [x] Flavor selection from `argv[0]` (`ld`, `ld.qld`, `ld64`, …) and `-flavor`
+      (the ld64 parser itself is M8)
+- [x] Concurrent symbol table with deterministic interning, and the
+      order-independent archive extraction driver
+- [x] Format-neutral GC, ICF and merge-section engines
+- [x] Output writer: mapped output, parallel chunks, build-id
 - [x] Input file loading: mmap, format detection by magic, `ar` archives
       (GNU, BSD, COFF and thin variants, symbol index), `-l` library search
 - [x] Test harness: fixture compilation with the system gcc/clang,

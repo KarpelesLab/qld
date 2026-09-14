@@ -152,6 +152,14 @@ extract the member when its archive comes first on the command line. qld
 does not, because deciding by position would make whether a member is pulled
 in depend on command-line order again.
 
+### Shared libraries beat archive members
+
+If a symbol is defined both by a shared library and by an archive member that
+has not been extracted, qld uses the shared library's definition, wherever the
+two appear on the command line. GNU ld and lld extract the member when the
+archive comes first. To force the static definition, name the object directly
+or wrap the archive in `--whole-archive`.
+
 ### Default library search paths
 
 GNU ld has built-in `SEARCH_DIR`s from its default linker script. qld, like
