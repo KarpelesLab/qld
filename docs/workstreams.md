@@ -165,8 +165,9 @@ with core count.
 
 **Build:**
 
-- An `OutputFile` that unlinks any existing file, creates a new one, sets its
-  length, and maps it writable; plus an in-memory variant for library callers.
+- An `OutputFile` that creates the output next to its final path, sets its
+  length, maps it writable, and replaces any old file on commit; plus an
+  in-memory variant for library callers. *(Done: merged.)*
 - Safe splitting into disjoint `&mut [u8]` chunks for parallel writers.
 - Parallel build-id hashing (block hashes combined into one value), with
   `fast`, `md5`, `sha1`, `uuid` and explicit-hex modes. Pure Rust MD5 and SHA-1

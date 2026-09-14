@@ -177,10 +177,16 @@ knows its size, or at least an upper bound.
 
 The final file size is known before any byte is written. The writer then:
 
-1. Creates the output as a new file (unlinking any existing one first, which
-   avoids `ETXTBSY` and avoids flushing the old file's pages). It sets the
-   file length and maps the file writable. When mapping is impossible, for
-   example on a pipe, it writes to an anonymous buffer instead.
+1. Creates the output as a temporary file next to the final path, sets its
+   length and maps it writable. When mapping is impossible it writes to a
+   heap buffer instead. Pipes and devices (including anything under `/dev`
+   and `/proc`) are written into directly, never replaced.
+   On commit, the old output is unlinked and the temporary file renamed into
+   place. This avoids `ETXTBSY` when the old output is running, leaves the old
+   output intact if the link fails, and avoids the data flush that btrfs and
+   ext4 trigger when a rename replaces an existing file (measured: 45 ms
+   versus 270–550 ms for a 1 GiB output). Unlink-first and plain atomic
+   rename are available as alternative strategies.
 2. Splits the mapping into disjoint `&mut [u8]` slices, one per output chunk.
    This uses `split_at_mut` and is the one place that needs careful slicing,
    but no `unsafe` aliasing.

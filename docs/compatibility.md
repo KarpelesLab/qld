@@ -128,9 +128,17 @@ succeed. The error message names the missing search path.
 ### Other differences
 
 - **Unknown `-z` keywords** produce a warning, not an error (same as GNU ld).
-- **Output file replacement.** The existing output file is unlinked and a new
-  one is created, rather than truncated in place. This matches gold, lld and
-  mold. It means hard links to the old output are not updated.
+- **Output file replacement.** The output is written to a temporary file and
+  renamed over the old one, rather than truncated in place. As with gold, lld
+  and mold, hard links to the old output are not updated, and a symlink at
+  the output path is replaced rather than followed. Paths that are pipes or
+  devices (anything under `/dev` or `/proc`, such as `-o /dev/stdout`) are
+  written into directly.
+- **Build ID values.** `--build-id=md5` and `--build-id=sha1` produce digests
+  of the right length and kind, but not the same values as GNU ld: qld hashes
+  1 MiB blocks in parallel and then hashes the block digests.
+  `--build-id=fast` is an 8-byte xxHash64 tree hash. Values are stable
+  across platforms and thread counts.
 - **Threads.** Parallel by default. `--threads=N`, `--no-threads` and
   `--thread-count=N` (gold) are honored.
 
