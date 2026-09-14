@@ -10,7 +10,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::args::LinkOptions;
-use crate::diag::{Diagnostic, DiagnosticSink};
+use crate::diag::{Collect, Diagnostic, DiagnosticSink, Severity};
 use crate::elf::read::Relocations;
 use crate::elf::read::consts::{
     EM_X86_64, ET_EXEC, SHF_ALLOC, reloc_name, x86_64::R_X86_64_IRELATIVE,
@@ -120,17 +120,42 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         layout.file_size,
         &crate::output::OutputOptions::default(),
     )?;
-    let errors_before = input.diagnostics.error_count();
+    // Chunks report into a collector; problems are emitted afterwards in
+    // input order, so the diagnostics do not depend on scheduling.
+    let collected = Collect::new();
+    let local = WriteInput {
+        options: input.options,
+        addresses: input.addresses,
+        symtab: input.symtab,
+        linker: input.linker,
+        entry: input.entry,
+        diagnostics: &collected,
+    };
     file.write_chunks(&ranges, |index, out| {
         let Some(&(_, chunk)) = chunks.get(index) else {
             return Err(Error::Internal("chunk index out of range".into()));
         };
-        write_chunk(input, chunk, out)
+        write_chunk(&local, chunk, out)
     })?;
-    let errors = input
-        .diagnostics
-        .error_count()
-        .saturating_sub(errors_before);
+    let mut problems = collected.take_sorted();
+    problems.sort_by(|a, b| {
+        let key = |d: &Diagnostic| {
+            let location = d.locations.first();
+            (
+                d.order,
+                location.map(|l| l.section.clone()),
+                location.and_then(|l| l.offset),
+            )
+        };
+        key(a).cmp(&key(b)).then_with(|| a.message.cmp(&b.message))
+    });
+    let errors = problems
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    for problem in problems {
+        input.diagnostics.emit(problem);
+    }
     if errors > 0 && !input.options.noinhibit_exec {
         return Err(Error::Reported { errors });
     }
