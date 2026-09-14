@@ -758,7 +758,11 @@ fn errors_carry_positions() {
         "{e}"
     );
     let error: qld::Error = e.into();
-    assert!(error.to_string().contains("line 4"), "{error}");
+    assert!(matches!(error, qld::Error::Script(_)));
+    assert!(
+        error.to_string().starts_with("test.ld:4:3: syntax error"),
+        "{error}"
+    );
 
     let e = parse_str("x = 1;\ny = @;").unwrap_err();
     assert_eq!((e.line, e.column), (2, 5));
