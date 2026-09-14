@@ -217,6 +217,100 @@ fn inflate_committed_fixture() {
 }
 
 // ---------------------------------------------------------------------------
+// zstd
+// ---------------------------------------------------------------------------
+
+/// Compresses every corpus with the `zstd` command at a range of levels and
+/// options, and checks that qld's decoder reproduces the input.
+#[test]
+fn zstd_matches_system_zstd() {
+    let Some(zstd) = find_program("zstd") else {
+        return skip("zstd not found");
+    };
+    let dir = scratch_dir("zstd-cli");
+    let variants: &[(&str, &[&str])] = &[
+        ("fast5", &["--fast=5"]),
+        ("l1", &["-1"]),
+        ("l3", &["-3"]),
+        ("l3nocheck", &["-3", "--no-check"]),
+        ("l9", &["-9"]),
+        ("l19", &["-19"]),
+        ("ultra22", &["--ultra", "-22"]),
+        ("long", &["-3", "--long=24"]),
+        ("nosize", &["-3", "--no-content-size"]),
+    ];
+    let mut checked = 0;
+    for (name, data) in corpora() {
+        let raw = dir.join(format!("{name}.bin"));
+        std::fs::write(&raw, &data).unwrap();
+        for (tag, args) in variants {
+            if matches!(*tag, "l19" | "ultra22") && data.len() > 400_000 {
+                continue; // slow to compress; covered by the smaller corpora
+            }
+            let packed = dir.join(format!("{name}.{tag}.zst"));
+            let status = Command::new(&zstd)
+                .args(*args)
+                .args(["-q", "-f", "-o"])
+                .arg(&packed)
+                .arg(&raw)
+                .status()
+                .unwrap();
+            assert!(status.success(), "zstd {args:?} failed");
+            let compressed = std::fs::read(&packed).unwrap();
+            let mut out = vec![0u8; data.len()];
+            if let Err(error) = Codec::Zstd.decompress_into(&compressed, &mut out) {
+                panic!("{name}.{tag}: {error}");
+            }
+            assert!(out == data, "{name}.{tag}: output differs");
+            checked += 1;
+        }
+    }
+    println!("checked {checked} zstd streams");
+}
+
+/// The committed zstd fixtures decode (runs without any tools).
+#[test]
+fn zstd_committed_fixtures() {
+    let expected = std::fs::read(data_dir().join("mixed.bin")).unwrap();
+    for name in ["mixed.l3.zst", "mixed.l19.zst"] {
+        let compressed = std::fs::read(data_dir().join(name)).unwrap();
+        let mut out = vec![0u8; expected.len()];
+        Codec::Zstd.decompress_into(&compressed, &mut out).unwrap();
+        assert_eq!(out, expected, "{name}");
+    }
+}
+
+/// Several frames in a row, including a skippable frame, decode as one.
+#[test]
+fn zstd_concatenated_frames() {
+    let Some(zstd) = find_program("zstd") else {
+        return skip("zstd not found");
+    };
+    let dir = scratch_dir("zstd-frames");
+    let parts = [noise(5000, 1), b"hello ".repeat(3000), vec![0u8; 70_000]];
+    let mut stream = Vec::new();
+    let mut expected = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let raw = dir.join(format!("part{i}"));
+        std::fs::write(&raw, part).unwrap();
+        let packed = run(Command::new(&zstd).args(["-q", "-c", "-5"]).arg(&raw)).unwrap();
+        stream.extend_from_slice(&packed);
+        expected.extend_from_slice(part);
+        // A skippable frame between frames.
+        stream.extend_from_slice(&0x184d_2a53u32.to_le_bytes());
+        stream.extend_from_slice(&3u32.to_le_bytes());
+        stream.extend_from_slice(b"abc");
+    }
+    let mut out = vec![0u8; expected.len()];
+    Codec::Zstd.decompress_into(&stream, &mut out).unwrap();
+    assert!(out == expected);
+    let mut short = vec![0u8; expected.len() - 1];
+    assert!(Codec::Zstd.decompress_into(&stream, &mut short).is_err());
+    let mut long = vec![0u8; expected.len() + 1];
+    assert!(Codec::Zstd.decompress_into(&stream, &mut long).is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Throughput benchmarks (`cargo test --release --test debug -- --ignored
 // --nocapture bench_`). No framework: they print MB/s.
 // ---------------------------------------------------------------------------
@@ -294,6 +388,54 @@ fn bench_deflate() {
             z.len() as f64 / data.len() as f64,
             sys_speed,
             sys_size as f64 / data.len() as f64,
+        );
+    }
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bench_zstd() {
+    let Some(zstd) = find_program("zstd") else {
+        return skip("zstd not found");
+    };
+    let data = bench_corpus(64 << 20);
+    let dir = scratch_dir("bench-zstd");
+    let raw = dir.join("corpus.bin");
+    std::fs::write(&raw, &data).unwrap();
+    for level in [1, 3, 9, 19] {
+        let packed = dir.join(format!("corpus.{level}.zst"));
+        let ok = Command::new(&zstd)
+            .args(["-q", "-f", "-T0", &format!("-{level}"), "-o"])
+            .arg(&packed)
+            .arg(&raw)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return skip("zstd failed");
+        }
+        let z = std::fs::read(&packed).unwrap();
+        let mut buf = vec![0u8; data.len()];
+        let elapsed = best_of(5, || Codec::Zstd.decompress_into(&z, &mut buf).unwrap());
+        assert!(buf == data);
+        // The reference decoder's in-memory speed: `zstd -b` on the file.
+        let reference = run(Command::new(&zstd)
+            .args(["-b", &format!("-{level}"), "-i1"])
+            .arg(&raw))
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_default();
+        // Progress lines are separated by '\r'; the decompression speed is
+        // the second "MB/s" figure of the last complete one.
+        let reference = reference
+            .split(['\r', '\n'])
+            .rfind(|line| line.matches("MB/s").count() == 2)
+            .and_then(|line| line.rsplit(',').next())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        println!(
+            "zstd level {level}: {:.1} MiB -> {:.1} MiB, qld {:.0} MB/s, libzstd (zstd -b) {reference}",
+            z.len() as f64 / 1048576.0,
+            data.len() as f64 / 1048576.0,
+            mb_per_s(data.len(), elapsed),
         );
     }
 }

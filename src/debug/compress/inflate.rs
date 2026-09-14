@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 
 use super::DecodeError;
 use super::adler32::adler32;
+use super::copy::copy_match;
 
 /// Bits indexed by the primary literal/length table.
 const LITLEN_BITS: u32 = 11;
@@ -630,47 +631,6 @@ fn huffman_block(
             }
         })?;
     }
-}
-
-/// Copies a `length`-byte match from `distance` bytes back. Returns the new
-/// output position, or `None` if the match starts before the output or ends
-/// past it.
-#[inline(always)]
-fn copy_match(out: &mut [u8], o: usize, distance: usize, length: usize) -> Option<usize> {
-    let src = o.checked_sub(distance)?;
-    let end = o.checked_add(length)?;
-    if distance == 0 || end > out.len() {
-        return None;
-    }
-    if distance >= 8 && end.wrapping_add(8) <= out.len() {
-        // Eight bytes at a time. The source never overlaps the destination
-        // word, and any overshoot past `end` is overwritten later.
-        let (mut s, mut d) = (src, o);
-        loop {
-            let word: [u8; 8] = out.get(s..s.wrapping_add(8))?.try_into().ok()?;
-            out.get_mut(d..d.wrapping_add(8))?.copy_from_slice(&word);
-            s = s.wrapping_add(8);
-            d = d.wrapping_add(8);
-            if d >= end {
-                break;
-            }
-        }
-    } else if distance == 1 {
-        let byte = *out.get(src)?;
-        out.get_mut(o..end)?.fill(byte);
-    } else if distance >= length {
-        out.copy_within(src..src.wrapping_add(length), o);
-    } else {
-        // Overlapping: the output repeats with period `distance`. Copy
-        // whole periods, doubling the copied run each time.
-        let mut done = 0usize;
-        while done < length {
-            let n = (length.wrapping_sub(done)).min(distance.wrapping_add(done));
-            out.copy_within(src..src.wrapping_add(n), o.wrapping_add(done));
-            done = done.wrapping_add(n);
-        }
-    }
-    Some(end)
 }
 
 /// Decompresses zlib data (RFC 1950) into `out`, which must be filled

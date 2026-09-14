@@ -18,6 +18,7 @@
 //! an implementation for a library crate is a local change.
 
 mod adler32;
+mod copy;
 pub mod deflate;
 mod inflate;
 pub mod zstd;
