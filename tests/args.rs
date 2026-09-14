@@ -264,6 +264,7 @@ fn z_sample(name: &str) -> &'static str {
         "stack-size" => "0x100000",
         "start-stop-visibility" => "hidden",
         "cet-report" => "error",
+        "dead-reloc-in-nonalloc" => ".debug_*=0xffffffff",
         _ => "value",
     }
 }
@@ -1320,4 +1321,22 @@ fn random_command_lines_never_panic() {
         }
         let _ = parse_gnu_with(&argv, &reader);
     }
+}
+
+#[test]
+fn dead_reloc_in_nonalloc_rules_accumulate() {
+    let options = link(&[
+        "-z",
+        "dead-reloc-in-nonalloc=.debug_*=0",
+        "-zdead-reloc-in-nonalloc=.debug_ranges=0x1",
+        "in.o",
+    ]);
+    assert_eq!(
+        options.dead_reloc_in_nonalloc,
+        [(".debug_*".to_owned(), 0), (".debug_ranges".to_owned(), 1)]
+    );
+    assert!(
+        error(&["-z", "dead-reloc-in-nonalloc=.debug_info=zz", "in.o"])
+            .contains("dead-reloc-in-nonalloc")
+    );
 }

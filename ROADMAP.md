@@ -75,7 +75,7 @@ The first end-to-end link: fully static x86-64 Linux executables.
 - [x] Linker-defined symbols (`_end`, `_etext`, `__bss_start`, `__ehdr_start`, …)
 - [x] `--build-id` (parallel tree hash), `-s`/`-S`, `--strip-debug`
 - [x] `--icf`, `-Map`, `--why-live`, `--print-gc-sections`
-- [ ] Compressed debug sections in inputs (`-gz`), waiting on W10
+- [~] Compressed debug sections in inputs (`-gz`): W10's API merged, ELF driver hookup pending
 - [ ] Musl C programs verified (only the Rust musl target is tested so far)
 - [x] Parallel output writer: mapped output, disjoint slices per chunk,
       replacing an existing output atomically
@@ -176,8 +176,9 @@ its linker.
 - [ ] Identical code folding: `--icf=safe` (using `.llvm_addrsig`) and `--icf=all`
 - [ ] String tail merging (`-O2`)
 - [ ] Section ordering: `--symbol-ordering-file`, `--call-graph-profile-sort`
-- [ ] Compressed debug sections: read and write zlib and zstd
-      (`--compress-debug-sections`)
+- [~] Compressed debug sections: read and write zlib and zstd
+      (`--compress-debug-sections`): codecs and section API done (in-crate,
+      parallel); ELF driver hookup pending
 - [ ] `--gdb-index` and `--debug-names` generation
 - [ ] Unlinking a large old output file in the background
 - [ ] Optional separate-debug output (`--separate-debug-file`) with

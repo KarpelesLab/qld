@@ -107,11 +107,11 @@ name plus version where the format has versions, with the precomputed hash
 selecting the shard. Each symbol records its current best definition. Each
 format backend supplies a precedence function for "which definition wins"
 (ELF: strong > common > weak > shared > lazy, where the larger of two common
-symbols wins). COMDAT groups are deduplicated right after resolution: the
-first live file in input order keeps each group, and any winning definition
-that sat in a discarded group is resolved again. Deduplicating before
-insertion would save that second step, but the resolver has no hook between
-loading a round's files and interning their symbols yet.
+symbols wins). COMDAT groups are claimed before their definitions are
+inserted, through a per-round hook: the earliest round wins, then the lowest
+input position within the round, and claims from earlier rounds are final.
+Definitions in discarded group copies are never inserted. (The ELF backend
+still deduplicates after resolution until it adopts the hook.)
 
 Symbol IDs never depend on thread scheduling. Names are interned in batches:
 new names are collected in parallel, then numbered in order of first
@@ -120,7 +120,12 @@ same IDs as a single-threaded one.
 
 Archive extraction proceeds in rounds until nothing changes:
 
-1. Insert the definitions of all live objects, in parallel.
+0. Load the files that became live in this round (in parallel), then run the
+   backend's round hook on them in input order (COMDAT claims).
+1. Intern the new files' names and insert their definitions and references,
+   in one parallel pass over the new files only. Rounds under a few thousand
+   symbols run on the calling thread, where splitting work costs more than
+   it saves.
 2. Collect the symbols that became referenced in this round (or whose best
    definition only just became lazy) and that some archive's lazy index can
    satisfy. Symbols handled in earlier rounds are not examined again.
