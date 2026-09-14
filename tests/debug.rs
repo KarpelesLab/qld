@@ -12,8 +12,15 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use qld::debug::compress::deflate::{Level, zlib_compress, zlib_compress_chunked};
+use qld::debug::compress::deflate::{
+    DEFAULT_CHUNK_SIZE, Level, zlib_compress, zlib_compress_chunked,
+};
 use qld::debug::compress::{Codec, zlib_decompress_into};
+use qld::debug::section::{
+    CompressedSection, OutputCompression, compress_section, decompressed_name, encode_chdr,
+    section_contents,
+};
+use qld::elf::read::{Elf64Le, ObjectFile, Source};
 
 fn skip(reason: impl std::fmt::Display) {
     println!("SKIPPED: {reason}");
@@ -214,6 +221,236 @@ fn inflate_committed_fixture() {
     let mut out = vec![0u8; expected.len()];
     Codec::Zlib.decompress_into(&compressed, &mut out).unwrap();
     assert_eq!(out, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Compressed ELF sections
+// ---------------------------------------------------------------------------
+
+/// A C source with enough functions and types to give several hundred KiB
+/// of DWARF.
+fn big_c_source(functions: usize) -> String {
+    let mut src = String::from("#include <stddef.h>\n");
+    for i in 0..functions {
+        src.push_str(&format!(
+            "struct s{i} {{ int a; long b[{n}]; const char *name; struct s{i} *next; }};\n\
+             static int helper{i}(struct s{i} *p, int k) {{\n  int t = k * {i};\n  \
+             for (int j = 0; j < {n}; j++) t += (int)p->b[j];\n  return t + p->a;\n}}\n\
+             int func{i}(int k) {{\n  struct s{i} v = {{ k, {{0}}, \"f{i}\", NULL }};\n  \
+             return helper{i}(&v, k);\n}}\n",
+            n = i % 7 + 1
+        ));
+    }
+    src
+}
+
+/// Compiles `source` with the given flags into `dir/name.o`.
+fn compile(dir: &Path, name: &str, source: &str, flags: &[&str]) -> Option<PathBuf> {
+    let cc = find_program("gcc").or_else(|| find_program("cc"))?;
+    let src = dir.join(format!("{name}.c"));
+    std::fs::write(&src, source).ok()?;
+    let obj = dir.join(format!("{name}.o"));
+    run(Command::new(cc)
+        .args(flags)
+        .args(["-c", "-o"])
+        .arg(&obj)
+        .arg(&src))?;
+    Some(obj)
+}
+
+/// Section names and headers of an ELF64 little-endian object.
+fn sections(data: &[u8]) -> Vec<(String, qld::elf::read::SectionHeader)> {
+    let object = ObjectFile::<Elf64Le>::parse(data, Source::new(Path::new("x.o"))).unwrap();
+    object
+        .elf()
+        .enumerate_sections()
+        .map(|(_, h)| {
+            let name = String::from_utf8_lossy(object.section_name(&h).unwrap()).into_owned();
+            (name, h)
+        })
+        .collect()
+}
+
+/// Decompresses every compressed section with qld and compares it with the
+/// same section after `objcopy --decompress-debug-sections`.
+#[test]
+fn compressed_input_sections_match_objcopy() {
+    let Some(objcopy) = find_program("objcopy") else {
+        return skip("objcopy not found");
+    };
+    let dir = scratch_dir("input-sections");
+    // Some toolchains compress debug sections by default; start from none.
+    let Some(plain) = compile(&dir, "plain", &big_c_source(40), &["-g", "-O1", "-gz=none"]) else {
+        return skip("no C compiler");
+    };
+    let mut variants: Vec<(String, PathBuf)> = Vec::new();
+    for kind in ["zlib", "zlib-gnu", "zstd"] {
+        let out = dir.join(format!("objcopy-{kind}.o"));
+        if run(Command::new(&objcopy)
+            .arg(format!("--compress-debug-sections={kind}"))
+            .arg(&plain)
+            .arg(&out))
+        .is_some()
+        {
+            variants.push((format!("objcopy {kind}"), out));
+        }
+    }
+    for kind in ["zlib", "zstd"] {
+        if let Some(obj) = compile(
+            &dir,
+            &format!("gz-{kind}"),
+            &big_c_source(40),
+            &["-g", "-O1", &format!("-gz={kind}")],
+        ) {
+            variants.push((format!("gcc -gz={kind}"), obj));
+        }
+    }
+    let mut checked = 0;
+    for (label, path) in &variants {
+        let reference = dir.join("reference.o");
+        run(Command::new(&objcopy)
+            .arg("--decompress-debug-sections")
+            .arg(path)
+            .arg(&reference))
+        .expect("objcopy --decompress-debug-sections");
+        let data = std::fs::read(path).unwrap();
+        let ref_data = std::fs::read(&reference).unwrap();
+        let ref_sections = sections(&ref_data);
+        let object = ObjectFile::<Elf64Le>::parse(&data, Source::new(path)).unwrap();
+        for (index, header) in object.elf().enumerate_sections() {
+            let Some(compressed) = CompressedSection::detect(&object, &header).unwrap() else {
+                continue;
+            };
+            let name = object.section_name(&header).unwrap();
+            let name = String::from_utf8_lossy(&decompressed_name(name)).into_owned();
+            let expected = ref_sections
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, h)| *h)
+                .unwrap_or_else(|| panic!("{label}: {name} missing after objcopy"));
+            let expected = &ref_data
+                [expected.sh_offset as usize..(expected.sh_offset + expected.sh_size) as usize];
+            let got = compressed.decompress(object.source()).unwrap();
+            assert!(got == expected, "{label}: section {index} ({name}) differs");
+            let contents = section_contents(&object, &header).unwrap();
+            assert!(*contents == *expected);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0 || variants.is_empty());
+    println!("checked {checked} sections in {} objects", variants.len());
+}
+
+/// Replaces the contents of section `index` of an ELF64 little-endian file:
+/// the new contents go at the end of the file, and the header's offset,
+/// size, flags and alignment are updated.
+fn replace_section(elf: &mut Vec<u8>, index: usize, contents: &[u8], flags: u64, align: u64) {
+    let read_u64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    let shoff = read_u64(elf, 0x28) as usize;
+    let shentsize = u16::from_le_bytes([elf[0x3a], elf[0x3b]]) as usize;
+    while !elf.len().is_multiple_of(8) {
+        elf.push(0);
+    }
+    let offset = elf.len() as u64;
+    elf.extend_from_slice(contents);
+    let hdr = shoff + index * shentsize;
+    elf[hdr + 8..hdr + 16].copy_from_slice(&flags.to_le_bytes());
+    elf[hdr + 24..hdr + 32].copy_from_slice(&offset.to_le_bytes());
+    elf[hdr + 32..hdr + 40].copy_from_slice(&(contents.len() as u64).to_le_bytes());
+    elf[hdr + 48..hdr + 56].copy_from_slice(&align.to_le_bytes());
+}
+
+/// Compresses the debug sections of an object with qld, then checks that
+/// binutils reads them: `readelf -z --debug-dump` matches the original,
+/// and `objcopy --decompress-debug-sections` restores the original bytes.
+#[test]
+fn compressed_output_sections_accepted_by_binutils() {
+    const SHF_COMPRESSED: u64 = 0x800;
+    let (Some(objcopy), Some(readelf)) = (find_program("objcopy"), find_program("readelf")) else {
+        return skip("objcopy or readelf not found");
+    };
+    let dir = scratch_dir("output-sections");
+    let Some(plain) = compile(
+        &dir,
+        "plain",
+        &big_c_source(400),
+        &["-g", "-O1", "-gz=none"],
+    ) else {
+        return skip("no C compiler");
+    };
+    let original = std::fs::read(&plain).unwrap();
+    let dump = |path: &Path| {
+        let out = run(Command::new(&readelf)
+            .args([
+                "-W",
+                "-z",
+                "--debug-dump=info,abbrev,line,str,aranges,Ranges,loc",
+            ])
+            .arg(path))
+        .expect("readelf");
+        // The dump names the file; compare everything else.
+        String::from_utf8_lossy(&out).replace(&path.display().to_string(), "FILE")
+    };
+    let expected_dump = dump(&plain);
+
+    for (label, chunk, level) in [
+        ("fast", DEFAULT_CHUNK_SIZE, Level::FASTEST),
+        ("default-4k-chunks", 4096, Level::DEFAULT),
+        ("stored-1k-chunks", 1000, Level::STORE),
+    ] {
+        let mut patched = original.clone();
+        let mut compressed = 0;
+        for (index, (name, header)) in sections(&original).iter().enumerate() {
+            if !name.starts_with(".debug_") || header.sh_size == 0 {
+                continue;
+            }
+            let start = header.sh_offset as usize;
+            let data = &original[start..start + header.sh_size as usize];
+            let contents = if chunk == DEFAULT_CHUNK_SIZE {
+                compress_section::<Elf64Le>(
+                    data,
+                    OutputCompression::Zlib(level),
+                    header.sh_addralign,
+                )
+                .unwrap()
+            } else {
+                let mut contents =
+                    encode_chdr::<Elf64Le>(1, data.len() as u64, header.sh_addralign);
+                contents.extend_from_slice(&zlib_compress_chunked(data, level, chunk));
+                contents
+            };
+            replace_section(
+                &mut patched,
+                index,
+                &contents,
+                header.sh_flags | SHF_COMPRESSED,
+                8,
+            );
+            compressed += 1;
+        }
+        assert!(compressed > 3);
+        let path = dir.join(format!("{label}.o"));
+        std::fs::write(&path, &patched).unwrap();
+        assert!(
+            dump(&path) == expected_dump,
+            "{label}: readelf -z --debug-dump differs"
+        );
+        let restored = dir.join(format!("{label}-restored.o"));
+        run(Command::new(&objcopy)
+            .arg("--decompress-debug-sections")
+            .arg(&path)
+            .arg(&restored))
+        .expect("objcopy --decompress-debug-sections");
+        let restored = std::fs::read(&restored).unwrap();
+        for ((name, a), (_, b)) in sections(&original).iter().zip(sections(&restored).iter()) {
+            if !name.starts_with(".debug_") {
+                continue;
+            }
+            let x = &original[a.sh_offset as usize..(a.sh_offset + a.sh_size) as usize];
+            let y = &restored[b.sh_offset as usize..(b.sh_offset + b.sh_size) as usize];
+            assert!(x == y, "{label}: {name} differs after objcopy round trip");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
