@@ -1,13 +1,12 @@
 //! PE-specific link options.
 //!
-//! [`LinkOptions`](crate::args::LinkOptions) does not yet carry the MinGW
-//! PE options (`--subsystem`, `--out-implib`, `--dynamicbase`, …): the GNU
-//! option table marks them
-//! [`Unsupported`](crate::args::table::Status::Unsupported), and `src/args`
-//! belongs to another workstream. [`PeOptions`] holds them meanwhile, with
-//! [`PeOptions::from_link_options`] deriving everything the shared options do
-//! carry. Library callers set the rest directly; when the option table grows
-//! the fields, `from_link_options` is the only place that has to change.
+//! [`PeOptions`] is what the PE backend reads. The command line fills it in
+//! through [`PeOptions::from_link_options`], which maps
+//! [`LinkOptions::pe`](crate::args::LinkOptions::pe) — the MinGW options
+//! `--subsystem`, `--out-implib`, `--dynamicbase`, … — together with the
+//! shared options that also matter to PE (`-shared`, `--image-base`,
+//! `-nostdlib`). Library callers can build a [`PeOptions`] directly instead;
+//! every field has a GNU ld `i386pep` default.
 
 use std::path::PathBuf;
 
@@ -65,11 +64,11 @@ pub enum AutoImport {
     Enabled,
 }
 
-/// Everything a PE link needs that [`LinkOptions`] does not carry yet.
+/// Everything the PE backend needs to describe an image.
 ///
 /// Every field has a MinGW `ld` default, so
-/// [`PeOptions::from_link_options`] alone produces the binary
-/// `x86_64-w64-mingw32-gcc` expects.
+/// [`PeOptions::from_link_options`] on a command line that names no PE
+/// option produces the binary `x86_64-w64-mingw32-gcc` expects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PeOptions {
@@ -207,15 +206,19 @@ impl Default for PeOptions {
 }
 
 impl PeOptions {
-    /// The PE options implied by `options`.
+    /// The PE options a command line asks for.
     ///
-    /// `-shared` becomes [`dll`](Self::dll), `--image-base` and `-z stack-size`
-    /// are copied, and `-nostdlib` suppresses `.drectve` `-defaultlib:`
-    /// directives. Everything else keeps its MinGW default until the option
-    /// table carries it.
+    /// Everything comes from [`LinkOptions`]: the MinGW options from
+    /// [`LinkOptions::pe`], `-shared` and `--dll` from
+    /// [`kind`](LinkOptions::kind), and `--image-base`, `--export-dynamic`
+    /// and `-nostdlib` from the shared options they already had. A field that
+    /// no option sets (the import library's DLL name, `-nodefaultlib:` names
+    /// and `.drectve` exports) keeps its default for library callers to set.
     #[must_use]
     pub fn from_link_options(options: &LinkOptions) -> Self {
+        let pe = &options.pe;
         let dll = options.kind == OutputKind::Shared;
+        let names = |list: &[String]| list.iter().map(|name| name.as_bytes().to_vec()).collect();
         Self {
             machine: options
                 .target
@@ -223,13 +226,47 @@ impl PeOptions {
                 .unwrap_or(IMAGE_FILE_MACHINE_AMD64),
             dll,
             image_base: options.image_base,
-            stack: (
-                options.stack_size.unwrap_or(DEFAULT_STACK_RESERVE),
-                DEFAULT_STACK_COMMIT,
-            ),
+            section_alignment: pe.section_alignment,
+            file_alignment: pe.file_alignment,
+            subsystem: pe.subsystem,
+            subsystem_version: Version::new(pe.major_subsystem_version, pe.minor_subsystem_version),
+            os_version: Version::new(pe.major_os_version, pe.minor_os_version),
+            image_version: Version::new(pe.major_image_version, pe.minor_image_version),
+            stack: pe.stack,
+            heap: pe.heap,
+            dynamicbase: pe.dynamicbase,
+            nxcompat: pe.nxcompat,
+            high_entropy_va: pe.high_entropy_va,
+            tsaware: pe.tsaware,
+            no_seh: pe.no_seh,
+            forceinteg: pe.forceinteg,
+            no_isolation: pe.no_isolation,
+            no_bind: pe.no_bind,
+            wdmdriver: pe.wdmdriver,
+            large_address_aware: pe.large_address_aware,
+            disable_reloc_section: !pe.reloc_section,
+            insert_timestamp: pe.insert_timestamp,
+            out_implib: pe.out_implib.clone(),
+            output_def: pe.output_def.clone(),
+            def_file: pe.def_file.clone(),
+            export_all_symbols: pe.export_all_symbols || (dll && options.export_dynamic),
+            exclude_all_symbols: pe.exclude_all_symbols,
+            exclude_symbols: names(&pe.exclude_symbols),
+            kill_at: pe.kill_at,
+            add_stdcall_alias: pe.add_stdcall_alias,
+            enable_stdcall_fixup: pe.stdcall_fixup,
+            auto_import: if pe.auto_import {
+                AutoImport::Enabled
+            } else {
+                AutoImport::Disabled
+            },
+            runtime_pseudo_reloc: pe.runtime_pseudo_reloc,
             no_default_lib: options.nostdlib,
-            export_all_symbols: dll && options.export_dynamic,
-            ..Self::default()
+            no_default_libs: Vec::new(),
+            exclude_modules_for_implib: names(&pe.exclude_modules_for_implib),
+            implib_dll_name: None,
+            exports: names(&pe.exports),
+            warn_duplicate_exports: pe.warn_duplicate_exports,
         }
     }
 
@@ -364,6 +401,28 @@ mod tests {
             ..PeOptions::default()
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn command_line_defaults_match_the_mingw_defaults() {
+        // A command line that names no PE option must describe exactly the
+        // image `PeOptions::default()` does, so that the option table and
+        // this module cannot drift apart.
+        let options = LinkOptions::new();
+        assert_eq!(PeOptions::from_link_options(&options), PeOptions::default());
+    }
+
+    #[test]
+    fn shared_output_becomes_a_dll() {
+        let options = LinkOptions {
+            kind: OutputKind::Shared,
+            export_dynamic: true,
+            nostdlib: true,
+            ..LinkOptions::new()
+        };
+        let pe = PeOptions::from_link_options(&options);
+        assert!(pe.dll && pe.export_all_symbols && pe.no_default_lib);
+        assert_eq!(pe.effective_image_base(), DEFAULT_IMAGE_BASE_DLL);
     }
 
     #[test]

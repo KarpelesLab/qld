@@ -19,7 +19,9 @@ use crate::args::options::{
     ReportLevel, UnresolvedSymbols,
 };
 use crate::args::response::{self, FileReader, FsReader};
-use crate::args::table::{self, Action, ArgKind, DynFlag, OptionDef, Status, ZAction, ZArg};
+use crate::args::table::{
+    self, Action, ArgKind, DynFlag, OptionDef, PeAction, PeFlag, Status, ZAction, ZArg,
+};
 use crate::error::{Error, Result};
 
 /// What a command line asked for.
@@ -221,8 +223,8 @@ pub fn usage() -> String {
     // libtool decides whether the linker can build shared libraries by
     // looking for ": supported targets:.* elf" in `ld --help`. List only what
     // qld links today; later milestones extend these lines.
-    text.push_str("qld: supported targets: elf64-x86-64\n");
-    text.push_str("qld: supported emulations: elf_x86_64\n");
+    text.push_str("qld: supported targets: elf64-x86-64 pei-x86-64\n");
+    text.push_str("qld: supported emulations: elf_x86_64 i386pep\n");
     text
 }
 
@@ -326,7 +328,7 @@ impl GnuParser {
         let mut only_inputs = false;
         while let Some(arg) = args.next() {
             if only_inputs {
-                self.push_file(arg);
+                self.push_file(arg)?;
                 continue;
             }
             if arg == b"--" {
@@ -334,7 +336,7 @@ impl GnuParser {
                 continue;
             }
             if arg.len() < 2 || !arg.starts_with(b"-") {
-                self.push_file(arg);
+                self.push_file(arg)?;
                 continue;
             }
             let matched = match_option(&arg, &mut args)?;
@@ -362,9 +364,26 @@ impl GnuParser {
         self.finish()
     }
 
-    fn push_file(&mut self, arg: Vec<u8>) {
+    /// Records a positional input.
+    ///
+    /// A file named `*.def` is a module-definition file rather than an
+    /// object, as in GNU ld's PE emulations: it names the exports and the
+    /// DLL, so it is kept aside instead of being handed to the input reader.
+    fn push_file(&mut self, arg: Vec<u8>) -> Result<()> {
         let path = PathBuf::from(bytes_to_os(arg));
+        if is_def_file(&path) {
+            if let Some(first) = &self.options.pe.def_file {
+                return Err(Error::Option(format!(
+                    "only one .def file may be given: {} and {}",
+                    first.display(),
+                    path.display()
+                )));
+            }
+            self.options.pe.def_file = Some(path);
+            return Ok(());
+        }
         self.options.push_input(InputKind::File(path), self.attrs);
+        Ok(())
     }
 
     fn finish(mut self) -> Result<ParseOutcome> {
@@ -740,8 +759,69 @@ impl GnuParser {
                     }
                 }
             }
+
+            Action::Pe(action) => self.apply_pe(m, action)?,
         }
         Ok(None)
+    }
+
+    /// Applies one PE/COFF option.
+    ///
+    /// These are per-emulation options in GNU ld: they parse whatever the
+    /// target is, and only a PE link reads them.
+    fn apply_pe(&mut self, m: &Matched, action: PeAction) -> Result<()> {
+        let pe = &mut self.options.pe;
+        match action {
+            PeAction::Flag(flag, on) => match flag {
+                PeFlag::Dynamicbase => pe.dynamicbase = on,
+                PeFlag::Nxcompat => pe.nxcompat = on,
+                PeFlag::HighEntropyVa => pe.high_entropy_va = on,
+                PeFlag::Tsaware => pe.tsaware = on,
+                PeFlag::NoSeh => pe.no_seh = on,
+                PeFlag::ForceInteg => pe.forceinteg = on,
+                PeFlag::NoIsolation => pe.no_isolation = on,
+                PeFlag::NoBind => pe.no_bind = on,
+                PeFlag::WdmDriver => pe.wdmdriver = on,
+                PeFlag::LargeAddressAware => pe.large_address_aware = on,
+                PeFlag::RelocSection => pe.reloc_section = on,
+                PeFlag::InsertTimestamp => pe.insert_timestamp = on,
+                PeFlag::ExportAllSymbols => pe.export_all_symbols = on,
+                PeFlag::ExcludeAllSymbols => pe.exclude_all_symbols = on,
+                PeFlag::KillAt => pe.kill_at = on,
+                PeFlag::AddStdcallAlias => pe.add_stdcall_alias = on,
+                PeFlag::StdcallFixup => pe.stdcall_fixup = Some(on),
+                PeFlag::AutoImport => pe.auto_import = on,
+                PeFlag::RuntimePseudoReloc => pe.runtime_pseudo_reloc = on,
+                PeFlag::WarnDuplicateExports => pe.warn_duplicate_exports = on,
+            },
+            PeAction::Subsystem => {
+                let value = text(m)?;
+                let (subsystem, version) = crate::coff::options::parse_subsystem(&value)?;
+                pe.subsystem = Some(subsystem);
+                if let Some(version) = version {
+                    pe.major_subsystem_version = version.major;
+                    pe.minor_subsystem_version = version.minor;
+                }
+            }
+            PeAction::SectionAlignment => pe.section_alignment = alignment(m)?,
+            PeAction::FileAlignment => pe.file_alignment = alignment(m)?,
+            PeAction::Stack => pe.stack = reserve_and_commit(m, pe.stack)?,
+            PeAction::Heap => pe.heap = reserve_and_commit(m, pe.heap)?,
+            PeAction::MajorImageVersion => pe.major_image_version = version_field(m)?,
+            PeAction::MinorImageVersion => pe.minor_image_version = version_field(m)?,
+            PeAction::MajorOsVersion => pe.major_os_version = version_field(m)?,
+            PeAction::MinorOsVersion => pe.minor_os_version = version_field(m)?,
+            PeAction::MajorSubsystemVersion => pe.major_subsystem_version = version_field(m)?,
+            PeAction::MinorSubsystemVersion => pe.minor_subsystem_version = version_field(m)?,
+            PeAction::OutImplib => pe.out_implib = Some(path(m)?),
+            PeAction::OutputDef => pe.output_def = Some(path(m)?),
+            PeAction::ExcludeSymbols => pe.exclude_symbols.extend(comma_list(m)?),
+            PeAction::ExcludeModulesForImplib => {
+                pe.exclude_modules_for_implib.extend(comma_list(m)?);
+            }
+            PeAction::Export => pe.exports.push(text(m)?),
+        }
+        Ok(())
     }
 
     fn apply_z(&mut self, keyword: &[u8]) -> Result<()> {
@@ -802,7 +882,14 @@ impl GnuParser {
                         .ok_or_else(bad)?,
                 );
             }
-            ZAction::StackSize => o.stack_size = Some(parse_int(value).ok_or_else(bad)?),
+            ZAction::StackSize => {
+                let size = parse_int(value).ok_or_else(bad)?;
+                o.stack_size = Some(size);
+                // PE has no PT_GNU_STACK; the reserve in the optional header
+                // is what `-z stack-size` means there, and `--stack` sets the
+                // same field, so the last one written wins.
+                o.pe.stack.0 = size;
+            }
             ZAction::CopyReloc(on) => o.copy_relocs = on,
             ZAction::CombReloc(on) => o.combine_relocs = on,
             ZAction::PackRelativeRelocs(on) => o.pack_relative_relocs = on,
@@ -953,6 +1040,12 @@ fn take_value(
     })
 }
 
+/// Whether `path` names a module-definition file (`*.def`, in any case).
+fn is_def_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.as_encoded_bytes().eq_ignore_ascii_case(b"def"))
+}
+
 fn missing(spelling: &str) -> Error {
     Error::Option(format!("missing argument to {spelling}"))
 }
@@ -982,6 +1075,43 @@ fn integer(m: &Matched) -> Result<u64> {
 fn hex(m: &Matched) -> Result<u64> {
     let value = text(m)?;
     parse_hex(&value).ok_or_else(|| bad_value(m, &value))
+}
+
+/// A PE alignment: a `strtoul`-style integer that fits in 32 bits.
+fn alignment(m: &Matched) -> Result<u32> {
+    let value = integer(m)?;
+    u32::try_from(value).map_err(|_| bad_value(m, &text(m).unwrap_or_default()))
+}
+
+/// A PE version field: a `strtoul`-style integer that fits in 16 bits.
+fn version_field(m: &Matched) -> Result<u16> {
+    let value = integer(m)?;
+    u16::try_from(value).map_err(|_| bad_value(m, &text(m).unwrap_or_default()))
+}
+
+/// `--stack` and `--heap`: `RESERVE[,COMMIT]`, keeping `current`'s commit
+/// size when only a reserve is given, as GNU ld's PE emulations do.
+fn reserve_and_commit(m: &Matched, current: (u64, u64)) -> Result<(u64, u64)> {
+    let value = text(m)?;
+    let (reserve, commit) = match value.split_once(',') {
+        Some((reserve, commit)) => (reserve, Some(commit)),
+        None => (value.as_str(), None),
+    };
+    let reserve = parse_int(reserve).ok_or_else(|| bad_value(m, &value))?;
+    let commit = match commit {
+        Some(commit) => parse_int(commit).ok_or_else(|| bad_value(m, &value))?,
+        None => current.1,
+    };
+    Ok((reserve, commit))
+}
+
+/// A comma-separated list of names, as `--exclude-symbols` takes.
+fn comma_list(m: &Matched) -> Result<Vec<String>> {
+    Ok(text(m)?
+        .split([',', ' '])
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn one_of(m: &Matched, allowed: &[&str]) -> Result<String> {
