@@ -15,3 +15,9 @@
 //!   `arch/`, starting with x86-64.
 //!
 //! See `ROADMAP.md` M1 and M2, and `docs/formats.md`.
+//!
+//! Submodules:
+//!
+//! - [`read`]: zero-copy parsing of objects and shared objects (W7).
+
+pub mod read;
