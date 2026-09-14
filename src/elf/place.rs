@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use crate::elf::read::consts::{
     SHF_ALLOC, SHF_EXECINSTR, SHF_GNU_RETAIN, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE,
-    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS,
+    SHF_X86_64_LARGE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS,
 };
 use crate::ids::SectionId;
 
@@ -73,9 +73,9 @@ pub struct Placement<'a> {
     pub script: Option<Box<crate::elf::script_layout::ScriptPlacement>>,
 }
 
-/// Flags that are not carried from input to output sections.
+/// Flags that are carried from input to output sections.
 const OUTPUT_FLAG_MASK: u64 =
-    SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_MERGE | SHF_STRINGS | SHF_TLS;
+    SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_MERGE | SHF_STRINGS | SHF_TLS | SHF_X86_64_LARGE;
 
 enum Assigned<'a> {
     Rule(u16, u16),
