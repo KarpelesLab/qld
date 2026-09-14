@@ -1,0 +1,22 @@
+# M6: gcc -flto, position-independent executable with thread-local
+# variables defined in IR, one of them also used from a native object.
+description = "gcc -flto PIE with TLS defined in IR and used from native code"
+compile = [
+  "cc -O2 -flto -fPIE -pthread -c main.c",
+  "cc -O2 -fPIE -c native.c",
+]
+driver = "cc"
+link = "-O2 -flto -pie -pthread -o out main.o native.o"
+run = "./out"
+expect.stdout = """
+thread: counter=16 name=main
+main: counter=11 name=main
+"""
+expect.readelf = [
+  "DYN (Position-Independent Executable file)",
+  "TLS ",
+  "tls_counter_lto_qld",
+  "!__gnu_lto_slim",
+]
+determinism = true
+timeout = 120

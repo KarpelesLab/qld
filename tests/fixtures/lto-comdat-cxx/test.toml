@@ -1,0 +1,30 @@
+# M6: C++ COMDAT groups shared between IR and native objects. main.o and
+# a.o are LTO IR, b.o is native and comes last, so the IR copies of the
+# inline function, its static local, the template and the vtable win the
+# group claims; b.o's references then bind to definitions that only the
+# generated code provides, which qld must report as used from a regular
+# object (PREVAILING_DEF) so LTO keeps them. out2 links b.o first, so the
+# native copies win and the IR copies are preempted.
+description = "C++ COMDAT deduplication across LTO IR and native objects"
+compile = [
+  "c++ -O1 -flto -c a.cpp",
+  "c++ -O1 -c b.cpp",
+  "c++ -O1 -flto -c main.cpp",
+]
+driver = "c++"
+link = ["-O1 -flto -o out2 b.o main.o a.o", "-O1 -flto -o out main.o a.o b.o"]
+run = "./out2 && ./out"
+expect.stdout = """
+from_a=15 from_b=31
+counter=2
+same counter: yes
+same vtable: yes
+same template: yes
+from_a=15 from_b=31
+counter=2
+same counter: yes
+same vtable: yes
+same template: yes
+"""
+determinism = true
+timeout = 120

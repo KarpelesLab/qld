@@ -1,0 +1,42 @@
+# M6: relocatable output (-r) with LTO. The plugin sees LDPO_REL. GCC's
+# default incremental link hands back an object that is IR again, which
+# qld copies through the -r path, and which the final link claims once
+# more; -flinker-output=nolto-rel makes the plugin generate native code.
+# qld reports every prevailing definition as PREVAILING_DEF for -r, so
+# nothing is internalized away (dead_function_lto_qld survives -r).
+description = "gcc -flto with -r: incremental IR output and native output"
+compile = [
+  "cc -O2 -flto -c main.c",
+  "cc -O2 -flto -c square.c",
+  "cc -O2 -c native.c",
+]
+driver = "cc"
+link = [
+  "-O2 -flto -r -o combined-ir.o main.o square.o",
+  "-O2 -flto -r -flinker-output=nolto-rel -o combined.o main.o square.o",
+  "-O2 -flto -o out-ir combined-ir.o native.o",
+  "-O2 -o out combined.o native.o",
+]
+output = "combined.o"
+run = "./out-ir && ./out"
+expect.stdout = """
+square=49
+native=42
+native->ir=2010
+square=49
+native=42
+native->ir=2010
+"""
+expect.readelf = [
+  "REL (Relocatable file)",
+  "dead_function_lto_qld",
+  "square_lto_qld",
+  "!.gnu.lto_",
+]
+expect.readelf_files."combined-ir.o" = ["REL (Relocatable file)", ".gnu.lto_", "__gnu_lto_slim"]
+# GCC's incremental IR output differs from run to run (under GNU ld too),
+# so relinks cannot be compared byte for byte.
+determinism = false
+timeout = 120
+# The IR sections of the incremental output have a random name suffix.
+diff.ignore = [".gnu.lto_"]

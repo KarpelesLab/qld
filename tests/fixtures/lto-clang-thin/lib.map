@@ -1,0 +1,4 @@
+LIBLTO_1 {
+  global: lib_api_lto_qld; lib_calls_lto_qld;
+  local: *;
+};

@@ -1,0 +1,24 @@
+# M6: weak and common symbols across LTO IR (main.o) and a native object.
+# A strong native definition preempts a weak IR one, a strong IR definition
+# prevails over a weak native one that the native object itself calls, an
+# undefined weak reference stays null, and IR and native common symbols
+# merge to the largest.
+description = "gcc -flto weak definitions, weak references and common symbols"
+compile = [
+  "cc -O2 -fcommon -flto -c main.c",
+  "cc -O2 -fcommon -c native.c",
+]
+driver = "cc"
+link = "-O2 -flto -fcommon -o out main.o native.o"
+run = "./out"
+expect.stdout = """
+overridden: strong native
+only weak: weak ir kept
+hook: absent
+native sees: strong ir
+common counter: 7
+common same: yes
+"""
+expect.readelf = ["!__gnu_lto_slim"]
+determinism = true
+timeout = 120
