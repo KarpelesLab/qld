@@ -72,7 +72,7 @@ pub fn version_line() -> String {
 ///
 /// Parallel stages run in a rayon pool with `options.threads` threads (one
 /// per core when unset), created for the duration of the link. To run in a
-/// pool you already own, call the format driver (such as [`elf::link`])
+/// pool you already own, call the format driver (such as [`elf::link`](fn@elf::link))
 /// inside your pool's `install` instead.
 ///
 /// # Errors
