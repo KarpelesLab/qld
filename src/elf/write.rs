@@ -1432,6 +1432,15 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 Dynamic::Symbolic(_) => Ok(()),
                 _ => put(out, sa),
             },
+            Kind::Pc
+                if matches!(target.def, super::refs::Def::Undefined { .. })
+                    && sa == 0
+                    && arch
+                        .nop_undefined_branch(out, rel.offset, rel.r_type)
+                        .unwrap_or(false) =>
+            {
+                Ok(())
+            }
             Kind::Pc => {
                 // A branch that cannot reach its target goes through the
                 // range-extension thunk layout placed for this output
@@ -1505,7 +1514,15 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 let size = target.raw.map_or(0, |r| r.st_size);
                 put(out, size.wrapping_add_signed(a))
             }
+            // An undefined (weak) TLS symbol has no thread pointer offset;
+            // GNU ld and lld write the addend, as for an absolute value.
+            Kind::TpOff if matches!(target.def, super::refs::Def::Undefined { .. }) => {
+                put(out, a as u64)
+            }
             Kind::TpOff => put(out, sa.wrapping_sub(tp)),
+            Kind::DtpOff if matches!(target.def, super::refs::Def::Undefined { .. }) => {
+                put(out, a as u64)
+            }
             Kind::DtpOff => {
                 let value = if alloc && executable {
                     sa.wrapping_sub(tp)

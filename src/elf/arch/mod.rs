@@ -692,6 +692,25 @@ impl Arch {
         }
     }
 
+    /// Replaces a branch to an undefined weak symbol, which has no address
+    /// to branch to, with the instruction GNU ld writes there (AArch64: a
+    /// `nop`). Returns `false` when the architecture keeps the branch.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplyError`] when the instruction is outside the section.
+    pub fn nop_undefined_branch(
+        self,
+        out: &mut [u8],
+        offset: u64,
+        r_type: u32,
+    ) -> Result<bool, ApplyError> {
+        match self {
+            Self::X86_64 => Ok(false),
+            Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
+        }
+    }
+
     /// Fills `out` with no-op instructions, as the architecture's default
     /// fill does for gaps in executable sections.
     pub fn write_nops(self, out: &mut [u8]) {

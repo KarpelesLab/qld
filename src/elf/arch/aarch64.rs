@@ -496,6 +496,21 @@ pub fn relax_tls(
     }
 }
 
+/// Replaces a `bl`/`b` to an undefined weak symbol with a `nop`, as GNU ld
+/// does: the symbol has no address, so the call is skipped rather than
+/// branching to zero.
+///
+/// # Errors
+///
+/// [`ApplyError::OutOfBounds`] when the instruction is outside the section.
+pub fn nop_undefined_branch(out: &mut [u8], offset: u64, r_type: u32) -> Result<bool, ApplyError> {
+    if !matches!(r_type, R_AARCH64_CALL26 | R_AARCH64_JUMP26) {
+        return Ok(false);
+    }
+    put(out, offset, NOP)?;
+    Ok(true)
+}
+
 /// Fills `out` with `nop` instructions; a partial word is zeroed.
 pub fn write_nops(out: &mut [u8]) {
     let (words, rest) = out.as_chunks_mut::<4>();
