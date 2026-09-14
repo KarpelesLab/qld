@@ -733,6 +733,9 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         has_tls |= section.flags & SHF_TLS != 0;
         has_relro |= is_relro(section);
     }
+    if has_tls {
+        align_tls_start(&mut out_sections, &alloc);
+    }
     let has_synthetic = |kind: Synthetic| {
         out_sections.iter().any(|s| {
             s.members
@@ -1173,6 +1176,34 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
 /// page boundary: as GNU ld's `DATA_SEGMENT_RELRO_END`, the sections are
 /// placed backwards from the first page boundary after their forward
 /// layout, and the following sections start at that boundary.
+/// Gives the first TLS section the alignment of the whole TLS segment, so
+/// that `PT_TLS` starts on a `p_align` boundary, as GNU ld and lld do.
+///
+/// The dynamic linker places the block by `p_vaddr % p_align` and rounds its
+/// size up to `p_align`; the thread pointer offsets the linker computes
+/// ([`Tls::tp`]) only agree with that when the segment starts aligned. A
+/// 4-byte `.tdata` followed by an 8-aligned `.tbss` otherwise put every
+/// `@tpoff` 4 bytes off (LLVM's `TimeTraceProfilerInstance`).
+fn align_tls_start(sections: &mut [OutSection<'_>], alloc: &[usize]) {
+    fn is_tls(section: &OutSection<'_>) -> bool {
+        section.flags & SHF_TLS != 0
+    }
+    let align = alloc
+        .iter()
+        .filter_map(|&i| sections.get(i))
+        .filter(|s| is_tls(s))
+        .map(|s| s.align)
+        .max()
+        .unwrap_or(1);
+    let first = alloc
+        .iter()
+        .copied()
+        .find(|&i| sections.get(i).is_some_and(is_tls));
+    if let Some(section) = first.and_then(|i| sections.get_mut(i)) {
+        section.align = section.align.max(align);
+    }
+}
+
 fn relro_start<F: Fn(&OutSection<'_>) -> bool>(
     sections: &[OutSection<'_>],
     alloc: &[usize],
