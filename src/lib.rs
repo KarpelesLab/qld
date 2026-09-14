@@ -22,6 +22,8 @@
 //! | [`elf`], [`coff`], [`macho`] | Format backends |
 //! | [`arch`] | Instruction-level helpers shared across formats |
 //! | [`debug`] | DWARF handling: compression, indexes, line lookup |
+//! | [`demangle`] | Itanium C++ and Rust symbol demangling for diagnostics |
+//! | [`hints`] | Suggestions for undefined symbols: missing `-l`, versions, near misses |
 //! | [`plugin`] | LTO plugin host (feature `plugin`) |
 //!
 //! Format backends own their own symbol precedence and layout rules. The
@@ -33,9 +35,11 @@ pub mod arch;
 pub mod args;
 pub mod coff;
 pub mod debug;
+pub mod demangle;
 pub mod diag;
 pub mod elf;
 pub mod error;
+pub mod hints;
 pub mod ids;
 pub mod input;
 pub mod macho;

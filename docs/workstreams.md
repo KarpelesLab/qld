@@ -50,6 +50,9 @@ can work at the same time without colliding.
 | W8 | ELF layout, writing and link driver | `src/elf/**` (extends `read/` as needed) | W7 | merged (M1) |
 | W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | merged |
 | W10 | DWARF | `src/debug/**` | W7 | in progress |
+| W11 | Dynamic ELF on x86-64 (M2) | `src/elf/**` | W8 | in progress |
+| W12 | Symbol resolution follow-ups | `src/symbols/**` | W4 | in progress |
+| W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | in progress |
 
 W1–W7 and W9 can all run at once. They share no files.
 
@@ -279,6 +282,41 @@ skip behavior keeps CI green until M1 lands.
 **Build:** tombstone values for relocations into dead sections, `SHF_COMPRESSED`
 and `.zdebug_*` decompression, zlib/zstd output compression, and the lazy
 line-table lookup that turns a section offset into `file:line` for diagnostics.
+
+---
+
+## W11: Dynamic ELF on x86-64 (M2)
+
+**Goal:** roadmap M2 — PIE, shared object inputs and outputs, PLT/GOT,
+`.dynamic`, symbol versioning, RELRO, `DT_RELR`, `-r`.
+
+**Owns:** `src/elf/**` (taking over from W8), `tests/elf_link.rs`, new fixture
+directories.
+
+**Done when:** every M2 fixture in `tests/fixtures/` passes, the differential
+runner agrees with GNU ld on dynamic symbols, `DT_*` tags and dynamic
+relocations, and the PIE and shared-library outputs load under glibc `ld.so`.
+
+---
+
+## W12: Symbol resolution follow-ups
+
+**Goal:** the two requests W8 made of `src/symbols/`: per-round work
+proportional to the round's files (not all files), and a hook between loading
+a round's files and interning their symbols so backends can claim COMDAT
+groups before insertion.
+
+**Owns:** `src/symbols/**`, `tests/symbols.rs`.
+
+---
+
+## W13: Symbol hints and demangling
+
+**Goal:** "intelligent library symbol matching" diagnostics
+(`docs/optimizations.md`) and a demangler for Itanium C++ and Rust names.
+
+**Owns:** `src/hints/**`, `src/demangle/**`, `tests/hints.rs`,
+`tests/demangle.rs`. Wiring into the ELF driver is a later integration step.
 
 ---
 
