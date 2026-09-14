@@ -30,8 +30,23 @@
 
 #![deny(clippy::arithmetic_side_effects)]
 
+mod ast;
 mod error;
+mod lexer;
+mod parser;
 mod pattern;
 
+pub use ast::{
+    Assert, AssignKind, AssignOp, Assignment, BinaryOp, Command, CommandKind, DataSize, Expr,
+    FileSpec, Fill, InputFile, InputName, InputSectionDescription, InsertPosition,
+    MemoryAttributes, MemoryRegion, OutputSection, OutputSectionCommand, OutputSectionCommandKind,
+    OutputSectionType, Overlay, OverlaySection, Phdr, Script, SectionConstraint, SectionFlag,
+    SectionSpec, SectionsCommand, SectionsCommandKind, SortMode, Span, UnaryOp, VersionNode,
+    VersionPattern,
+};
 pub use error::{EvalError, ScriptError};
+pub use parser::{
+    FsReader, NoIncludes, ScriptReader, parse_defsym, parse_expression, parse_script,
+    parse_version_script,
+};
 pub use pattern::{Pattern, file_matches, init_priority};
