@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use qld::debug::compress::deflate::{Level, zlib_compress, zlib_compress_chunked};
 use qld::debug::compress::{Codec, zlib_decompress_into};
 
 fn skip(reason: impl std::fmt::Display) {
@@ -166,6 +167,45 @@ for f in sorted(os.listdir(d)):
     println!("checked {checked} zlib streams");
 }
 
+/// qld's chunked zlib output decompresses with the system zlib, at every
+/// level and several chunk sizes.
+#[test]
+fn deflate_output_accepted_by_system_zlib() {
+    let Some(python) = find_program("python3") else {
+        return skip("python3 not found");
+    };
+    let dir = scratch_dir("deflate-zlib");
+    let mut jobs = 0;
+    for (name, data) in corpora() {
+        std::fs::write(dir.join(format!("{name}.bin")), &data).unwrap();
+        for level in 0..=9 {
+            for chunk in [4096, 1 << 20] {
+                let z = zlib_compress_chunked(&data, Level::new(level), chunk);
+                std::fs::write(dir.join(format!("{name}.{level}.{chunk}.z")), z).unwrap();
+                jobs += 1;
+            }
+        }
+    }
+    let script = r#"
+import sys, zlib, os
+d = sys.argv[1]
+n = 0
+for f in sorted(os.listdir(d)):
+    if not f.endswith('.z'):
+        continue
+    raw = open(os.path.join(d, f.split('.')[0] + '.bin'), 'rb').read()
+    dec = zlib.decompressobj()
+    out = dec.decompress(open(os.path.join(d, f), 'rb').read())
+    assert dec.eof and not dec.unused_data, f
+    assert out == raw, f
+    n += 1
+print(n)
+"#;
+    let out = run(Command::new(python).arg("-c").arg(script).arg(&dir))
+        .expect("system zlib rejected qld's output");
+    assert_eq!(String::from_utf8_lossy(&out).trim(), jobs.to_string());
+}
+
 /// The committed zlib fixture decodes (runs without any tools).
 #[test]
 fn inflate_committed_fixture() {
@@ -210,6 +250,52 @@ fn best_of(rounds: usize, mut f: impl FnMut()) -> std::time::Duration {
         })
         .min()
         .unwrap()
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bench_deflate() {
+    let data = bench_corpus(64 << 20);
+    let python = find_program("python3");
+    let dir = scratch_dir("bench-deflate");
+    let raw = dir.join("corpus.bin");
+    std::fs::write(&raw, &data).unwrap();
+    for level in [1u8, 6, 9] {
+        let lvl = Level::new(level);
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut z = Vec::new();
+        let one = best_of(2, || z = serial.install(|| zlib_compress(&data, lvl)));
+        let mut zp = Vec::new();
+        let all = best_of(3, || zp = zlib_compress(&data, lvl));
+        assert!(z == zp, "output depends on thread count");
+        let mut back = vec![0u8; data.len()];
+        zlib_decompress_into(&z, &mut back).unwrap();
+        assert!(back == data);
+        let system = python.as_ref().and_then(|python| {
+            let script = format!(
+                "import zlib,sys,time\nd=open(sys.argv[1],'rb').read()\nt=time.perf_counter()\nz=zlib.compress(d,{level})\nt=time.perf_counter()-t\nprint(len(d)/1048576/t, len(z))"
+            );
+            let out = run(Command::new(python).arg("-c").arg(&script).arg(&raw))?;
+            let text = String::from_utf8_lossy(&out).into_owned();
+            let mut words = text.split_whitespace();
+            let speed: f64 = words.next()?.parse().ok()?;
+            let size: usize = words.next()?.parse().ok()?;
+            Some((speed, size))
+        });
+        let (sys_speed, sys_size) = system.unwrap_or((0.0, 0));
+        println!(
+            "deflate level {level}: qld 1 thread {:.0} MB/s, {} threads {:.0} MB/s, ratio {:.3}; system zlib (1 thread) {:.0} MB/s, ratio {:.3}",
+            mb_per_s(data.len(), one),
+            rayon::current_num_threads(),
+            mb_per_s(data.len(), all),
+            z.len() as f64 / data.len() as f64,
+            sys_speed,
+            sys_size as f64 / data.len() as f64,
+        );
+    }
 }
 
 #[test]
