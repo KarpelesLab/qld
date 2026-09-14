@@ -292,7 +292,7 @@ that cross workstream boundaries. The integrator does these between merges.
 | W2 | `Error` variant for "library not found" (`cannot find -lfoo`) | done: `Error::NotFound` |
 | W2 | `Error` variant for "too many input files" | done: `Error::Limit` |
 | W5 | `Error` variant for internal/layout errors | done: `Error::Internal` |
-| W6 | `Error::Internal` so backend-bug `InputError`s convert into `crate::Error` | variant added; `From` impl in `passes` still to write |
+| W6 | `Error::Internal` so backend-bug `InputError`s convert into `crate::Error` | done |
 | W4 | `const fn` ID accessors and `Default` on IDs | done |
 | W1 | Emit `LinkOptions::warnings` to the diagnostic sink, honoring `--no-warnings` / `--fatal-warnings` | done (`main.rs`) |
 | W1 | Re-export `parse_gnu_with` from the crate root | done |
@@ -300,7 +300,7 @@ that cross workstream boundaries. The integrator does these between merges.
 | W3 | Layout-side script semantics: `DATA_SEGMENT_*` relro adjustment, `PROVIDE` only-if-referenced, `NEXT_SECTION`, section-relative symbols from `.` | open, for W8 / M3 |
 | W1 | Let `ParseOutcome` grow print-and-exit variants (`--print-sysroot`, `--print-output-format`); `main.rs` must handle them | open |
 | W1 | `target.rs`: more operating systems (FreeBSD, …) and architectures (MIPS, PowerPC32, …) for their `-m` emulations | open, when needed |
-| W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | open |
+| W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | done: `split_section` + `merge_split_sections` |
 | W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |
 
 ## Launching an agent

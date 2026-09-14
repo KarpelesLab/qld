@@ -59,7 +59,10 @@ by walking the pieces in input order.
 - Splitting happens while objects are parsed, so relocations that point into
   merge sections can be expressed as (piece, addend-within-piece) during the
   relocation scan. Deduplication and offset assignment run after GC, and
-  before ICF.
+  before ICF. Splitting stores each piece's hash; deduplication mixes it with
+  the output group, confirms equality by bytes, and accepts an optional
+  per-piece liveness bitmap so dead pieces take no space (piece-level GC is a
+  later optimization).
 
 ## Relocation relaxation
 
