@@ -7,7 +7,7 @@
 | Unit | Parsers, expression evaluator, relocation math, hash tables | `#[cfg(test)]` beside the code | every commit |
 | Option corpus | Real argv captured from gcc/clang/rustc/cargo/meson/cmake builds, parsed and checked against the expected `LinkOptions` | `tests/corpus/` | every commit |
 | Fixtures | Small C/C++/asm/Rust programs compiled with the host toolchain, linked by qld, **executed**, and their output checked | `tests/fixtures/` | every commit |
-| Differential | The same link done by qld and GNU ld (and lld where available); normalized `readelf`/`objdump` output compared | `tests/diff/` | every commit |
+| Differential | The same link done by qld and GNU ld (and lld where available); normalized `readelf`/`objdump` output compared | `tests/differential.rs` | every commit |
 | Cross-arch | Fixtures cross-compiled and run under `qemu-user` | `tests/fixtures/` + CI matrix | every commit (x86-64, aarch64, riscv64); nightly (others) |
 | Real projects | Build and test suites of external projects with qld as the linker | `tests/projects/` scripts | nightly |
 | Fuzzing | `cargo fuzz` targets for every parser and the linker script evaluator | `fuzz/` | continuous / nightly |
@@ -20,16 +20,28 @@ Each fixture is a directory holding source files and a `test.toml`:
 ```toml
 # tests/fixtures/tls-gd-to-le/test.toml
 compile = ["cc -O2 -fPIC -c tls.c", "cc -O2 -c main.c"]
-link    = "-static -o out main.o tls.o"
+driver  = "cc"                          # link through the compiler driver,
+link    = "-static -o out main.o tls.o" # which adds crt files and libc
 run     = "./out"
 expect.stdout = "42\n"
 expect.readelf = ["PT_TLS", "!R_X86_64_TPOFF64"]  # must / must-not appear
 targets = ["x86_64-linux-gnu", "aarch64-linux-gnu"]
 ```
 
-Checks can also be written as FileCheck-style patterns against
-`readelf`/`llvm-readobj` output, so that test ideas can be adapted from
-existing linker test suites.
+Without `driver`, `link` is passed to the linker as raw arguments, which only
+suits programs that need no libc. With `driver = "cc"`, the compiler driver is
+pointed at the linker under test (`-B` for gcc, `--ld-path=` for clang). The
+complete key list, environment variables (`QLD_FIXTURE`,
+`QLD_FIXTURE_LINKER`, `QLD_TEST_*`) and skip rules are in
+[`tests/README.md`](../tests/README.md).
+
+Every fixture is validated against GNU ld:
+`cargo test --test fixtures -- --ignored` runs them all with it. A fixture
+where qld intentionally differs from GNU ld is marked `gnu_ld = "fail"`.
+
+Checks are substring matches today. FileCheck-style patterns against
+`readelf`/`llvm-readobj` output are planned, so that test ideas can be adapted
+from existing linker test suites.
 
 ### Borrowing upstream test suites
 

@@ -74,10 +74,11 @@ clang --ld-path=/path/to/qld hello.c
 # Through gcc: put a directory containing an `ld` symlink to qld first on the -B path
 gcc -B/opt/qld/bin hello.c
 
-# Through rustc / cargo (.cargo/config.toml)
+# Through rustc / cargo (.cargo/config.toml). Recent rustc links with its
+# bundled rust-lld by default on x86-64 Linux; turn that off first.
 # [target.x86_64-unknown-linux-gnu]
 # linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=qld"]
+# rustflags = ["-C", "linker-features=-lld", "-C", "link-arg=--ld-path=/path/to/qld"]
 ```
 
 ## Requirements

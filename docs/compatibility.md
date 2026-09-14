@@ -94,7 +94,7 @@ qld 0.1.0 (compatible with GNU linkers)
 | --- | --- |
 | clang | `-fuse-ld=qld` (looks up `ld.qld` in `PATH`), or `--ld-path=/path/to/qld` |
 | gcc | `-B<dir>`, where `<dir>/ld` is a symlink to qld. Newer GCC versions may accept `-fuse-ld=` values other than bfd/gold/lld/mold; check your version. |
-| rustc | `-C linker=clang -C link-arg=-fuse-ld=qld`, or `-C link-arg=-fuse-ld=/path/to/qld` with clang |
+| rustc | `-C linker=clang -C link-arg=--ld-path=/path/to/qld`. On targets where rustc links with its bundled `rust-lld` by default (x86-64 Linux on recent stable), also pass `-C linker-features=-lld`, otherwise rustc's own `-fuse-ld=lld` wins over a later `-B` or `-fuse-ld` |
 | Apple clang | `-fuse-ld=/path/to/ld64.qld` or `--ld-path=` |
 
 ## Intentional behavioral differences

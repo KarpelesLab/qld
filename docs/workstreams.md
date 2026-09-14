@@ -48,7 +48,7 @@ can work at the same time without colliding.
 | W6 | GC / ICF / merge passes | `src/passes/**` | — | merged |
 | W7 | ELF reading | `src/elf/read/**` | — | yes |
 | W8 | ELF layout and writing | `src/elf/{layout,synth,arch}/**` | W7 | after W7 |
-| W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | yes |
+| W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | merged |
 | W10 | DWARF | `src/debug/**` | W7 | after W7 |
 
 W1–W7 and W9 can all run at once. They share no files.

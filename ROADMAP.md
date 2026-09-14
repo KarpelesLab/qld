@@ -35,10 +35,10 @@ Set up the project skeleton and the infrastructure every later milestone needs.
 - [ ] Flavor selection from `argv[0]` (`ld`, `ld.qld`, `ld64`, …) and `-flavor`
 - [x] Input file loading: mmap, format detection by magic, `ar` archives
       (GNU, BSD, COFF and thin variants, symbol index), `-l` library search
-- [ ] Test harness: fixture compilation with the system gcc/clang,
+- [x] Test harness: fixture compilation with the system gcc/clang,
       run-the-output tests, differential comparison against GNU ld
       ([testing.md](docs/testing.md))
-- [ ] Fuzz targets for every parser (`cargo fuzz`)
+- [ ] Fuzz targets for every parser (`cargo fuzz`) — deferred: needs a separate crate; randomized corruption tests meanwhile
 
 **Exit criteria:** `qld --help` and `qld --version` work. All options on the
 test corpus of real-world command lines (captured from gcc, clang and rustc
