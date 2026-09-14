@@ -1111,3 +1111,76 @@ fn auto_import_and_runtime_pseudo_relocs() {
     let error = qld_link(&options, &pe).unwrap_err();
     assert!(error.contains("exported_data"), "{error}");
 }
+
+/// A `-g` build keeps its DWARF sections, which is what MinGW debugging
+/// needs: PE carries no separate debug directory here.
+#[test]
+fn dwarf_sections_survive() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    let dir = scratch("dwarf-sections");
+    let Some(object) = compile(&dir, "debuggable", HELLO, &["-g"]) else {
+        return;
+    };
+    let Some(argv) = link_argv(&dir, &[object.as_str(), "-o", "gnu.exe", "-g", "-fno-lto"]) else {
+        return;
+    };
+    let options = options_from(&argv, &dir.join("qld.exe"));
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link a -g build:\n{error}");
+    }
+    let Some(sections) = readobj(&dir, "qld.exe", &["--sections"]) else {
+        return;
+    };
+    for name in [".debug_info", ".debug_line", ".debug_abbrev"] {
+        assert!(sections.contains(name), "{name} missing:\n{sections}");
+    }
+    // Debug sections must be discardable, so the loader does not map them.
+    assert!(sections.contains("IMAGE_SCN_MEM_DISCARDABLE"), "{sections}");
+}
+
+/// The image is byte-identical across repeated links and thread counts.
+#[test]
+fn output_is_deterministic() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    let dir = scratch("determinism");
+    let Some(object) = compile(&dir, "hello", HELLO, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(&dir, &[object.as_str(), "-o", "gnu.exe", "-fno-lto"]) else {
+        return;
+    };
+    let mut first: Option<Vec<u8>> = None;
+    for threads in [Some(1), Some(8), None] {
+        for run in 0..2 {
+            let name = format!("out-{}-{run}.exe", threads.unwrap_or(0));
+            let mut options = options_from(&argv, &dir.join(&name));
+            options.threads = threads;
+            let pe = PeOptions::from_link_options(&options);
+            if let Err(error) = qld_link(&options, &pe) {
+                panic!("qld failed to link:\n{error}");
+            }
+            let bytes = std::fs::read(dir.join(&name)).unwrap();
+            match &first {
+                None => first = Some(bytes),
+                Some(expected) => {
+                    assert_eq!(
+                        bytes.len(),
+                        expected.len(),
+                        "{name} differs in length from the first link"
+                    );
+                    assert!(
+                        &bytes == expected,
+                        "{name} is not byte-identical to the first link"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -34,6 +34,13 @@ pub struct SymbolTable {
     pub bytes: Vec<u8>,
     /// `NumberOfSymbols`, auxiliary records included.
     pub count: u32,
+    /// The raw 8-byte `Name` field of each output section header.
+    ///
+    /// A name longer than eight bytes becomes `/<offset>` into the string
+    /// table, which is GNU `ld`'s `--enable-long-section-names`. DWARF
+    /// section names need it, and it is only possible when a string table is
+    /// written at all.
+    pub section_names: Vec<[u8; 8]>,
 }
 
 impl SymbolTable {
@@ -57,6 +64,14 @@ struct Entry<'a> {
 /// Builds the image's symbol table.
 #[must_use]
 pub fn build(addresses: &Addresses<'_, '_>, layout: &Layout) -> SymbolTable {
+    // The string table starts with its own size, then the long section
+    // names, so a section header can point into it.
+    let mut strings: Vec<u8> = vec![0, 0, 0, 0];
+    let mut section_names = Vec::with_capacity(layout.sections.len());
+    for section in &layout.sections {
+        section_names.push(section_name_field(&section.name, &mut strings));
+    }
+
     let mut entries: Vec<Entry<'_>> = Vec::new();
     for (index, section) in layout.sections.iter().enumerate() {
         let mut aux = [0u8; SYMBOL_SIZE];
@@ -122,7 +137,6 @@ pub fn build(addresses: &Addresses<'_, '_>, layout: &Layout) -> SymbolTable {
     entries.append(&mut undefined);
 
     let mut records: Vec<u8> = Vec::with_capacity(entries.len().saturating_mul(SYMBOL_SIZE));
-    let mut strings: Vec<u8> = vec![0, 0, 0, 0];
     let mut count = 0u32;
     for entry in &entries {
         if entry.name.len() <= 8 {
@@ -156,12 +170,47 @@ pub fn build(addresses: &Addresses<'_, '_>, layout: &Layout) -> SymbolTable {
     SymbolTable {
         bytes: records,
         count,
+        section_names,
     }
+}
+
+/// The `Name` field of a section header: the name itself when it fits in
+/// eight bytes, or `/<decimal offset>` into the string table.
+fn section_name_field(name: &[u8], strings: &mut Vec<u8>) -> [u8; 8] {
+    let mut field = [0u8; 8];
+    if name.len() <= 8 {
+        if let Some(slot) = field.get_mut(..name.len()) {
+            slot.copy_from_slice(name);
+        }
+        return field;
+    }
+    let offset = strings.len();
+    strings.extend_from_slice(name);
+    strings.push(0);
+    let reference = format!("/{offset}");
+    let bytes = reference.as_bytes();
+    let len = bytes.len().min(8);
+    if let (Some(slot), Some(source)) = (field.get_mut(..len), bytes.get(..len)) {
+        slot.copy_from_slice(source);
+    }
+    field
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_section_names_go_to_the_string_table() {
+        let mut strings = vec![0u8; 4];
+        assert_eq!(section_name_field(b".text", &mut strings), *b".text\0\0\0");
+        assert_eq!(strings.len(), 4, "a short name needs no string");
+        let field = section_name_field(b".debug_info", &mut strings);
+        assert_eq!(&field[..2], b"/4");
+        assert_eq!(&strings[4..16], b".debug_info\0");
+        let field = section_name_field(b".debug_abbrev", &mut strings);
+        assert_eq!(&field[..3], b"/16");
+    }
 
     #[test]
     fn an_empty_table_writes_nothing() {

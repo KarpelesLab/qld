@@ -348,13 +348,20 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
         w.u32(directory.size)?;
     }
 
-    // The section table.
-    for section in &layout.sections {
-        let mut name = [0u8; 8];
-        let len = section.name.len().min(8);
-        if let (Some(slot), Some(source)) = (name.get_mut(..len), section.name.get(..len)) {
-            slot.copy_from_slice(source);
-        }
+    // The section table. Long names need the string table the symbol table
+    // carries, so `-s` truncates them as GNU ld does.
+    for (index, section) in layout.sections.iter().enumerate() {
+        let name = match input.symbols.section_names.get(index) {
+            Some(name) => *name,
+            None => {
+                let mut name = [0u8; 8];
+                let len = section.name.len().min(8);
+                if let (Some(slot), Some(source)) = (name.get_mut(..len), section.name.get(..len)) {
+                    slot.copy_from_slice(source);
+                }
+                name
+            }
+        };
         w.put(&name)?;
         w.u32(section.virtual_size)?;
         w.u32(section.rva)?;
