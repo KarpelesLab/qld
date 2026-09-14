@@ -3,9 +3,10 @@
 //! Property-style tests generate random inputs from a fixed seed and check
 //! that interning and resolution give identical results for every rayon
 //! thread count and every order in which inputs are handed over, and that
-//! resolution agrees with a naive sequential model of the fixpoint.
+//! resolution agrees with a naive sequential model of the fixpoint, with and
+//! without COMDAT groups claimed through a `RoundHook`.
 //!
-//! The `#[ignore]`d stress tests print timings:
+//! The `#[ignore]`d stress and timing tests print timings:
 //!
 //! ```sh
 //! cargo test --release --test symbols -- --ignored --nocapture
@@ -16,8 +17,9 @@ use std::time::Instant;
 
 use qld::symbols::elf_reference::ElfReferenceRules;
 use qld::symbols::{
-    DefinitionKind, InputPosition, InternJob, Resolution, ResolveFile, SymbolFlags, SymbolName,
-    SymbolTable, SymbolUse, resolve_symbols,
+    DefinitionKind, GroupClaims, InputPosition, InternJob, Resolution, ResolveFile, RoundFile,
+    RoundHook, SymbolFlags, SymbolName, SymbolTable, SymbolUse, resolve_symbols,
+    resolve_symbols_with,
 };
 use qld::{FileId, Result, SymbolId};
 use rayon::prelude::*;
@@ -340,6 +342,9 @@ struct FileSpec {
     member: u32,
     live_at_start: bool,
     symbols: Vec<(usize, Use)>,
+    /// COMDAT groups: the signature's name index, and the indices (into
+    /// `symbols`) of the definitions in the group's sections.
+    comdats: Vec<(usize, Vec<usize>)>,
 }
 
 struct Scenario {
@@ -378,6 +383,7 @@ fn random_scenario(rng: &mut Rng, pool_size: usize) -> Scenario {
             member: 0,
             live_at_start: true,
             symbols,
+            comdats: Vec::new(),
         });
     }
     for group in objects..objects + dsos {
@@ -390,6 +396,7 @@ fn random_scenario(rng: &mut Rng, pool_size: usize) -> Scenario {
             member: 0,
             live_at_start: true,
             symbols,
+            comdats: Vec::new(),
         });
     }
     for group in objects + dsos..objects + dsos + archives {
@@ -413,6 +420,7 @@ fn random_scenario(rng: &mut Rng, pool_size: usize) -> Scenario {
                 member,
                 live_at_start: whole_archive,
                 symbols,
+                comdats: Vec::new(),
             });
         }
     }
@@ -429,6 +437,10 @@ struct TestFile<'a> {
     names: Vec<SymbolName<'a>>,
     uses: Vec<SymbolUse>,
     loaded: bool,
+    /// COMDAT groups: signature and member symbol indices.
+    comdats: Vec<(SymbolName<'a>, Vec<usize>)>,
+    /// Per group, whether a claim hook discarded this copy.
+    discarded: Vec<bool>,
 }
 
 impl<'a> ResolveFile<'a> for TestFile<'a> {
@@ -540,6 +552,12 @@ fn build_files<'a>(
                 names: file_names,
                 uses,
                 loaded: false,
+                comdats: spec
+                    .comdats
+                    .iter()
+                    .map(|(signature, members)| (names.name(*signature), members.clone()))
+                    .collect(),
+                discarded: vec![false; spec.comdats.len()],
             }
         })
         .collect()
@@ -558,6 +576,21 @@ struct Summary {
     file_ids: Vec<(InputPosition, Vec<u32>)>,
     undefined: Vec<(String, Vec<(InputPosition, u32)>)>,
     duplicates: Vec<(String, InputPosition, Vec<InputPosition>)>,
+    /// Discarded COMDAT group copies: file position and signature.
+    discarded: BTreeSet<(InputPosition, String)>,
+}
+
+fn discarded_groups(files: &[TestFile<'_>]) -> BTreeSet<(InputPosition, String)> {
+    files
+        .iter()
+        .flat_map(|file| {
+            file.comdats
+                .iter()
+                .zip(&file.discarded)
+                .filter(|(_, discarded)| **discarded)
+                .map(|((signature, _), _)| (file.position, signature.display().to_string()))
+        })
+        .collect()
 }
 
 fn summarize(
@@ -623,6 +656,7 @@ fn summarize(
                 )
             })
             .collect(),
+        discarded: discarded_groups(files),
     }
 }
 
@@ -682,15 +716,39 @@ struct ModelOutcome {
     winners: BTreeMap<String, (DefinitionKind, InputPosition, u64)>,
     undefined: BTreeSet<String>,
     duplicates: BTreeSet<String>,
+    /// Discarded COMDAT group copies: file position and signature.
+    discarded: BTreeSet<(InputPosition, String)>,
 }
 
 /// A deliberately naive, sequential model of the fixpoint: recompute every
 /// winner from scratch each round, and extract the lazy winner of every
-/// referenced symbol.
+/// referenced symbol. COMDAT groups are claimed as files become live: by
+/// round, then by position; definitions in discarded copies do not count.
 fn model_resolution(names: &NamePool, scenario: &Scenario, layout: &Layout) -> ModelOutcome {
     let files = &scenario.files;
     let positions: Vec<InputPosition> = files.iter().map(|f| layout.position(f)).collect();
     let mut live: Vec<bool> = files.iter().map(|f| f.live_at_start).collect();
+    // Per file and symbol: whether a discarded group holds the definition.
+    let mut ignored: Vec<Vec<bool>> = files.iter().map(|f| vec![false; f.symbols.len()]).collect();
+    let mut discarded = BTreeSet::new();
+    let mut claimed = BTreeSet::new();
+    let mut claim = |newly_live: &mut Vec<usize>, ignored: &mut Vec<Vec<bool>>| {
+        newly_live.sort_by_key(|&i| positions[i]);
+        for &i in newly_live.iter() {
+            for (signature, members) in &files[i].comdats {
+                if !claimed.insert(*signature) {
+                    discarded.insert((positions[i], names.display(*signature)));
+                    for &member in members {
+                        ignored[i][member] = true;
+                    }
+                }
+            }
+        }
+    };
+    claim(
+        &mut (0..files.len()).filter(|&i| live[i]).collect(),
+        &mut ignored,
+    );
 
     // Best candidate key: higher rank, then larger aux for commons, then
     // lower position.
@@ -708,11 +766,14 @@ fn model_resolution(names: &NamePool, scenario: &Scenario, layout: &Layout) -> M
         )
     };
 
-    let winners = |live: &[bool]| {
+    let winners = |live: &[bool], ignored: &[Vec<bool>]| {
         let mut best: HashMap<usize, (Key, DefinitionKind, usize, u64)> = HashMap::new();
         for (i, file) in files.iter().enumerate() {
-            for &(name, u) in &file.symbols {
+            for (s, &(name, u)) in file.symbols.iter().enumerate() {
                 let Use::Def(kind, aux) = u else { continue };
+                if live[i] && ignored[i][s] {
+                    continue;
+                }
                 let kind = if live[i] { kind } else { DefinitionKind::Lazy };
                 let aux = if live[i] { aux } else { 0 };
                 let k = key(kind, aux, positions[i]);
@@ -726,7 +787,7 @@ fn model_resolution(names: &NamePool, scenario: &Scenario, layout: &Layout) -> M
     };
 
     loop {
-        let best = winners(&live);
+        let best = winners(&live, &ignored);
         let mut extract = BTreeSet::new();
         for (i, file) in files.iter().enumerate() {
             if !live[i] {
@@ -743,19 +804,23 @@ fn model_resolution(names: &NamePool, scenario: &Scenario, layout: &Layout) -> M
         if extract.is_empty() {
             break;
         }
-        for owner in extract {
+        for &owner in &extract {
             live[owner] = true;
         }
+        claim(&mut extract.into_iter().collect(), &mut ignored);
     }
 
-    let best = winners(&live);
+    let best = winners(&live, &ignored);
     let mut undefined = BTreeSet::new();
     let mut duplicates = BTreeSet::new();
     for (i, file) in files.iter().enumerate() {
         if !live[i] {
             continue;
         }
-        for &(name, u) in &file.symbols {
+        for (s, &(name, u)) in file.symbols.iter().enumerate() {
+            if ignored[i][s] {
+                continue;
+            }
             match (u, best.get(&name)) {
                 (Use::Ref(false), None | Some((_, DefinitionKind::Lazy, _, _))) => {
                     undefined.insert(names.display(name));
@@ -783,16 +848,27 @@ fn model_resolution(names: &NamePool, scenario: &Scenario, layout: &Layout) -> M
             .collect(),
         undefined,
         duplicates,
+        discarded,
     }
 }
 
 fn outcome(names: &NamePool, scenario: &Scenario, layout: &Layout, threads: usize) -> ModelOutcome {
+    outcome_with(names, scenario, layout, threads, &mut ())
+}
+
+fn outcome_with<'a>(
+    names: &'a NamePool,
+    scenario: &Scenario,
+    layout: &Layout,
+    threads: usize,
+    hook: &mut (dyn RoundHook<TestFile<'a>> + Send),
+) -> ModelOutcome {
     let order: Vec<usize> = (0..scenario.files.len()).collect();
     let mut files = build_files(names, scenario, layout, &order);
     pool(threads).install(|| {
         let mut table = SymbolTable::new();
-        let resolution =
-            resolve_symbols(&mut table, &ElfReferenceRules, &mut files).expect("resolve");
+        let resolution = resolve_symbols_with(&mut table, &ElfReferenceRules, &mut files, hook)
+            .expect("resolve");
         let live = resolution
             .live_files()
             .map(|f| files[f.index()].position)
@@ -821,6 +897,7 @@ fn outcome(names: &NamePool, scenario: &Scenario, layout: &Layout, threads: usiz
                 .iter()
                 .map(|d| d.name.display().to_string())
                 .collect(),
+            discarded: discarded_groups(&files),
         }
     })
 }
@@ -888,6 +965,418 @@ fn resolution_matches_sequential_model_for_any_command_line_order() {
         for set in &undefined_sets {
             let set: BTreeSet<String> = set.iter().cloned().collect();
             assert!(always_live_refs.is_subset(&set), "seed {seed}");
+        }
+    }
+}
+
+// ----- COMDAT groups ----------------------------------------------------------
+
+/// Marks a group copy discarded and stops reporting its definitions.
+fn discard(file: &mut TestFile<'_>, group: usize) {
+    file.discarded[group] = true;
+    for &member in &file.comdats[group].1 {
+        if matches!(file.uses[member], SymbolUse::Definition { .. }) {
+            file.uses[member] = SymbolUse::Ignore;
+        }
+    }
+}
+
+/// Checks what the driver promises a hook: rounds in sequence, files loaded,
+/// sorted by `(position, id)`, and only newly live ones.
+fn check_round(round: usize, expected: usize, files: &[RoundFile<'_, TestFile<'_>>]) {
+    assert_eq!(round, expected, "round index");
+    assert!(
+        files
+            .windows(2)
+            .all(|pair| (pair[0].file.position, pair[0].id) < (pair[1].file.position, pair[1].id)),
+        "round files out of order"
+    );
+    for entry in files {
+        assert!(entry.file.loaded, "hook before load");
+        assert_eq!(entry.file.live_at_start, round == 0, "not newly live");
+    }
+}
+
+/// Claims groups through [`GroupClaims`], offering in parallel.
+#[derive(Default)]
+struct ParallelClaims<'a> {
+    claims: GroupClaims<'a>,
+    rounds: usize,
+}
+
+impl<'a> RoundHook<TestFile<'a>> for ParallelClaims<'a> {
+    fn after_load(
+        &mut self,
+        round: usize,
+        files: &mut [RoundFile<'_, TestFile<'a>>],
+    ) -> Result<()> {
+        check_round(round, self.rounds, files);
+        self.rounds += 1;
+        let claims = self.claims.begin_round();
+        // Offer in reverse order, to show the order of offers does not matter.
+        files.par_iter().rev().for_each(|entry| {
+            for (signature, _) in &entry.file.comdats {
+                claims.offer(*signature, entry.file.position, entry.id);
+            }
+        });
+        files.par_iter_mut().for_each(|entry| {
+            for group in 0..entry.file.comdats.len() {
+                if !claims.is_owner(&entry.file.comdats[group].0, entry.id) {
+                    discard(entry.file, group);
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Claims groups sequentially, in the order the driver hands files over.
+#[derive(Default)]
+struct SequentialClaims {
+    owners: BTreeMap<Vec<u8>, FileId>,
+    rounds: usize,
+}
+
+impl<'a> RoundHook<TestFile<'a>> for SequentialClaims {
+    fn after_load(
+        &mut self,
+        round: usize,
+        files: &mut [RoundFile<'_, TestFile<'a>>],
+    ) -> Result<()> {
+        check_round(round, self.rounds, files);
+        self.rounds += 1;
+        for entry in files.iter_mut() {
+            for group in 0..entry.file.comdats.len() {
+                let signature = entry.file.comdats[group].0.bytes().to_vec();
+                if *self.owners.entry(signature).or_insert(entry.id) != entry.id {
+                    discard(entry.file, group);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Group templates: template `t` has signature name `base + 5t` and defines
+/// names `base + 5t + 1 ..= base + 5t + size(t)`.
+const TEMPLATE_SPAN: usize = 5;
+
+/// A random scenario whose objects and archive members also carry copies of
+/// `templates` COMDAT groups. Every copy of a group defines the same names,
+/// strong or weak at random, and nothing else defines them.
+fn random_comdat_scenario(rng: &mut Rng, pool_size: usize, templates: usize) -> Scenario {
+    let mut scenario = random_scenario(rng, pool_size);
+    let size = |t: usize| 1 + t % 4;
+    for file in &mut scenario.files {
+        let shared = file
+            .symbols
+            .iter()
+            .any(|(_, u)| matches!(u, Use::Def(DefinitionKind::Shared, _)));
+        if shared {
+            continue;
+        }
+        if rng.chance(40) {
+            let mut chosen = BTreeSet::new();
+            for _ in 0..1 + rng.below(3) {
+                chosen.insert(rng.below(templates));
+            }
+            for t in chosen {
+                let base = pool_size + t * TEMPLATE_SPAN;
+                let members = (1..=size(t))
+                    .map(|k| {
+                        let kind = if rng.chance(70) {
+                            DefinitionKind::Regular
+                        } else {
+                            DefinitionKind::Weak
+                        };
+                        file.symbols.push((base + k, Use::Def(kind, 0)));
+                        file.symbols.len() - 1
+                    })
+                    .collect();
+                file.comdats.push((base, members));
+            }
+        }
+        if rng.chance(30) {
+            let t = rng.below(templates);
+            let name = pool_size + t * TEMPLATE_SPAN + 1 + rng.below(size(t));
+            if file.symbols.iter().all(|&(n, _)| n != name) {
+                file.symbols.push((name, Use::Ref(false)));
+            }
+        }
+    }
+    scenario
+}
+
+fn run_with_hook<'a>(
+    threads: usize,
+    files: &mut [TestFile<'a>],
+    hook: &mut (dyn RoundHook<TestFile<'a>> + Send),
+) -> Summary {
+    pool(threads).install(|| {
+        let mut table = SymbolTable::new();
+        let resolution =
+            resolve_symbols_with(&mut table, &ElfReferenceRules, files, hook).expect("resolve");
+        summarize(&table, files, &resolution)
+    })
+}
+
+#[test]
+fn comdat_claims_match_sequential_model_for_any_command_line_order() {
+    const POOL: usize = 300;
+    const TEMPLATES: usize = 12;
+    let names = NamePool::new(POOL + TEMPLATES * TEMPLATE_SPAN);
+    let (mut discards, mut late_rounds) = (0, 0);
+    for seed in 0..8u64 {
+        let mut rng = Rng(0xc0da7 + seed);
+        let scenario = random_comdat_scenario(&mut rng, POOL, TEMPLATES);
+        for layout_index in 0..4 {
+            let layout = if layout_index == 0 {
+                Layout::identity(&scenario)
+            } else {
+                Layout::shuffled(&scenario, &mut rng)
+            };
+            let expected = model_resolution(&names, &scenario, &layout);
+            for threads in [1, 8] {
+                let actual = outcome_with(
+                    &names,
+                    &scenario,
+                    &layout,
+                    threads,
+                    &mut ParallelClaims::default(),
+                );
+                assert_eq!(
+                    actual, expected,
+                    "seed {seed}, layout {layout_index}, {threads} threads"
+                );
+            }
+            let sequential = outcome_with(
+                &names,
+                &scenario,
+                &layout,
+                2,
+                &mut SequentialClaims::default(),
+            );
+            assert_eq!(sequential, expected, "seed {seed}, layout {layout_index}");
+            discards += expected.discarded.len();
+            // Discarded copies in extracted members.
+            late_rounds += expected
+                .discarded
+                .iter()
+                .filter(|(position, _)| position.member() > 0)
+                .count();
+        }
+    }
+    assert!(
+        discards > 50 && late_rounds > 10,
+        "{discards} / {late_rounds}"
+    );
+}
+
+#[test]
+fn comdat_claims_are_independent_of_threads_and_file_order() {
+    const POOL: usize = 400;
+    const TEMPLATES: usize = 16;
+    let names = NamePool::new(POOL + TEMPLATES * TEMPLATE_SPAN);
+    for seed in 0..6u64 {
+        let mut rng = Rng(0x9209 + seed);
+        let scenario = random_comdat_scenario(&mut rng, POOL, TEMPLATES);
+        let layout = Layout::shuffled(&scenario, &mut rng);
+        let mut reference: Option<Summary> = None;
+        for threads in THREAD_COUNTS {
+            for permutation in 0..3 {
+                let mut order: Vec<usize> = (0..scenario.files.len()).collect();
+                if permutation > 0 {
+                    rng.shuffle(&mut order);
+                }
+                let mut files = build_files(&names, &scenario, &layout, &order);
+                let summary = if permutation == 2 {
+                    run_with_hook(threads, &mut files, &mut SequentialClaims::default())
+                } else {
+                    run_with_hook(threads, &mut files, &mut ParallelClaims::default())
+                };
+                match &reference {
+                    None => reference = Some(summary),
+                    Some(reference) => assert_eq!(
+                        &summary, reference,
+                        "seed {seed}, {threads} threads, permutation {permutation}"
+                    ),
+                }
+            }
+        }
+        assert!(!reference.unwrap().discarded.is_empty(), "seed {seed}");
+    }
+}
+
+/// A hand-written file: `"D:name"` strong, `"W:name"` weak, `"U:name"`
+/// reference; `comdats` lists `(signature, member symbol indices)`.
+fn elf_like(
+    position: InputPosition,
+    live_at_start: bool,
+    specs: &[&'static str],
+    comdats: &[(&'static str, &[usize])],
+) -> TestFile<'static> {
+    let mut file = TestFile {
+        position,
+        live_at_start,
+        lazy: Vec::new(),
+        names: Vec::new(),
+        uses: Vec::new(),
+        loaded: false,
+        comdats: comdats
+            .iter()
+            .map(|(signature, members)| (SymbolName::new(signature.as_bytes()), members.to_vec()))
+            .collect(),
+        discarded: vec![false; comdats.len()],
+    };
+    for spec in specs {
+        let (tag, name) = spec.split_once(':').unwrap();
+        let name = SymbolName::new(name.as_bytes());
+        let use_ = match tag {
+            "D" => SymbolUse::Definition {
+                kind: DefinitionKind::Regular,
+                aux: 0,
+            },
+            "W" => SymbolUse::Definition {
+                kind: DefinitionKind::Weak,
+                aux: 0,
+            },
+            _ => SymbolUse::Reference { weak: false },
+        };
+        if matches!(use_, SymbolUse::Definition { .. }) {
+            file.lazy.push(name);
+        }
+        file.names.push(name);
+        file.uses.push(use_);
+    }
+    file
+}
+
+/// Resolves with the given hook and returns the table and resolution.
+fn resolve_elf_like<'a>(
+    threads: usize,
+    files: &mut [TestFile<'a>],
+    hook: &mut (dyn RoundHook<TestFile<'a>> + Send),
+) -> (SymbolTable<'a>, Resolution<'a>) {
+    pool(threads).install(|| {
+        let mut table = SymbolTable::new();
+        let resolution =
+            resolve_symbols_with(&mut table, &ElfReferenceRules, files, hook).expect("resolve");
+        (table, resolution)
+    })
+}
+
+fn lookup(table: &SymbolTable<'_>, name: &str) -> SymbolId {
+    table.lookup(&SymbolName::new(name.as_bytes())).unwrap()
+}
+
+#[test]
+fn comdat_group_claimed_in_an_earlier_round_stays_claimed() {
+    let position = InputPosition::new;
+    // main.o needs `a` from libx.a, whose member needs `b` from liby.a. Both
+    // members carry group "inline" defining `inline_fn`. liby.a comes first
+    // on the command line, but its member is extracted a round later, so
+    // libx.a's copy is kept.
+    let build = || {
+        vec![
+            elf_like(position(0, 0), true, &["D:main", "U:a"], &[]),
+            elf_like(
+                position(1, 0),
+                false,
+                &["D:b", "D:inline_fn", "U:inline_fn"],
+                &[("inline", &[1])],
+            ),
+            elf_like(
+                position(2, 0),
+                false,
+                &["D:a", "U:b", "D:inline_fn"],
+                &[("inline", &[2])],
+            ),
+        ]
+    };
+
+    // Without the hook, both copies define `inline_fn`: the earlier input
+    // wins and the other is a duplicate.
+    let mut files = build();
+    let (table, resolution) = resolve_elf_like(1, &mut files, &mut ());
+    assert_eq!(
+        resolution.extracted(),
+        [vec![FileId::new(2)], vec![FileId::new(1)]]
+    );
+    let inline_fn = lookup(&table, "inline_fn");
+    assert_eq!(table.definition_file(inline_fn), Some(FileId::new(1)));
+    assert_eq!(resolution.duplicates().len(), 1);
+
+    for threads in THREAD_COUNTS {
+        for sequential in [false, true] {
+            let mut files = build();
+            let (table, resolution) = if sequential {
+                resolve_elf_like(threads, &mut files, &mut SequentialClaims::default())
+            } else {
+                resolve_elf_like(threads, &mut files, &mut ParallelClaims::default())
+            };
+            assert_eq!(resolution.extracted().len(), 2);
+            let inline_fn = lookup(&table, "inline_fn");
+            assert_eq!(table.definition_file(inline_fn), Some(FileId::new(2)));
+            assert!(resolution.duplicates().is_empty());
+            assert!(resolution.undefined().is_empty());
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|f| f.discarded[..].to_vec())
+                    .collect::<Vec<_>>(),
+                [vec![], vec![true], vec![false]]
+            );
+        }
+    }
+}
+
+#[test]
+fn comdat_copy_in_a_later_object_does_not_win_a_symbol() {
+    let position = InputPosition::new;
+    // Both objects carry group "tmpl"; the first defines `f` weak, the second
+    // strong. Precedence alone would pick the second object's `f`.
+    let build = || {
+        vec![
+            elf_like(position(2, 0), true, &["U:f"], &[]),
+            elf_like(
+                position(1, 0),
+                true,
+                &["D:g", "D:f", "U:h"],
+                &[("tmpl", &[1])],
+            ),
+            elf_like(position(0, 0), true, &["W:f", "D:h"], &[("tmpl", &[0])]),
+        ]
+    };
+    let mut files = build();
+    let (table, _) = resolve_elf_like(1, &mut files, &mut ());
+    let f = lookup(&table, "f");
+    assert_eq!(table.definition_file(f), Some(FileId::new(1)));
+
+    let mut reference = None;
+    for threads in THREAD_COUNTS {
+        for permutation in 0..3usize {
+            let mut files = build();
+            files.rotate_left(permutation);
+            let (table, resolution) = if permutation == 2 {
+                resolve_elf_like(threads, &mut files, &mut SequentialClaims::default())
+            } else {
+                resolve_elf_like(threads, &mut files, &mut ParallelClaims::default())
+            };
+            let f = table.definition(lookup(&table, "f"));
+            assert_eq!(f.kind, DefinitionKind::Weak);
+            assert_eq!(f.position, position(0, 0));
+            let discarded: Vec<InputPosition> = files
+                .iter()
+                .filter(|file| file.discarded.iter().any(|&d| d))
+                .map(|file| file.position)
+                .collect();
+            assert_eq!(discarded, [position(1, 0)]);
+            assert!(resolution.duplicates().is_empty());
+            let summary = summarize(&table, &files, &resolution);
+            match &reference {
+                None => reference = Some(summary),
+                Some(reference) => assert_eq!(&summary, reference, "{threads} threads"),
+            }
         }
     }
 }
@@ -1073,6 +1562,7 @@ fn small_static_link() -> (NamePool, Scenario) {
             member: 0,
             live_at_start: true,
             symbols,
+            comdats: Vec::new(),
         });
     }
     let mut in_chain = vec![None; MEMBERS];
@@ -1114,6 +1604,7 @@ fn small_static_link() -> (NamePool, Scenario) {
             member: member_index[archive],
             live_at_start: false,
             symbols,
+            comdats: Vec::new(),
         });
         member_index[archive] += 1;
     }
@@ -1204,6 +1695,7 @@ fn stress_resolve_large_link() {
             member: 0,
             live_at_start: true,
             symbols,
+            comdats: Vec::new(),
         });
     }
     for group in 3000..3020 {
@@ -1228,6 +1720,7 @@ fn stress_resolve_large_link() {
                 member,
                 live_at_start: false,
                 symbols,
+                comdats: Vec::new(),
             });
         }
     }

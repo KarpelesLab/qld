@@ -6,15 +6,19 @@
 //! 1. **Load** the files that became live (in parallel): initially the
 //!    objects and shared libraries on the command line, later the archive
 //!    members chosen in the previous round.
-//! 2. **Intern** their global symbol names, and in the first round the lazy
+//! 2. **Hook**: [`RoundHook::after_load`] sees the newly loaded files, in
+//!    input-position order, before any of their symbols is read. A backend
+//!    uses it to claim COMDAT groups and to stop reporting definitions from
+//!    group copies it discards.
+//! 3. **Intern** their global symbol names, and in the first round the lazy
 //!    names of every archive member, as one [`intern_batch`] (so IDs stay
 //!    deterministic).
-//! 3. **Insert and mark**, in parallel: offer each definition, lazy ones
+//! 4. **Insert and mark**, in parallel: offer each definition, lazy ones
 //!    included, to the table, which keeps the best candidate per symbol under
 //!    the [`Resolver`]; and set reference flags. A symbol whose
 //!    [`REFERENCED`](SymbolFlags::REFERENCED) bit this sets for the first
 //!    time is a candidate for extraction.
-//! 4. **Choose members**: for each candidate whose best definition
+//! 5. **Choose members**: for each candidate whose best definition
 //!    [`extracts`](Resolver::extracts) (by default: is lazy), its defining
 //!    member becomes live. Because lazy candidates compete by input position,
 //!    that member is the earliest one that defines the symbol.
@@ -116,13 +120,81 @@ pub trait ResolveFile<'a>: Send + Sync {
     /// the error of the file with the lowest position is returned.
     fn load(&mut self) -> Result<()>;
 
-    /// The file's global symbols, after [`load`](Self::load).
+    /// The file's global symbols, after [`load`](Self::load) and the round's
+    /// [`RoundHook::after_load`].
     fn symbol_names(&self) -> &[SymbolName<'a>];
 
     /// What entry `index` of [`symbol_names`](Self::symbol_names) does.
-    /// Called from many threads, only with `index < symbol_names().len()`.
+    /// Called from many threads, only with `index < symbol_names().len()`,
+    /// and only after the round's [`RoundHook::after_load`].
     fn symbol_use(&self, index: usize) -> SymbolUse;
 }
+
+/// A file that became live in the current round, as handed to
+/// [`RoundHook::after_load`].
+#[derive(Debug)]
+pub struct RoundFile<'r, F> {
+    /// The file's ID: its index in the slice passed to [`resolve_symbols`].
+    pub id: FileId,
+    /// The loaded file.
+    pub file: &'r mut F,
+}
+
+/// A backend hook into each round of [`resolve_symbols_with`].
+///
+/// The driver calls [`after_load`](Self::after_load) once per round, on the
+/// calling thread, after the round's newly live files are loaded and before
+/// their [`symbol_names`](ResolveFile::symbol_names) and
+/// [`symbol_use`](ResolveFile::symbol_use) are read. Whatever the hook changes
+/// in those files is what the round interns and inserts.
+///
+/// # COMDAT groups
+///
+/// The intended use is claiming COMDAT groups before insertion, so that
+/// definitions from discarded group copies never enter the table:
+///
+/// 1. For each file in `files` (input-position order), claim each of its
+///    groups unless another file already holds the signature. A group
+///    claimed in an earlier round stays claimed, even by a file with a
+///    higher position. [`GroupClaims`](super::GroupClaims) does this
+///    deterministically, and in parallel.
+/// 2. In each file that lost a claim, make `symbol_use` report the
+///    definitions in the discarded group's sections as
+///    [`SymbolUse::Ignore`]. Their names keep their IDs, so relocations
+///    against them resolve to the kept copy's definitions.
+///
+/// Because the kept copy's file is live in the same or an earlier round, its
+/// definitions reach the table no later than the discarded ones would have,
+/// and a discarded definition is never reported as a duplicate. Copies of a
+/// group normally define the same symbols. If a kept copy lacks one, and an
+/// archive member was extracted for it, that member's lazy candidate stays
+/// in the table and references to the symbol are reported undefined, as with
+/// a stale archive index.
+///
+/// # Determinism
+///
+/// `files` is sorted by `(position, id)` and holds exactly the files that
+/// became live in this round, so a hook that decides by that order (or by
+/// lowest position, as [`GroupClaims`](super::GroupClaims) does) gives the
+/// same result for every thread count.
+///
+/// The unit type `()` is the no-op hook [`resolve_symbols`] uses.
+pub trait RoundHook<F> {
+    /// Called once per round after loading; see the [trait documentation](Self).
+    /// `round` is 0 for the files live at start, and `r` for the members
+    /// listed in [`Resolution::extracted`]`()[r - 1]`.
+    ///
+    /// # Errors
+    ///
+    /// An error stops resolution and is returned by
+    /// [`resolve_symbols_with`].
+    fn after_load(&mut self, round: usize, files: &mut [RoundFile<'_, F>]) -> Result<()> {
+        let _ = (round, files);
+        Ok(())
+    }
+}
+
+impl<F> RoundHook<F> for () {}
 
 /// The outcome of [`resolve_symbols`].
 #[derive(Debug)]
@@ -259,6 +331,8 @@ where
 /// Runs in the current rayon pool. The result, including every symbol ID, is
 /// the same for any thread count.
 ///
+/// This is [`resolve_symbols_with`] and the no-op hook `()`.
+///
 /// # Errors
 ///
 /// Returns the first (by input position) error from [`ResolveFile::load`] in
@@ -275,6 +349,27 @@ pub fn resolve_symbols<'a, F, R>(
 where
     F: ResolveFile<'a>,
     R: Resolver + ?Sized,
+{
+    resolve_symbols_with(table, resolver, files, &mut ())
+}
+
+/// Resolves like [`resolve_symbols`], calling `hook` in every round between
+/// loading the newly live files and reading their symbols; see
+/// [`RoundHook`].
+///
+/// # Errors
+///
+/// As for [`resolve_symbols`], plus any error the hook returns.
+pub fn resolve_symbols_with<'a, F, R, H>(
+    table: &mut SymbolTable<'a>,
+    resolver: &R,
+    files: &mut [F],
+    hook: &mut H,
+) -> Result<Resolution<'a>>
+where
+    F: ResolveFile<'a>,
+    R: Resolver + ?Sized,
+    H: RoundHook<F> + ?Sized,
 {
     if u32::try_from(files.len()).is_err() {
         return Err(Error::Limit(format!(
@@ -293,8 +388,21 @@ where
         (0..count).partition(|&index| files[index].is_live_at_start());
     let mut extracted = Vec::new();
 
-    loop {
-        load_files(&mut select_mut(files, &load), &load)?;
+    for round in 0.. {
+        {
+            let mut loaded = select_mut(files, &load);
+            load_files(&mut loaded, &load)?;
+            let mut round_files: Vec<RoundFile<'_, F>> = load
+                .iter()
+                .zip(loaded)
+                .map(|(&index, file)| RoundFile {
+                    id: FileId::new(index),
+                    file,
+                })
+                .collect();
+            round_files.sort_by_key(|entry| (entry.file.position(), entry.id));
+            hook.after_load(round, &mut round_files)?;
+        }
         for &index in &load {
             live[index] = true;
         }
@@ -598,6 +706,8 @@ mod tests {
         uses: Vec<SymbolUse>,
         loads: usize,
         fail: bool,
+        /// Set by [`Recorder`]; symbols must not be read before it runs.
+        hooked: bool,
     }
 
     fn parse(spec: &'static str) -> (SymbolName<'static>, SymbolUse) {
@@ -641,6 +751,7 @@ mod tests {
             uses,
             loads: 0,
             fail: false,
+            hooked: false,
         }
     }
 
@@ -679,19 +790,50 @@ mod tests {
         }
 
         fn symbol_names(&self) -> &[SymbolName<'a>] {
-            assert_eq!(self.loads, 1, "symbols read before load");
+            assert!(self.loads == 1 && self.hooked, "symbols read too early");
             &self.names
         }
 
         fn symbol_use(&self, index: usize) -> SymbolUse {
-            assert_eq!(self.loads, 1, "symbols read before load");
+            assert!(self.loads == 1 && self.hooked, "symbols read too early");
             self.uses[index]
+        }
+    }
+
+    /// Records each round's files and marks them hooked.
+    #[derive(Default)]
+    struct Recorder {
+        rounds: Vec<Vec<(InputPosition, usize)>>,
+        fail_in_round: Option<usize>,
+    }
+
+    impl RoundHook<Mock> for Recorder {
+        fn after_load(&mut self, round: usize, files: &mut [RoundFile<'_, Mock>]) -> Result<()> {
+            assert_eq!(round, self.rounds.len());
+            let mut entries = Vec::new();
+            for entry in files.iter_mut() {
+                assert_eq!(entry.file.loads, 1, "hook before load");
+                assert!(!entry.file.hooked, "file handed to the hook twice");
+                entry.file.hooked = true;
+                entries.push((entry.file.position, entry.id.index()));
+            }
+            self.rounds.push(entries);
+            if self.fail_in_round == Some(round) {
+                return Err(Error::Internal(format!("hook failed in round {round}")));
+            }
+            Ok(())
         }
     }
 
     fn run(files: &mut [Mock]) -> (SymbolTable<'static>, Resolution<'static>) {
         let mut table = SymbolTable::new();
-        let resolution = resolve_symbols(&mut table, &ElfReferenceRules, files).unwrap();
+        let resolution = resolve_symbols_with(
+            &mut table,
+            &ElfReferenceRules,
+            files,
+            &mut Recorder::default(),
+        )
+        .unwrap();
         (table, resolution)
     }
 
@@ -850,16 +992,68 @@ mod tests {
     }
 
     #[test]
+    fn hook_sees_each_rounds_new_files_in_position_order() {
+        let mut files = [
+            member(3, 1, &["D:c"]),
+            object(2, &["U:a", "U:b"]),
+            member(3, 0, &["D:a", "U:c"]),
+            object(0, &["D:main"]),
+            member(1, 0, &["D:b"]),
+            member(1, 1, &["D:unused"]),
+        ];
+        let mut recorder = Recorder::default();
+        let mut table = SymbolTable::new();
+        let resolution =
+            resolve_symbols_with(&mut table, &ElfReferenceRules, &mut files, &mut recorder)
+                .unwrap();
+        let p = InputPosition::new;
+        assert_eq!(
+            recorder.rounds,
+            [
+                vec![(p(0, 0), 3), (p(2, 0), 1)],
+                vec![(p(1, 0), 4), (p(3, 0), 2)],
+                vec![(p(3, 1), 0)],
+            ]
+        );
+        assert_eq!(resolution.extracted().len(), 2);
+        assert!(!files[5].hooked);
+    }
+
+    #[test]
+    fn hook_error_stops_resolution() {
+        let mut files = [object(0, &["U:a"]), member(1, 0, &["D:a"])];
+        let mut recorder = Recorder {
+            fail_in_round: Some(1),
+            ..Recorder::default()
+        };
+        let mut table = SymbolTable::new();
+        let error = resolve_symbols_with(&mut table, &ElfReferenceRules, &mut files, &mut recorder)
+            .unwrap_err();
+        assert!(matches!(error, Error::Internal(_)), "{error}");
+        assert_eq!(recorder.rounds.len(), 2);
+    }
+
+    #[test]
     fn symbol_table_overflow_is_a_limit_error() {
         // Round 0 interns main, a, b; extracting the member adds c and d.
+        let mut files = [
+            object(0, &["D:main", "U:a"]),
+            member(1, 0, &["D:a", "D:b", "U:c", "U:d"]),
+        ];
         for (limit, ok) in [(5, true), (4, false), (2, false)] {
-            let mut files = [
-                object(0, &["D:main", "U:a"]),
-                member(1, 0, &["D:a", "D:b", "U:c", "U:d"]),
-            ];
+            for file in &mut files {
+                file.loads = 0;
+                file.hooked = false;
+            }
             let mut table = SymbolTable::new();
             table.set_limit(limit);
-            match resolve_symbols(&mut table, &ElfReferenceRules, &mut files) {
+            let result = resolve_symbols_with(
+                &mut table,
+                &ElfReferenceRules,
+                &mut files,
+                &mut Recorder::default(),
+            );
+            match result {
                 Ok(_) => assert!(ok, "limit {limit}"),
                 Err(Error::Limit(message)) => {
                     assert!(!ok, "limit {limit}: {message}");

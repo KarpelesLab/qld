@@ -22,6 +22,10 @@
 //!   and extracts archive members, round by round, to a fixpoint, over any
 //!   file type implementing [`ResolveFile`]. Each round's work is
 //!   proportional to the files that became live in it.
+//! - [`RoundHook`] and [`resolve_symbols_with`]: a per-round hook between
+//!   loading files and inserting their symbols, and [`GroupClaims`], the
+//!   deterministic claim table a backend uses there to deduplicate COMDAT
+//!   groups before insertion.
 //! - Undefined and duplicate symbols as sorted data ([`UndefinedSymbol`],
 //!   [`DuplicateSymbol`]) for diagnostics to render.
 //!
@@ -30,6 +34,7 @@
 //!
 //! This module must not depend on any format backend.
 
+mod claims;
 mod definition;
 pub mod elf_reference;
 mod flags;
@@ -39,9 +44,12 @@ pub mod resolve;
 pub mod table;
 mod util;
 
+pub use claims::{ClaimRound, GroupClaims};
 pub use definition::{Definition, DefinitionKind, Resolver, takes_precedence};
 pub use flags::SymbolFlags;
 pub use name::{InputPosition, SymbolName};
 pub use report::{DuplicateSymbol, SymbolReference, UndefinedSymbol};
-pub use resolve::{Resolution, ResolveFile, SymbolUse, resolve_symbols};
+pub use resolve::{
+    Resolution, ResolveFile, RoundFile, RoundHook, SymbolUse, resolve_symbols, resolve_symbols_with,
+};
 pub use table::{InternJob, SymbolTable};
