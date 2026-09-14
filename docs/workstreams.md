@@ -41,11 +41,11 @@ can work at the same time without colliding.
 | ID | Area | Owns | Depends on | Ready |
 | --- | --- | --- | --- | --- |
 | W1 | Command-line parsing | `src/args/**` | — | yes |
-| W2 | Input files and archives | `src/input/**` | — | yes |
+| W2 | Input files and archives | `src/input/**` | — | merged |
 | W3 | Linker scripts | `src/script/**` | — | yes |
 | W4 | Symbol table and interning | `src/symbols/**` | — | yes |
-| W5 | Output writer | `src/output/**` | — | yes |
-| W6 | GC / ICF / merge passes | `src/passes/**` | — | yes |
+| W5 | Output writer | `src/output/**` | — | merged |
+| W6 | GC / ICF / merge passes | `src/passes/**` | — | merged |
 | W7 | ELF reading | `src/elf/read/**` | — | yes |
 | W8 | ELF layout and writing | `src/elf/{layout,synth,arch}/**` | W7 | after W7 |
 | W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | yes |
@@ -279,6 +279,19 @@ and `.zdebug_*` decompression, zlib/zstd output compression, and the lazy
 line-table lookup that turns a section offset into `file:line` for diagnostics.
 
 ---
+
+## Integration follow-ups
+
+Changes requested by merged workstreams that need a frozen shared file, or
+that cross workstream boundaries. The integrator does these between merges.
+
+| From | Change | Status |
+| --- | --- | --- |
+| W2 | `Error` variant for "library not found" (`cannot find -lfoo`), currently `Error::Io` with `NotFound` | open |
+| W5 | `Error` variant for internal/layout errors, currently `Error::Io` with `InvalidInput` | open |
+| W6 | `Error::Internal` so backend-bug `InputError`s convert into `crate::Error` (same variant as W5's) | open |
+| W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | open |
+| W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |
 
 ## Launching an agent
 

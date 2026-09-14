@@ -51,7 +51,7 @@ flowchart TD
     LTO -- yes --> P[LTO plugin<br/>compile & re-add objects] --> F
     LTO -- no --> G[Relocation scan<br/>GC graph, GOT/PLT/TLS needs]
     G --> H[Garbage collection<br/>parallel mark]
-    H --> I[ICF / merge sections<br/>parallel]
+    H --> I[Merge sections, then ICF<br/>parallel]
     I --> J[Synthesize sections<br/>GOT, PLT, dynamic, eh_frame_hdr, ...]
     J --> K[Layout<br/>output sections, segments, addresses, thunks, relaxation]
     K --> L[Write output<br/>parallel copy + relocate in place]
@@ -90,6 +90,11 @@ section headers, a local symbol table that maps each entry to a global
 `SymbolId` once names are interned, and relocation slices that stay unparsed
 until they are needed. Symbol names are hashed during this parallel pass, so
 the resolution phase never hashes a string twice.
+
+Mergeable sections (`SHF_MERGE`) are split into pieces here too, with each
+piece's hash computed on the same pass. The relocation scan (stage 6) needs
+pieces to exist so it can express a reference into a merge section as
+(piece, addend within piece); deduplication waits until after GC.
 
 Archives start as a symbol index (the armap, or a scan of members when there
 is none). A member is parsed only when resolution extracts it. `--whole-archive`
@@ -138,19 +143,24 @@ three things:
 `--gc-sections` runs a parallel graph mark. It starts from the roots: the entry
 point, `-u`/`--undefined`, exported and dynamic symbols, `KEEP` sections,
 init/fini arrays, `SHF_GNU_RETAIN`, and non-allocated sections. Work spreads
-over rayon scopes, and each section's mark bit is an atomic compare-and-swap.
+over rayon scopes, and each section's mark bit is claimed atomically (a cheap
+read first, then an atomic OR).
 Unmarked sections are removed, along with their FDEs in `.eh_frame`. Symbols
 that are then no longer referenced are dropped from GOT/PLT and from the
 dynamic symbol table. See [optimizations.md](optimizations.md#garbage-collection-tree-shaking).
 
-### 8. Folding and merging
+### 8. Merging, then folding
 
-- **ICF** hashes section contents together with their relocation targets and
-  refines equivalence classes over a few parallel rounds. `safe` mode uses the
-  address-significance tables.
-- **Mergeable sections** (`SHF_MERGE`, including `SHF_STRINGS`) are split into
-  pieces in parallel, inserted into a concurrent deduplicating map, and then
-  assigned output offsets in a deterministic order.
+Order matters: merging runs first, because ICF must compare references into
+merge sections by the piece they land on, not by input section and offset.
+
+1. **Mergeable sections**: the live pieces split in stage 4 are inserted into
+   a sharded deduplicating map and assigned output offsets in first-occurrence
+   order.
+2. **ICF** hashes section contents together with their relocation targets
+   (references into merge sections resolved to merged pieces) and refines
+   equivalence classes over parallel rounds until nothing splits. `safe` mode
+   uses the address-significance tables.
 
 ### 9. Synthetic sections
 
