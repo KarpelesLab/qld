@@ -56,6 +56,8 @@ can work at the same time without colliding.
 | W16 | M2 exit criteria: real-world builds | `src/elf/**`, `tests/projects/**` | W11 | merged (M2 met) |
 | W14 | PE/COFF reading | `src/coff/**` | — | merged |
 | W17 | LTO plugin host | `src/plugin/**` | — | merged |
+| W18 | LTO in the ELF driver (M6) | `src/elf/{inputs,resolve,object,lto}*`, `tests/lto*` | W17 | in progress |
+| W19 | Linker-script layout and raw outputs (M3) | `src/elf/{rules,place,layout,write,defined,script_layout,rawout}*`, `tests/script_link*` | W3, W16 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -364,6 +366,33 @@ resolutions, and collect the native objects the plugin produces. Wiring it
 into the ELF driver's resolution rounds is a later integration step.
 
 **Owns:** `src/plugin/**`, `tests/plugin.rs`, `tests/data/plugin/`.
+
+---
+
+## W18: LTO in the ELF driver (M6)
+
+**Goal:** `gcc -flto` and `clang -flto`/`-flto=thin` links work end to end:
+IR inputs (including archive members) are claimed through
+`plugin::Session`, take part in resolution, and are replaced by the native
+objects the plugin produces. Meets ROADMAP M6's exit criteria.
+
+**Owns:** `src/elf/inputs.rs`, `src/elf/resolve.rs`, `src/elf/object.rs`, a
+new `src/elf/lto.rs`, `tests/lto.rs`, new fixtures. Shares `src/elf/link.rs`
+with W19 (keep edits there small).
+
+---
+
+## W19: Linker-script layout and raw outputs (M3)
+
+**Goal:** `-T script` drives layout (`SECTIONS`, `MEMORY`, `PHDRS`, `AT>`,
+`KEEP`, `/DISCARD/`, `PROVIDE`, `ASSERT`, `INSERT`), `-Ttext`/`--section-start`,
+and `--oformat binary|ihex|srec` plus `-b binary` inputs. Meets ROADMAP M3's
+exit criteria (Linux kernel boots; bare-metal addresses match GNU ld).
+
+**Owns:** `src/elf/rules.rs`, `src/elf/place.rs`, `src/elf/layout.rs`,
+`src/elf/write.rs`, `src/elf/defined.rs`, new `src/elf/script_layout*` and
+`src/elf/rawout*` modules, `tests/script_link.rs`, new fixtures. Shares
+`src/elf/link.rs` with W18 (keep edits there small).
 
 ---
 
