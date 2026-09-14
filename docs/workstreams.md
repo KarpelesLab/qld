@@ -51,7 +51,7 @@ can work at the same time without colliding.
 | W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | merged |
 | W10 | DWARF | `src/debug/**` | W7 | merged |
 | W11 | Dynamic ELF on x86-64 (M2) | `src/elf/**` | W8 | in progress |
-| W12 | Symbol resolution follow-ups | `src/symbols/**` | W4 | in progress |
+| W12 | Symbol resolution follow-ups | `src/symbols/**` | W4 | merged |
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | in progress |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -341,10 +341,11 @@ that cross workstream boundaries. The integrator does these between merges.
 | W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | done: `split_section` + `merge_split_sections` |
 | W8 | `Location` label so duplicate symbols print `>>> defined at` | done: `Diagnostic::detail` |
 | W8 | Let the ELF driver size the pool when `--threads` is absent | done (`lib.rs`) |
-| W8 | `resolve_symbols` runs parallel iterators over all files every round, including inactive archive members: 17 ms at 64 threads vs 2.5 ms on one for static hello. Iterate only the round's files, or `with_min_len` | open |
-| W8 | `ResolveFile` hook between loading and interning, so COMDAT groups can be claimed before insertion | open |
+| W8 | `resolve_symbols` runs parallel iterators over all files every round, including inactive archive members: 17 ms at 64 threads vs 2.5 ms on one for static hello. Iterate only the round's files, or `with_min_len` | done (W12) |
+| W8 | `ResolveFile` hook between loading and interning, so COMDAT groups can be claimed before insertion | done (W12) |
 | W8 | Switch the local debug tombstone helper in `elf/write.rs` to W10's rules, handle compressed inputs and `--compress-debug-sections` via `crate::debug`, and pass `LinkOptions::dead_reloc_in_nonalloc` | open, for W11 (API merged) |
 | W10 | `-z dead-reloc-in-nonalloc=` parsing in `src/args` | done |
+| W12 | Adopt `RoundHook` + `GroupClaims` for COMDAT in `src/elf/` (claim before insertion; delete `redirect_discarded`) | open, for W11 |
 | W10 | Fill `Location::source` for undefined-symbol diagnostics with `debug::dwarf::LineLookup` | open, for W11 |
 | W8 | `ifunc-static` fixture prints "same address: no" when built with clang, under GNU ld too: fixture/toolchain issue | open |
 | W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | open, investigate |
