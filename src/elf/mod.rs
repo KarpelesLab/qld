@@ -15,7 +15,7 @@
 //! | [`inputs`] | 2–3: `-l` search, archives with lazy members, shared objects, input scripts, target inference |
 //! | [`object`] | 4: per-object symbols for resolution, section classes, merge splitting, COMDAT groups, notes |
 //! | [`dso`] | 4–5: shared object symbols, `DT_NEEDED` and `--as-needed`, undefined symbols of shared libraries |
-//! | [`resolve`] | 5: ELF precedence rules, COMDAT deduplication, duplicate symbol diagnostics |
+//! | [`resolve`] | 5: ELF precedence rules, COMDAT group claims during resolution rounds, duplicate symbol diagnostics |
 //! | [`xref`] | 5: `-y`/`--trace-symbol`, `--warn-common` and the `--cref` table |
 //! | [`export`] | 5: output mode, merged visibility, exports, preemptibility, version scripts |
 //! | [`sections`] | Dense input section numbering, liveness and the ICF fold map |
@@ -37,7 +37,7 @@
 //! | [`values`] | Symbol, section, GOT and PLT addresses after layout |
 //! | [`write`](mod@write) | 11: parallel chunked writing, relocation in place, `.rela.dyn`, `.eh_frame_hdr` |
 //! | [`emit`] | `--emit-relocs`: input relocations rewritten into `.rela` trailers |
-//! | [`map`] | `-Map` and `-M` |
+//! | [`map`] | `-Map` and `-M`, and where the `--cref` table goes |
 //! | [`relocatable`] | 10–11 for `-r`: combined sections, groups, symbol table and rewritten relocations |
 //! | [`arch`] | Per-architecture relocation classification, relaxation and PLT encodings (x86-64) |
 //!

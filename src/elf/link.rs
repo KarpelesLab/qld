@@ -208,7 +208,8 @@ fn link_inputs<'a>(
         relocatable::revive_named(files, &mut sections, b".note.GNU-stack");
     }
     resolve::deduplicate_comdat(files, &mut sections);
-    let mut errors = resolve::report_duplicates(files, &resolution, &sections, diagnostics);
+    let mut errors =
+        resolve::report_duplicates(files, &resolution, &sections, options.demangle, diagnostics);
     report_gnu_warnings(files, &symbols, diagnostics);
     xref::trace_symbols(files, &resolution, options, diagnostics);
     xref::warn_common(files, &resolution, options, diagnostics);
@@ -616,6 +617,68 @@ fn nonempty_outputs(
     nonempty
 }
 
+/// A symbol name for diagnostics: demangled when `demangle` is set, with
+/// its `@VERSION`.
+fn symbol_display(name: SymbolName<'_>, demangle: bool) -> String {
+    let base = crate::hints::display_symbol(name.bytes(), demangle);
+    match name.version() {
+        Some(version) => format!("{base}@{}", String::from_utf8_lossy(version)),
+        None => base.into_owned(),
+    }
+}
+
+/// Library and near-miss hints ([`crate::hints`]) for each group of
+/// undefined references. Runs only when a link has undefined symbols.
+fn undefined_hints(
+    refs: &Refs<'_, '_>,
+    groups: &[&[UndefinedRef]],
+    options: &LinkOptions,
+    needed: &dso::Needed,
+) -> Vec<Vec<crate::hints::Hint>> {
+    use crate::hints::{Hinter, LinkedLibrary, SearchScope, Undefined};
+    let mut linked: Vec<LinkedLibrary> = Vec::new();
+    for (index, file) in refs.files.iter().enumerate() {
+        let library = match file.role {
+            inputs::InputRole::Shared => LinkedLibrary {
+                path: file.path(),
+                dropped_as_needed: !needed.is_needed(index),
+                static_only: false,
+            },
+            inputs::InputRole::Member => LinkedLibrary::new(file.path()),
+            _ => continue,
+        };
+        if !linked.iter().any(|l| l.path == library.path) {
+            linked.push(library);
+        }
+    }
+    let undefined: Vec<Undefined<'_>> = groups
+        .iter()
+        .filter_map(|g| g.first())
+        .map(|r| {
+            let name = refs.symbols.name(r.symbol);
+            match name.version() {
+                Some(version) => Undefined::versioned(name.bytes(), version),
+                None => Undefined::new(name.bytes()),
+            }
+        })
+        .collect();
+    let defined: Vec<&[u8]> = refs
+        .symbols
+        .ids()
+        .filter(|&id| {
+            matches!(
+                refs.symbols.definition_kind(id),
+                crate::symbols::DefinitionKind::Regular
+                    | crate::symbols::DefinitionKind::Weak
+                    | crate::symbols::DefinitionKind::Common
+                    | crate::symbols::DefinitionKind::Shared
+            ) && refs.symbols.name(id).version().is_none()
+        })
+        .map(|id| refs.symbols.name(id).bytes())
+        .collect();
+    Hinter::new(SearchScope::from_options(options), linked).hints(&undefined, &defined)
+}
+
 /// Reports undefined symbols, lld-style. Returns the number of errors.
 fn report_undefined(
     refs: &Refs<'_, '_>,
@@ -662,6 +725,11 @@ fn report_undefined(
     } else {
         dso::defined_in_dependencies(refs.files, needed, options, &names)
     };
+    let hints = if names.is_empty() || ignore {
+        Vec::new()
+    } else {
+        undefined_hints(refs, &groups, options, needed)
+    };
     for (group_index, group) in groups.into_iter().enumerate() {
         let Some(first) = group.first() else {
             continue;
@@ -676,10 +744,11 @@ fn report_undefined(
             continue;
         }
         let order = refs.files.get(first.file).map_or(0, |f| f.position.raw());
+        let shown = symbol_display(name, options.demangle);
         let mut diagnostic = if options.warn_unresolved_symbols {
-            Diagnostic::warning(format!("undefined symbol: {}", name.display()))
+            Diagnostic::warning(format!("undefined symbol: {shown}"))
         } else {
-            Diagnostic::error(format!("undefined symbol: {}", name.display()))
+            Diagnostic::error(format!("undefined symbol: {shown}"))
         };
         diagnostic = diagnostic.order(order);
         for reference in group.iter().take(MAX_REFERENCES) {
@@ -706,12 +775,14 @@ fn report_undefined(
         }
         if let Some(Some((library, needed_by))) = in_dependencies.get(group_index) {
             diagnostic = diagnostic.note(format!(
-                "'{}' is defined in {}, which {} needs but which is not in the link \
+                "'{shown}' is defined in {}, which {} needs but which is not in the link \
                  (DSO missing from command line); add it to the command line",
-                name.display(),
                 library.display(),
                 needed_by.display()
             ));
+        }
+        if let Some(hints) = hints.get(group_index) {
+            diagnostic = crate::hints::attach(diagnostic, hints, options.demangle);
         }
         diagnostics.emit(diagnostic);
         if !options.warn_unresolved_symbols {

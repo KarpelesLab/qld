@@ -737,6 +737,64 @@ fn stdout_of(dir: &Path, binary: &str) -> String {
 }
 
 #[test]
+fn undefined_symbols_get_hints_and_demangled_names() {
+    require!("cc", "c++");
+    let dir = scratch("undefined-hints");
+    fs::write(
+        dir.join("m.cc"),
+        "namespace ns { int helper_qld(int); }\nint main() { return ns::helper_qld(1); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("h.cc"),
+        "namespace ns { int helper_qld(long x) { return (int)x; } }\n",
+    )
+    .unwrap();
+    run_ok(&dir, "c++", &["-c", "m.cc", "h.cc"]);
+    let shim = shim(&dir);
+    let output = run(&dir, "c++", &[&shim, "-o", "out", "m.o", "h.o"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("undefined symbol: ns::helper_qld(int)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("did you mean: ns::helper_qld(long)?"),
+        "{stderr}"
+    );
+    let output = run(
+        &dir,
+        "c++",
+        &[&shim, "-o", "out", "m.o", "h.o", "-Wl,--no-demangle"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("undefined symbol: _ZN2ns10helper_qldEi"),
+        "{stderr}"
+    );
+
+    // A library in the search path that defines the symbol.
+    compile_with(
+        &dir,
+        "lib",
+        "int in_library_qld(void) { return 3; }\n",
+        &["-fPIC"],
+    );
+    cc_link_ok(&dir, &["-shared", "-o", "libhintqld.so", "lib.o"]);
+    compile_with(
+        &dir,
+        "main",
+        "int in_library_qld(void);\nint main(void) { return in_library_qld(); }\n",
+        &["-fPIE"],
+    );
+    let output = cc_link(&dir, &["-o", "out", "main.o", "-L."]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("-lhintqld"), "{stderr}");
+}
+
+#[test]
 fn gc_sections_drops_imports_only_dead_code_uses() {
     require!("cc", "readelf");
     let dir = scratch("gc-imports");

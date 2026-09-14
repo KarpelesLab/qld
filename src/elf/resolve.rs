@@ -185,6 +185,7 @@ pub fn report_duplicates(
     files: &[ElfInput<'_>],
     resolution: &Resolution<'_>,
     sections: &Sections,
+    demangle: bool,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
     let mut errors = 0usize;
@@ -199,9 +200,11 @@ pub fn report_duplicates(
         if others.is_empty() || in_dead_section(files, sections, &duplicate.winner) {
             continue;
         }
-        let mut diagnostic =
-            Diagnostic::error(format!("duplicate symbol: {}", duplicate.name.display()))
-                .order(duplicate.winner.position.raw());
+        let mut diagnostic = Diagnostic::error(format!(
+            "duplicate symbol: {}",
+            crate::hints::display_symbol(duplicate.name.bytes(), demangle)
+        ))
+        .order(duplicate.winner.position.raw());
         for def in std::iter::once(&duplicate.winner).chain(others) {
             diagnostic = diagnostic.detail(format!("defined at {}", definition_site(files, def)));
         }
