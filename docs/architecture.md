@@ -107,8 +107,11 @@ name plus version where the format has versions, with the precomputed hash
 selecting the shard. Each symbol records its current best definition. Each
 format backend supplies a precedence function for "which definition wins"
 (ELF: strong > common > weak > shared > lazy, where the larger of two common
-symbols wins; COMDAT groups are deduplicated by first occurrence in input
-order before their definitions are inserted).
+symbols wins). COMDAT groups are deduplicated right after resolution: the
+first live file in input order keeps each group, and any winning definition
+that sat in a discarded group is resolved again. Deduplicating before
+insertion would save that second step, but the resolver has no hook between
+loading a round's files and interning their symbols yet.
 
 Symbol IDs never depend on thread scheduling. Names are interned in batches:
 new names are collected in parallel, then numbered in order of first

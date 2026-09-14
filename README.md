@@ -6,9 +6,12 @@ their command lines, so compiler drivers (`gcc`, `clang`, `rustc`) and build
 systems can use it with no other changes. It is also a Rust library, so tools
 can link programs in-process.
 
-> **Status: pre-alpha, design phase.** No code has been written yet. This
-> repository has only the design documents and the roadmap. Everything below
-> describes what qld is meant to become, not what it does today.
+> **Status: pre-alpha.** qld links **static x86-64 Linux executables**
+> (roadmap milestone M1): C, C++ with exceptions and threads, and Rust
+> programs against glibc or musl, including `--gc-sections`, `--icf`, TLS,
+> IFUNC, debug info and `--build-id`. It can link itself. Dynamic linking
+> (PIE, shared libraries) is next (M2); everything else below describes where
+> qld is going, not what it does today. See [ROADMAP.md](ROADMAP.md).
 
 ## Goals
 

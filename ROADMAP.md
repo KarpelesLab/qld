@@ -57,26 +57,29 @@ archives.
 
 The first end-to-end link: fully static x86-64 Linux executables.
 
-- [ ] ELF64 little-endian relocatable object parsing (zero-copy)
-- [ ] Symbol resolution: strong/weak/common/undefined; archive member extraction
+- [x] ELF64 little-endian relocatable object parsing (zero-copy)
+- [x] Symbol resolution: strong/weak/common/undefined; archive member extraction
       that does not depend on input order; COMDAT group deduplication
-- [ ] Section model: output section assignment from default rules, `SHF_MERGE`
+- [x] Section model: output section assignment from default rules, `SHF_MERGE`
       string/constant merging, `.init_array`/`.fini_array`/`.ctors` ordering
       (`SORT_BY_INIT_PRIORITY`)
-- [ ] `--gc-sections` with the usual roots (entry, `-u`, `KEEP`, init/fini arrays,
+- [x] `--gc-sections` with the usual roots (entry, `-u`, `KEEP`, init/fini arrays,
       `__start_`/`__stop_` references, `SHF_GNU_RETAIN`)
-- [ ] `.eh_frame` parsing, deduplicating CIEs, dropping FDEs of GC'ed sections,
+- [x] `.eh_frame` parsing, deduplicating CIEs, dropping FDEs of GC'ed sections,
       `.eh_frame_hdr` generation
-- [ ] x86-64 relocations for static links; GOT for `GOTPCREL`; `GOTPCRELX` relaxation
-- [ ] TLS: `PT_TLS`, local-exec, and IE/GD/LD/TLSDESC → LE relaxation
-- [ ] IFUNC in static binaries (`R_X86_64_IRELATIVE`, `__rela_iplt_start/end`)
-- [ ] Program headers: `PT_LOAD` (with `-z separate-code` default layout),
+- [x] x86-64 relocations for static links; GOT for `GOTPCREL`; `GOTPCRELX` relaxation
+- [x] TLS: `PT_TLS`, local-exec, and IE/GD/LD/TLSDESC → LE relaxation
+- [x] IFUNC in static binaries (`R_X86_64_IRELATIVE`, `__rela_iplt_start/end`)
+- [x] Program headers: `PT_LOAD` (with `-z separate-code` default layout),
       `PT_TLS`, `PT_GNU_STACK`, `PT_GNU_PROPERTY`/`.note.gnu.property` (CET/IBT)
-- [ ] Linker-defined symbols (`_end`, `_etext`, `__bss_start`, `__ehdr_start`, …)
-- [ ] `--build-id` (parallel tree hash), `-s`/`-S`, `--strip-debug`
-- [ ] Parallel output writer: mapped output, disjoint slices per chunk,
-      unlinking and replacing an existing output atomically
-- [ ] Undefined-symbol diagnostics with `referenced by file.o:(.text+0x12)`
+- [x] Linker-defined symbols (`_end`, `_etext`, `__bss_start`, `__ehdr_start`, …)
+- [x] `--build-id` (parallel tree hash), `-s`/`-S`, `--strip-debug`
+- [x] `--icf`, `-Map`, `--why-live`, `--print-gc-sections`
+- [ ] Compressed debug sections in inputs (`-gz`), waiting on W10
+- [ ] Musl C programs verified (only the Rust musl target is tested so far)
+- [x] Parallel output writer: mapped output, disjoint slices per chunk,
+      replacing an existing output atomically
+- [x] Undefined-symbol diagnostics with `referenced by file.o:(.text+0x12)`
 
 **Exit criteria:** Static C and C++ programs against glibc and musl link and run,
 including exceptions, threads and TLS. The fixture suite passes. `readelf -a`

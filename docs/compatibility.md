@@ -182,7 +182,20 @@ succeed. The error message names the missing search path.
   `--build-id=fast` is an 8-byte xxHash64 tree hash. Values are stable
   across platforms and thread counts.
 - **Threads.** Parallel by default. `--threads=N`, `--no-threads` and
-  `--thread-count=N` (gold) are honored.
+  `--thread-count=N` (gold) are honored. Without them, the thread count is
+  sized from the input (one thread per 16 MiB, at most 32), because small
+  links run faster on few threads. Output never depends on the thread count.
+- **Executable stack.** An object without a `.note.GNU-stack` section does not
+  make the stack executable (lld's choice); GNU ld treats such objects as
+  needing one. Use `-z execstack` to request it.
+- **Hidden symbols in `.symtab`.** Hidden global symbols are written as
+  `LOCAL`, as lld does; GNU ld keeps them `GLOBAL` in static executables.
+- **No tail merging of `.debug_str` by default.** GNU ld tail-merges mergeable
+  strings at every level; qld, like lld, does it only at `-O2`, so debug-heavy
+  outputs can be a few percent larger.
+- **`--print-gc-sections` and `--print-icf-sections`** write their lines as
+  `qld: note: …` diagnostics.
+- **`PT_GNU_RELRO`** is not emitted in static executables yet (M2).
 
 ### Linker scripts
 

@@ -15,6 +15,8 @@ available).
 
 **Edges:** relocations from a live section, `SHF_LINK_ORDER` dependencies, and
 section group membership (a live member keeps its whole COMDAT group alive).
+Non-allocated sections are roots but contribute **no** edges: otherwise
+`.debug_info` would keep every function it describes alive.
 
 **Granularity:** the unit is the input section. ELF code needs
 `-ffunction-sections -fdata-sections` to be removed per function. For Mach-O,

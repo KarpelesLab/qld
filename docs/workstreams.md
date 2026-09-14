@@ -47,7 +47,7 @@ can work at the same time without colliding.
 | W5 | Output writer | `src/output/**` | — | merged |
 | W6 | GC / ICF / merge passes | `src/passes/**` | — | merged |
 | W7 | ELF reading | `src/elf/read/**` | — | merged |
-| W8 | ELF layout, writing and link driver | `src/elf/**` (extends `read/` as needed) | W7 | in progress |
+| W8 | ELF layout, writing and link driver | `src/elf/**` (extends `read/` as needed) | W7 | merged (M1) |
 | W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | merged |
 | W10 | DWARF | `src/debug/**` | W7 | in progress |
 
@@ -301,6 +301,13 @@ that cross workstream boundaries. The integrator does these between merges.
 | W1 | Let `ParseOutcome` grow print-and-exit variants (`--print-sysroot`, `--print-output-format`); `main.rs` must handle them | open |
 | W1 | `target.rs`: more operating systems (FreeBSD, …) and architectures (MIPS, PowerPC32, …) for their `-m` emulations | open, when needed |
 | W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | done: `split_section` + `merge_split_sections` |
+| W8 | `Location` label so duplicate symbols print `>>> defined at` | done: `Diagnostic::detail` |
+| W8 | Let the ELF driver size the pool when `--threads` is absent | done (`lib.rs`) |
+| W8 | `resolve_symbols` runs parallel iterators over all files every round, including inactive archive members: 17 ms at 64 threads vs 2.5 ms on one for static hello. Iterate only the round's files, or `with_min_len` | open |
+| W8 | `ResolveFile` hook between loading and interning, so COMDAT groups can be claimed before insertion | open |
+| W8 | Switch the local debug tombstone helper in `elf/write.rs` to W10's rules, and handle compressed inputs via W10 | open, after W10 |
+| W8 | `ifunc-static` fixture prints "same address: no" when built with clang, under GNU ld too: fixture/toolchain issue | open |
+| W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | open, investigate |
 | W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |
 
 ## Launching an agent
