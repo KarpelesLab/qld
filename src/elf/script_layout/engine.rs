@@ -185,6 +185,12 @@ struct Engine<'e, 'l, 'a> {
     dot: u64,
     current: Option<u32>,
     last_os: Option<u32>,
+    /// GNU's `prefer_next_section`: `.` was assigned outside an output
+    /// section, so symbols assigned from `.` belong to the next section.
+    prefer_next: bool,
+    /// GNU's `found_end`: an `_end`-like symbol has been assigned, after
+    /// which symbols always belong to the previous section.
+    found_end: bool,
     pass: u32,
     final_pass: bool,
     errors: Vec<(Span, String)>,
@@ -259,6 +265,16 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
         };
         let stmt_noalloc = self.stmt(index).is_some_and(OutputStmt::is_noalloc_type);
         !stmt_noalloc && (out.input_flags & sec::ALLOC != 0 || out.dot_moved || out.has_data)
+    }
+
+    /// Whether the output section holds thread-local data, which GNU ld
+    /// never associates a symbol with.
+    fn is_tls(&self, index: u32) -> bool {
+        self.input
+            .placement
+            .outputs
+            .get(index as usize)
+            .is_some_and(|o| o.flags & SHF_TLS != 0)
     }
 
     fn is_tbss(&self, index: u32) -> bool {
@@ -380,6 +396,44 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
         None
     }
 
+    /// GNU's `section_for_dot`: the output section a symbol assigned from
+    /// `.` outside an output section belongs to. Assignments belong to the
+    /// previous section, unless `.` has been assigned since it ended, in
+    /// which case they belong to the next one; past an `_end`-like symbol
+    /// they always belong to the previous section.
+    fn section_for_dot(&self) -> Option<u32> {
+        if (self.last_os.is_none() || (self.prefer_next && !self.found_end))
+            && let Some(next) = self.next_alloc_output()
+        {
+            return Some(next);
+        }
+        self.last_os
+    }
+
+    /// The first allocated output section that exists after the one being
+    /// processed, in statement order.
+    fn next_alloc_output(&self) -> Option<u32> {
+        let statements = &self.placed.statements;
+        let start = match self.last_os {
+            Some(last) => statements
+                .iter()
+                .position(|s| matches!(s, Statement::Output(i) if *i == last))
+                .map(|p| p.saturating_add(1))?,
+            None => 0,
+        };
+        statements.get(start..)?.iter().find_map(|s| match s {
+            Statement::Output(i)
+                if self.enabled(*i)
+                    && self.outs.get(*i as usize).is_some_and(|o| o.exists)
+                    && self.alloc_of(*i)
+                    && !self.is_tls(*i) =>
+            {
+                Some(*i)
+            }
+            _ => None,
+        })
+    }
+
     fn output_by_name(&self, name: &[u8]) -> Option<u32> {
         if name == b"NEXT_SECTION" {
             let statements = &self.placed.statements;
@@ -408,7 +462,19 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
 
     fn assignment(&mut self, assignment: &'e Assignment, span: Span) {
         self.span = span;
+        let target = assignment.target.as_slice();
+        if target
+            .iter()
+            .copied()
+            .skip_while(|&b| b == b'_')
+            .eq(*b"end")
+        {
+            self.found_end = true;
+        }
         if assignment.is_dot() {
+            if self.current.is_none() {
+                self.prefer_next = true;
+            }
             match eval_dot_assignment(assignment, self) {
                 Ok(next) => {
                     self.dot = next;
@@ -438,11 +504,10 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
                 // relative to the section holding `.` once it is final.
                 if value.from_dot
                     && value.section == ValueSection::Absolute
-                    && let Some(last) = self.last_os
-                    && let Some(out) = self.outs.get(last as usize)
-                    && value.value >= out.vma
+                    && let Some(index) = self.section_for_dot()
+                    && let Some(out) = self.outs.get(index as usize)
                 {
-                    value = Value::relative(last, value.value.wrapping_sub(out.vma));
+                    value = Value::relative(index, value.value.wrapping_sub(out.vma));
                 }
                 let pass = self.pass;
                 if let Some(sym) = self.syms.get_mut(slot) {
@@ -795,6 +860,7 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
         }
         if alloc {
             self.last_os = Some(index);
+            self.prefer_next = false;
         }
         let dotdelta = if self.is_tbss(index) { 0 } else { size };
         self.dot = self.dot.wrapping_add(dotdelta);
@@ -913,6 +979,8 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
         self.dot = 0;
         self.current = None;
         self.last_os = None;
+        self.prefer_next = false;
+        self.found_end = false;
         self.pass = self.pass.wrapping_add(1);
         for out in &mut self.outs {
             out.processed = false;
@@ -1874,6 +1942,8 @@ fn layout_with<'a>(
         dot: 0,
         current: None,
         last_os: None,
+        prefer_next: false,
+        found_end: false,
         pass: 0,
         final_pass: false,
         errors: Vec::new(),
