@@ -1399,6 +1399,18 @@ fn build_entries(
             }
         }
     }
+    // Linker-generated sections belong to the first input object, after its
+    // own sections, as GNU ld creates them there.
+    let synthetic_id = files
+        .iter()
+        .enumerate()
+        .find_map(|(index, file)| {
+            file.object.as_ref()?;
+            let base = *sections.base.get(index)?;
+            let count = *sections.count.get(index)?;
+            (base != NONE).then(|| base.saturating_add(count).saturating_sub(1))
+        })
+        .unwrap_or(0);
     for place in &placed.synthetic {
         if place.output == NONE {
             continue;
@@ -1427,7 +1439,7 @@ fn build_entries(
                     member: b"",
                     name: b"",
                     align: align.max(1),
-                    id: 0,
+                    id: if class == 2 { u32::MAX } else { synthetic_id },
                 },
             ));
         }
@@ -1462,12 +1474,19 @@ fn build_entries(
         list.sort_by(|(ea, sa), (eb, sb)| {
             ea.sub
                 .cmp(&eb.sub)
-                .then(sa.class.cmp(&sb.class))
+                .then((sa.class >= 2).cmp(&(sb.class >= 2)))
                 .then_with(|| {
+                    let rule = rules.get(&(output, ea.sub)).copied().flatten();
                     if sa.class != 1 || sb.class != 1 {
-                        return core::cmp::Ordering::Equal;
+                        // Sorted descriptions put generated sections first,
+                        // which keeps the order total.
+                        return if rule.is_some() {
+                            sa.class.cmp(&sb.class)
+                        } else {
+                            core::cmp::Ordering::Equal
+                        };
                     }
-                    match rules.get(&(output, ea.sub)).copied().flatten() {
+                    match rule {
                         Some(rule) => {
                             let files = if rule.files {
                                 sa.file.cmp(sb.file).then(sa.member.cmp(sb.member))
@@ -1480,6 +1499,7 @@ fn build_entries(
                     }
                 })
                 .then(sa.id.cmp(&sb.id))
+                .then(sa.class.cmp(&sb.class))
         });
         result.push(list.into_iter().map(|(e, _)| e).collect());
     }
