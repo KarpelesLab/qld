@@ -1901,7 +1901,15 @@ fn tbd_macos_sdk() {
     let arm64 = target("arm64-macos");
     let main = stub.main().unwrap();
     assert!(main.install_name.starts_with("/usr/lib/libSystem"));
-    assert!(main.has_target(&arm64));
+    assert!(
+        main.has_target(&arm64),
+        "arm64-macos missing; main targets: {:?}; libraries: {:?}",
+        main.targets,
+        stub.libraries
+            .iter()
+            .map(|lib| (&lib.install_name, &lib.targets))
+            .collect::<Vec<_>>()
+    );
     let exported = |symbol: &str| {
         stub.libraries
             .iter()
