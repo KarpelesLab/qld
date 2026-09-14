@@ -23,8 +23,10 @@ const LEAF_WEIGHT: usize = 4096;
 
 /// The caller handed a pass inconsistent data.
 ///
-/// These are interface errors (a backend bug or an unvalidated index taken
-/// from an input file), reported as values so the passes never panic.
+/// These are interface errors, reported as values so the passes never panic.
+/// Backends validate input files before handing data to a pass, so an
+/// `InputError` means a bug in qld: it converts into
+/// [`crate::Error::Internal`] with `?`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputError {
@@ -50,6 +52,14 @@ pub enum InputError {
     },
     /// A size or count does not fit the pass's index types.
     TooLarge(&'static str),
+    /// Two things that must agree do not, such as a merge section's kind and
+    /// its group's.
+    Mismatch {
+        /// The two things that disagree.
+        what: &'static str,
+        /// The index of the offending item, or the offending length.
+        index: u64,
+    },
 }
 
 impl fmt::Display for InputError {
@@ -63,11 +73,19 @@ impl fmt::Display for InputError {
                 write!(f, "{what} index {index} out of range (len {len})")
             }
             Self::TooLarge(what) => write!(f, "{what} too large"),
+            Self::Mismatch { what, index } => write!(f, "{what} do not match ({index})"),
         }
     }
 }
 
 impl std::error::Error for InputError {}
+
+impl From<InputError> for crate::Error {
+    /// A pass was given inconsistent data by its caller: an internal error.
+    fn from(error: InputError) -> Self {
+        Self::Internal(format!("inconsistent pass input: {error}"))
+    }
+}
 
 /// A list of variable-length rows stored in two flat vectors.
 ///
@@ -395,5 +413,18 @@ mod tests {
         }
         let checked = Csr::from_parts(csr.offsets().to_vec(), csr.values().to_vec());
         assert!(checked.is_ok());
+    }
+
+    #[test]
+    fn input_errors_are_internal_errors() {
+        fn convert() -> crate::Result<()> {
+            Err(InputError::TooLarge("row lengths"))?
+        }
+        let error = convert().unwrap_err();
+        assert!(matches!(error, crate::Error::Internal(_)));
+        assert_eq!(
+            error.to_string(),
+            "internal error: inconsistent pass input: row lengths too large"
+        );
     }
 }
