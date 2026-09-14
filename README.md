@@ -7,9 +7,10 @@ systems can use it with no other changes. It is also a Rust library, so tools
 can link programs in-process.
 
 > **Status: pre-alpha.** qld links **static x86-64 Linux executables**
-> (roadmap milestone M1): C, C++ with exceptions and threads, and Rust
-> programs against glibc or musl, including `--gc-sections`, `--icf`, TLS,
-> IFUNC, debug info and `--build-id`. It can link itself. Dynamic linking
+> (roadmap milestone M1): C and C++ (exceptions, threads, TLS, IFUNC) against
+> glibc, and Rust programs against glibc or musl, with `--gc-sections`,
+> `--icf`, debug info and `--build-id`. A statically linked qld built by qld
+> works as a linker. Dynamic linking
 > (PIE, shared libraries) is next (M2); everything else below describes where
 > qld is going, not what it does today. See [ROADMAP.md](ROADMAP.md).
 
@@ -63,6 +64,23 @@ can link programs in-process.
 | [docs/library-api.md](docs/library-api.md) | Planned Rust crate API |
 | [docs/testing.md](docs/testing.md) | Test strategy, differential testing, benchmarks |
 | [docs/development.md](docs/development.md) | Toolchain, coding rules, dependency and `unsafe` policy |
+
+## Usage
+
+Today (static x86-64 only):
+
+```sh
+# gcc: -B points at a directory whose `ld` is a symlink to qld
+gcc -static -B/opt/qld/bin hello.c -o hello
+
+# Rust, static glibc. Until PIE support lands (M2), ask for a non-PIE binary.
+RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static \
+  -C linker=gcc -C linker-features=-lld -C link-arg=-B/opt/qld/bin" \
+  cargo build --release --target x86_64-unknown-linux-gnu
+```
+
+Gentoo's GCC compresses debug info by default; add `-gz=none` when compiling
+with `-g` until compressed input sections are supported.
 
 ## Planned usage
 
