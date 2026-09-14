@@ -1,7 +1,7 @@
 # Real-project builds
 
-Build scripts and notes for the M2 exit criteria (`ROADMAP.md`): large
-projects built and tested with qld as the system linker. They download
+Build scripts and notes for the M2, M3 and M6 exit criteria (`ROADMAP.md`):
+large projects built and tested with qld as the system linker. They download
 release tarballs, need a host toolchain and network access, and take
 minutes to an hour, so they are for manual and nightly runs only;
 `cargo test` never runs them.
@@ -25,10 +25,14 @@ tests/projects/coreutils.sh ~/.cache/qld-projects/qld ~/.cache/qld-projects
 | `musl.sh` | musl `ld.so` loading qld's shared objects | [musl.md](musl.md) |
 | `lto.sh` | M6: zlib, lua, curl, OpenSSL, coreutils or Python with `gcc -flto`, `clang -flto` or `-flto=thin` | [lto.md](lto.md) |
 | `rust-lto.sh` | M6: `-C linker-plugin-lto` (Rust and C, and qld's unit tests) through LLVMgold | [lto.md](lto.md) |
+| `kernel.sh` | M3: the Linux kernel, built with a shim, compared with GNU ld and booted in QEMU | [kernel.md](kernel.md) |
+| `baremetal.sh` | M3: a firmware image from a linker script, compared with GNU ld down to the raw bytes | [baremetal.md](baremetal.md) |
 
 `coreutils.sh`, `curl.sh`, `openssl.sh` and `python.sh` take a third
 argument, `gnu`, to build the same tree with the system GNU ld for
-comparison.
+comparison. `kernel.sh` and `baremetal.sh` compare with GNU ld themselves,
+and need it installed (`GNU_LD=` to name it); `kernel.sh` also wants
+`qemu-system-x86_64` and `cpio` for the boot, and skips it without them.
 
 ## How qld is put in the build
 
@@ -42,6 +46,11 @@ comparison.
   configure, CMake and `x.py`;
 - every script checks `readelf -p .comment` for `Linker: qld` on the
   executables and shared objects it built (`check_linked_by_qld`).
+
+`kernel.sh` is the exception: the kernel is built with `LD=` pointing at its
+own shim (`$SCRATCH/bin/ld-kernel`), which routes the 32-bit links, the
+version probes and `ld -r` to GNU ld and everything else to qld, and logs
+which linker ran each call. See [kernel.md](kernel.md).
 
 The `ld` wrapper also:
 
@@ -80,6 +89,8 @@ See each project's notes. Summary of the last full run (qld at the head of
 | Rust | 1.98.1 | stage 1 builds; `tests/ui` 21288 passed, `library/std` passed |
 | musl | 1.2.5 | shared libraries, PIE, non-PIE and zlib's tests run under musl's `ld.so` |
 | LTO (M6, W18) | as above | zlib, lua, curl, OpenSSL: tests pass with gcc, clang and ThinLTO; coreutils and Python: same results as GNU ld; see [lto.md](lto.md) |
+| Linux kernel (M3) | 7.2.5 | defconfig `bzImage` links with qld and boots in QEMU; 43 allocated sections and all 238897 symbols have GNU ld's addresses; see [kernel.md](kernel.md) |
+| Bare metal (M3) | — | MEMORY/`AT>`/PHDRS images match GNU ld's addresses, and the binary, ihex and srec files are byte-identical; see [baremetal.md](baremetal.md) |
 
 ## Performance
 
