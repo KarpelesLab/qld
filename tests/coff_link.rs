@@ -31,9 +31,10 @@ fn prefix() -> &'static str {
             return prefix.to_string_lossy().into_owned();
         }
         for candidate in ["x86_64-w64-mingw32-", ""] {
-            if tool(&format!("{candidate}gcc")).is_some()
-                || tool(&format!("{candidate}gcc.exe")).is_some()
-            {
+            // The unprefixed name must be a MinGW compiler, not the host's:
+            // on Linux and macOS `gcc` builds ELF and Mach-O, and these tests
+            // would then link the wrong format instead of skipping.
+            if targets_mingw(&format!("{candidate}gcc")) {
                 return candidate.to_owned();
             }
         }
@@ -55,6 +56,19 @@ fn tool(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+/// Whether `compiler` exists and builds Windows objects (`-dumpmachine`
+/// reports a `mingw` or `windows-gnu` target).
+fn targets_mingw(compiler: &str) -> bool {
+    let Ok(output) = Command::new(compiler).arg("-dumpmachine").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let target = String::from_utf8_lossy(&output.stdout);
+    target.contains("mingw") || target.contains("windows-gnu")
 }
 
 /// A fresh, empty directory for one test.
