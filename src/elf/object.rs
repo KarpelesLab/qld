@@ -1,0 +1,468 @@
+//! Relocatable input objects as the link sees them.
+//!
+//! [`ObjectInput`] wraps a parsed [`ObjectFile`] with what later stages need
+//! per file: the global symbol names (prehashed for interning) and how each
+//! one takes part in resolution, a classification of every section, the
+//! relocation section of every section, the COMDAT groups, and the GNU
+//! property and stack notes.
+//!
+//! Parsing touches only headers and the symbol table; section contents and
+//! relocations stay in the mapping until they are needed.
+
+#![deny(clippy::arithmetic_side_effects)]
+
+use crate::elf::read::consts::{
+    EM_X86_64, SHF_ALLOC, SHF_EXCLUDE, SHF_EXECINSTR, SHF_MERGE, SHF_WRITE, SHT_GROUP,
+    SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NULL, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+    SHT_SYMTAB_SHNDX, STB_LOCAL, STB_WEAK,
+};
+use crate::elf::read::{Elf64Le, GnuProperties, ObjectFile, SectionHeader, SectionIndex, Source};
+use crate::error::{Error, Result};
+use crate::passes::merge::{MergeKind, SplitSection, split_section};
+use crate::symbols::{DefinitionKind, SymbolName, SymbolUse};
+
+use super::resolve::AUX_COMDAT;
+
+/// How an input section takes part in the output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionKind {
+    /// Never copied: the null section, symbol and string tables, relocation
+    /// sections, groups, `.note.GNU-stack`, `.note.gnu.property` (merged into
+    /// a synthetic note), `SHF_EXCLUDE` sections, stripped debug sections.
+    Ignored,
+    /// Copied (or allocated, for `SHT_NOBITS`) and relocated.
+    Regular,
+    /// A `SHF_MERGE` section whose pieces are deduplicated.
+    Merge,
+    /// An `.eh_frame` section, rebuilt from its live records.
+    EhFrame,
+}
+
+/// One section of an input object.
+#[derive(Clone, Copy, Debug)]
+pub struct InputSection<'a> {
+    /// The section name.
+    pub name: &'a [u8],
+    /// The section header.
+    pub header: SectionHeader,
+    /// How the section is used.
+    pub kind: SectionKind,
+    /// Index of the relocation section that applies to this one, or 0.
+    pub relocs: u32,
+    /// Index plus one of the COMDAT group (in [`ObjectInput::groups`]) this
+    /// section belongs to, or 0.
+    pub group: u32,
+    /// For [`SectionKind::Merge`], the index of its split in
+    /// [`ObjectInput::splits`].
+    pub split: u32,
+}
+
+impl InputSection<'_> {
+    /// Whether the section occupies memory at run time.
+    #[must_use]
+    pub fn is_alloc(&self) -> bool {
+        self.header.sh_flags & SHF_ALLOC != 0
+    }
+
+    /// Whether the section is `SHT_NOBITS`.
+    #[must_use]
+    pub fn is_nobits(&self) -> bool {
+        self.header.sh_type == SHT_NOBITS
+    }
+}
+
+/// A COMDAT group of an input object.
+#[derive(Clone, Debug)]
+pub struct ComdatGroup<'a> {
+    /// The group signature.
+    pub signature: &'a [u8],
+    /// Member section indices.
+    pub members: Vec<u32>,
+}
+
+/// What `--wrap` does to undefined references.
+#[derive(Clone, Debug, Default)]
+pub struct WrapTable {
+    /// `(name, __wrap_name, __real_name)` for each wrapped symbol, sorted by
+    /// name.
+    entries: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+}
+
+impl WrapTable {
+    /// Builds the table for the `--wrap` options.
+    #[must_use]
+    pub fn new(names: &[String]) -> Self {
+        let mut entries: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = names
+            .iter()
+            .map(|name| {
+                let name = name.as_bytes().to_vec();
+                let mut wrapped = b"__wrap_".to_vec();
+                wrapped.extend_from_slice(&name);
+                let mut real = b"__real_".to_vec();
+                real.extend_from_slice(&name);
+                (name, wrapped, real)
+            })
+            .collect();
+        entries.sort();
+        entries.dedup();
+        Self { entries }
+    }
+
+    /// Whether no symbol is wrapped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The name an undefined reference to `name` resolves to.
+    #[must_use]
+    pub fn redirect<'s>(&'s self, name: &'s [u8]) -> &'s [u8] {
+        if self.entries.is_empty() {
+            return name;
+        }
+        if let Ok(found) = self.entries.binary_search_by(|e| e.0.as_slice().cmp(name))
+            && let Some(entry) = self.entries.get(found)
+        {
+            return &entry.1;
+        }
+        if name.starts_with(b"__real_")
+            && let Some(entry) = self.entries.iter().find(|e| e.2.as_slice() == name)
+        {
+            return &entry.0;
+        }
+        name
+    }
+}
+
+/// Settings that affect how objects are read.
+#[derive(Clone, Copy, Debug)]
+pub struct ParseConfig<'a> {
+    /// Drop debug sections (`-S`, `-s`).
+    pub strip_debug: bool,
+    /// `--wrap` redirections.
+    pub wrap: &'a WrapTable,
+}
+
+/// A parsed input object.
+#[derive(Debug)]
+pub struct ObjectInput<'a> {
+    /// The underlying ELF reader.
+    pub elf: ObjectFile<'a, Elf64Le>,
+    /// Index of the first global symbol.
+    pub first_global: usize,
+    /// Global symbol names, in symbol table order from `first_global`.
+    pub names: Vec<SymbolName<'a>>,
+    /// How each global symbol takes part in resolution.
+    pub uses: Vec<SymbolUse>,
+    /// Every section, by section index.
+    pub sections: Vec<InputSection<'a>>,
+    /// COMDAT groups.
+    pub groups: Vec<ComdatGroup<'a>>,
+    /// Whether a `.note.GNU-stack` section was present.
+    pub has_gnu_stack_note: bool,
+    /// Whether `.note.GNU-stack` requests an executable stack.
+    pub exec_stack: bool,
+    /// GNU properties, when the object has a `.note.gnu.property`.
+    pub properties: Option<GnuProperties>,
+    /// Index of the `.llvm_addrsig` section, or 0.
+    pub addrsig: u32,
+    /// Indices of `.gnu.warning*` sections.
+    pub warnings: Vec<u32>,
+    /// The pieces of every [`SectionKind::Merge`] section, split at parse
+    /// time.
+    pub splits: Vec<SplitSection<'a>>,
+}
+
+/// Whether a section name is debug information that `--strip-debug` drops.
+#[must_use]
+pub fn is_debug_name(name: &[u8]) -> bool {
+    name.starts_with(b".debug")
+        || name.starts_with(b".zdebug")
+        || name.starts_with(b".gnu.debuglto_")
+        || name == b".line"
+        || name.starts_with(b".stab")
+}
+
+impl<'a> ObjectInput<'a> {
+    /// Parses an object and prepares its symbols for resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Malformed`] for malformed files, and
+    /// [`Error::Unimplemented`] for objects qld cannot link yet.
+    pub fn parse(data: &'a [u8], source: Source<'a>, config: &ParseConfig<'a>) -> Result<Self> {
+        let elf = ObjectFile::<Elf64Le>::parse(data, source)?;
+        if elf.elf().header().e_machine != EM_X86_64 {
+            return Err(source.malformed(18, "ELF machine (incompatible with elf_x86_64)"));
+        }
+
+        let count = elf.section_count();
+        let mut sections = Vec::with_capacity(count);
+        let mut has_gnu_stack_note = false;
+        let mut exec_stack = false;
+        let mut has_property_note = false;
+        let mut addrsig = 0u32;
+        let mut warnings = Vec::new();
+        for (index, header) in elf.elf().enumerate_sections() {
+            let name = elf.section_name(&header)?;
+            let flags = header.sh_flags;
+            let kind = match header.sh_type {
+                SHT_NULL | SHT_SYMTAB | SHT_STRTAB | SHT_REL | SHT_RELA | SHT_GROUP
+                | SHT_SYMTAB_SHNDX => SectionKind::Ignored,
+                SHT_LLVM_ADDRSIG => {
+                    addrsig = index;
+                    SectionKind::Ignored
+                }
+                _ if flags & SHF_EXCLUDE != 0 => SectionKind::Ignored,
+                _ if name == b".note.GNU-stack" => {
+                    has_gnu_stack_note = true;
+                    exec_stack |= flags & SHF_EXECINSTR != 0;
+                    SectionKind::Ignored
+                }
+                _ if name == b".note.gnu.property" => {
+                    has_property_note = true;
+                    SectionKind::Ignored
+                }
+                _ if name.starts_with(b".gnu.warning") => {
+                    // `.gnu.warning.SYM`: a message for links that use SYM.
+                    warnings.push(index);
+                    SectionKind::Ignored
+                }
+                _ if config.strip_debug && flags & SHF_ALLOC == 0 && is_debug_name(name) => {
+                    SectionKind::Ignored
+                }
+                _ if elf.is_eh_frame(&header)? && flags & SHF_ALLOC != 0 => SectionKind::EhFrame,
+                _ if flags & SHF_MERGE != 0
+                    && header.sh_entsize != 0
+                    && flags & SHF_WRITE == 0
+                    && header.sh_type != SHT_NOBITS =>
+                {
+                    SectionKind::Merge
+                }
+                _ => SectionKind::Regular,
+            };
+            sections.push(InputSection {
+                name,
+                header,
+                kind,
+                relocs: 0,
+                group: 0,
+                split: 0,
+            });
+        }
+
+        // Relocation sections: attach them to their targets. A merge section
+        // with relocations is copied as a regular section instead.
+        for (index, header) in elf.elf().enumerate_sections() {
+            if !matches!(header.sh_type, SHT_REL | SHT_RELA) {
+                continue;
+            }
+            let target = usize::try_from(header.sh_info)
+                .ok()
+                .filter(|&t| t != 0)
+                .and_then(|t| sections.get_mut(t));
+            let Some(target) = target else {
+                // GNU as emits relocation sections for nothing only in broken
+                // objects; treat a zero target as malformed.
+                return Err(source.malformed(
+                    elf.elf().section_header_offset(index),
+                    "relocation section target",
+                ));
+            };
+            if header.sh_link != elf.symbols().section_index() && header.sh_link != 0 {
+                return Err(source.malformed(
+                    elf.elf().section_header_offset(index),
+                    "relocation section symbol table link",
+                ));
+            }
+            if target.relocs != 0 {
+                return Err(source.malformed(
+                    elf.elf().section_header_offset(index),
+                    "relocation section target (duplicate)",
+                ));
+            }
+            target.relocs = index;
+            if target.kind == SectionKind::Merge {
+                target.kind = SectionKind::Regular;
+            }
+        }
+
+        // COMDAT groups.
+        let mut groups = Vec::new();
+        for group in elf.groups() {
+            let group = group?;
+            if !group.is_comdat() {
+                continue;
+            }
+            let signature = elf.group_signature(&group)?;
+            let group_number = u32::try_from(groups.len())
+                .ok()
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(|| source.malformed(group.header.sh_offset, "section group count"))?;
+            let mut members = Vec::with_capacity(group.member_count());
+            for member in group.members() {
+                let section = usize::try_from(member)
+                    .ok()
+                    .and_then(|m| sections.get_mut(m))
+                    .filter(|_| member != 0)
+                    .ok_or_else(|| {
+                        source.malformed(group.header.sh_offset, "section group member")
+                    })?;
+                if section.group != 0 {
+                    return Err(source.malformed(
+                        group.header.sh_offset,
+                        "section group member (in two groups)",
+                    ));
+                }
+                section.group = group_number;
+                members.push(member);
+            }
+            groups.push(ComdatGroup { signature, members });
+        }
+
+        // Split mergeable sections into pieces now, while the file is hot.
+        let mut splits = Vec::new();
+        for section in &mut sections {
+            if section.kind != SectionKind::Merge {
+                continue;
+            }
+            let Some(kind) = merge_kind(&section.header) else {
+                section.kind = SectionKind::Regular;
+                continue;
+            };
+            let data = elf.section_data(&section.header)?;
+            let alignment = section.header.sh_addralign.max(1);
+            if !alignment.is_power_of_two() {
+                section.kind = SectionKind::Regular;
+                continue;
+            }
+            let split = split_section(data, kind, alignment).map_err(|malformed| {
+                let mut error = malformed.into_error(source.path, section.header.sh_offset);
+                if let Error::Malformed { member, .. } = &mut error {
+                    *member = source.member.map(str::to_owned);
+                }
+                error
+            })?;
+            section.split = u32::try_from(splits.len())
+                .map_err(|_| Error::Limit("too many merge sections in one object".into()))?;
+            splits.push(split);
+        }
+
+        let properties = if has_property_note {
+            Some(elf.gnu_properties()?)
+        } else {
+            None
+        };
+
+        let symbols = *elf.symbols();
+        let first_global = symbols.first_global();
+        let global_count = symbols.len().saturating_sub(first_global);
+        let mut names = Vec::with_capacity(global_count);
+        let mut uses = Vec::with_capacity(global_count);
+        for index in first_global..symbols.len() {
+            let Some(raw) = symbols.get_raw(index) else {
+                break;
+            };
+            let name = symbols.name(index, &raw)?;
+            let section = symbols.section(index, &raw)?;
+            let binding = raw.binding();
+            let weak = binding == STB_WEAK;
+            let (name, use_) = match section {
+                _ if binding == STB_LOCAL => (name, SymbolUse::Ignore),
+                SectionIndex::Undefined => {
+                    (config.wrap.redirect(name), SymbolUse::Reference { weak })
+                }
+                SectionIndex::Common => (
+                    name,
+                    SymbolUse::Definition {
+                        kind: DefinitionKind::Common,
+                        aux: raw.st_size & !AUX_COMDAT,
+                    },
+                ),
+                SectionIndex::Absolute => (name, definition(weak, false)),
+                SectionIndex::Section(s) => {
+                    let section = usize::try_from(s)
+                        .ok()
+                        .and_then(|s| sections.get(s))
+                        .ok_or_else(|| {
+                            source.malformed(
+                                symbols.strtab().file_offset(),
+                                format!("section index {s} of symbol {index}"),
+                            )
+                        })?;
+                    (name, definition(weak, section.group != 0))
+                }
+                SectionIndex::Reserved(_) => (name, SymbolUse::Ignore),
+            };
+            // `redirect` may return a name owned by the wrap table, which
+            // lives as long as the link.
+            names.push(SymbolName::new(strip_default_version(name)));
+            uses.push(use_);
+        }
+
+        Ok(Self {
+            elf,
+            first_global,
+            names,
+            uses,
+            sections,
+            groups,
+            has_gnu_stack_note,
+            exec_stack,
+            properties,
+            addrsig,
+            warnings,
+            splits,
+        })
+    }
+
+    /// The object's source, for diagnostics.
+    #[must_use]
+    pub fn source(&self) -> Source<'a> {
+        self.elf.source()
+    }
+
+    /// The input section `index`, if it exists.
+    #[must_use]
+    pub fn section(&self, index: u32) -> Option<&InputSection<'a>> {
+        self.sections.get(usize::try_from(index).ok()?)
+    }
+
+    /// Returns an error naming this file.
+    #[must_use]
+    pub fn malformed(&self, offset: u64, what: impl Into<String>) -> Error {
+        self.source().malformed(offset, what)
+    }
+}
+
+/// How a mergeable section splits, or `None` if it cannot be merged.
+fn merge_kind(header: &SectionHeader) -> Option<MergeKind> {
+    use crate::elf::read::consts::SHF_STRINGS;
+    if header.sh_flags & SHF_STRINGS != 0 {
+        let char_size = u8::try_from(header.sh_entsize).ok()?;
+        matches!(char_size, 1 | 2 | 4).then_some(MergeKind::Strings { char_size })
+    } else {
+        (header.sh_entsize != 0).then_some(MergeKind::Fixed {
+            entry_size: header.sh_entsize,
+        })
+    }
+}
+
+fn definition(weak: bool, comdat: bool) -> SymbolUse {
+    SymbolUse::Definition {
+        kind: if weak {
+            DefinitionKind::Weak
+        } else {
+            DefinitionKind::Regular
+        },
+        aux: if comdat { AUX_COMDAT } else { 0 },
+    }
+}
+
+/// `foo@@VERSION` defines `foo` in a static link.
+fn strip_default_version(name: &[u8]) -> &[u8] {
+    match name.windows(2).position(|w| w == b"@@") {
+        Some(at) => name.get(..at).unwrap_or(name),
+        None => name,
+    }
+}
