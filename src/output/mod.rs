@@ -14,3 +14,5 @@
 //! This module and [`crate::input`] are the only places allowed to use
 //! `unsafe`, for mapping. Every block needs a `SAFETY` comment.
 //! See `docs/architecture.md` ("Output writing").
+
+pub mod hash;
