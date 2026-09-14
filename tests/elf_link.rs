@@ -887,6 +887,31 @@ fn gc_sections_drops_imports_only_dead_code_uses() {
     cc_link_ok(&dir, &["-o", "all", "main.o"]);
     let symbols = readelf(&dir, &["--dyn-syms", "all"]);
     assert!(symbols.contains("chdir"), "{symbols}");
+
+    // In a shared object, an undefined symbol only dead code refers to is
+    // left out too (LLVM's plugins and DisableABIBreakingChecks).
+    compile_with(
+        &dir,
+        "plugin",
+        "extern int missing_live_qld, missing_dead_qld;\n\
+         int live_qld(void) { return missing_live_qld; }\n\
+         static int dead_qld(void) { return missing_dead_qld; }\n\
+         int (*unused_qld)(void) __attribute__((weak, visibility(\"hidden\"))) = dead_qld;\n",
+        &["-fPIC", "-ffunction-sections", "-fdata-sections"],
+    );
+    cc_link_ok(
+        &dir,
+        &[
+            "-shared",
+            "-o",
+            "libplugin.so",
+            "plugin.o",
+            "-Wl,--gc-sections",
+        ],
+    );
+    let symbols = readelf(&dir, &["--dyn-syms", "libplugin.so"]);
+    assert!(symbols.contains("missing_live_qld"), "{symbols}");
+    assert!(!symbols.contains("missing_dead_qld"), "{symbols}");
 }
 
 #[test]

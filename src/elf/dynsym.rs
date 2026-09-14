@@ -434,9 +434,12 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
                     (referenced || flags.intersects(needs)).then_some((id, false))
                 }
                 DefinitionKind::Undefined | DefinitionKind::Lazy => {
+                    // As for imports, a reference from code --gc-sections
+                    // removed does not count (GNU ld leaves it out).
+                    let referenced = flags.contains(REF_REGULAR)
+                        && (!options.gc_sections || flags.contains(REF_LIVE));
                     let wanted = flags.contains(PREEMPTIBLE)
-                        && (flags.intersects(needs)
-                            || (mode.shared && flags.contains(REF_REGULAR)));
+                        && (flags.intersects(needs) || (mode.shared && referenced));
                     wanted.then_some((id, false))
                 }
                 DefinitionKind::Regular | DefinitionKind::Weak | DefinitionKind::Common => {
