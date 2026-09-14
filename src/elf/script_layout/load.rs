@@ -46,14 +46,18 @@ impl Prepared {
     /// Adds the symbols scripts refer to as references of the linker's
     /// internal file, so that archive members defining them are loaded
     /// and garbage collection keeps their sections. Symbols a script
-    /// defines itself are skipped; names only read by `PROVIDE`s are weak
-    /// references, which do not load archive members.
+    /// defines itself, and names only read by `PROVIDE`s, are skipped.
     pub fn add_internal_names(&self, names: &mut Vec<(Vec<u8>, SymbolUse)>) {
         let Some(script) = &self.script else {
             return;
         };
         for (name, provide_only) in &script.referenced {
-            if script.defined.contains(name) || names.iter().any(|(n, _)| n == name) {
+            // GNU ld does not read the right-hand side of a PROVIDE nothing
+            // needs, so those names are not references.
+            if *provide_only
+                || script.defined.contains(name)
+                || names.iter().any(|(n, _)| n == name)
+            {
                 continue;
             }
             names.push((

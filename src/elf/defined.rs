@@ -353,6 +353,31 @@ fn symbol_def(symbols: &SymbolTable<'_>, files: &[ElfInput<'_>], id: SymbolId) -
     }
 }
 
+/// The section header index a linker-defined symbol belongs to, when its
+/// value alone does not tell: a script symbol assigned relative to an
+/// output section, or `__start_SEC`/`__stop_SEC`, belongs to that section
+/// even at its end, where the next section may start.
+#[must_use]
+pub fn linker_shndx(
+    addresses: &super::values::Addresses<'_, '_>,
+    linker: &LinkerSymbols,
+    id: SymbolId,
+) -> Option<u16> {
+    let layout = addresses.layout;
+    let (_, value) = linker.entries.iter().find(|(i, _)| *i == id)?;
+    let position = match *value {
+        Value::Script { slot, .. } => layout.script_symbols.get(slot as usize)?.section?,
+        Value::OutputStart(output) | Value::OutputEnd(output) => {
+            let position = layout.output_places.get(output as usize)?.2;
+            (position != super::sections::NONE).then_some(position)?
+        }
+        _ => return None,
+    };
+    u16::try_from(position.checked_add(1)?)
+        .ok()
+        .filter(|&i| i < crate::elf::read::consts::SHN_LORESERVE)
+}
+
 /// Backend flag: the symbol's value is an absolute number, not an address
 /// in the image (`--defsym name=0x1234`), so position-independent output
 /// does not relocate it.

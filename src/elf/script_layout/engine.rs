@@ -59,6 +59,9 @@ pub struct ScriptSymbol {
     pub absolute: bool,
     /// Whether an assignment defined it.
     pub defined: bool,
+    /// For a section-relative value, the position in
+    /// [`Layout::sections`] of its output section.
+    pub section: Option<u32>,
 }
 
 /// One member of an output section during assignment.
@@ -2379,6 +2382,13 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
                 value: value.resolve(&engine),
                 absolute: !matches!(value.section, ValueSection::Relative(_)) && !value.from_dot,
                 defined: true,
+                section: match value.section {
+                    ValueSection::Relative(output) => output_places
+                        .get(output as usize)
+                        .map(|p| p.2)
+                        .filter(|&p| p != NONE),
+                    _ => None,
+                },
             },
             None => ScriptSymbol {
                 name: name.clone(),
