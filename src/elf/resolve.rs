@@ -238,7 +238,7 @@ pub fn report_duplicates(
             Diagnostic::error(format!("duplicate symbol: {}", duplicate.name.display()))
                 .order(duplicate.winner.position.raw());
         for def in std::iter::once(&duplicate.winner).chain(others) {
-            diagnostic = diagnostic.note(format!("defined at {}", definition_site(files, def)));
+            diagnostic = diagnostic.detail(format!("defined at {}", definition_site(files, def)));
         }
         diagnostics.emit(diagnostic);
         errors = errors.saturating_add(1);

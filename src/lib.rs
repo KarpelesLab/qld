@@ -70,27 +70,30 @@ pub fn version_line() -> String {
 
 /// Runs a link described by `options`.
 ///
-/// Parallel stages run in a rayon pool with `options.threads` threads (one
-/// per core when unset), created for the duration of the link. To run in a
-/// pool you already own, call the format driver (such as [`elf::link`](fn@elf::link))
-/// inside your pool's `install` instead.
+/// With `--threads`, parallel stages run in a rayon pool of that size created
+/// for the duration of the link. Without it, the format driver chooses: the
+/// ELF driver sizes a pool from the input (small links run faster on few
+/// threads), never larger than the current pool. To run in a pool you already
+/// own, call `link` (or a format driver such as [`elf::link`](fn@elf::link))
+/// inside your pool's `install`.
 ///
 /// # Errors
 ///
 /// Returns any fatal error from the link, including
 /// [`Error::Unimplemented`] for targets and features not supported yet.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
-    let mut pool = rayon::ThreadPoolBuilder::new();
-    if let Some(threads) = options.threads {
-        pool = pool.num_threads(threads);
-    }
-    let pool = pool
-        .build()
-        .map_err(|error| Error::Internal(format!("cannot create thread pool: {error}")))?;
-    pool.install(|| match options.target.map(|target| target.format) {
+    let run = || match options.target.map(|target| target.format) {
         None | Some(BinaryFormat::Elf) => elf::link(options, diagnostics),
         Some(format) => Err(Error::Unimplemented(format!(
             "{format:?} output (see ROADMAP.md)"
         ))),
-    })
+    };
+    match options.threads {
+        Some(threads) => rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| Error::Internal(format!("cannot create thread pool: {error}")))?
+            .install(run),
+        None => run(),
+    }
 }

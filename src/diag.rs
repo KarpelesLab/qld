@@ -90,6 +90,9 @@ pub struct Diagnostic {
     pub message: String,
     /// Places in the input this diagnostic refers to.
     pub locations: Vec<Location>,
+    /// Context lines rendered under the message as `>>> {detail}`, the way
+    /// lld writes them (`defined at a.o:(.text+0x0)`).
+    pub details: Vec<String>,
     /// Extra notes, rendered under the message.
     pub notes: Vec<String>,
     /// Sort key for deterministic output: usually the command-line position of
@@ -104,6 +107,7 @@ impl Diagnostic {
             severity,
             message: message.into(),
             locations: Vec::new(),
+            details: Vec::new(),
             notes: Vec::new(),
             order: u64::MAX,
         }
@@ -123,6 +127,13 @@ impl Diagnostic {
     #[must_use]
     pub fn at(mut self, location: Location) -> Self {
         self.locations.push(location);
+        self
+    }
+
+    /// Adds a context line, rendered as `>>> {detail}`.
+    #[must_use]
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.details.push(detail.into());
         self
     }
 
@@ -223,6 +234,9 @@ impl DiagnosticSink for Stderr {
         );
         for location in &diagnostic.locations {
             text.push_str(&format!(">>> referenced by {location}\n"));
+        }
+        for detail in &diagnostic.details {
+            text.push_str(&format!(">>> {detail}\n"));
         }
         for note in &diagnostic.notes {
             text.push_str(&format!(">>> note: {note}\n"));
