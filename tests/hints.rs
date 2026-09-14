@@ -394,6 +394,84 @@ fn sysroot_prefixes() {
 }
 
 #[test]
+fn malformed_libraries_are_skipped() {
+    if !tools() {
+        return;
+    }
+    let scratch = Scratch::new("malformed");
+    let good = shared(
+        &scratch,
+        "int good_func(void) { return 1; }",
+        "lib/libgood.so",
+        &[],
+    );
+    let bytes = std::fs::read(&good).unwrap();
+    let ar = archive(
+        &scratch,
+        &[("m", "int arch_func(void) { return 2; }")],
+        "lib/libarch.a",
+    );
+    let ar_bytes = std::fs::read(&ar).unwrap();
+    // Truncations and byte flips of a real shared object and archive, plus
+    // scripts that loop or name missing files.
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for i in 0..40 {
+        let source = if i % 2 == 0 { &bytes } else { &ar_bytes };
+        let mut corrupt = source.clone();
+        if i % 3 == 0 {
+            corrupt.truncate((next() as usize) % source.len());
+        } else {
+            for _ in 0..8 {
+                let at = (next() as usize) % corrupt.len();
+                corrupt[at] = next() as u8;
+            }
+        }
+        std::fs::write(scratch.path(&format!("lib/libbad{i}.so")), corrupt).unwrap();
+    }
+    scratch.write("lib/libloop.so", "INPUT ( libloop.so )");
+    scratch.write(
+        "lib/libmissing.so",
+        "GROUP ( /nonexistent/libx.so -lnothere )",
+    );
+    scratch.write("lib/libgarbage.so", "GROUP ( ( ( ");
+    let scope = SearchScope {
+        search_paths: vec![scratch.path("lib")],
+        sysroot: None,
+    };
+    let hints = Hinter::new(scope.clone(), Vec::new()).hints(
+        &[Undefined::new(b"good_func"), Undefined::new(b"arch_func")],
+        &[],
+    );
+    assert!(!hints[0].is_empty() && !hints[1].is_empty());
+    // Corrupt copies that still parse may define the symbols too, and sort
+    // first; the intact libraries must be in the index either way.
+    let flags = |hints: &[Hint]| -> Vec<String> {
+        hints.iter().map(|h| library_of(h).0.to_string()).collect()
+    };
+    let index = LibraryIndex::build(&scope, &[], &[b"good_func", b"arch_func"]);
+    let defines = |name: &[u8], file: &str| {
+        index.definitions(name).iter().any(|d| {
+            index.objects()[d.object]
+                .path
+                .file_name()
+                .is_some_and(|n| n == file)
+        })
+    };
+    assert!(
+        defines(b"good_func", "libgood.so"),
+        "{:?}",
+        flags(&hints[0])
+    );
+    assert!(defines(b"arch_func", "libarch.a"), "{:?}", flags(&hints[1]));
+}
+
+#[test]
 fn deterministic_across_thread_counts() {
     if !tools() {
         return;
