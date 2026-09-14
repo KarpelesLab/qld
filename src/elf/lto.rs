@@ -235,6 +235,7 @@ pub fn resolve<'a>(
 #[cfg(feature = "plugin")]
 mod plugin_link {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use hashbrown::HashMap;
     use rayon::prelude::*;
@@ -365,6 +366,8 @@ mod plugin_link {
         session: Option<Session>,
         /// Number of files claimed so far.
         claims: usize,
+        /// Time spent loading plugins and in their claim handlers.
+        claim_time: Duration,
     }
 
     impl Driver<'_> {
@@ -412,17 +415,21 @@ mod plugin_link {
             handle: usize,
             known_used: bool,
         ) -> Result<Option<IrSymbols<'a>>> {
+            let start = Instant::now();
             let mut input = input_file(file, handle)?;
             input.known_used = known_used;
             let diagnostics = self.diagnostics;
             let claim = self.claims;
             let session = self.session()?;
-            let Some(claimed) = session.claim(&input, diagnostics)? else {
-                return Ok(None);
-            };
-            let symbols = ir_symbols(file, claimed, claim)?;
-            self.claims = self.claims.saturating_add(1);
-            Ok(Some(symbols))
+            let claimed = session.claim(&input, diagnostics)?;
+            let symbols = claimed
+                .map(|claimed| ir_symbols(file, claimed, claim))
+                .transpose()?;
+            if symbols.is_some() {
+                self.claims = self.claims.saturating_add(1);
+            }
+            self.claim_time = self.claim_time.saturating_add(start.elapsed());
+            Ok(symbols)
         }
     }
 
@@ -755,6 +762,18 @@ mod plugin_link {
             diagnostics,
             session: None,
             claims: 0,
+            claim_time: Duration::ZERO,
+        };
+        // `QLD_TIMING`, as in the driver: where LTO links spend their time.
+        let timing = std::env::var_os("QLD_TIMING").is_some();
+        let start = Instant::now();
+        let lap = |what: &str| {
+            if timing {
+                eprintln!(
+                    "qld: lto {what}: {:.1} ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         };
 
         // Members the archive index does not describe, in input order.
@@ -786,6 +805,14 @@ mod plugin_link {
         let Some(mut session) = driver.session.take() else {
             return Ok((symbols, resolution, LtoLink::default()));
         };
+        if timing {
+            eprintln!(
+                "qld: lto claims ({} files, plugin loading included): {:.1} ms",
+                driver.claims,
+                driver.claim_time.as_secs_f64() * 1000.0
+            );
+        }
+        lap("first resolution");
         if !inputs.files.iter().any(|file| file.ir.is_some()) {
             // Only unextracted members were claimed: nothing to compile.
             return Ok((
@@ -817,6 +844,7 @@ mod plugin_link {
             },
             diagnostics,
         )?;
+        lap("code generation");
         if output.errors > 0 {
             return Err(Error::Reported {
                 errors: output.errors,
@@ -885,6 +913,7 @@ mod plugin_link {
         let mut symbols = SymbolTable::new();
         let mut comdat = ComdatHook::default();
         let resolution = resolve_symbols_with(&mut symbols, rules, &mut inputs.files, &mut comdat)?;
+        lap("second resolution");
         Ok((
             symbols,
             resolution,
