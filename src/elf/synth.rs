@@ -36,7 +36,7 @@ use crate::ids::SymbolId;
 use crate::output::build_id::build_id_size;
 use crate::symbols::SymbolFlags;
 
-use super::arch::x86_64::{IPLT_ENTRY_SIZE, PLT_ENTRY_SIZE, PLT_GOT_ENTRY_SIZE};
+use super::arch::{Arch, DynKind, PltFlags};
 use super::export::{Mode, PREEMPTIBLE};
 use super::inputs::ElfInput;
 use super::refs::{Def, Refs};
@@ -101,20 +101,7 @@ impl EntryList {
     }
 }
 
-/// What a GOT entry holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GotKind {
-    /// The symbol's address (one word).
-    Address,
-    /// TLS module ID and offset (two words).
-    TlsGd,
-    /// The thread pointer offset (one word).
-    TpOff,
-    /// A TLS descriptor (two words).
-    TlsDesc,
-    /// The module-local TLS module ID and a zero offset (two words).
-    TlsLd,
-}
+pub use super::arch::GotKind;
 
 /// A space reserved in the executable for a copy relocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +119,8 @@ pub struct CopyReloc {
 /// The planned synthetic sections.
 #[derive(Debug, Default)]
 pub struct Synth {
+    /// The architecture, chosen once per link.
+    pub arch: Arch,
     /// The output mode.
     pub mode: Option<Mode>,
     /// Address GOT entries.
@@ -160,8 +149,12 @@ pub struct Synth {
     pub dynbss: (u64, u64),
     /// Size and alignment of the copy relocation block in `.data.rel.ro`.
     pub dynrelro: (u64, u64),
-    /// IBT-enabled PLT.
+    /// IBT-enabled PLT (x86-64), or BTI-enabled PLT (AArch64).
     pub ibt: bool,
+    /// AArch64 `GNU_PROPERTY_AARCH64_FEATURE_1_BTI` is set on the output.
+    pub bti: bool,
+    /// AArch64 `GNU_PROPERTY_AARCH64_FEATURE_1_PAC` is set on the output.
+    pub pac: bool,
     /// Reserved words at the start of `.got.plt`.
     pub got_plt_reserved: u64,
     /// Dynamic relocations in `.rela.dyn` that come from GOT entries and
@@ -219,6 +212,15 @@ impl Synth {
     #[must_use]
     pub fn dynamic(&self) -> bool {
         self.mode.is_some_and(|m| m.dynamic)
+    }
+
+    /// The shape of PLT entries: landing pads for x86-64 IBT or AArch64
+    /// BTI.
+    #[must_use]
+    pub fn plt_flags(&self) -> PltFlags {
+        PltFlags {
+            landing_pad: self.ibt,
+        }
     }
 
     /// Plans GOT, PLT and copy relocation entries from the scan.
@@ -431,7 +433,7 @@ impl Synth {
             }
         }
         if self.tlsld {
-            add(SlotReloc::Module(0));
+            add(SlotReloc::Module(DynKind::DtpMod));
         }
         other = other.saturating_add(u64_len(self.copies.len()));
         (relative, other)
@@ -572,32 +574,44 @@ impl Synth {
                 (entries.saturating_mul(24), 8)
             }
             Synthetic::Plt => {
+                let flags = self.plt_flags();
+                let align = self.arch.plt_align();
                 if dynamic {
                     // GNU ld keeps the lazy PLT header when only `.plt.got`
                     // entries exist.
                     let entries = self.plt_entries();
                     if entries == 0 && self.plt_got.is_empty() {
-                        (0, 16)
+                        (0, align)
                     } else {
-                        (PLT_ENTRY_SIZE.saturating_mul(entries.saturating_add(1)), 16)
+                        (
+                            self.arch.plt_header_size(flags).saturating_add(
+                                entries.saturating_mul(self.arch.plt_entry_size(flags)),
+                            ),
+                            align,
+                        )
                     }
                 } else {
-                    (count(&self.iplt).saturating_mul(IPLT_ENTRY_SIZE), 16)
+                    (
+                        count(&self.iplt).saturating_mul(self.arch.iplt_entry_size()),
+                        align,
+                    )
                 }
             }
             Synthetic::PltSec => {
-                if dynamic && self.ibt {
-                    (self.plt_entries().saturating_mul(PLT_ENTRY_SIZE), 16)
+                // Only x86-64 IBT splits the PLT in two.
+                if dynamic && self.ibt && self.arch == Arch::X86_64 {
+                    (
+                        self.plt_entries()
+                            .saturating_mul(self.arch.plt_entry_size(self.plt_flags())),
+                        self.arch.plt_align(),
+                    )
                 } else {
-                    (0, 16)
+                    (0, self.arch.plt_align())
                 }
             }
             Synthetic::PltGot => {
-                let (entry, align) = if self.ibt {
-                    (PLT_ENTRY_SIZE, 16)
-                } else {
-                    (PLT_GOT_ENTRY_SIZE, 8)
-                };
+                let entry = self.arch.plt_got_entry_size(self.plt_flags());
+                let align = if entry >= 16 { 16 } else { 8 };
                 (count(&self.plt_got).saturating_mul(entry), align)
             }
             Synthetic::EhFrameHdr => {
@@ -680,12 +694,12 @@ fn copy_shape(refs: &Refs<'_, '_>, id: SymbolId) -> (u64, u64, bool) {
 pub enum SlotReloc {
     /// None: the word is final at link time.
     None,
-    /// `R_X86_64_RELATIVE`.
+    /// A relative relocation.
     Relative,
-    /// A relocation of this type against the owner's dynamic symbol.
-    Symbolic(u32),
-    /// A relocation of this type against symbol 0 (the output itself).
-    Module(u32),
+    /// A relocation of this kind against the owner's dynamic symbol.
+    Symbolic(DynKind),
+    /// A relocation of this kind against symbol 0 (the output itself).
+    Module(DynKind),
 }
 
 /// The dynamic relocations of the (one or two) GOT words of `owner`'s
@@ -697,14 +711,11 @@ pub fn got_slot_relocs(
     owner: Owner,
     kind: GotKind,
 ) -> [SlotReloc; 2] {
-    use crate::elf::read::consts::x86_64::{
-        R_X86_64_DTPMOD64, R_X86_64_DTPOFF64, R_X86_64_GLOB_DAT, R_X86_64_TLSDESC, R_X86_64_TPOFF64,
-    };
     if !mode.dynamic {
         return [SlotReloc::None; 2];
     }
     if kind == GotKind::TlsLd {
-        return [SlotReloc::Module(R_X86_64_DTPMOD64), SlotReloc::None];
+        return [SlotReloc::Module(DynKind::DtpMod), SlotReloc::None];
     }
     let target = match owner {
         Owner::Global(id) => Some(refs.global_target(id, true)),
@@ -723,7 +734,7 @@ pub fn got_slot_relocs(
     match kind {
         GotKind::Address => {
             if preemptible {
-                [SlotReloc::Symbolic(R_X86_64_GLOB_DAT), SlotReloc::None]
+                [SlotReloc::Symbolic(DynKind::GlobDat), SlotReloc::None]
             } else if mode.pic && defined && !absolute {
                 [SlotReloc::Relative, SlotReloc::None]
             } else {
@@ -732,9 +743,9 @@ pub fn got_slot_relocs(
         }
         GotKind::TpOff => {
             if preemptible {
-                [SlotReloc::Symbolic(R_X86_64_TPOFF64), SlotReloc::None]
+                [SlotReloc::Symbolic(DynKind::TpOff), SlotReloc::None]
             } else if mode.shared {
-                [SlotReloc::Module(R_X86_64_TPOFF64), SlotReloc::None]
+                [SlotReloc::Module(DynKind::TpOff), SlotReloc::None]
             } else {
                 [SlotReloc::None; 2]
             }
@@ -742,23 +753,23 @@ pub fn got_slot_relocs(
         GotKind::TlsGd => {
             if preemptible {
                 [
-                    SlotReloc::Symbolic(R_X86_64_DTPMOD64),
-                    SlotReloc::Symbolic(R_X86_64_DTPOFF64),
+                    SlotReloc::Symbolic(DynKind::DtpMod),
+                    SlotReloc::Symbolic(DynKind::DtpOff),
                 ]
             } else if mode.shared {
-                [SlotReloc::Module(R_X86_64_DTPMOD64), SlotReloc::None]
+                [SlotReloc::Module(DynKind::DtpMod), SlotReloc::None]
             } else {
                 [SlotReloc::None; 2]
             }
         }
         GotKind::TlsDesc => {
             if preemptible {
-                [SlotReloc::Symbolic(R_X86_64_TLSDESC), SlotReloc::None]
+                [SlotReloc::Symbolic(DynKind::TlsDesc), SlotReloc::None]
             } else {
-                [SlotReloc::Module(R_X86_64_TLSDESC), SlotReloc::None]
+                [SlotReloc::Module(DynKind::TlsDesc), SlotReloc::None]
             }
         }
-        GotKind::TlsLd => [SlotReloc::Module(R_X86_64_DTPMOD64), SlotReloc::None],
+        GotKind::TlsLd => [SlotReloc::Module(DynKind::DtpMod), SlotReloc::None],
     }
 }
 

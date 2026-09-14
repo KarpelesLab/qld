@@ -24,11 +24,12 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::elf::read::Relocation;
-use crate::elf::read::consts::x86_64::{R_X86_64_64, R_X86_64_PLT32, R_X86_64_PLT32_BND};
 use crate::elf::read::consts::{SHF_ALLOC, SHF_WRITE, STT_FUNC, STT_GNU_IFUNC};
 use crate::symbols::SymbolFlags;
 
-use super::arch::x86_64::{self, Class, ClassifyContext, ClassifyError, Kind, TlsMode, Width};
+use super::arch::{
+    Arch, Class, ClassifyContext, ClassifyError, DynKind, GotKind, Kind, TlsMode, Width,
+};
 use super::export::{Mode, PREEMPTIBLE};
 use super::refs::{Def, Target};
 use super::scan::NEEDS_IPLT;
@@ -38,10 +39,10 @@ use super::scan::NEEDS_IPLT;
 pub enum Dynamic {
     /// Nothing: the value is final at link time.
     None,
-    /// `R_X86_64_RELATIVE`: the load base is added to `S + A`.
+    /// A relative relocation: the load base is added to `S + A`.
     Relative,
-    /// A symbolic dynamic relocation (`R_X86_64_64`) against the symbol.
-    Symbolic(u32),
+    /// A symbolic dynamic relocation against the symbol.
+    Symbolic(DynKind),
 }
 
 /// Why a relocation cannot be linked in this output.
@@ -100,6 +101,8 @@ pub struct Context {
     pub relax: bool,
     /// `-z copyreloc` (the default).
     pub copy_relocs: bool,
+    /// The architecture, chosen once per link.
+    pub arch: Arch,
 }
 
 /// Whether a relative relocation at `offset` of a section aligned to
@@ -191,7 +194,9 @@ pub fn decide(
 ) -> Result<Decision, ClassifyError> {
     let mut classify = classify_context(context, target, flags);
     classify.code = section_flags & crate::elf::read::consts::SHF_EXECINSTR != 0;
-    let class = x86_64::classify(rel.r_type, rel.addend, data, rel.offset, classify)?;
+    let class = context
+        .arch
+        .classify(rel.r_type, rel.addend, data, rel.offset, classify)?;
     let p = props(target, flags);
     let mode = context.mode;
     let mut decision = Decision {
@@ -216,29 +221,38 @@ pub fn decide(
     if p.local_ifunc && p.global {
         decision.flags |= NEEDS_IPLT;
     }
+    if class.needs_got() {
+        match class.slot {
+            GotKind::Address => need(&mut decision, SymbolFlags::NEEDS_GOT, LocalNeed::Got),
+            GotKind::TpOff => need(
+                &mut decision,
+                SymbolFlags::NEEDS_GOTTPOFF,
+                LocalNeed::GotTpOff,
+            ),
+            GotKind::TlsGd => need(&mut decision, SymbolFlags::NEEDS_TLSGD, LocalNeed::TlsGd),
+            GotKind::TlsDesc => need(
+                &mut decision,
+                SymbolFlags::NEEDS_TLSDESC,
+                LocalNeed::TlsDesc,
+            ),
+            GotKind::TlsLd => decision.tls_ld = true,
+        }
+    }
     match class.kind {
-        Kind::GotPc | Kind::GotEntry => need(&mut decision, SymbolFlags::NEEDS_GOT, LocalNeed::Got),
-        Kind::GdToIe | Kind::DescToIe | Kind::GotTpOff => {
+        Kind::GdToIe | Kind::DescToIe => {
             need(
                 &mut decision,
                 SymbolFlags::NEEDS_GOTTPOFF,
                 LocalNeed::GotTpOff,
             );
         }
-        Kind::TlsGd => need(&mut decision, SymbolFlags::NEEDS_TLSGD, LocalNeed::TlsGd),
-        Kind::TlsDesc => need(
-            &mut decision,
-            SymbolFlags::NEEDS_TLSDESC,
-            LocalNeed::TlsDesc,
-        ),
-        Kind::TlsLd => decision.tls_ld = true,
         Kind::TpOff => {
             if mode.dynamic && (mode.shared || p.preemptible) {
                 decision.problem = Some(Problem::LocalExecTls);
             }
         }
-        Kind::Pc => {
-            let plt = matches!(rel.r_type, R_X86_64_PLT32 | R_X86_64_PLT32_BND);
+        Kind::Pc | Kind::Page => {
+            let plt = context.arch.is_branch(rel.r_type);
             if p.preemptible {
                 if plt {
                     decision.flags |= SymbolFlags::NEEDS_PLT;
@@ -252,6 +266,13 @@ pub fn decide(
             }
         }
         Kind::Abs => {
+            // An absolute value packed into an instruction is the low half
+            // of a PC-relative pair (`adrp` plus `add`/`ldr`): it never
+            // becomes a dynamic relocation, and the `adrp` half reports the
+            // problem if there is one.
+            if matches!(class.width, Width::Field(field) if !field.is_data()) {
+                return Ok(decision);
+            }
             if !mode.dynamic {
                 return Ok(decision);
             }
@@ -262,7 +283,7 @@ pub fn decide(
                         decision.dynamic = Dynamic::Relative;
                     }
                 } else if mode.shared || writable || !p.shared {
-                    decision.dynamic = Dynamic::Symbolic(R_X86_64_64);
+                    decision.dynamic = Dynamic::Symbolic(DynKind::Abs64);
                     decision.flags |= SymbolFlags::NEEDS_DYNSYM;
                 } else {
                     direct_reference(&mut decision, context, p);

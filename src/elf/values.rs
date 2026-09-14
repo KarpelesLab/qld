@@ -336,20 +336,17 @@ impl<'x, 'a> Addresses<'x, 'a> {
         }
         let index = u64::try_from(self.synth.iplt.index(owner)?).ok()?;
         let (base, ..) = self.layout.synthetic(Synthetic::Plt)?;
-        base.checked_add(index.checked_mul(super::arch::x86_64::IPLT_ENTRY_SIZE)?)
+        base.checked_add(index.checked_mul(self.synth.arch.iplt_entry_size())?)
     }
 
     /// The address code jumps to for `owner`'s PLT entry: `.plt.sec` with
     /// IBT, `.plt` without, or `.plt.got`.
     #[must_use]
     pub fn plt_address(&self, owner: Owner) -> Option<u64> {
-        use super::arch::x86_64::{PLT_ENTRY_SIZE, PLT_GOT_ENTRY_SIZE};
+        let arch = self.synth.arch;
+        let flags = self.synth.plt_flags();
         if let Some(index) = self.synth.plt_got.index(owner) {
-            let entry = if self.synth.ibt {
-                PLT_ENTRY_SIZE
-            } else {
-                PLT_GOT_ENTRY_SIZE
-            };
+            let entry = arch.plt_got_entry_size(flags);
             let (base, ..) = self.layout.synthetic(Synthetic::PltGot)?;
             return base.checked_add(u64::try_from(index).ok()?.checked_mul(entry)?);
         }
@@ -357,20 +354,22 @@ impl<'x, 'a> Addresses<'x, 'a> {
             return self.iplt_address(owner);
         }
         let index = self.synth.plt_index(owner)?;
-        if self.synth.ibt {
-            let (base, ..) = self.layout.synthetic(Synthetic::PltSec)?;
-            base.checked_add(index.checked_mul(PLT_ENTRY_SIZE)?)
-        } else {
-            self.lazy_plt_address(index)
+        if let Some((base, ..)) = self.layout.synthetic(Synthetic::PltSec) {
+            return base.checked_add(index.checked_mul(arch.plt_entry_size(flags))?);
         }
+        self.lazy_plt_address(index)
     }
 
     /// The address of lazy `.plt` entry `index` (after the header).
     #[must_use]
     pub fn lazy_plt_address(&self, index: u64) -> Option<u64> {
-        use super::arch::x86_64::PLT_ENTRY_SIZE;
+        let arch = self.synth.arch;
+        let flags = self.synth.plt_flags();
         let (base, ..) = self.layout.synthetic(Synthetic::Plt)?;
-        base.checked_add(index.checked_add(1)?.checked_mul(PLT_ENTRY_SIZE)?)
+        base.checked_add(
+            arch.plt_header_size(flags)
+                .checked_add(index.checked_mul(arch.plt_entry_size(flags))?)?,
+        )
     }
 
     /// The address of the address GOT entry for `owner`.

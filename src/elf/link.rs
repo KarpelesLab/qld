@@ -342,6 +342,7 @@ fn link_inputs<'a>(
         mode,
         relax: options.relax,
         copy_relocs: options.copy_relocs,
+        arch: super::arch::Arch::of(options, files),
     };
     let scan = scan::scan(&refs, &context);
     for file in &scan.files {

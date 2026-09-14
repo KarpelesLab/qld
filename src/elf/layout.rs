@@ -36,6 +36,7 @@ use crate::elf::read::consts::{
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 
+use super::arch::Arch;
 use super::ehframe::EhFrames;
 use super::export::Mode;
 use super::inputs::ElfInput;
@@ -189,11 +190,22 @@ pub struct Tls {
 }
 
 impl Tls {
-    /// The thread pointer's address for local-exec offsets (variant II: the
-    /// TLS block ends at the thread pointer).
+    /// The thread pointer's address for local-exec offsets.
+    ///
+    /// x86-64 uses variant II: the TLS block ends at the thread pointer.
+    /// AArch64 uses variant I: the thread pointer is below the block, with
+    /// a thread control block between them, rounded up to the block's
+    /// alignment ([`Arch::tcb_size`]).
     #[must_use]
-    pub fn tp(&self) -> u64 {
+    pub fn tp(&self, arch: Arch) -> u64 {
         let align = self.align.max(1);
+        if arch.tls_variant1() {
+            let tcb = arch
+                .tcb_size()
+                .checked_add(align.wrapping_sub(1))
+                .map_or(arch.tcb_size(), |v| v & !align.wrapping_sub(1));
+            return self.start.wrapping_sub(tcb);
+        }
         let size = self
             .memsz
             .checked_add(align.wrapping_sub(1))
@@ -710,7 +722,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         .options
         .max_page_size
         .filter(|p| p.is_power_of_two())
-        .unwrap_or(DEFAULT_PAGE);
+        .unwrap_or_else(|| input.synth.arch.default_max_page());
     let default_base = if mode.pic { 0 } else { DEFAULT_BASE };
     let base = input
         .options
