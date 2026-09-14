@@ -16,8 +16,10 @@
 //! rewrites and which is then skipped.
 //!
 //! The PLT is GNU ld's: a 32-byte header that saves `x16`/`x30` and jumps
-//! through `.got.plt[2]`, then one 16-byte entry per symbol (24 bytes with
-//! BTI, whose entries start with `bti c`).
+//! through `.got.plt[2]`, then one 16-byte entry per symbol. With BTI the
+//! header starts with `bti c`, because the entries reach it through
+//! `br x17`; the entries themselves are only reached by direct branches
+//! and keep their 16-byte form, as in GNU ld.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -596,11 +598,11 @@ pub fn write_plt_entry(
     flags: PltFlags,
 ) -> Result<(), ApplyError> {
     let mut at = 0u64;
-    if flags.landing_pad {
+    if flags.entry_landing_pad {
         put(out, at, insn::BTI_C)?;
         at = at.wrapping_add(4);
     }
-    let end = if flags.landing_pad { 24 } else { 16 };
+    let end = if flags.entry_landing_pad { 24 } else { 16 };
     write_got_jump(out, at, entry.wrapping_add(at), slot, end)
 }
 
@@ -830,7 +832,16 @@ mod tests {
         assert_eq!(words, [0x9000_0110, 0xf940_0211, 0x9100_0210, 0xd61f_0220]);
         // With BTI the entry grows to 24 bytes and starts with `bti c`.
         let mut entry = [0u8; 24];
-        write_plt_entry(&mut entry, 0x6a0, 0x20000, PltFlags { landing_pad: true }).unwrap();
+        write_plt_entry(
+            &mut entry,
+            0x6a0,
+            0x20000,
+            PltFlags {
+                landing_pad: true,
+                entry_landing_pad: true,
+            },
+        )
+        .unwrap();
         let words: Vec<u32> = entry
             .as_chunks::<4>()
             .0

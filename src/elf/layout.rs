@@ -406,6 +406,7 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 ///
 /// Returns [`Error::Limit`] when the image does not fit the address space.
 pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
+    input.synth.arch.check_options(input.options)?;
     if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
         return crate::elf::script_layout::layout(input, script, placed);
     }

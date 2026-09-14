@@ -324,8 +324,15 @@ pub struct RelaxValues {
 /// Options that change the shape of PLT entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PltFlags {
-    /// x86-64 IBT (`endbr64` and `.plt.sec`) or AArch64 BTI (`bti c`).
+    /// The PLT header starts with a landing pad: x86-64 `endbr64`, or
+    /// AArch64 `bti c` because PLT entries reach the header through
+    /// `br x17`.
     pub landing_pad: bool,
+    /// PLT entries start with one too. On x86-64 that is IBT (and the
+    /// jumps move to `.plt.sec`); on AArch64 entries are only reached by
+    /// direct branches, so GNU ld leaves them without one unless
+    /// `-z force-bti` asks.
+    pub entry_landing_pad: bool,
 }
 
 impl Arch {
@@ -408,6 +415,22 @@ impl Arch {
             Self::X86_64 => 0x1000,
             Self::AArch64 => 0x1_0000,
         }
+    }
+
+    /// Rejects options whose AArch64 effect is not implemented, rather
+    /// than silently producing a binary that does not have it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::Error::Unimplemented`] for the Cortex-A53 erratum
+    /// workarounds.
+    pub fn check_options(self, options: &LinkOptions) -> crate::error::Result<()> {
+        if self == Self::AArch64 && options.fix_cortex_a53_843419 {
+            return Err(crate::error::Error::Unimplemented(
+                "--fix-cortex-a53-843419 (roadmap M4: the erratum workaround)".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Whether calls can fall out of range, so layout has to insert
@@ -571,7 +594,7 @@ impl Arch {
     pub fn plt_entry_size(self, flags: PltFlags) -> u64 {
         match self {
             Self::X86_64 => 16,
-            Self::AArch64 if flags.landing_pad => 24,
+            Self::AArch64 if flags.entry_landing_pad => 24,
             Self::AArch64 => 16,
         }
     }
@@ -582,7 +605,7 @@ impl Arch {
         match self {
             Self::X86_64 if flags.landing_pad => 16,
             Self::X86_64 => 8,
-            Self::AArch64 if flags.landing_pad => 24,
+            Self::AArch64 if flags.entry_landing_pad => 24,
             Self::AArch64 => 16,
         }
     }
@@ -670,6 +693,7 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::X86_64 => x86_64::write_plt_jump(out, entry, slot, flags.landing_pad),
+            #[allow(clippy::match_same_arms)]
             Self::AArch64 => aarch64::write_plt_entry(out, entry, slot, flags),
         }
     }

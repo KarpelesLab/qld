@@ -150,12 +150,8 @@ pub struct Synth {
     pub dynbss: (u64, u64),
     /// Size and alignment of the copy relocation block in `.data.rel.ro`.
     pub dynrelro: (u64, u64),
-    /// IBT-enabled PLT (x86-64), or BTI-enabled PLT (AArch64).
+    /// IBT-enabled PLT (x86-64), or BTI-enabled PLT header (AArch64).
     pub ibt: bool,
-    /// AArch64 `GNU_PROPERTY_AARCH64_FEATURE_1_BTI` is set on the output.
-    pub bti: bool,
-    /// AArch64 `GNU_PROPERTY_AARCH64_FEATURE_1_PAC` is set on the output.
-    pub pac: bool,
     /// Reserved words at the start of `.got.plt`.
     pub got_plt_reserved: u64,
     /// Dynamic relocations in `.rela.dyn` that come from GOT entries and
@@ -216,11 +212,12 @@ impl Synth {
     }
 
     /// The shape of PLT entries: landing pads for x86-64 IBT or AArch64
-    /// BTI.
+    /// BTI. On AArch64 only the header needs one.
     #[must_use]
     pub fn plt_flags(&self) -> PltFlags {
         PltFlags {
             landing_pad: self.ibt,
+            entry_landing_pad: self.ibt && self.arch == Arch::X86_64,
         }
     }
 
