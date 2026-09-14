@@ -58,6 +58,8 @@ can work at the same time without colliding.
 | W17 | LTO plugin host | `src/plugin/**` | — | merged |
 | W18 | LTO in the ELF driver (M6) | `src/elf/{inputs,resolve,object,lto}*`, `tests/lto*` | W17 | merged (M6) |
 | W19 | Linker-script layout and raw outputs (M3) | `src/elf/{rules,place,layout,write,defined,script_layout,rawout}*`, `tests/script_link*` | W3, W16 | merged (M3) |
+| W20 | AArch64 ELF (M4) | `src/elf/arch/**`, `src/arch/**`, thunk/relaxation hooks in `src/elf/{layout,write,scan,synth}.rs`, `tests/aarch64*` | W16 | in progress |
+| W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -393,6 +395,30 @@ exit criteria (Linux kernel boots; bare-metal addresses match GNU ld).
 `src/elf/write.rs`, `src/elf/defined.rs`, new `src/elf/script_layout*` and
 `src/elf/rawout*` modules, `tests/script_link.rs`, new fixtures. Shares
 `src/elf/link.rs` with W18 (keep edits there small).
+
+---
+
+## W20: AArch64 ELF (M4)
+
+**Goal:** qld links AArch64 Linux ELF: relocations, range-extension thunks,
+GOT/PLT, TLS (including TLSDESC), BTI/PAC properties, and the ADRP
+relaxations. Exit criterion: the fixture suite passes for
+`aarch64-unknown-linux-gnu`, compared against that target's GNU ld, and a
+CI job on an arm64 runner runs the binaries.
+
+**Owns:** `src/elf/arch/**`, `src/arch/**`, the architecture hooks in
+`src/elf/{layout,write,scan,synth,values}.rs`, `tests/aarch64.rs`, new
+`aarch64-*` fixtures.
+
+---
+
+## W21: PE/COFF linking (M7)
+
+**Goal:** qld produces Windows PE32+ executables and DLLs from COFF objects,
+MinGW flavor: symbol resolution, layout, imports and exports, base
+relocations, SEH, and `--out-implib`. The readers are merged (W14).
+
+**Owns:** `src/coff/**` outside `read/`, `tests/coff_link.rs`, new fixtures.
 
 ---
 
