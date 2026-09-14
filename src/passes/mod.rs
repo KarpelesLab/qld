@@ -27,6 +27,7 @@ pub mod gc;
 pub mod graph;
 mod hash;
 pub mod icf;
+pub mod merge;
 
 pub use bitset::{AtomicBitSet, BitSet};
 pub use csr::{Csr, CsrBuilder, InputError};
@@ -35,4 +36,8 @@ pub use graph::{GraphBuilder, SectionGraph};
 pub use icf::{
     IcfGroup, IcfInput, IcfMode, IcfReloc, IcfReport, IcfResult, IcfSection, IcfTarget,
     fold_identical,
+};
+pub use merge::{
+    MalformedMerge, MergeError, MergeGroup, MergeKind, MergeProblem, MergeSection, MergedGroup,
+    MergedSections, OutputPiece, PieceId, PieceRef, merge_sections,
 };
