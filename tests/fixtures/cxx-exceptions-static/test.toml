@@ -1,0 +1,21 @@
+# M1: static libstdc++ and libgcc_eh. Unwinding needs .eh_frame, .gcc_except_table
+# and (with --eh-frame-hdr, which not every GCC passes for -static) PT_GNU_EH_FRAME.
+description = "static C++ with exceptions thrown across object files"
+compile = ["c++ -O2 -c main.cpp", "c++ -O2 -c thrower.cpp"]
+driver = "c++"
+link = "-static -Wl,--eh-frame-hdr -o out main.o thrower.o"
+run = "./out"
+expect.stdout = """
+unwind depth 0
+unwind depth 1
+unwind depth 2
+caught: boom at depth 0
+caught int 42
+done
+"""
+expect.readelf = [
+  "GNU_EH_FRAME",
+  ".eh_frame_hdr",
+  ".gcc_except_table",
+  "!INTERP",
+]

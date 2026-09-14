@@ -1,0 +1,14 @@
+# Static PIE: no interpreter, self-relocating through RELATIVE relocations
+# that glibc's startup code applies.
+description = "static position-independent executable"
+compile = ["cc -O2 -fPIE -c main.c"]
+driver = "cc"
+link = "-static-pie -o out main.o"
+run = "./out"
+expect.stdout = "static-pie: 3 entries, last=gamma\n"
+expect.readelf = [
+  "DYN (Position-Independent Executable file)",
+  "R_X86_64_RELATIVE",
+  "!INTERP",
+  "!(NEEDED)",
+]

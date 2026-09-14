@@ -1,0 +1,30 @@
+# M2: build a shared library, then an executable against it. Covers PLT calls
+# into the library, a GOT reference to library data, SONAME/NEEDED, $ORIGIN
+# RUNPATH, and the library calling back into the executable, which needs
+# -rdynamic (--export-dynamic) to put the callback in .dynsym.
+description = "shared library plus executable, with a callback into the executable"
+compile = ["cc -O2 -fPIC -c greet.c", "cc -O2 -fPIE -c main.c"]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libgreet.so -o libgreet.so greet.o",
+  "-o out main.o -L. -lgreet -Wl,-rpath,$ORIGIN -rdynamic",
+]
+run = "./out"
+expect.stdout = """
+hello from libgreet
+callback: called from the library (1)
+greet_calls=1
+"""
+expect.readelf = [
+  "Shared library: [libgreet.so]",
+  "$ORIGIN",
+  "exe_callback",
+  "R_X86_64_JUMP_SLOT",
+]
+expect.readelf_files."libgreet.so" = [
+  "DYN (Shared object file)",
+  "Library soname: [libgreet.so]",
+  "greet_calls",
+  "exe_callback",
+]
+determinism = true

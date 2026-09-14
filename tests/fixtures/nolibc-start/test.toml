@@ -1,0 +1,20 @@
+# M1: the smallest possible link. No libc, no compiler driver: qld is invoked
+# directly with two freestanding objects, as a raw `ld` command line.
+description = "freestanding _start with raw linker arguments"
+compile = [
+  "cc -O2 -ffreestanding -fno-pic -fno-stack-protector -fno-asynchronous-unwind-tables -c start.c",
+  "cc -O2 -ffreestanding -fno-pic -fno-stack-protector -fno-asynchronous-unwind-tables -c message.c",
+]
+link = "-static -o out start.o message.o"
+run = "./out"
+expect.stdout = "hello from _start\nsecond message\n"
+expect.exit = 7
+expect.readelf = [
+  "EXEC (Executable file)",
+  "Entry point address:",
+  "_start",
+  "!INTERP",
+  "!.dynamic",
+]
+targets = ["x86_64-linux-gnu"]
+determinism = true

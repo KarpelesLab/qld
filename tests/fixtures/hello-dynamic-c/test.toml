@@ -1,0 +1,15 @@
+# M2: dynamically linked against glibc, through the compiler driver.
+description = "dynamic hello world in C"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, dynamic world\n"
+expect.readelf = [
+  "INTERP",
+  "Shared library: [libc.so.6]",
+  "(NEEDED)",
+  "GNU_RELRO",
+  "!TEXTREL",
+]
+determinism = true
