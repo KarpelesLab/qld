@@ -28,6 +28,18 @@ cxx=${LLVM_CXX:-clang++}
 if [ "$KIND" = shared ]; then shared=ON; else shared=OFF; fi
 jobs=${JOBS:-$(nproc)}
 
+if [ -n "${RELINK:-}" ] && [ -f build.ninja ]; then
+  # Delete every linked output so that ninja relinks them (and only them)
+  # with the current qld; ninja does not track the linker binary.
+  find . -type f \( -perm -u+x -o -name '*.so' -o -name '*.so.*' \) -not -path './CMakeFiles/*' |
+    while read -r f; do
+      if head -c 4 "$f" | grep -q ELF && readelf -h "$f" 2>/dev/null | grep -Eq 'Type: +(EXEC|DYN)'; then
+        rm -f "$f"
+      fi
+    done
+  : > "$QLD_LINK_LOG"
+fi
+
 t0=$(now)
 cmake -G Ninja "$srcdir/llvm" \
   -DCMAKE_BUILD_TYPE=Release \

@@ -40,7 +40,12 @@ put_script() {
 put_script "$QLD_BIN/ld" <<EOF
 #!/bin/sh
 if [ -n "\${QLD_LINK_LOG:-}" ]; then
-  { printf 'cd %s;' "\$(pwd)"; for a in "\$@"; do printf " '%s'" "\$a"; done; printf '\n'; } >> "\$QLD_LINK_LOG"
+  # One write per line, so that parallel links do not interleave.
+  line="cd '\$(pwd)' &&"
+  for a in "\$@"; do line="\$line '\$a'"; done
+  tmp="\${QLD_LINK_LOG}.\$\$"
+  printf '%s\n' "\$line" > "\$tmp" && cat "\$tmp" >> "\$QLD_LINK_LOG"
+  rm -f "\$tmp"
 fi
 case " \$* " in *" --help "*) help=1 ;; *) help= ;; esac
 if [ -n "\$help" ] && [ -z "\${QLD_NO_HELP_WORKAROUND:-}" ]; then
