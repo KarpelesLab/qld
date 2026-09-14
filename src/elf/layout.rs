@@ -1013,16 +1013,18 @@ fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result<(u64, u64)
                 .and_then(|f| f.object.as_ref())
                 .and_then(|o| o.section(index))
                 .ok_or_else(|| Error::Internal("unknown input section".into()))?;
-            let size = if section.kind == SectionKind::EhFrame {
-                input
+            if section.kind == SectionKind::EhFrame {
+                // Records are concatenated with no padding: unwinders that
+                // walk `.eh_frame` from `__EH_FRAME_BEGIN__` (static binaries
+                // without `.eh_frame_hdr`) stop at the first zero word.
+                let size = input
                     .eh_frames
                     .find(id)
                     .and_then(|i| input.eh_frames.sections.get(i))
-                    .map_or(0, |s| s.size)
-            } else {
-                section.header.sh_size
-            };
-            (size, section.header.sh_addralign)
+                    .map_or(0, |s| s.size);
+                return Ok((size, 1));
+            }
+            (section.header.sh_size, section.header.sh_addralign)
         }
         Member::Merge(group) => {
             let merged = input

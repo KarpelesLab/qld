@@ -1,0 +1,14 @@
+# Debug information in a static link: .debug_* sections are copied and
+# relocated, .debug_str goes through string merging, and references to
+# sections removed by --gc-sections get tombstone values. Compiled with
+# -gz=none, since compressed debug sections are handled by the DWARF
+# workstream.
+description = "static link with uncompressed DWARF and --gc-sections"
+compile = ["cc -O1 -g -gz=none -ffunction-sections -c main.c"]
+driver = "cc"
+link = "-static -Wl,--gc-sections -o out main.o"
+run = "./out"
+expect.stdout = "debug: 42\n"
+expect.readelf_args = "-S --debug-dump=info"
+expect.readelf = [".debug_info", ".debug_line", ".debug_str", "used_debug_function_qld"]
+determinism = true

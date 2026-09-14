@@ -1,0 +1,16 @@
+# -s drops .symtab and .strtab; --build-id=sha1 writes a 20-byte
+# NT_GNU_BUILD_ID note in its own PT_NOTE, hashed over the finished image.
+description = "static link with -s and --build-id=sha1"
+compile = ["cc -O2 -c main.c"]
+driver = "cc"
+link = "-static -s -Wl,--build-id=sha1 -o out main.o"
+run = "./out"
+expect.stdout = "stripped: 7\n"
+expect.readelf_args = "-S -n"
+expect.readelf = [
+  "Build ID: ",
+  ".note.gnu.build-id",
+  "!.symtab",
+  "!strip_marker_function_qld",
+]
+determinism = true

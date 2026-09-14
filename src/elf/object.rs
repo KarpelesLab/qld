@@ -231,6 +231,17 @@ impl<'a> ObjectInput<'a> {
                 _ if config.strip_debug && flags & SHF_ALLOC == 0 && is_debug_name(name) => {
                     SectionKind::Ignored
                 }
+                _ if header.is_compressed() => {
+                    return Err(Error::Unimplemented(format!(
+                        "compressed section {} in {} (workstream W10: DWARF, \
+                         roadmap M5; link with -S to drop debug sections)",
+                        String::from_utf8_lossy(name),
+                        match source.member {
+                            Some(member) => format!("{}({member})", source.path.display()),
+                            None => source.path.display().to_string(),
+                        }
+                    )));
+                }
                 _ if elf.is_eh_frame(&header)? && flags & SHF_ALLOC != 0 => SectionKind::EhFrame,
                 _ if flags & SHF_MERGE != 0
                     && header.sh_entsize != 0
