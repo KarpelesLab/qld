@@ -20,8 +20,26 @@ use qld::coff::PeOptions;
 use qld::diag::Collect;
 use qld::target::{Architecture, BinaryFormat, Endianness, OperatingSystem, PointerWidth, Target};
 
-/// The MinGW tool prefix the tests use.
-const PREFIX: &str = "x86_64-w64-mingw32-";
+/// The MinGW tool prefix the tests use. Cross toolchains prefix their tools
+/// with the target triple; a native MinGW environment (MSYS2's MINGW64, which
+/// the Windows CI job uses) has them unprefixed, because the target is the
+/// host. `QLD_MINGW_PREFIX` overrides both.
+fn prefix() -> &'static str {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        if let Some(prefix) = std::env::var_os("QLD_MINGW_PREFIX") {
+            return prefix.to_string_lossy().into_owned();
+        }
+        for candidate in ["x86_64-w64-mingw32-", ""] {
+            if tool(&format!("{candidate}gcc")).is_some()
+                || tool(&format!("{candidate}gcc.exe")).is_some()
+            {
+                return candidate.to_owned();
+            }
+        }
+        "x86_64-w64-mingw32-".to_owned()
+    })
+}
 
 /// Reports a skipped check, or fails when `QLD_REQUIRE_COFF_TOOLS` is set.
 fn skip(reason: &str) {
@@ -79,7 +97,7 @@ fn run(program: &str, args: &[&str], dir: &Path) -> Option<std::process::Output>
 fn link_argv(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
     let mut full = vec!["-###"];
     full.extend_from_slice(args);
-    let output = run(&format!("{PREFIX}gcc"), &full, dir)?;
+    let output = run(&format!("{}gcc", prefix()), &full, dir)?;
     let text = String::from_utf8_lossy(&output.stderr).into_owned();
     let line = text
         .lines()
@@ -201,7 +219,7 @@ fn compile(dir: &Path, name: &str, source: &str, flags: &[&str]) -> Option<Strin
     let object = format!("{name}.o");
     let mut args = vec!["-c", "-fno-lto", file.as_str(), "-o", object.as_str()];
     args.extend_from_slice(flags);
-    run(&format!("{PREFIX}gcc"), &args, dir)?;
+    run(&format!("{}gcc", prefix()), &args, dir)?;
     // An absolute path, so the linker can be run from any directory.
     Some(dir.join(&object).to_str()?.to_string())
 }
@@ -222,7 +240,7 @@ int main(void) {
 /// RUN ON WINDOWS: the image should print `hello from qld` and exit 0.
 #[test]
 fn console_hello_world() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -235,7 +253,7 @@ fn console_hello_world() {
     };
     // GNU ld's own image, as the reference.
     let gnu = run(
-        &format!("{PREFIX}gcc"),
+        &format!("{}gcc", prefix()),
         &[object.as_str(), "-o", "gnu.exe", "-fno-lto"],
         &dir,
     );
@@ -297,7 +315,7 @@ fn console_hello_world() {
 /// The output section set and their characteristics match GNU `ld`'s.
 #[test]
 fn sections_match_gnu_ld() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -309,7 +327,7 @@ fn sections_match_gnu_ld() {
         return;
     };
     if run(
-        &format!("{PREFIX}gcc"),
+        &format!("{}gcc", prefix()),
         &[object.as_str(), "-o", "gnu.exe", "-fno-lto"],
         &dir,
     )
@@ -353,7 +371,7 @@ fn image_base_and_alignment_options_are_validated() {
 
 #[test]
 fn missing_symbols_are_reported() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -408,7 +426,7 @@ int main(void) {
 /// `42`, and exit 0.
 #[test]
 fn dll_with_import_library() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -496,7 +514,7 @@ fn dll_with_import_library() {
         "gnu-client.exe",
         "-fno-lto",
     ];
-    if run(&format!("{PREFIX}gcc"), &gnu_args, &dir).is_some() {
+    if run(&format!("{}gcc", prefix()), &gnu_args, &dir).is_some() {
         let Some(theirs) = readobj(&dir, "gnu-client.exe", &["--coff-imports"]) else {
             return;
         };
@@ -552,14 +570,14 @@ int main() {
 /// `unwound main`, then `caught boom`, and exit 0.
 #[test]
 fn cxx_exceptions_and_seh_unwind_data() {
-    if tool(&format!("{PREFIX}g++")).is_none() {
+    if tool(&format!("{}g++", prefix())).is_none() {
         skip("x86_64-w64-mingw32-g++ not found");
         return;
     }
     let dir = scratch("cxx-exceptions");
     std::fs::write(dir.join("throw.cpp"), CXX).unwrap();
     if run(
-        &format!("{PREFIX}g++"),
+        &format!("{}g++", prefix()),
         &["-c", "-fno-lto", "throw.cpp", "-o", "throw.o"],
         &dir,
     )
@@ -637,7 +655,7 @@ fn pdata_is_sorted(dir: &Path, file: &str) -> bool {
 fn gxx_link_argv(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
     let mut full = vec!["-###"];
     full.extend_from_slice(args);
-    let output = run(&format!("{PREFIX}g++"), &full, dir)?;
+    let output = run(&format!("{}g++", prefix()), &full, dir)?;
     let text = String::from_utf8_lossy(&output.stderr).into_owned();
     let line = text
         .lines()
@@ -670,7 +688,7 @@ int main(void) {
 /// RUN ON WINDOWS: the image should print `8` and exit 0.
 #[test]
 fn thread_local_storage() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -709,14 +727,14 @@ END
 /// RUN ON WINDOWS: `LoadString` should find string 1.
 #[test]
 fn windres_resources() {
-    if tool(&format!("{PREFIX}windres")).is_none() {
+    if tool(&format!("{}windres", prefix())).is_none() {
         skip("x86_64-w64-mingw32-windres not found");
         return;
     }
     let dir = scratch("windres-resources");
     std::fs::write(dir.join("app.rc"), RESOURCE).unwrap();
     if run(
-        &format!("{PREFIX}windres"),
+        &format!("{}windres", prefix()),
         &["app.rc", "-O", "coff", "-o", "app-rc.o"],
         &dir,
     )
@@ -764,7 +782,7 @@ int hidden(void) { return 4; }
 /// Exports named by a `.def` file, with an explicit ordinal.
 #[test]
 fn def_file_exports() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -854,7 +872,7 @@ fn unimplemented_options_are_refused() {
 /// `dlltool` library holds.
 #[test]
 fn short_import_library_and_direct_dll() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -955,7 +973,7 @@ fn short_import_library_and_direct_dll() {
 /// `ld`'s image sit at the same addresses.
 #[test]
 fn symbol_table_matches_gnu_ld() {
-    if tool(&format!("{PREFIX}gcc")).is_none() || tool(&format!("{PREFIX}nm")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() || tool(&format!("{}nm", prefix())).is_none() {
         skip("the MinGW toolchain is not available");
         return;
     }
@@ -967,7 +985,7 @@ fn symbol_table_matches_gnu_ld() {
         return;
     };
     if run(
-        &format!("{PREFIX}gcc"),
+        &format!("{}gcc", prefix()),
         &[object.as_str(), "-o", "gnu.exe", "-fno-lto"],
         &dir,
     )
@@ -981,7 +999,7 @@ fn symbol_table_matches_gnu_ld() {
         panic!("qld failed to link:\n{error}");
     }
     let symbols = |file: &str| -> Vec<(String, String)> {
-        let Some(output) = run(&format!("{PREFIX}nm"), &[file], &dir) else {
+        let Some(output) = run(&format!("{}nm", prefix()), &[file], &dir) else {
             return Vec::new();
         };
         String::from_utf8_lossy(&output.stdout)
@@ -1046,7 +1064,7 @@ int main(void) {
 /// `41`, and exit 0.
 #[test]
 fn auto_import_and_runtime_pseudo_relocs() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -1092,7 +1110,7 @@ fn auto_import_and_runtime_pseudo_relocs() {
     }
     // The pseudo-relocation list must be non-empty and bracketed by the
     // symbols the MinGW runtime walks.
-    let Some(symbols) = run(&format!("{PREFIX}nm"), &["auto.exe"], &dir) else {
+    let Some(symbols) = run(&format!("{}nm", prefix()), &["auto.exe"], &dir) else {
         return;
     };
     let text = String::from_utf8_lossy(&symbols.stdout).into_owned();
@@ -1129,7 +1147,7 @@ fn auto_import_and_runtime_pseudo_relocs() {
 /// needs: PE carries no separate debug directory here.
 #[test]
 fn dwarf_sections_survive() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
@@ -1158,7 +1176,7 @@ fn dwarf_sections_survive() {
 /// The image is byte-identical across repeated links and thread counts.
 #[test]
 fn output_is_deterministic() {
-    if tool(&format!("{PREFIX}gcc")).is_none() {
+    if tool(&format!("{}gcc", prefix())).is_none() {
         skip("x86_64-w64-mingw32-gcc not found");
         return;
     }
