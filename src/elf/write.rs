@@ -27,7 +27,9 @@ use crate::ids::SectionId;
 use crate::output::{ChunkRange, OutputFile};
 use crate::symbols::SymbolFlags;
 
-use super::arch::{self, ApplyError, Arch, DynKind, GotKind, Kind, RelaxValues, width_bytes};
+use super::arch::{
+    self, ApplyError, Arch, DynKind, GotKind, Kind, RelaxValues, Width, width_bytes,
+};
 use super::defined::LinkerSymbols;
 use super::dynsym::{self, DynamicPlan};
 use super::ehframe::EhSection;
@@ -41,6 +43,7 @@ use super::scan::{ScanResult, location};
 use super::symtab::{SymtabPlan, write_strtab, write_symtab};
 use super::synth::{Owner, SlotReloc, got_slot_relocs, write_build_id_header};
 use super::values::Addresses;
+use crate::arch::aarch64::Field as A64Field;
 
 /// What one output chunk holds.
 #[derive(Clone, Copy, Debug)]
@@ -1429,7 +1432,25 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 Dynamic::Symbolic(_) => Ok(()),
                 _ => put(out, sa),
             },
-            Kind::Pc => put(out, sa.wrapping_sub(place)),
+            Kind::Pc => {
+                // A branch that cannot reach its target goes through the
+                // range-extension thunk layout placed for this output
+                // section (`elf::arch::thunk`).
+                let mut sa = sa;
+                if class.width == Width::Field(A64Field::Branch26)
+                    && !crate::arch::aarch64::branch_in_range(place, sa)
+                    && let Some(output) = addresses
+                        .layout
+                        .section_shndx
+                        .get(id.index())
+                        .copied()
+                        .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
+                    && let Some(thunk) = addresses.layout.thunk_for(output, sa)
+                {
+                    sa = thunk;
+                }
+                put(out, sa.wrapping_sub(place))
+            }
             Kind::Page => put(out, page(sa).wrapping_sub(page(place))),
             Kind::Got => {
                 slot_address().and_then(|g| put(out, g.wrapping_add_signed(a).wrapping_sub(place)))

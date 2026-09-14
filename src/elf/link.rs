@@ -485,6 +485,7 @@ fn link_inputs<'a>(
         .any(|o| o.exec_stack);
     let mut layout = layout::layout(&LayoutInput {
         options,
+        refs,
         rules: &rule_set,
         files,
         sections: &sections,
@@ -527,6 +528,7 @@ fn link_inputs<'a>(
             synth.relr_size = size;
             layout = layout::layout(&LayoutInput {
                 options,
+                refs,
                 rules: &rule_set,
                 files,
                 sections: &sections,
@@ -606,6 +608,7 @@ fn link_inputs<'a>(
         if !sizes.is_empty() {
             layout = layout::layout(&LayoutInput {
                 options,
+                refs,
                 rules: &rule_set,
                 files,
                 sections: &sections,

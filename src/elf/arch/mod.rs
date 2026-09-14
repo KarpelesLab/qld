@@ -410,6 +410,13 @@ impl Arch {
         }
     }
 
+    /// Whether calls can fall out of range, so layout has to insert
+    /// range-extension thunks.
+    #[must_use]
+    pub fn needs_thunks(self) -> bool {
+        self == Self::AArch64
+    }
+
     /// Whether `-z separate-code` is the default, as it is for GNU ld's
     /// x86 targets but not for AArch64.
     #[must_use]
