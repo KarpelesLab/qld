@@ -51,7 +51,7 @@ flowchart TD
     LTO -- yes --> P[LTO plugin<br/>compile & re-add objects] --> F
     LTO -- no --> G[Relocation scan<br/>GC graph, GOT/PLT/TLS needs]
     G --> H[Garbage collection<br/>parallel mark]
-    H --> I[ICF / merge sections<br/>parallel]
+    H --> I[Merge sections, then ICF<br/>parallel]
     I --> J[Synthesize sections<br/>GOT, PLT, dynamic, eh_frame_hdr, ...]
     J --> K[Layout<br/>output sections, segments, addresses, thunks, relaxation]
     K --> L[Write output<br/>parallel copy + relocate in place]
@@ -91,6 +91,11 @@ section headers, a local symbol table that maps each entry to a global
 until they are needed. Symbol names are hashed during this parallel pass, so
 the resolution phase never hashes a string twice.
 
+Mergeable sections (`SHF_MERGE`) are split into pieces here too, with each
+piece's hash computed on the same pass. The relocation scan (stage 6) needs
+pieces to exist so it can express a reference into a merge section as
+(piece, addend within piece); deduplication waits until after GC.
+
 Archives start as a symbol index (the armap, or a scan of members when there
 is none). A member is parsed only when resolution extracts it. `--whole-archive`
 members are parsed eagerly.
@@ -101,13 +106,21 @@ The global symbol table is a sharded concurrent hash map, keyed by interned
 name plus version where the format has versions, with the precomputed hash
 selecting the shard. Each symbol records its current best definition. Each
 format backend supplies a precedence function for "which definition wins"
-(ELF: strong > weak > common > lazy > shared, with COMDAT groups deduplicated
-by first occurrence in input order).
+(ELF: strong > common > weak > shared > lazy, where the larger of two common
+symbols wins; COMDAT groups are deduplicated by first occurrence in input
+order before their definitions are inserted).
+
+Symbol IDs never depend on thread scheduling. Names are interned in batches:
+new names are collected in parallel, then numbered in order of first
+occurrence (input position, then symbol index), so a parallel run assigns the
+same IDs as a single-threaded one.
 
 Archive extraction proceeds in rounds until nothing changes:
 
 1. Insert the definitions of all live objects, in parallel.
-2. Collect the undefined symbols that some archive's lazy index can satisfy.
+2. Collect the symbols that became referenced in this round (or whose best
+   definition only just became lazy) and that some archive's lazy index can
+   satisfy. Symbols handled in earlier rounds are not examined again.
 3. Extract the chosen members. When several archives can satisfy a symbol,
    the one earliest on the command line wins. Parse the members in parallel
    and go back to step 1.
@@ -138,19 +151,24 @@ three things:
 `--gc-sections` runs a parallel graph mark. It starts from the roots: the entry
 point, `-u`/`--undefined`, exported and dynamic symbols, `KEEP` sections,
 init/fini arrays, `SHF_GNU_RETAIN`, and non-allocated sections. Work spreads
-over rayon scopes, and each section's mark bit is an atomic compare-and-swap.
+over rayon scopes, and each section's mark bit is claimed atomically (a cheap
+read first, then an atomic OR).
 Unmarked sections are removed, along with their FDEs in `.eh_frame`. Symbols
 that are then no longer referenced are dropped from GOT/PLT and from the
 dynamic symbol table. See [optimizations.md](optimizations.md#garbage-collection-tree-shaking).
 
-### 8. Folding and merging
+### 8. Merging, then folding
 
-- **ICF** hashes section contents together with their relocation targets and
-  refines equivalence classes over a few parallel rounds. `safe` mode uses the
-  address-significance tables.
-- **Mergeable sections** (`SHF_MERGE`, including `SHF_STRINGS`) are split into
-  pieces in parallel, inserted into a concurrent deduplicating map, and then
-  assigned output offsets in a deterministic order.
+Order matters: merging runs first, because ICF must compare references into
+merge sections by the piece they land on, not by input section and offset.
+
+1. **Mergeable sections**: the live pieces split in stage 4 are inserted into
+   a sharded deduplicating map and assigned output offsets in first-occurrence
+   order.
+2. **ICF** hashes section contents together with their relocation targets
+   (references into merge sections resolved to merged pieces) and refines
+   equivalence classes over parallel rounds until nothing splits. `safe` mode
+   uses the address-significance tables.
 
 ### 9. Synthetic sections
 
@@ -177,10 +195,16 @@ knows its size, or at least an upper bound.
 
 The final file size is known before any byte is written. The writer then:
 
-1. Creates the output as a new file (unlinking any existing one first, which
-   avoids `ETXTBSY` and avoids flushing the old file's pages). It sets the
-   file length and maps the file writable. When mapping is impossible, for
-   example on a pipe, it writes to an anonymous buffer instead.
+1. Creates the output as a temporary file next to the final path, sets its
+   length and maps it writable. When mapping is impossible it writes to a
+   heap buffer instead. Pipes and devices (including anything under `/dev`
+   and `/proc`) are written into directly, never replaced.
+   On commit, the old output is unlinked and the temporary file renamed into
+   place. This avoids `ETXTBSY` when the old output is running, leaves the old
+   output intact if the link fails, and avoids the data flush that btrfs and
+   ext4 trigger when a rename replaces an existing file (measured: 45 ms
+   versus 270–550 ms for a 1 GiB output). Unlink-first and plain atomic
+   rename are available as alternative strategies.
 2. Splits the mapping into disjoint `&mut [u8]` slices, one per output chunk.
    This uses `split_at_mut` and is the one place that needs careful slicing,
    but no `unsafe` aliasing.
@@ -260,8 +284,11 @@ Who works where, and which files each task owns, is in
 | Output writing | disjoint mutable slices from one writable mapping |
 
 Library users can run qld inside their own rayon pool
-(`ThreadPool::install`). qld never creates a global pool implicitly when it is
-used as a library.
+(`ThreadPool::install`). Parallel stages run on whatever pool is current, so a
+call made outside `install` uses (and lazily creates) rayon's global pool. The
+`link()` entry point will install a pool sized by `--threads` for its
+duration, so the CLI and library callers who don't bring a pool get the
+configured thread count.
 
 ## Error handling and diagnostics
 

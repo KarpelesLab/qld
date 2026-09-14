@@ -8,7 +8,7 @@
 macro_rules! define_id {
     ($(#[$attr:meta])* $name:ident) => {
         $(#[$attr])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u32);
 
         impl $name {
@@ -27,21 +27,21 @@ macro_rules! define_id {
             /// Returns the zero-based index this ID stands for.
             #[inline]
             #[must_use]
-            pub fn index(self) -> usize {
+            pub const fn index(self) -> usize {
                 self.0 as usize
             }
 
             /// Returns the raw 32-bit value.
             #[inline]
             #[must_use]
-            pub fn as_u32(self) -> u32 {
+            pub const fn as_u32(self) -> u32 {
                 self.0
             }
 
             /// Creates an ID from a raw 32-bit value.
             #[inline]
             #[must_use]
-            pub fn from_u32(raw: u32) -> Self {
+            pub const fn from_u32(raw: u32) -> Self {
                 Self(raw)
             }
         }

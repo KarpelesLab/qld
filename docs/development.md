@@ -70,8 +70,10 @@ See [architecture.md](architecture.md#module-layout) for the layout and
   Modules that parse untrusted bytes (`input`, `elf/read`, `script`, and
   the future COFF and Mach-O readers) put
   `#![deny(clippy::arithmetic_side_effects)]` at the top of their module, so
-  every unchecked `+` is a compile error there. Randomized truncation and
-  corruption tests check that nothing panics.
+  every unchecked `+` is a compile error there. Other modules may opt in
+  too (the output writer does, for layout offsets); intentionally wrapping
+  math such as hash functions uses `wrapping_*` explicitly. Randomized
+  truncation and corruption tests check that nothing panics.
 - **Determinism.** No `HashMap` iteration order in outputs, no
   dependence on the order parallel tasks finish, and no timestamps unless an
   option asks for them. If you collect results in parallel, sort them by input

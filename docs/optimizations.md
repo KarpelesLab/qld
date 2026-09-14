@@ -56,8 +56,10 @@ by walking the pieces in input order.
 
 - `-O2` enables **tail merging** of strings (`"bar"` shares the storage of
   `"foobar"`). It costs a suffix sort per output section, so it is off at `-O1`.
-- Relocations that point into merge sections are rewritten to (piece,
-  addend-within-piece) during the relocation scan.
+- Splitting happens while objects are parsed, so relocations that point into
+  merge sections can be expressed as (piece, addend-within-piece) during the
+  relocation scan. Deduplication and offset assignment run after GC, and
+  before ICF.
 
 ## Relocation relaxation
 

@@ -1,0 +1,20 @@
+# Symbol visibility in a shared library: hidden symbols stay out of .dynsym
+# and bind locally; protected symbols are exported but bind locally inside the
+# library; default symbols are exported and preemptible.
+description = "hidden, protected and default visibility in a shared library"
+compile = ["cc -O2 -fPIC -c lib.c", "cc -O2 -c main.c"]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libvis.so -o libvis.so lib.o",
+  "-o out main.o -L. -lvis -Wl,-rpath,$ORIGIN",
+]
+run = "./out"
+expect.stdout = "exported=10 via_hidden=21 protected=30\n"
+expect.readelf_args = "--dyn-syms -d"
+expect.readelf = ["exported_qld", "protected_qld", "!helper_hidden_qld"]
+expect.readelf_files."libvis.so" = [
+  "exported_qld",
+  "PROTECTED",
+  "!helper_hidden_qld",
+  "Library soname: [libvis.so]",
+]

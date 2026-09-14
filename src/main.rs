@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use qld::args::ParseOutcome;
-use qld::diag::{DiagnosticSink, Stderr};
+use qld::diag::{Diagnostic, DiagnosticSink, Stderr};
 
 fn main() -> ExitCode {
     let diagnostics = Stderr::new(qld::PROGRAM_NAME);
@@ -32,6 +32,18 @@ fn run(args: &[std::ffi::OsString], diagnostics: &dyn DiagnosticSink) -> qld::Re
             println!("{}", qld::version_line());
             Ok(())
         }
-        ParseOutcome::Link(options) => qld::link(&options, diagnostics),
+        ParseOutcome::Link(options) => {
+            if !options.no_warnings {
+                for warning in &options.warnings {
+                    diagnostics.emit(Diagnostic::warning(warning.clone()));
+                }
+            }
+            if options.fatal_warnings && !options.warnings.is_empty() {
+                return Err(qld::Error::Reported {
+                    errors: options.warnings.len(),
+                });
+            }
+            qld::link(&options, diagnostics)
+        }
     }
 }

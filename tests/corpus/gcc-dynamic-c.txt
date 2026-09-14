@@ -1,0 +1,52 @@
+# Linker argv captured from: gcc -O2 -no-pie -o gcc-dynamic-c hello.c
+# Tools: gcc (Gentoo 15.3.0 p8) 15.3.0, GNU ld (Gentoo 2.46.1 p1) 2.46.1
+# Host: x86_64-pc-linux-gnu (Gentoo). One argument per line; argv[0] is not included.
+# Machine-specific paths are normalized: build dir -> /build, $HOME -> /home/user,
+# temporary file names -> XXXXXX.
+#! output = gcc-dynamic-c
+#! kind = Executable
+#! gc_sections = false
+-plugin
+/usr/libexec/gcc/x86_64-pc-linux-gnu/15/liblto_plugin.so
+-plugin-opt=/usr/libexec/gcc/x86_64-pc-linux-gnu/15/lto-wrapper
+-plugin-opt=-fresolution=/tmp/ccXXXXXX.res
+-plugin-opt=-pass-through=-lgcc
+-plugin-opt=-pass-through=-lgcc_s
+-plugin-opt=-pass-through=-lc
+-plugin-opt=-pass-through=-lgcc
+-plugin-opt=-pass-through=-lgcc_s
+--build-id
+--eh-frame-hdr
+-m
+elf_x86_64
+-dynamic-linker
+/lib64/ld-linux-x86-64.so.2
+-z
+now
+-o
+gcc-dynamic-c
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crt1.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crti.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/crtbegin.o
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64
+-L/lib/../lib64
+-L/usr/lib/../lib64
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../x86_64-pc-linux-gnu/lib
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../..
+-L/lib
+-L/usr/lib
+/tmp/ccXXXXXX.o
+-lgcc
+--push-state
+--as-needed
+-lgcc_s
+--pop-state
+-lc
+-lgcc
+--push-state
+--as-needed
+-lgcc_s
+--pop-state
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/crtend.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crtn.o

@@ -1,0 +1,15 @@
+# M1: the first program qld must link. Static glibc, no dynamic sections.
+description = "static hello world in C"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "EXEC (Executable file)",
+  "GNU_STACK",
+  "!INTERP",
+  "!.dynamic",
+  "!R_X86_64_JUMP_SLOT",
+]
+determinism = true

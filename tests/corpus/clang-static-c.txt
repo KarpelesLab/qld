@@ -1,0 +1,36 @@
+# Linker argv captured from: clang -O2 -static -o clang-static-c hello.c
+# Tools: clang version 22.1.8, GNU ld (Gentoo 2.46.1 p1) 2.46.1
+# Host: x86_64-pc-linux-gnu (Gentoo). One argument per line; argv[0] is not included.
+# Machine-specific paths are normalized: build dir -> /build, $HOME -> /home/user,
+# temporary file names -> XXXXXX.
+#! output = clang-static-c
+#! kind = StaticExecutable
+--hash-style=gnu
+--eh-frame-hdr
+-m
+elf_x86_64
+-static
+-o
+clang-static-c
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crt1.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crti.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/crtbeginT.o
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64
+-L/lib/../lib64
+-L/usr/lib64
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../x86_64-pc-linux-gnu/lib
+-L/lib
+-L/usr/lib
+-z
+relro
+-z
+now
+/tmp/hello-XXXXXX.o
+--start-group
+-lgcc
+-lgcc_eh
+-lc
+--end-group
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/crtend.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crtn.o

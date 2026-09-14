@@ -1,0 +1,19 @@
+# M1: local-exec TLS in a static executable, with initialized (.tdata) and
+# zero-initialized (.tbss) variables, read from two threads.
+description = "static TLS, local-exec model"
+compile = ["cc -O2 -fno-pic -ftls-model=local-exec -pthread -c main.c"]
+driver = "cc"
+link = "-static -pthread -o out main.o"
+run = "./out"
+expect.stdout = """
+thread: tdata=43 tbss=2 tarr=tls-thread
+main: tdata=42 tbss=0 tarr=tls
+"""
+expect.readelf = [
+  "TLS ",
+  ".tdata",
+  ".tbss",
+  "!R_X86_64_TPOFF64",
+  "!R_X86_64_DTPMOD64",
+  "!INTERP",
+]
