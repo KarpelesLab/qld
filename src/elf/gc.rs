@@ -45,7 +45,7 @@ pub fn collect(
     eh_frames: &EhFrames<'_>,
     linker: &LinkerSymbols,
     internal: &InternalNames,
-) -> Result<Vec<SectionId>> {
+) -> Result<(Vec<SectionId>, SectionGraph)> {
     let total = refs.sections.len();
 
     // Extra edges: eh_frame, link order, groups.
@@ -189,7 +189,75 @@ pub fn collect(
             (was_live && !live.is_live(id)).then_some(id)
         })
         .collect();
-    Ok(removed)
+    Ok((removed, graph))
+}
+
+/// Reports `--why-live`: for every defined global symbol matching one of
+/// `patterns` (with `*` and `?` wildcards), the reference chain from a GC
+/// root to its section, or that it was removed.
+pub fn report_why_live(
+    refs: &Refs<'_, '_>,
+    graph: &SectionGraph,
+    patterns: &[String],
+    diagnostics: &dyn DiagnosticSink,
+) {
+    let patterns: Vec<crate::script::Pattern> = patterns
+        .iter()
+        .map(|p| crate::script::Pattern::section(p.as_bytes()))
+        .collect();
+    let mut matches: Vec<(crate::ids::SymbolId, SectionId)> = refs
+        .symbols
+        .ids()
+        .filter_map(|id| {
+            let name = refs.symbols.name(id);
+            if !patterns.iter().any(|p| p.matches(name.bytes())) {
+                return None;
+            }
+            let target = refs.global_target(id, true);
+            Some((id, refs.target_section(&target)?))
+        })
+        .collect();
+    matches.sort_unstable();
+    for (id, section) in matches {
+        let name = refs.symbols.name(id);
+        let message = match crate::passes::why_live(graph, section) {
+            Some(chain) => {
+                let mut diagnostic = Diagnostic::new(
+                    crate::diag::Severity::Note,
+                    format!("live symbol: {}", name.display()),
+                );
+                for &link in chain.iter().rev().skip(1) {
+                    diagnostic = diagnostic.note(format!("kept alive by {}", describe(refs, link)));
+                }
+                if chain.len() == 1 {
+                    diagnostic = diagnostic.note("is a GC root".to_string());
+                }
+                diagnostic
+            }
+            None => Diagnostic::new(
+                crate::diag::Severity::Note,
+                format!("symbol {} is removed by --gc-sections", name.display()),
+            ),
+        };
+        diagnostics.emit(message.order(u64::from(id.as_u32())));
+    }
+}
+
+fn describe(refs: &Refs<'_, '_>, id: SectionId) -> String {
+    let Some((file, index)) = refs.sections.locate(id) else {
+        return String::new();
+    };
+    let Some(input) = refs.files.get(file) else {
+        return String::new();
+    };
+    let name = input
+        .object
+        .as_ref()
+        .and_then(|o| o.section(index))
+        .map_or_else(String::new, |s| {
+            String::from_utf8_lossy(s.name).into_owned()
+        });
+    format!("{}:({name})", input.display())
 }
 
 fn relocation_count(refs: &Refs<'_, '_>, section: SectionId) -> usize {
@@ -208,9 +276,15 @@ fn relocation_count(refs: &Refs<'_, '_>, section: SectionId) -> usize {
     {
         return 0;
     }
-    object
+    // Through the reader, which checks the table lies inside the file: the
+    // count sizes an allocation.
+    match object
         .section(input.relocs)
-        .map_or(0, |r| usize::try_from(r.header.sh_size / 24).unwrap_or(0))
+        .map(|r| object.elf.relocation_section(input.relocs, &r.header))
+    {
+        Some(Ok(Some(relocations))) => relocations.relocations.len(),
+        _ => 0,
+    }
 }
 
 /// Prints `--print-gc-sections` lines for removed allocated sections.

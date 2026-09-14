@@ -117,7 +117,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                 }
                 let live = match symbols.section(index, &raw) {
                     Ok(SectionIndex::Section(section)) => {
-                        refs.sections.is_live_in(file_index, section)
+                        refs.sections.is_present_in(file_index, section)
                     }
                     Ok(SectionIndex::Absolute) => true,
                     _ => false,
@@ -143,7 +143,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                     let target = refs.global_target(id, true);
                     match target.def {
                         Def::Section { file, section, .. } => {
-                            refs.sections.is_live_in(file, section)
+                            refs.sections.is_present_in(file, section)
                         }
                         _ => true,
                     }
@@ -230,7 +230,12 @@ fn put_sym(out: &mut [u8], name: usize, info: u8, other: u8, shndx: u16, value: 
 }
 
 fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32) -> u16 {
-    let Some(id) = addresses.refs.sections.id(file, section) else {
+    let Some(id) = addresses
+        .refs
+        .sections
+        .id(file, section)
+        .and_then(|id| addresses.refs.sections.resolve(id))
+    else {
         return SHN_UNDEF;
     };
     let index = addresses

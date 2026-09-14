@@ -21,14 +21,17 @@ use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
+use crate::passes::IcfMode;
 use crate::symbols::{SymbolName, SymbolTable, resolve_symbols};
 
 use super::common;
 use super::defined;
 use super::ehframe;
 use super::gc;
+use super::icf;
 use super::inputs::{self, InternalNames, parse_number};
 use super::layout::{self, LayoutInput, TrailerSizes};
+use super::map;
 use super::merge;
 use super::object::{ParseConfig, WrapTable};
 use super::place;
@@ -129,9 +132,12 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
             resolution: &resolution,
             sections: &sections,
         };
-        let removed = gc::collect(&refs, &placement, &eh_frames, &linker, &internal)?;
+        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, &internal)?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
+        }
+        if !options.why_live.is_empty() {
+            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
         }
         for id in &removed {
             if let Some(slot) = sections.live.get_mut(id.index()) {
@@ -171,8 +177,31 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
 
     let commons = common::allocate(&refs);
     let merged = merge::merge(files, &sections, &placement, options.optimize >= 2)?;
-    eh_frames.finalize(&refs);
     lap("merge");
+    let icf_mode = match options.icf.as_deref() {
+        Some("all") => Some(IcfMode::All),
+        Some("safe") => Some(IcfMode::Safe),
+        _ => None,
+    };
+    if let Some(mode) = icf_mode {
+        let fold_into = icf::fold(
+            &refs,
+            &placement,
+            &merged,
+            mode,
+            options.print_icf_sections,
+            diagnostics,
+        )?;
+        sections.apply_folding(fold_into);
+        lap("icf");
+    }
+    let refs = Refs {
+        files,
+        symbols: &symbols,
+        resolution: &resolution,
+        sections: &sections,
+    };
+    eh_frames.finalize(&refs);
 
     let mut synth = Synth::default();
     synth.plan_entries(&symbols, &scan);
@@ -223,6 +252,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         entry,
         diagnostics,
     })?;
+    map::write(options, &addresses, &plan)?;
     lap("write");
     Ok(())
 }

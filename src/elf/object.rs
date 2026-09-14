@@ -252,6 +252,17 @@ impl<'a> ObjectInput<'a> {
                 }
                 _ => SectionKind::Regular,
             };
+            if kind != SectionKind::Ignored {
+                // Layout trusts the sizes of copied sections: check now that
+                // their contents lie inside the file.
+                elf.section_data(&header)?;
+                if header.sh_addralign > 1 && !header.sh_addralign.is_power_of_two() {
+                    return Err(source.malformed(
+                        elf.elf().section_header_offset(index),
+                        "section alignment (not a power of two)",
+                    ));
+                }
+            }
             sections.push(InputSection {
                 name,
                 header,

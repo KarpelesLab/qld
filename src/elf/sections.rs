@@ -34,6 +34,9 @@ pub struct Sections {
     /// Whether each section is part of the output: not ignored, not in a
     /// discarded COMDAT group, not garbage collected, not folded by ICF.
     pub live: Vec<bool>,
+    /// For sections folded by ICF, the section they fold into ([`NONE`]
+    /// otherwise). Empty when ICF did not run.
+    pub fold_into: Vec<u32>,
 }
 
 impl Sections {
@@ -89,7 +92,37 @@ impl Sections {
             count,
             owner,
             live,
+            fold_into: Vec::new(),
         })
+    }
+
+    /// Installs the ICF result: folded sections stop being live, and
+    /// [`Sections::resolve`] redirects them.
+    pub fn apply_folding(&mut self, fold_into: Vec<u32>) {
+        for (live, &rep) in self.live.iter_mut().zip(&fold_into) {
+            if rep != NONE {
+                *live = false;
+            }
+        }
+        self.fold_into = fold_into;
+    }
+
+    /// The section whose output location `id` has: `id` itself if live, the
+    /// kept section if `id` was folded, `None` if it is not in the output.
+    #[must_use]
+    pub fn resolve(&self, id: SectionId) -> Option<SectionId> {
+        if self.is_live(id) {
+            return Some(id);
+        }
+        let rep = *self.fold_into.get(id.index())?;
+        (rep != NONE).then(|| SectionId::from_u32(rep))
+    }
+
+    /// Whether section `index` of `file` is live or folded into a live one.
+    #[must_use]
+    pub fn is_present_in(&self, file: usize, index: u32) -> bool {
+        self.id(file, index)
+            .is_some_and(|id| self.resolve(id).is_some())
     }
 
     /// Total number of sections.

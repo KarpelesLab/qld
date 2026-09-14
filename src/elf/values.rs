@@ -172,7 +172,9 @@ impl<'x, 'a> Addresses<'x, 'a> {
         let refs = &self.refs;
         let id = refs.sections.id(file, section)?;
         if !refs.sections.is_live(id) {
-            return None;
+            // Folded by ICF: the kept section has the same contents.
+            let kept = refs.sections.resolve(id)?;
+            return Some(self.section_address(kept)?.wrapping_add(offset));
         }
         let kind = refs
             .files
@@ -262,7 +264,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
                     return Some((self.section_offset_address(file, section, offset)?, 0));
                 }
                 if let Some(global) = target.global {
-                    if !self.refs.sections.is_live_in(file, section) {
+                    if !self.refs.sections.is_present_in(file, section) {
                         return None;
                     }
                     return Some((*self.globals.get(global.index())?, addend));
