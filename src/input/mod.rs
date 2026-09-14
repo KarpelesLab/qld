@@ -19,6 +19,9 @@
 //!   indexes. Members are not parsed here: the reader yields their names and
 //!   byte ranges (or paths, for thin archives), and the caller parses them
 //!   lazily when resolution extracts them.
+//! - [`search`] resolves `-l` names and linker-script paths against search
+//!   directories and the sysroot, through the [`FileSystem`] trait so that
+//!   tests stay hermetic.
 //!
 //! Mapping needs `unsafe`; it is confined to the private `map` submodule.
 //! Everything else treats input as untrusted: no panics, no unchecked
@@ -35,10 +38,12 @@ pub mod identify;
 #[allow(unsafe_code)] // File mapping; see the module's SAFETY comments.
 mod map;
 mod read;
+pub mod search;
 pub mod table;
 
 pub use archive::{
     Archive, ArchiveKind, ArchiveSymbol, Member, MemberData, SymbolIndex, SymbolIndexKind,
 };
 pub use identify::{FileFormat, GccLtoProbe, identify, identify_with};
+pub use search::{FileSystem, LibraryNaming, RealFileSystem, SearchContext};
 pub use table::{FileTable, InputFile, Source};
