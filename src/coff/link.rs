@@ -30,7 +30,9 @@ use crate::input::FileTable;
 use crate::symbols::{DefinitionKind, SymbolFlags, SymbolName, SymbolTable, resolve_symbols_with};
 
 use super::defined;
-use super::directives::Directives;
+use super::directives::{Directives, ExportRequest};
+use super::edata;
+use super::implib;
 use super::inputs::{self, CoffInput, InternalNames};
 use super::layout::{self, CommonSymbol, LayoutInput};
 use super::object::GlobalKind;
@@ -146,11 +148,34 @@ pub fn link_with(
     let emit_relocs = pe.dynamicbase && !pe.disable_reloc_section;
     let output_path = options.output_path();
 
+    // Exports: a `.def` file, `-export:` directives and the command line,
+    // or everything a DLL defines.
+    let mut requests = directives.exports.clone();
+    requests.extend(command_line_exports(pe, diagnostics));
+    if let Some(path) = &pe.def_file {
+        requests.extend(def_exports(path)?);
+    }
+    let dll_name = pe
+        .implib_dll_name
+        .clone()
+        .unwrap_or_else(|| edata::default_dll_name(&output_path));
+    let exports = edata::plan(&requests, &symbols, files, &resolution, pe, &dll_name);
+    let export_size = exports.size();
+    if let Some(path) = &pe.out_implib {
+        implib::write(path, &exports, pe.machine)?;
+    }
+    if let Some(path) = &pe.output_def {
+        implib::write_def(path, &exports)?;
+    }
+
     // Lay out, relocate, then lay out again with the real `.reloc` size.
     let mut reloc_size = 0u32;
     let mut attempt = 0u32;
     loop {
         let mut synthetic: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+        if export_size > 0 {
+            synthetic.push((b".edata".to_vec(), export_size, 4));
+        }
         if emit_relocs && reloc_size > 0 {
             synthetic.push((b".reloc".to_vec(), reloc_size, 4));
         }
@@ -172,6 +197,14 @@ pub fn link_with(
             aliases: aliases.clone(),
         };
         let mut generated: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if export_size > 0
+            && let Some(section) = plan.by_name(b".edata")
+        {
+            generated.push((
+                b".edata".to_vec(),
+                exports.render(&addresses, section.rva, diagnostics),
+            ));
+        }
         let (contents, applied) = write::render(&addresses, &generated);
         let encoded = if emit_relocs {
             reloc::encode_base_relocs(&applied.base_relocs)
@@ -192,8 +225,9 @@ pub fn link_with(
         if errors > 0 && !options.noinhibit_exec {
             return Err(Error::Reported { errors });
         }
+        let has_relocs = !encoded.is_empty();
         generated.push((b".reloc".to_vec(), encoded));
-        let (contents, _) = if generated.iter().any(|(_, bytes)| !bytes.is_empty()) {
+        let (contents, _) = if has_relocs {
             write::render(&addresses, &generated)
         } else {
             (contents, applied)
@@ -218,6 +252,35 @@ pub fn link_with(
         )?;
         return Ok(());
     }
+}
+
+/// The `-export:` specifications given on the command line.
+fn command_line_exports(pe: &PeOptions, diagnostics: &dyn DiagnosticSink) -> Vec<ExportRequest> {
+    let mut requests = Vec::new();
+    for text in &pe.exports {
+        match super::read::directives::parse_export(text) {
+            Ok(spec) => requests.push(ExportRequest::from_spec(&spec)),
+            Err(problem) => diagnostics.emit(Diagnostic::error(format!(
+                "invalid export `{}`: {problem}",
+                String::from_utf8_lossy(text)
+            ))),
+        }
+    }
+    requests
+}
+
+/// The `EXPORTS` entries of a module-definition file.
+fn def_exports(path: &std::path::Path) -> Result<Vec<ExportRequest>> {
+    let text = std::fs::read(path).map_err(|error| Error::Io {
+        path: Some(path.to_path_buf()),
+        source: error,
+    })?;
+    let definition = super::read::parse_module_definition(&text, super::read::Source::new(path))?;
+    Ok(definition
+        .exports
+        .iter()
+        .map(ExportRequest::from_spec)
+        .collect())
 }
 
 /// Rejects options whose effect is not implemented for PE yet, rather than

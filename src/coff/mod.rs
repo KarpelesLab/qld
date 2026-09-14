@@ -12,18 +12,23 @@
 //! | [`object`] | A parsed object: sections, COMDAT groups and a flat symbol list |
 //! | [`resolve`] | COFF symbol precedence and COMDAT selection |
 //! | [`directives`] | `.drectve` directives the link acts on |
+//! | [`edata`] | The export directory |
+//! | [`implib`] | `--out-implib` and `--output-def` |
 //! | [`layout`] | Output sections, grouped-section ordering, RVAs |
 //! | [`defined`] | The symbols MinGW's C runtime expects the linker to define |
 //! | [`reloc`] | Symbol addresses, relocation application, base relocations |
 //! | [`write`] | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
 //!
-//! Not implemented yet: exports and `--out-implib`, short import objects and
-//! direct `.dll` inputs, auto-import and runtime pseudo-relocations,
-//! resources, `-r`, `--gc-sections`, and architectures other than x86-64.
+//! Not implemented yet: short import objects and direct `.dll` inputs,
+//! auto-import and runtime pseudo-relocations, resources, `-r`,
+//! `--gc-sections`, the COFF symbol table in the output, and architectures
+//! other than x86-64.
 
 pub mod defined;
 pub mod directives;
+pub mod edata;
+pub mod implib;
 pub mod inputs;
 pub mod layout;
 pub mod link;

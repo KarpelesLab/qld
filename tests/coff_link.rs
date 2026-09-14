@@ -367,3 +367,142 @@ fn missing_symbols_are_reported() {
     let error = qld_link(&options, &pe).unwrap_err();
     assert!(error.contains("nowhere"), "{error}");
 }
+
+const LIBRARY: &str = r#"
+#include <stdio.h>
+__declspec(dllexport) int exported_data = 41;
+__declspec(dllexport) int add_one(int value) { return value + 1; }
+__declspec(dllexport) void greet(void) { fputs("hello from the dll\n", stdout); }
+int not_exported(void) { return 7; }
+"#;
+
+const CLIENT: &str = r#"
+#include <stdio.h>
+__declspec(dllimport) extern int exported_data;
+__declspec(dllimport) int add_one(int value);
+__declspec(dllimport) void greet(void);
+int main(void) {
+    greet();
+    printf("%d\n", add_one(exported_data));
+    return 0;
+}
+"#;
+
+/// A DLL with `__declspec(dllexport)` exports and an import library, and an
+/// executable linked against it.
+///
+/// RUN ON WINDOWS: the executable should print `hello from the dll` then
+/// `42`, and exit 0.
+#[test]
+fn dll_with_import_library() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    let dir = scratch("dll-with-import-library");
+    let Some(library_object) = compile(&dir, "library", LIBRARY, &[]) else {
+        return;
+    };
+    // The DLL: gcc's `-shared` line, with qld producing the import library.
+    let Some(argv) = link_argv(
+        &dir,
+        &[
+            "-shared",
+            library_object.as_str(),
+            "-o",
+            "sample.dll",
+            "-fno-lto",
+        ],
+    ) else {
+        return;
+    };
+    let mut options = options_from(&argv, &dir.join("sample.dll"));
+    options.kind = qld::args::OutputKind::Shared;
+    let mut pe = PeOptions::from_link_options(&options);
+    pe.out_implib = Some(dir.join("libsample.dll.a"));
+    pe.output_def = Some(dir.join("sample.def"));
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link the DLL:\n{error}");
+    }
+
+    let Some(exports) = readobj(&dir, "sample.dll", &["--coff-exports"]) else {
+        return;
+    };
+    for name in ["add_one", "greet", "exported_data"] {
+        assert!(exports.contains(name), "{name} missing from:\n{exports}");
+    }
+    assert!(
+        !exports.contains("not_exported"),
+        "a non-dllexport symbol leaked:\n{exports}"
+    );
+    let Some(headers) = readobj(&dir, "sample.dll", &["--file-headers"]) else {
+        return;
+    };
+    assert!(headers.contains("IMAGE_FILE_DLL"), "{headers}");
+    assert!(!headers.contains("ExportTableRVA: 0x0"), "{headers}");
+    assert!(headers.contains("ImageBase: 0x180000000"), "{headers}");
+
+    let def = std::fs::read_to_string(dir.join("sample.def")).unwrap();
+    assert!(def.starts_with("EXPORTS\n"), "{def}");
+    assert!(def.contains("add_one @"), "{def}");
+
+    // The executable, linked against the import library qld just wrote.
+    let Some(client_object) = compile(&dir, "client", CLIENT, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(
+        &dir,
+        &[client_object.as_str(), "-o", "client.exe", "-fno-lto"],
+    ) else {
+        return;
+    };
+    let mut options = options_from(&argv, &dir.join("client.exe"));
+    let implib = dir.join("libsample.dll.a");
+    options.inputs.push(InputSpec {
+        kind: InputKind::File(implib.clone()),
+        attrs: InputAttrs::default(),
+        position: options.inputs.len(),
+    });
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link against its own import library:\n{error}");
+    }
+    let Some(imports) = readobj(&dir, "client.exe", &["--coff-imports"]) else {
+        return;
+    };
+    assert!(imports.contains("sample.dll"), "{imports}");
+    assert!(imports.contains("add_one"), "{imports}");
+    assert!(imports.contains("exported_data"), "{imports}");
+
+    // GNU ld must accept the same import library, and bind the same
+    // symbols to the same DLL.
+    let gnu_args = [
+        client_object.as_str(),
+        implib.to_str().unwrap(),
+        "-o",
+        "gnu-client.exe",
+        "-fno-lto",
+    ];
+    if run(&format!("{PREFIX}gcc"), &gnu_args, &dir).is_some() {
+        let Some(theirs) = readobj(&dir, "gnu-client.exe", &["--coff-imports"]) else {
+            return;
+        };
+        let ours = imports;
+        // The DLL's place on the command line decides its table addresses,
+        // so compare the symbols it binds rather than the RVAs.
+        let entry = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|line| !line.contains("sample.dll"))
+                .skip(1)
+                .skip_while(|line| !line.trim().starts_with("Symbol:"))
+                .take_while(|line| line.trim().starts_with("Symbol:"))
+                .map(|line| line.trim().to_string())
+                .collect()
+        };
+        assert_eq!(
+            entry(&ours),
+            entry(&theirs),
+            "GNU ld read qld's import library differently"
+        );
+    }
+}
