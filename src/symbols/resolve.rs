@@ -9,12 +9,12 @@
 //! 2. **Intern** their global symbol names, and in the first round the lazy
 //!    names of every archive member, as one [`intern_batch`] (so IDs stay
 //!    deterministic).
-//! 3. **Insert** definitions, lazy ones included, in parallel. The table
-//!    keeps the best candidate per symbol under the [`Resolver`].
-//! 4. **Mark references** from the newly live files, in parallel. A symbol
-//!    whose [`REFERENCED`](SymbolFlags::REFERENCED) bit this sets for the
-//!    first time is a candidate for extraction.
-//! 5. **Choose members**: for each candidate whose best definition
+//! 3. **Insert and mark**, in parallel: offer each definition, lazy ones
+//!    included, to the table, which keeps the best candidate per symbol under
+//!    the [`Resolver`]; and set reference flags. A symbol whose
+//!    [`REFERENCED`](SymbolFlags::REFERENCED) bit this sets for the first
+//!    time is a candidate for extraction.
+//! 4. **Choose members**: for each candidate whose best definition
 //!    [`extracts`](Resolver::extracts) (by default: is lazy), its defining
 //!    member becomes live. Because lazy candidates compete by input position,
 //!    that member is the earliest one that defines the symbol.
@@ -29,6 +29,15 @@
 //! `docs/compatibility.md`, "Archive resolution order"). Input order only
 //! decides *which* definition wins.
 //!
+//! # Cost
+//!
+//! A round's work is proportional to the files that became live in it (the
+//! first round also covers every lazy file's index names): the driver keeps
+//! the round's file indices and never walks the whole file list after the
+//! first round. Small rounds, below a few thousand symbols, run on the
+//! calling thread, because waking a large pool for them costs more than the
+//! work. The final undefined and duplicate reports cover the live files.
+//!
 //! [`intern_batch`]: SymbolTable::intern_batch
 
 use rayon::prelude::*;
@@ -38,11 +47,18 @@ use super::flags::SymbolFlags;
 use super::name::{InputPosition, SymbolName};
 use super::report::{DuplicateSymbol, SymbolReference, UndefinedSymbol};
 use super::table::{InternJob, SymbolTable};
+use super::util::select_mut;
 use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
 
 /// Files smaller than this many symbols are processed as one parallel task.
 const MIN_PARALLEL_SYMBOLS: usize = 1024;
+/// Passes over fewer symbols (or candidates) than this, in total, run on the
+/// calling thread.
+const MIN_PARALLEL_WORK: usize = 4096;
+/// Sizing the symbol ID vectors (a memset) runs in parallel only past this
+/// many entries.
+const MIN_PARALLEL_SIZING: usize = 1 << 20;
 
 /// How one entry of a live file's global symbol list takes part in
 /// resolution.
@@ -173,14 +189,68 @@ impl<'a> Resolution<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Role {
-    /// Nothing to do for this file this round.
-    Idle,
-    /// Contributes lazy definitions this round.
-    Lazy,
-    /// Became live this round.
-    Load,
+/// One file's symbols in a pass: the file index, the IDs of its entries,
+/// and whether the entries are its lazy names rather than its real symbols.
+#[derive(Clone, Copy)]
+struct Work<'s> {
+    file: usize,
+    ids: &'s [SymbolId],
+    lazy: bool,
+}
+
+/// Runs `f(file, work, symbol index, symbol ID)` on every entry of `work`
+/// and collects the `Some` results, in unspecified order. Parallel only when
+/// the total is large; small files are grouped into tasks, and only large
+/// files are split.
+fn map_symbols<'s, F, T, W>(files: &[F], work: &[Work<'s>], f: W) -> Vec<T>
+where
+    F: Sync,
+    T: Send,
+    W: Fn(&F, Work<'s>, usize, SymbolId) -> Option<T> + Sync,
+{
+    let f = &f;
+    let sequential = move |w: &Work<'s>| {
+        let (file, w) = (&files[w.file], *w);
+        w.ids
+            .iter()
+            .enumerate()
+            .filter_map(move |(symbol, &id)| f(file, w, symbol, id))
+    };
+    let total: usize = work.iter().map(|w| w.ids.len()).sum();
+    if total < MIN_PARALLEL_WORK {
+        return work.iter().flat_map(sequential).collect();
+    }
+    let (large, small): (Vec<Work<'s>>, Vec<Work<'s>>) = work
+        .iter()
+        .partition(|w| w.ids.len() >= 2 * MIN_PARALLEL_SYMBOLS);
+    let small_total: usize = small.iter().map(|w| w.ids.len()).sum();
+    let files_per_task = (MIN_PARALLEL_SYMBOLS * small.len() / small_total.max(1)).max(1);
+    small
+        .par_iter()
+        .with_min_len(files_per_task)
+        .flat_map_iter(sequential)
+        .chain(large.par_iter().flat_map(move |w| {
+            let (file, w) = (&files[w.file], *w);
+            w.ids
+                .par_iter()
+                .enumerate()
+                .with_min_len(MIN_PARALLEL_SYMBOLS)
+                .filter_map(move |(symbol, &id)| f(file, w, symbol, id))
+        }))
+        .collect()
+}
+
+fn sort_unstable_by_key<T, K, G>(items: &mut [T], key: G)
+where
+    T: Send,
+    K: Ord,
+    G: Fn(&T) -> K + Sync,
+{
+    if items.len() < MIN_PARALLEL_WORK {
+        items.sort_unstable_by_key(key);
+    } else {
+        items.par_sort_unstable_by_key(key);
+    }
 }
 
 /// Resolves the symbols of `files` into `table`, extracting archive members
@@ -217,73 +287,87 @@ where
     let mut live = vec![false; count];
     let mut symbol_ids: Vec<Vec<SymbolId>> = (0..count).map(|_| Vec::new()).collect();
     let mut lazy_ids: Vec<Vec<SymbolId>> = (0..count).map(|_| Vec::new()).collect();
-    let mut roles: Vec<Role> = files
-        .iter()
-        .map(|file| {
-            if file.is_live_at_start() {
-                Role::Load
-            } else {
-                Role::Lazy
-            }
-        })
-        .collect();
+    // The files to load this round, and (first round only) the lazy files,
+    // both in index order.
+    let (mut load, mut lazy): (Vec<usize>, Vec<usize>) =
+        (0..count).partition(|&index| files[index].is_live_at_start());
     let mut extracted = Vec::new();
 
     loop {
-        load_files(files, &roles)?;
-        for (live, role) in live.iter_mut().zip(&roles) {
-            if *role == Role::Load {
-                *live = true;
-            }
+        load_files(&mut select_mut(files, &load), &load)?;
+        for &index in &load {
+            live[index] = true;
         }
 
-        intern_round(table, files, &roles, &mut symbol_ids, &mut lazy_ids)?;
-
-        let table_ref = &*table;
         let files_ref = &*files;
-        let recheck = insert_definitions(
-            table_ref,
-            resolver,
+        intern_round(
+            table,
             files_ref,
-            &roles,
-            &symbol_ids,
-            &lazy_ids,
-        );
-        let newly_referenced = mark_references(table_ref, files_ref, &roles, &symbol_ids);
+            &load,
+            &lazy,
+            &mut symbol_ids,
+            &mut lazy_ids,
+        )?;
+        let work: Vec<Work<'_>> = load
+            .iter()
+            .map(|&file| Work {
+                file,
+                ids: &symbol_ids[file],
+                lazy: false,
+            })
+            .chain(lazy.iter().map(|&file| Work {
+                file,
+                ids: &lazy_ids[file],
+                lazy: true,
+            }))
+            .collect();
+        let table_ref = &*table;
+        let candidates = insert_and_mark(table_ref, resolver, files_ref, &work);
 
         let live_ref = &live;
-        let mut members: Vec<usize> = recheck
-            .par_iter()
-            .chain(newly_referenced.par_iter())
-            .filter_map(|&id| {
-                let current = table_ref.definition(id);
-                if !current.is_defined() || !resolver.extracts(&current) {
-                    return None;
-                }
-                let member = current.file.index();
-                (member < count && !live_ref[member]).then_some(member)
-            })
-            .collect();
-        members.par_sort_unstable();
+        let choose = |&id: &SymbolId| {
+            let current = table_ref.definition(id);
+            if !current.is_defined() || !resolver.extracts(&current) {
+                return None;
+            }
+            let member = current.file.index();
+            (member < count && !live_ref[member]).then_some(member)
+        };
+        let mut members: Vec<usize> = if candidates.len() < MIN_PARALLEL_WORK {
+            candidates.iter().filter_map(choose).collect()
+        } else {
+            candidates.par_iter().filter_map(choose).collect()
+        };
+        sort_unstable_by_key(&mut members, |&member| member);
         members.dedup();
         if members.is_empty() {
             break;
         }
 
-        roles.fill(Role::Idle);
         for &member in &members {
-            roles[member] = Role::Load;
             // The member's lazy candidates are superseded by its real symbols.
             lazy_ids[member] = Vec::new();
         }
-        let mut round: Vec<FileId> = members.into_iter().map(FileId::new).collect();
-        round.sort_by_key(|file| (files[file.index()].position(), *file));
-        extracted.push(round);
+        let mut round_members: Vec<FileId> = members.iter().copied().map(FileId::new).collect();
+        round_members.sort_by_key(|file| (files[file.index()].position(), *file));
+        extracted.push(round_members);
+        load = members;
+        lazy = Vec::new();
     }
     drop(lazy_ids);
 
-    let undefined = collect_undefined(table, files, &live, &symbol_ids);
-    let duplicates = collect_duplicates(table, resolver, files, &live, &symbol_ids);
+    let live_work: Vec<Work<'_>> = live
+        .iter()
+        .enumerate()
+        .filter(|&(_, &live)| live)
+        .map(|(file, _)| Work {
+            file,
+            ids: &symbol_ids[file],
+            lazy: false,
+        })
+        .collect();
+    let undefined = collect_undefined(table, files, &live_work);
+    let duplicates = collect_duplicates(table, resolver, files, &live_work);
     Ok(Resolution {
         live,
         symbol_ids,
@@ -293,13 +377,12 @@ where
     })
 }
 
-fn load_files<'a, F: ResolveFile<'a>>(files: &mut [F], roles: &[Role]) -> Result<()> {
+/// Loads `files`, whose indices are `indices`, in parallel.
+fn load_files<'a, F: ResolveFile<'a>>(files: &mut [&mut F], indices: &[usize]) -> Result<()> {
     let first_error = files
         .par_iter_mut()
-        .zip(roles.par_iter())
-        .enumerate()
-        .filter(|(_, (_, role))| **role == Role::Load)
-        .filter_map(|(index, (file, _))| {
+        .zip(indices.par_iter())
+        .filter_map(|(file, &index)| {
             let position = file.position();
             file.load().err().map(|error| (position, index, error))
         })
@@ -310,175 +393,136 @@ fn load_files<'a, F: ResolveFile<'a>>(files: &mut [F], roles: &[Role]) -> Result
     }
 }
 
+/// Interns the symbol names of the `load` files and the lazy names of the
+/// `lazy` files (both in index order) as one batch.
 fn intern_round<'a, F: ResolveFile<'a>>(
     table: &mut SymbolTable<'a>,
     files: &[F],
-    roles: &[Role],
+    load: &[usize],
+    lazy: &[usize],
     symbol_ids: &mut [Vec<SymbolId>],
     lazy_ids: &mut [Vec<SymbolId>],
 ) -> Result<()> {
-    // Size the output vectors in parallel (large files make this non-trivial).
-    files
-        .par_iter()
-        .zip(roles.par_iter())
-        .zip(symbol_ids.par_iter_mut().zip(lazy_ids.par_iter_mut()))
-        .for_each(|((file, role), (ids, lazy))| {
-            let (out, len) = match role {
-                Role::Idle => return,
-                Role::Load => (ids, file.symbol_names().len()),
-                Role::Lazy => (lazy, file.lazy_names().len()),
-            };
-            out.clear();
-            out.resize(len, SymbolId::from_u32(0));
-        });
-
-    let mut jobs: Vec<InternJob<'a, '_>> = files
+    let names = |index: usize, is_lazy: bool| {
+        let file = &files[index];
+        if is_lazy {
+            file.lazy_names()
+        } else {
+            file.symbol_names()
+        }
+    };
+    let mut outputs: Vec<(usize, bool, &mut Vec<SymbolId>)> = load
         .iter()
-        .zip(roles)
-        .zip(symbol_ids.iter_mut().zip(lazy_ids.iter_mut()))
-        .filter_map(|((file, role), (ids, lazy))| match role {
-            Role::Idle => None,
-            Role::Load => Some(InternJob {
-                position: file.position(),
-                names: file.symbol_names(),
-                ids: ids.as_mut_slice(),
-            }),
-            Role::Lazy => Some(InternJob {
-                position: file.position(),
-                names: file.lazy_names(),
-                ids: lazy.as_mut_slice(),
-            }),
+        .zip(select_mut(symbol_ids, load))
+        .map(|(&index, ids)| (index, false, ids))
+        .chain(
+            lazy.iter()
+                .zip(select_mut(lazy_ids, lazy))
+                .map(|(&index, ids)| (index, true, ids)),
+        )
+        .collect();
+
+    // Size the output vectors (large files make this non-trivial).
+    let total: usize = outputs
+        .iter()
+        .map(|(index, is_lazy, _)| names(*index, *is_lazy).len())
+        .sum();
+    let size = |(index, is_lazy, ids): &mut (usize, bool, &mut Vec<SymbolId>)| {
+        ids.clear();
+        ids.resize(names(*index, *is_lazy).len(), SymbolId::from_u32(0));
+    };
+    if total < MIN_PARALLEL_SIZING {
+        outputs.iter_mut().for_each(size);
+    } else {
+        outputs.par_iter_mut().for_each(size);
+    }
+
+    let mut jobs: Vec<InternJob<'a, '_>> = outputs
+        .into_iter()
+        .map(|(index, is_lazy, ids)| InternJob {
+            position: files[index].position(),
+            names: names(index, is_lazy),
+            ids: ids.as_mut_slice(),
         })
         .collect();
     table.try_intern_batch(&mut jobs)
 }
 
-/// Inserts this round's lazy and live definitions. Returns the symbols that
-/// were already referenced and whose new best definition extracts (only
+/// Inserts this round's lazy and live definitions and sets the reference
+/// flags of its live files. Returns the extraction candidates: the symbols
+/// whose `REFERENCED` bit this round set for the first time, and the
+/// already referenced symbols whose new best definition extracts (only
 /// possible with resolvers where a newly inserted candidate can extract).
-fn insert_definitions<'a, F, R>(
+/// May contain repeats.
+///
+/// Inserting and marking in one pass gives the same candidates, after
+/// filtering by the final definition, as inserting everything first: a
+/// symbol referenced for the first time this round is a candidate either
+/// way, and a definition that ends up best was best when inserted.
+fn insert_and_mark<'a, F, R>(
     table: &SymbolTable<'a>,
     resolver: &R,
     files: &[F],
-    roles: &[Role],
-    symbol_ids: &[Vec<SymbolId>],
-    lazy_ids: &[Vec<SymbolId>],
+    work: &[Work<'_>],
 ) -> Vec<SymbolId>
 where
     F: ResolveFile<'a>,
     R: Resolver + ?Sized,
 {
-    let offer = |id: SymbolId, candidate: &Definition| {
-        let won = table.insert_definition(resolver, id, candidate);
-        (won && resolver.extracts(candidate) && table.flags(id).contains(SymbolFlags::REFERENCED))
+    map_symbols(files, work, |file, w, symbol, id| {
+        let (kind, aux) = if w.lazy {
+            (DefinitionKind::Lazy, 0)
+        } else {
+            match file.symbol_use(symbol) {
+                SymbolUse::Definition { kind, aux } => (kind, aux),
+                SymbolUse::Reference { weak: false } => {
+                    let before = table.set_flags(id, SymbolFlags::REFERENCED);
+                    return (!before.contains(SymbolFlags::REFERENCED)).then_some(id);
+                }
+                SymbolUse::Reference { weak: true } => {
+                    table.set_flags(id, SymbolFlags::WEAK_REFERENCED);
+                    return None;
+                }
+                SymbolUse::Ignore => return None,
+            }
+        };
+        let candidate = Definition {
+            kind,
+            file: FileId::new(w.file),
+            index: u32::try_from(symbol).unwrap_or(u32::MAX),
+            position: file.position(),
+            aux,
+        };
+        let won = table.insert_definition(resolver, id, &candidate);
+        (won && resolver.extracts(&candidate) && table.flags(id).contains(SymbolFlags::REFERENCED))
             .then_some(id)
-    };
-    files
-        .par_iter()
-        .zip(roles.par_iter())
-        .zip(symbol_ids.par_iter().zip(lazy_ids.par_iter()))
-        .enumerate()
-        .filter(|(_, ((_, role), _))| **role != Role::Idle)
-        .flat_map(|(index, ((file, role), (ids, lazy)))| {
-            let file_id = FileId::new(index);
-            let position = file.position();
-            let role = *role;
-            let ids = if role == Role::Load { ids } else { lazy };
-            ids.par_iter()
-                .enumerate()
-                .with_min_len(MIN_PARALLEL_SYMBOLS)
-                .filter_map(move |(symbol, &id)| {
-                    let (kind, aux) = if role == Role::Lazy {
-                        (DefinitionKind::Lazy, 0)
-                    } else {
-                        match file.symbol_use(symbol) {
-                            SymbolUse::Definition { kind, aux } => (kind, aux),
-                            SymbolUse::Reference { .. } | SymbolUse::Ignore => return None,
-                        }
-                    };
-                    let candidate = Definition {
-                        kind,
-                        file: file_id,
-                        index: u32::try_from(symbol).unwrap_or(u32::MAX),
-                        position,
-                        aux,
-                    };
-                    offer(id, &candidate)
-                })
-        })
-        .collect()
-}
-
-/// Sets reference flags for the newly live files. Returns the symbols whose
-/// `REFERENCED` bit this set for the first time.
-fn mark_references<'a, F: ResolveFile<'a>>(
-    table: &SymbolTable<'a>,
-    files: &[F],
-    roles: &[Role],
-    symbol_ids: &[Vec<SymbolId>],
-) -> Vec<SymbolId> {
-    files
-        .par_iter()
-        .zip(roles.par_iter())
-        .zip(symbol_ids.par_iter())
-        .filter(|((_, role), _)| **role == Role::Load)
-        .flat_map(|((file, _), ids)| {
-            ids.par_iter()
-                .enumerate()
-                .with_min_len(MIN_PARALLEL_SYMBOLS)
-                .filter_map(move |(symbol, &id)| match file.symbol_use(symbol) {
-                    SymbolUse::Reference { weak: false } => {
-                        let before = table.set_flags(id, SymbolFlags::REFERENCED);
-                        (!before.contains(SymbolFlags::REFERENCED)).then_some(id)
-                    }
-                    SymbolUse::Reference { weak: true } => {
-                        table.set_flags(id, SymbolFlags::WEAK_REFERENCED);
-                        None
-                    }
-                    SymbolUse::Definition { .. } | SymbolUse::Ignore => None,
-                })
-        })
-        .collect()
+    })
 }
 
 fn collect_undefined<'a, F: ResolveFile<'a>>(
     table: &SymbolTable<'a>,
     files: &[F],
-    live: &[bool],
-    symbol_ids: &[Vec<SymbolId>],
+    live_work: &[Work<'_>],
 ) -> Vec<UndefinedSymbol<'a>> {
-    let mut references: Vec<(SymbolId, SymbolReference)> = files
-        .par_iter()
-        .zip(live.par_iter())
-        .zip(symbol_ids.par_iter())
-        .enumerate()
-        .filter(|(_, ((_, live), _))| **live)
-        .flat_map(|(index, ((file, _), ids))| {
-            let file_id = FileId::new(index);
-            let position = file.position();
-            ids.par_iter()
-                .enumerate()
-                .with_min_len(MIN_PARALLEL_SYMBOLS)
-                .filter_map(move |(symbol, &id)| {
-                    if file.symbol_use(symbol) != (SymbolUse::Reference { weak: false }) {
-                        return None;
-                    }
-                    let kind = table.definition_kind(id);
-                    if kind != DefinitionKind::Undefined && kind != DefinitionKind::Lazy {
-                        return None;
-                    }
-                    Some((
-                        id,
-                        SymbolReference {
-                            position,
-                            file: file_id,
-                            index: u32::try_from(symbol).unwrap_or(u32::MAX),
-                        },
-                    ))
-                })
-        })
-        .collect();
-    references.par_sort_unstable();
+    let mut references: Vec<(SymbolId, SymbolReference)> =
+        map_symbols(files, live_work, |file, w, symbol, id| {
+            if file.symbol_use(symbol) != (SymbolUse::Reference { weak: false }) {
+                return None;
+            }
+            let kind = table.definition_kind(id);
+            if kind != DefinitionKind::Undefined && kind != DefinitionKind::Lazy {
+                return None;
+            }
+            Some((
+                id,
+                SymbolReference {
+                    position: file.position(),
+                    file: FileId::new(w.file),
+                    index: u32::try_from(symbol).unwrap_or(u32::MAX),
+                },
+            ))
+        });
+    sort_unstable_by_key(&mut references, |&entry| entry);
 
     let mut undefined: Vec<UndefinedSymbol<'a>> = references
         .chunk_by(|a, b| a.0 == b.0)
@@ -496,46 +540,32 @@ fn collect_duplicates<'a, F, R>(
     table: &SymbolTable<'a>,
     resolver: &R,
     files: &[F],
-    live: &[bool],
-    symbol_ids: &[Vec<SymbolId>],
+    live_work: &[Work<'_>],
 ) -> Vec<DuplicateSymbol<'a>>
 where
     F: ResolveFile<'a>,
     R: Resolver + ?Sized,
 {
-    let mut losers: Vec<(SymbolId, Definition)> = files
-        .par_iter()
-        .zip(live.par_iter())
-        .zip(symbol_ids.par_iter())
-        .enumerate()
-        .filter(|(_, ((_, live), _))| **live)
-        .flat_map(|(index, ((file, _), ids))| {
-            let file_id = FileId::new(index);
-            let position = file.position();
-            ids.par_iter()
-                .enumerate()
-                .with_min_len(MIN_PARALLEL_SYMBOLS)
-                .filter_map(move |(symbol, &id)| {
-                    let SymbolUse::Definition { kind, aux } = file.symbol_use(symbol) else {
-                        return None;
-                    };
-                    if kind == DefinitionKind::Undefined {
-                        return None;
-                    }
-                    let definition = Definition {
-                        kind,
-                        file: file_id,
-                        index: u32::try_from(symbol).unwrap_or(u32::MAX),
-                        position,
-                        aux,
-                    };
-                    let winner = table.definition(id);
-                    (winner != definition && resolver.is_duplicate(&winner, &definition))
-                        .then_some((id, definition))
-                })
-        })
-        .collect();
-    losers.par_sort_unstable_by_key(|(id, definition)| (*id, definition.tie_key()));
+    let mut losers: Vec<(SymbolId, Definition)> =
+        map_symbols(files, live_work, |file, w, symbol, id| {
+            let SymbolUse::Definition { kind, aux } = file.symbol_use(symbol) else {
+                return None;
+            };
+            if kind == DefinitionKind::Undefined {
+                return None;
+            }
+            let definition = Definition {
+                kind,
+                file: FileId::new(w.file),
+                index: u32::try_from(symbol).unwrap_or(u32::MAX),
+                position: file.position(),
+                aux,
+            };
+            let winner = table.definition(id);
+            (winner != definition && resolver.is_duplicate(&winner, &definition))
+                .then_some((id, definition))
+        });
+    sort_unstable_by_key(&mut losers, |(id, definition)| (*id, definition.tie_key()));
 
     let mut duplicates: Vec<DuplicateSymbol<'a>> = losers
         .chunk_by(|a, b| a.0 == b.0)
@@ -553,6 +583,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
     use crate::symbols::elf_reference::ElfReferenceRules;
 
     /// A synthetic input. Symbols are written as `"<tag>:<name>"`, where the
@@ -648,10 +679,12 @@ mod tests {
         }
 
         fn symbol_names(&self) -> &[SymbolName<'a>] {
+            assert_eq!(self.loads, 1, "symbols read before load");
             &self.names
         }
 
         fn symbol_use(&self, index: usize) -> SymbolUse {
+            assert_eq!(self.loads, 1, "symbols read before load");
             self.uses[index]
         }
     }

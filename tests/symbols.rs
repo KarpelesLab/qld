@@ -102,9 +102,22 @@ struct JobSpec {
     names: Vec<usize>,
 }
 
-fn random_jobs(rng: &mut Rng, pool_size: usize, jobs: usize, max_len: usize) -> Vec<JobSpec> {
+/// Random jobs. With `shared_positions`, several jobs get the same position,
+/// which makes the table break ties by name.
+fn random_jobs(
+    rng: &mut Rng,
+    pool_size: usize,
+    jobs: usize,
+    max_len: usize,
+    shared_positions: bool,
+) -> Vec<JobSpec> {
     let mut inputs: Vec<u32> = (0..jobs as u32).collect();
     rng.shuffle(&mut inputs);
+    if shared_positions {
+        for input in &mut inputs {
+            *input /= 4;
+        }
+    }
     inputs
         .into_iter()
         .map(|input| JobSpec {
@@ -124,26 +137,40 @@ fn random_jobs(rng: &mut Rng, pool_size: usize, jobs: usize, max_len: usize) -> 
         .collect()
 }
 
-/// The single-threaded definition of the expected IDs: walk every batch in
-/// position order and number names by first sight.
+/// The single-threaded definition of the expected IDs: walk every batch's
+/// names in `(position, index in job, name)` order and number them by first
+/// sight.
 fn model_ids(names: &NamePool, batches: &[Vec<JobSpec>]) -> Vec<Vec<Vec<u32>>> {
-    let mut ids: HashMap<usize, u32> = HashMap::new();
     let mut by_bytes: HashMap<SymbolName<'_>, u32> = HashMap::new();
     batches
         .iter()
         .map(|batch| {
-            let mut order: Vec<usize> = (0..batch.len()).collect();
-            order.sort_by_key(|&j| batch[j].position);
-            for &j in &order {
-                for &name in &batch[j].names {
-                    let next = by_bytes.len() as u32;
-                    let id = *by_bytes.entry(names.name(name)).or_insert(next);
-                    ids.insert(name, id);
-                }
+            let mut occurrences: Vec<(InputPosition, usize, usize)> = batch
+                .iter()
+                .flat_map(|job| {
+                    job.names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &name)| (job.position, index, name))
+                })
+                .collect();
+            occurrences.sort_by(|a, b| {
+                (a.0, a.1)
+                    .cmp(&(b.0, b.1))
+                    .then_with(|| names.entries[a.2].cmp(&names.entries[b.2]))
+            });
+            for (_, _, name) in occurrences {
+                let next = by_bytes.len() as u32;
+                by_bytes.entry(names.name(name)).or_insert(next);
             }
             batch
                 .iter()
-                .map(|job| job.names.iter().map(|name| ids[name]).collect())
+                .map(|job| {
+                    job.names
+                        .iter()
+                        .map(|&name| by_bytes[&names.name(name)])
+                        .collect()
+                })
                 .collect()
         })
         .collect()
@@ -198,11 +225,19 @@ fn intern_all(
 
 #[test]
 fn intern_ids_are_independent_of_threads_and_job_order() {
-    let names = NamePool::new(3000);
-    for seed in 0..4u64 {
+    // Seeds 0-3 make small batches (interned in position order on the
+    // calling thread when positions are distinct), seeds 4-5 batches large
+    // enough for the parallel path. Odd seeds share positions between jobs.
+    let names = NamePool::new(40_000);
+    for seed in 0..6u64 {
         let mut rng = Rng(seed);
-        let batches: Vec<Vec<JobSpec>> = (0..3)
-            .map(|_| random_jobs(&mut rng, names.entries.len(), 40, 300))
+        let (pool_size, batch_count, max_len) = if seed < 4 {
+            (3000, 3, 300)
+        } else {
+            (40_000, 2, 5000)
+        };
+        let batches: Vec<Vec<JobSpec>> = (0..batch_count)
+            .map(|_| random_jobs(&mut rng, pool_size, 40, max_len, seed % 2 == 1))
             .collect();
         let expected = model_ids(&names, &batches);
 

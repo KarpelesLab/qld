@@ -20,7 +20,8 @@
 //!   the real ones.
 //! - [`resolve_symbols`]: the format-neutral driver that inserts definitions
 //!   and extracts archive members, round by round, to a fixpoint, over any
-//!   file type implementing [`ResolveFile`].
+//!   file type implementing [`ResolveFile`]. Each round's work is
+//!   proportional to the files that became live in it.
 //! - Undefined and duplicate symbols as sorted data ([`UndefinedSymbol`],
 //!   [`DuplicateSymbol`]) for diagnostics to render.
 //!
@@ -36,6 +37,7 @@ mod name;
 mod report;
 pub mod resolve;
 pub mod table;
+mod util;
 
 pub use definition::{Definition, DefinitionKind, Resolver, takes_precedence};
 pub use flags::SymbolFlags;
