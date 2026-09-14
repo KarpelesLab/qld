@@ -38,7 +38,7 @@ use super::flags::SymbolFlags;
 use super::name::{InputPosition, SymbolName};
 use super::report::{DuplicateSymbol, SymbolReference, UndefinedSymbol};
 use super::table::{InternJob, SymbolTable};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
 
 /// Files smaller than this many symbols are processed as one parallel task.
@@ -191,14 +191,12 @@ enum Role {
 ///
 /// # Errors
 ///
-/// Returns the first (by input position) error from [`ResolveFile::load`].
-/// Undefined and duplicate symbols are not errors here; they are reported in
-/// the [`Resolution`].
-///
-/// # Panics
-///
-/// Panics if there are more than `u32::MAX` files, or if the table
-/// overflows (see [`SymbolTable::intern_batch`]).
+/// Returns the first (by input position) error from [`ResolveFile::load`] in
+/// the round where loading failed, or [`Error::Limit`] if there are more than
+/// `u32::MAX` files or the table would exceed
+/// [`MAX_SYMBOLS`](super::table::MAX_SYMBOLS) symbols. Undefined and
+/// duplicate symbols are not errors here; they are reported in the
+/// [`Resolution`].
 pub fn resolve_symbols<'a, F, R>(
     table: &mut SymbolTable<'a>,
     resolver: &R,
@@ -208,7 +206,13 @@ where
     F: ResolveFile<'a>,
     R: Resolver + ?Sized,
 {
-    assert!(u32::try_from(files.len()).is_ok(), "too many input files");
+    if u32::try_from(files.len()).is_err() {
+        return Err(Error::Limit(format!(
+            "{} input files (at most {})",
+            files.len(),
+            u32::MAX
+        )));
+    }
     let count = files.len();
     let mut live = vec![false; count];
     let mut symbol_ids: Vec<Vec<SymbolId>> = (0..count).map(|_| Vec::new()).collect();
@@ -233,7 +237,7 @@ where
             }
         }
 
-        intern_round(table, files, &roles, &mut symbol_ids, &mut lazy_ids);
+        intern_round(table, files, &roles, &mut symbol_ids, &mut lazy_ids)?;
 
         let table_ref = &*table;
         let files_ref = &*files;
@@ -312,7 +316,7 @@ fn intern_round<'a, F: ResolveFile<'a>>(
     roles: &[Role],
     symbol_ids: &mut [Vec<SymbolId>],
     lazy_ids: &mut [Vec<SymbolId>],
-) {
+) -> Result<()> {
     // Size the output vectors in parallel (large files make this non-trivial).
     files
         .par_iter()
@@ -346,7 +350,7 @@ fn intern_round<'a, F: ResolveFile<'a>>(
             }),
         })
         .collect();
-    table.intern_batch(&mut jobs);
+    table.try_intern_batch(&mut jobs)
 }
 
 /// Inserts this round's lazy and live definitions. Returns the symbols that
@@ -549,7 +553,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
     use crate::symbols::elf_reference::ElfReferenceRules;
 
     /// A synthetic input. Symbols are written as `"<tag>:<name>"`, where the
@@ -811,5 +814,26 @@ mod tests {
         let mut table = SymbolTable::new();
         let error = resolve_symbols(&mut table, &ElfReferenceRules, &mut files).unwrap_err();
         assert!(error.to_string().starts_with("input3"), "{error}");
+    }
+
+    #[test]
+    fn symbol_table_overflow_is_a_limit_error() {
+        // Round 0 interns main, a, b; extracting the member adds c and d.
+        for (limit, ok) in [(5, true), (4, false), (2, false)] {
+            let mut files = [
+                object(0, &["D:main", "U:a"]),
+                member(1, 0, &["D:a", "D:b", "U:c", "U:d"]),
+            ];
+            let mut table = SymbolTable::new();
+            table.set_limit(limit);
+            match resolve_symbols(&mut table, &ElfReferenceRules, &mut files) {
+                Ok(_) => assert!(ok, "limit {limit}"),
+                Err(Error::Limit(message)) => {
+                    assert!(!ok, "limit {limit}: {message}");
+                    assert!(table.len() <= limit);
+                }
+                Err(other) => panic!("limit {limit}: {other}"),
+            }
+        }
     }
 }

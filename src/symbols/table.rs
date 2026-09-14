@@ -40,6 +40,12 @@
 //! than every ID from the next. The resolution driver makes each round one
 //! batch, and the set of files in each round is itself deterministic.
 //!
+//! # Limits
+//!
+//! A table holds at most [`MAX_SYMBOLS`] names. [`SymbolTable::try_intern`]
+//! and [`SymbolTable::try_intern_batch`] return [`Error::Limit`] when a name
+//! would exceed it, and leave the table as it was before the call.
+//!
 //! # Shards and hashes
 //!
 //! Each shard holds a [`hashbrown::HashTable`] of 8-byte slots: the low 32
@@ -58,7 +64,7 @@
 //! symbol ID; reading a single field after resolution is a plain atomic load.
 
 use core::fmt;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use hashbrown::HashTable;
@@ -68,6 +74,7 @@ use rayon::prelude::*;
 use super::definition::{Definition, DefinitionKind, Resolver, takes_precedence};
 use super::flags::{self, SymbolFlags};
 use super::name::{InputPosition, SymbolName};
+use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
 
 /// Number of bits of the name hash that select a shard.
@@ -88,6 +95,10 @@ pub const MAX_SYMBOLS: usize = PENDING as usize;
 const PENDING: u32 = 1 << 31;
 /// Jobs are split into parallel chunks no smaller than this.
 const MIN_PARALLEL_CHUNK: usize = 1024;
+
+fn overflow(limit: usize) -> Error {
+    Error::Limit(format!("more than {limit} distinct symbol names"))
+}
 
 /// A name's first occurrence: job position, then index within the job.
 type Occurrence = (InputPosition, u32);
@@ -185,6 +196,9 @@ pub struct SymbolTable<'a> {
     def_position: Vec<AtomicU64>,
     def_aux: Vec<AtomicU64>,
     def_locks: Box<[Mutex<()>]>,
+    /// The most symbols this table may hold: [`MAX_SYMBOLS`], lowered only
+    /// by tests.
+    limit: usize,
 }
 
 impl Default for SymbolTable<'_> {
@@ -233,7 +247,14 @@ impl<'a> SymbolTable<'a> {
             def_position: Vec::with_capacity(symbols),
             def_aux: Vec::with_capacity(symbols),
             def_locks,
+            limit: MAX_SYMBOLS,
         }
+    }
+
+    /// Lowers the symbol limit, so tests can reach it.
+    #[cfg(test)]
+    pub(crate) fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.min(MAX_SYMBOLS);
     }
 
     /// Returns the number of distinct symbols.
@@ -295,10 +316,26 @@ impl<'a> SymbolTable<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if the table already holds [`MAX_SYMBOLS`] symbols.
+    /// Panics if the table already holds [`MAX_SYMBOLS`] symbols; see
+    /// [`try_intern`](Self::try_intern) for the fallible version.
     pub fn intern(&mut self, name: SymbolName<'a>) -> SymbolId {
+        match self.try_intern(name) {
+            Ok(id) => id,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// Interns one name like [`intern`](Self::intern), but returns an error
+    /// instead of panicking when the table is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] if `name` is new and the table already holds
+    /// [`MAX_SYMBOLS`] symbols. The table is unchanged.
+    pub fn try_intern(&mut self, name: SymbolName<'a>) -> Result<SymbolId> {
         let h32 = low32(name.hash());
         let next = self.names.len();
+        let limit = self.limit;
         let shard = get_mut(&mut self.shards[shard_of(name.hash())]);
         let names = &self.names;
         let entry = shard.table.entry(
@@ -307,9 +344,11 @@ impl<'a> SymbolTable<'a> {
             |slot| table_hash(slot.h32),
         );
         match entry {
-            Entry::Occupied(occupied) => SymbolId::from_u32(occupied.get().value),
+            Entry::Occupied(occupied) => Ok(SymbolId::from_u32(occupied.get().value)),
             Entry::Vacant(vacant) => {
-                assert!(next < MAX_SYMBOLS, "symbol table overflow");
+                if next >= limit {
+                    return Err(overflow(limit));
+                }
                 let id = SymbolId::new(next);
                 vacant.insert(Slot {
                     h32,
@@ -317,7 +356,7 @@ impl<'a> SymbolTable<'a> {
                 });
                 self.names.push(name);
                 self.grow_state(1);
-                id
+                Ok(id)
             }
         }
     }
@@ -332,8 +371,28 @@ impl<'a> SymbolTable<'a> {
     /// # Panics
     ///
     /// Panics if a job's `ids` and `names` differ in length, or if the table
-    /// would exceed [`MAX_SYMBOLS`] symbols.
+    /// would exceed [`MAX_SYMBOLS`] symbols; see
+    /// [`try_intern_batch`](Self::try_intern_batch) for the version that
+    /// returns the latter as an error.
     pub fn intern_batch(&mut self, jobs: &mut [InternJob<'a, '_>]) {
+        if let Err(error) = self.try_intern_batch(jobs) {
+            panic!("{error}");
+        }
+    }
+
+    /// Interns a batch like [`intern_batch`](Self::intern_batch), but returns
+    /// an error instead of panicking when the table would overflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] if the batch's new names would take the table
+    /// past [`MAX_SYMBOLS`] symbols. The table is then unchanged: no name of
+    /// the batch is added, and the jobs' `ids` hold unspecified values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a job's `ids` and `names` differ in length.
+    pub fn try_intern_batch(&mut self, jobs: &mut [InternJob<'a, '_>]) -> Result<()> {
         for job in jobs.iter() {
             assert_eq!(
                 job.names.len(),
@@ -343,6 +402,7 @@ impl<'a> SymbolTable<'a> {
         }
 
         // Pass 1: look up or provisionally insert, in parallel.
+        let overflowed = AtomicBool::new(false);
         {
             let this = &*self;
             jobs.par_iter_mut().for_each(|job| {
@@ -354,15 +414,30 @@ impl<'a> SymbolTable<'a> {
                     .with_min_len(MIN_PARALLEL_CHUNK)
                     .for_each(|(index, (id, name))| {
                         let index = u32::try_from(index).unwrap_or(u32::MAX);
-                        *id = SymbolId::from_u32(this.lookup_or_pend(name, (position, index)));
+                        *id = SymbolId::from_u32(this.lookup_or_pend(
+                            name,
+                            (position, index),
+                            &overflowed,
+                        ));
                     });
             });
         }
 
-        // Pass 2: number the pending names by first occurrence.
-        if !self.assign_pending() {
-            return;
+        let new_count: usize = self
+            .shards
+            .iter_mut()
+            .map(|shard| get_mut(shard).pending.len())
+            .sum();
+        if new_count == 0 {
+            return Ok(());
         }
+        if overflowed.into_inner() || new_count > self.limit.saturating_sub(self.names.len()) {
+            self.discard_pending();
+            return Err(overflow(self.limit));
+        }
+
+        // Pass 2: number the pending names by first occurrence.
+        self.assign_pending(new_count);
 
         // Pass 3: replace provisional handles with final IDs.
         let shards: Vec<&Shard<'a>> = self
@@ -388,12 +463,19 @@ impl<'a> SymbolTable<'a> {
         self.shards.par_iter_mut().for_each(|shard| {
             get_mut(shard).assigned = Vec::new();
         });
+        Ok(())
     }
 
     /// Pass 1 of interning for one name. Returns a final ID or a pending
-    /// handle.
+    /// handle. If the shard's pending list is full, sets `overflowed` and
+    /// returns a handle that must not be resolved.
     #[inline]
-    fn lookup_or_pend(&self, name: &SymbolName<'a>, occurrence: Occurrence) -> u32 {
+    fn lookup_or_pend(
+        &self,
+        name: &SymbolName<'a>,
+        occurrence: Occurrence,
+        overflowed: &AtomicBool,
+    ) -> u32 {
         let h32 = low32(name.hash());
         let mut guard = lock(&self.shards[shard_of(name.hash())]);
         let Shard { table, pending, .. } = &mut *guard;
@@ -422,12 +504,15 @@ impl<'a> SymbolTable<'a> {
                 value
             }
             Entry::Vacant(vacant) => {
-                // A shard's pending list cannot reach 2^31 entries before
-                // memory runs out (56 bytes each); treat it like MAX_SYMBOLS.
-                let local = u32::try_from(pending.len())
+                // A shard's pending list holds at most 2^31 names, which is
+                // also the table limit, so a full list means overflow.
+                let Some(local) = u32::try_from(pending.len())
                     .ok()
                     .filter(|&local| local < PENDING)
-                    .expect("symbol table overflow");
+                else {
+                    overflowed.store(true, Ordering::Relaxed);
+                    return u32::MAX;
+                };
                 pending.push(PendingName {
                     name: *name,
                     first: occurrence,
@@ -439,18 +524,23 @@ impl<'a> SymbolTable<'a> {
         }
     }
 
-    /// Pass 2 of interning. Returns `false` if there was nothing pending.
-    fn assign_pending(&mut self) -> bool {
+    /// Undoes pass 1 after an overflow: removes the provisional slots and
+    /// the pending names.
+    fn discard_pending(&mut self) {
+        for shard in self.shards.iter_mut() {
+            let shard = get_mut(shard);
+            if !shard.pending.is_empty() {
+                shard.table.retain(|slot| slot.value & PENDING == 0);
+                shard.pending = Vec::new();
+            }
+        }
+    }
+
+    /// Pass 2 of interning: numbers the `new_count` pending names, which the
+    /// caller checked fit in the table.
+    fn assign_pending(&mut self, new_count: usize) {
         let base = self.names.len();
         let mut shards: Vec<&mut Shard<'a>> = self.shards.iter_mut().map(get_mut).collect();
-        let new_count: usize = shards.iter().map(|shard| shard.pending.len()).sum();
-        if new_count == 0 {
-            return false;
-        }
-        assert!(
-            new_count <= MAX_SYMBOLS - base,
-            "symbol table overflow: more than {MAX_SYMBOLS} symbols"
-        );
 
         // Gather (first occurrence, shard, pending index) and sort.
         let view: Vec<&Shard<'a>> = shards.iter().map(|shard| &**shard).collect();
@@ -509,7 +599,7 @@ impl<'a> SymbolTable<'a> {
                 .enumerate()
                 .with_min_len(MIN_PARALLEL_CHUNK)
                 .for_each(|(rank, &(_, s, l))| {
-                    // base + rank < MAX_SYMBOLS, checked above.
+                    // base + rank < limit <= MAX_SYMBOLS, checked by the caller.
                     let id = (base + rank) as u32;
                     view[s as usize].assigned[l as usize].store(id, Ordering::Relaxed);
                 });
@@ -538,7 +628,6 @@ impl<'a> SymbolTable<'a> {
         });
 
         self.grow_state(new_count);
-        true
     }
 
     /// Appends default per-symbol state for `count` new symbols.
@@ -923,5 +1012,93 @@ mod tests {
             assert_eq!(table.name(*id), names[i]);
             assert_eq!(table.lookup(&names[i]), Some(*id));
         }
+    }
+
+    /// Interns `names` as one batch of jobs of `chunk` names each, at
+    /// positions `0, 1, ..` (or all at position 0), and returns the IDs.
+    fn intern_chunks(
+        table: &mut SymbolTable<'static>,
+        names: &[SymbolName<'static>],
+        chunk: usize,
+        same_position: bool,
+    ) -> Result<Vec<SymbolId>> {
+        let mut ids = vec![SymbolId::new(0); names.len()];
+        let mut jobs: Vec<InternJob<'static, '_>> = names
+            .chunks(chunk)
+            .zip(ids.chunks_mut(chunk))
+            .enumerate()
+            .map(|(j, (names, ids))| InternJob {
+                position: InputPosition::new(if same_position { 0 } else { j as u32 }, 0),
+                names,
+                ids,
+            })
+            .collect();
+        table.try_intern_batch(&mut jobs)?;
+        drop(jobs);
+        Ok(ids)
+    }
+
+    fn leaked_names(prefix: &str, count: usize) -> Vec<SymbolName<'static>> {
+        (0..count)
+            .map(|i| {
+                let text: &'static str = Box::leak(format!("{prefix}{i}").into_boxed_str());
+                SymbolName::new(text.as_bytes())
+            })
+            .collect()
+    }
+
+    fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn overflow_is_an_error_and_leaves_the_table_unchanged() {
+        // Small and large batches, with distinct and shared positions.
+        for (count, chunk, same_position) in [
+            (100, 7, false),
+            (100, 7, true),
+            (100_000, 5000, false),
+            (100_000, 5000, true),
+        ] {
+            let what = format!("{count} names, same position: {same_position}");
+            let first = leaked_names("first", 10);
+            let names = leaked_names("batch", count);
+            pool(4).install(|| {
+                let mut table = SymbolTable::new();
+                table.set_limit(count);
+                intern_chunks(&mut table, &first, 3, false).unwrap();
+                let error = intern_chunks(&mut table, &names, chunk, same_position).unwrap_err();
+                assert!(matches!(error, Error::Limit(_)), "{what}: {error}");
+                assert_eq!(table.len(), 10, "{what}");
+                assert!(table.lookup(&names[0]).is_none(), "{what}");
+                assert!(table.lookup(&names[count - 1]).is_none(), "{what}");
+                assert_eq!(table.lookup(&first[9]), Some(SymbolId::new(9)), "{what}");
+                assert_eq!(table.try_intern(names[0]).unwrap(), SymbolId::new(10));
+
+                // The table still works, up to the limit.
+                let rest = &names[1..count - 10];
+                let ids = intern_chunks(&mut table, rest, chunk, same_position).unwrap();
+                assert_eq!(table.len(), count, "{what}");
+                assert_eq!(table.lookup(&rest[0]), Some(SymbolId::new(11)), "{what}");
+                assert_eq!(table.lookup(&rest[rest.len() - 1]), ids.last().copied());
+                assert!(matches!(
+                    table.try_intern(names[count - 1]),
+                    Err(Error::Limit(_))
+                ));
+                assert_eq!(table.try_intern(first[0]).unwrap(), SymbolId::new(0));
+            });
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "limit exceeded")]
+    fn intern_panics_on_overflow() {
+        let mut table = SymbolTable::new();
+        table.set_limit(1);
+        table.intern(SymbolName::new(b"a"));
+        table.intern(SymbolName::new(b"b"));
     }
 }
