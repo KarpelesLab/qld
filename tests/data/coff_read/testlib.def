@@ -1,0 +1,10 @@
+; COFF reader fixture: module-definition file for import libraries.
+LIBRARY testlib.dll
+EXPORTS
+  plain_function
+  plain_data DATA
+  by_ordinal @7 NONAME
+  public_name=internal_name
+  constant_value CONSTANT
+  hinted @12
+  exported_as EXPORTAS real_export

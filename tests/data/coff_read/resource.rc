@@ -1,0 +1,5 @@
+// COFF reader fixture: a tiny resource script.
+STRINGTABLE
+BEGIN
+  1 "qld"
+END
