@@ -256,41 +256,83 @@ pub fn decompressed_name(name: &[u8]) -> Cow<'_, [u8]> {
 pub enum OutputCompression {
     /// zlib at the given level (lld uses level 1, or 6 with `-O2`).
     Zlib(Level),
-    /// Zstandard.
+    /// Zstandard, with qld's single fast strategy (between `zstd -1` and
+    /// `-3` in ratio; see [`compress::zstd`](super::compress::zstd)).
     Zstd,
+    /// The legacy GNU format (`zlib-gnu`): no `SHF_COMPRESSED`, the section
+    /// is renamed `.zdebug_*` and starts with `ZLIB` and the size. GNU ld
+    /// still writes it; lld dropped it.
+    ZlibGnu(Level),
 }
 
 impl OutputCompression {
     /// Parses a `--compress-debug-sections` value: `zlib`, `zlib-gabi`,
-    /// or `zstd`. `none` (and anything else) returns `None`.
+    /// `zlib-gnu` or `zstd`. `none` (and anything else) returns `None`.
     #[must_use]
     pub fn from_option(value: &str, level: Level) -> Option<Self> {
         match value {
             "zlib" | "zlib-gabi" => Some(Self::Zlib(level)),
+            "zlib-gnu" => Some(Self::ZlibGnu(level)),
             "zstd" => Some(Self::Zstd),
             _ => None,
         }
     }
+
+    /// Whether the output section gets `SHF_COMPRESSED` (every format but
+    /// `zlib-gnu`).
+    #[must_use]
+    pub fn is_gabi(self) -> bool {
+        !matches!(self, Self::ZlibGnu(_))
+    }
 }
 
-/// Builds the contents of an `SHF_COMPRESSED` section holding `data`: an
-/// `Elf_Chdr` for format `F`, then the compressed stream. `align` is the
-/// uncompressed section's alignment.
+/// The name of a compressed output section: `.debug_*` becomes `.zdebug_*`
+/// for [`OutputCompression::ZlibGnu`]; otherwise the name is unchanged.
+#[must_use]
+pub fn compressed_name(name: &[u8], compression: OutputCompression) -> Cow<'_, [u8]> {
+    match (compression, name.strip_prefix(b".debug")) {
+        (OutputCompression::ZlibGnu(_), Some(rest)) => {
+            let mut owned = Vec::with_capacity(name.len().saturating_add(1));
+            owned.extend_from_slice(ZDEBUG_PREFIX);
+            owned.extend_from_slice(rest);
+            Cow::Owned(owned)
+        }
+        _ => Cow::Borrowed(name),
+    }
+}
+
+/// Builds the contents of a compressed debug output section holding
+/// `data`: for the gABI formats, an `Elf_Chdr` for format `F` (with `align`,
+/// the uncompressed section's alignment) followed by the compressed stream;
+/// for `zlib-gnu`, the `ZLIB` header and the zlib stream (the section is
+/// then renamed with [`compressed_name`] and has no `SHF_COMPRESSED`).
 ///
 /// The data is compressed in parallel chunks on the current rayon pool; the
-/// output is deterministic and independent of the thread count.
+/// output is deterministic and independent of the thread count. GNU ld
+/// keeps a section uncompressed when compression does not make it smaller;
+/// that choice is the caller's.
 #[must_use]
 pub fn compress_section<F: ElfFormat>(
     data: &[u8],
     compression: OutputCompression,
     align: u64,
 ) -> Vec<u8> {
-    let (ch_type, stream) = match compression {
-        OutputCompression::Zlib(level) => (ELFCOMPRESS_ZLIB, zlib_compress(data, level)),
-        OutputCompression::Zstd => (ELFCOMPRESS_ZSTD, zstd_compress(data)),
-    };
     let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
-    let mut out = encode_chdr::<F>(ch_type, size, align);
+    let (mut out, stream) = match compression {
+        OutputCompression::Zlib(level) => (
+            encode_chdr::<F>(ELFCOMPRESS_ZLIB, size, align),
+            zlib_compress(data, level),
+        ),
+        OutputCompression::Zstd => (
+            encode_chdr::<F>(ELFCOMPRESS_ZSTD, size, align),
+            zstd_compress(data),
+        ),
+        OutputCompression::ZlibGnu(level) => {
+            let mut header = ZDEBUG_MAGIC.to_vec();
+            header.extend_from_slice(&size.to_be_bytes());
+            (header, zlib_compress(data, level))
+        }
+    };
     out.reserve_exact(stream.len());
     out.extend_from_slice(&stream);
     out
@@ -381,10 +423,15 @@ mod tests {
     #[test]
     fn zdebug_header() {
         let data = b"some debug info".repeat(40);
-        let z = zlib_compress(&data, Level::DEFAULT);
-        let mut contents = ZDEBUG_MAGIC.to_vec();
-        contents.extend_from_slice(&(data.len() as u64).to_be_bytes());
-        contents.extend_from_slice(&z);
+        let gnu = OutputCompression::from_option("zlib-gnu", Level::DEFAULT).unwrap();
+        assert!(!gnu.is_gabi());
+        let contents = compress_section::<Elf64Le>(&data, gnu, 1);
+        assert_eq!(&contents[..4], ZDEBUG_MAGIC);
+        assert_eq!(&*compressed_name(b".debug_line", gnu), b".zdebug_line");
+        assert_eq!(
+            &*compressed_name(b".debug_line", OutputCompression::Zstd),
+            b".debug_line"
+        );
         let section = CompressedSection::from_zdebug(&contents, 0x100, 1).unwrap();
         assert!(section.zdebug);
         assert_eq!(section.data_offset, 0x10c);

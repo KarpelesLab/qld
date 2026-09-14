@@ -14,8 +14,9 @@
 //! - Each 128 KiB block is written as compressed, RLE or raw, whichever is
 //!   smallest. Literals are Huffman-coded (weights described directly or
 //!   FSE-compressed) when that pays off. Sequences are FSE-coded with the
-//!   predefined tables or with per-block tables (RLE when a single code is
-//!   used), whichever encodes smaller. Repeat offsets are used.
+//!   predefined tables (blocks with few sequences), per-block tables (RLE
+//!   when a single code is used; blocks with many sequences), or whichever
+//!   of the two encodes smaller in between. Repeat offsets are used.
 //!
 //! Like the DEFLATE encoder, this only handles buffers it builds itself;
 //! indexing and arithmetic follow from the loop invariants noted in the
