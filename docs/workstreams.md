@@ -46,10 +46,10 @@ can work at the same time without colliding.
 | W4 | Symbol table and interning | `src/symbols/**` | — | merged |
 | W5 | Output writer | `src/output/**` | — | merged |
 | W6 | GC / ICF / merge passes | `src/passes/**` | — | merged |
-| W7 | ELF reading | `src/elf/read/**` | — | yes |
-| W8 | ELF layout and writing | `src/elf/{layout,synth,arch}/**` | W7 | after W7 |
+| W7 | ELF reading | `src/elf/read/**` | — | merged |
+| W8 | ELF layout, writing and link driver | `src/elf/**` (extends `read/` as needed) | W7 | in progress |
 | W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | merged |
-| W10 | DWARF | `src/debug/**` | W7 | after W7 |
+| W10 | DWARF | `src/debug/**` | W7 | in progress |
 
 W1–W7 and W9 can all run at once. They share no files.
 
@@ -230,7 +230,9 @@ no panics, and truncated or corrupted objects never panic in randomized tests.
 
 **Goal:** turn resolved inputs into a static x86-64 executable (roadmap M1).
 
-**Owns:** `src/elf/layout/**`, `src/elf/synth/**`, `src/elf/arch/**`.
+**Owns:** all of `src/elf/**`, including the driver in `src/elf/link.rs`
+(which `crate::link` calls inside a `--threads`-sized pool). W7 is merged, so
+W8 may extend `src/elf/read/` where layout needs more from the reader.
 
 **Build:** output section assignment matching GNU ld's default script,
 segments, linker-defined symbols, GOT/PLT synthesis, `.eh_frame_hdr`,
