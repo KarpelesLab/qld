@@ -303,6 +303,95 @@ fn present(refs: &Refs<'_, '_>, id: SymbolId) -> bool {
     }
 }
 
+/// Adds, for each imported weak data symbol, the strong symbol its shared
+/// library defines at the same place (glibc's `__environ` for `environ`,
+/// `__timezone` for `timezone`), as GNU ld does: it records a weak
+/// definition's "real" alias as dynamic whenever the weak one is. `chosen`
+/// is in symbol ID order and stays so.
+fn with_strong_aliases(
+    refs: &Refs<'_, '_>,
+    synth: &Synth,
+    mut chosen: Vec<(SymbolId, bool)>,
+) -> Vec<(SymbolId, bool)> {
+    let symbols = refs.symbols;
+    // (file, shndx, value, symbol) of each weak data import.
+    let mut wanted: Vec<(usize, u16, u64, SymbolId)> = chosen
+        .iter()
+        .filter(|&&(id, defined)| !defined && synth.copy_of(id).is_none())
+        .filter_map(|&(id, _)| {
+            let def = symbols.definition(id);
+            if def.kind != DefinitionKind::Shared {
+                return None;
+            }
+            let shared = refs.files.get(def.file.index())?.shared.as_ref()?;
+            let index = *shared.symbols.get(def.index as usize)?;
+            let raw = shared.elf.symbols().get_raw(index as usize)?;
+            (raw.binding() == STB_WEAK && !matches!(raw.kind(), STT_FUNC | STT_GNU_IFUNC))
+                .then_some((def.file.index(), raw.st_shndx, raw.st_value, id))
+        })
+        .collect();
+    if wanted.is_empty() {
+        return chosen;
+    }
+    wanted.sort_unstable();
+    let mut files: Vec<usize> = wanted.iter().map(|&(file, _, _, _)| file).collect();
+    files.dedup();
+    let mut added: Vec<SymbolId> = Vec::new();
+    for file in files {
+        let Some(shared) = refs.files.get(file).and_then(|f| f.shared.as_ref()) else {
+            continue;
+        };
+        let ids = refs.resolution.symbol_ids(crate::ids::FileId::new(file));
+        // The first strong symbol (by symbol index) at each wanted place.
+        let mut found: Vec<(u16, u64)> = Vec::new();
+        for (local, (&index, &id)) in shared.symbols.iter().zip(ids).enumerate() {
+            if !matches!(
+                shared.uses.get(local),
+                Some(crate::symbols::SymbolUse::Definition { .. })
+            ) || symbols.name(id).version().is_some()
+            {
+                continue;
+            }
+            let Some(raw) = shared.elf.symbols().get_raw(index as usize) else {
+                continue;
+            };
+            let place = (raw.st_shndx, raw.st_value);
+            if raw.binding() != STB_GLOBAL || found.contains(&place) {
+                continue;
+            }
+            let key = (file, place.0, place.1);
+            let from = wanted.partition_point(|&(f, shndx, value, _)| (f, shndx, value) < key);
+            let weak: &[(usize, u16, u64, SymbolId)] = wanted.get(from..).unwrap_or_default();
+            let count = weak
+                .iter()
+                .take_while(|&&(f, shndx, value, _)| (f, shndx, value) == key)
+                .count();
+            let weak = weak.get(..count).unwrap_or_default();
+            if weak.is_empty() {
+                continue;
+            }
+            found.push(place);
+            let def = symbols.definition(id);
+            if def.kind == DefinitionKind::Shared && def.file.index() == file {
+                // The alias is referenced as its weak symbol is (GNU ld
+                // copies the reference flags), which sets its binding.
+                for &(_, _, _, weak) in weak {
+                    let flags = symbols.flags(weak) & (REF_REGULAR | REF_REGULAR_STRONG);
+                    symbols.set_flags(id, flags);
+                }
+                added.push(id);
+            }
+        }
+    }
+    if added.is_empty() {
+        return chosen;
+    }
+    chosen.extend(added.into_iter().map(|id| (id, false)));
+    chosen.sort_unstable_by_key(|&(id, _)| id);
+    chosen.dedup_by_key(|&mut (id, _)| id);
+    chosen
+}
+
 /// Plans the dynamic symbol table; see the [module documentation](self).
 ///
 /// # Errors
@@ -357,6 +446,7 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
             }
         })
         .collect();
+    let chosen = with_strong_aliases(refs, input.synth, chosen);
 
     let mut imports: Vec<SymbolId> = Vec::new();
     let mut exports: Vec<Entry> = Vec::new();

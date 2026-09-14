@@ -1811,3 +1811,72 @@ fn archive_before_shared_library_is_extracted() {
     let dynamic = readelf(&dir, &["-d", "third"]);
     assert!(!dynamic.contains("libhelper.so"), "{dynamic}");
 }
+
+/// `PT_TLS` starts on its alignment even when `.tdata` is less aligned than
+/// `.tbss`: glibc places the block by `p_vaddr % p_align`, so local-exec
+/// offsets were 4 bytes off (LLVM's unit tests crashed in
+/// `timeTraceProfilerBegin`).
+#[test]
+fn tls_segment_starts_aligned() {
+    require!("cc", "readelf");
+    let dir = scratch("tls-segment-aligned");
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\n__thread int small_qld = 7;\n__thread void *ptr_qld;\n\
+         __attribute__((noinline)) static int *addr(void) { return &small_qld; }\n\
+         __attribute__((noinline)) static void **paddr(void) { return &ptr_qld; }\n\
+         int main(void) { *paddr() = addr(); printf(\"%d %d\\n\", *addr(), *(int *)*paddr()); return 0; }\n",
+        &["-fPIE"],
+    );
+    cc_link_ok(&dir, &["-pie", "-o", "out", "main.o"]);
+    assert_eq!(stdout_of(&dir, "out"), "7 7\n");
+    let segments = readelf(&dir, &["-l", "out"]);
+    let tls = segments
+        .lines()
+        .find(|l| l.trim_start().starts_with("TLS"))
+        .unwrap_or_else(|| panic!("no PT_TLS: {segments}"));
+    let fields: Vec<&str> = tls.split_whitespace().collect();
+    let vaddr = u64::from_str_radix(fields[2].trim_start_matches("0x"), 16).unwrap();
+    let align = u64::from_str_radix(fields[7].trim_start_matches("0x"), 16).unwrap();
+    assert_eq!(vaddr % align, 0, "{tls}");
+}
+
+/// Importing a weak data symbol also imports the strong symbol its library
+/// defines at the same address, as GNU ld does (glibc's `environ` brings
+/// `__environ`, `timezone` brings `__timezone`).
+#[test]
+fn weak_data_imports_bring_their_strong_alias() {
+    require!("cc", "readelf");
+    let dir = scratch("weak-data-alias");
+    compile_with(
+        &dir,
+        "lib",
+        "int strong_qld = 3;\nextern int weak_qld __attribute__((weak, alias(\"strong_qld\")));\n\
+         int func_qld(void) { return 1; }\n\
+         extern int weakfunc_qld(void) __attribute__((weak, alias(\"func_qld\")));\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\nextern int weak_qld;\nint weakfunc_qld(void);\n\
+         int main(void) { printf(\"%d %d\\n\", weak_qld, weakfunc_qld()); return 0; }\n",
+        &["-fPIC"],
+    );
+    cc_link_ok(&dir, &["-shared", "-o", "libalias.so", "lib.o"]);
+    for (output, kind) in [("out", "-pie"), ("libuser.so", "-shared")] {
+        cc_link_ok(&dir, &[kind, "-o", output, "main.o", "-L.", "-lalias"]);
+        let dynsym = readelf(&dir, &["--dyn-syms", output]);
+        assert!(
+            dynsym.contains("GLOBAL DEFAULT  UND strong_qld"),
+            "{dynsym}"
+        );
+        // Functions have no such aliases.
+        assert!(
+            !dynsym.lines().any(|l| l.ends_with(" func_qld")),
+            "{dynsym}"
+        );
+    }
+    assert_eq!(stdout_of(&dir, "out"), "3 1\n");
+}
