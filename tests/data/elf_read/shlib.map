@@ -1,0 +1,8 @@
+VERS_1 {
+  global: v1_fn; versioned; shared_data;
+  local: *;
+};
+
+VERS_2 {
+  global: v2_fn; versioned; shared_tls; ptrs;
+} VERS_1;
