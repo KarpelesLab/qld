@@ -53,6 +53,7 @@ can work at the same time without colliding.
 | W11 | Dynamic ELF on x86-64 (M2) | `src/elf/**` | W8 | merged (M2) |
 | W12 | Symbol resolution follow-ups | `src/symbols/**` | W4 | merged |
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | merged |
+| W16 | M2 exit criteria: real-world builds | `src/elf/**`, `tests/projects/**` | W11 | in progress |
 | W14 | PE/COFF reading | `src/coff/**` | — | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | in progress |
 
@@ -319,6 +320,17 @@ groups before insertion.
 
 **Owns:** `src/hints/**`, `src/demangle/**`, `tests/hints.rs`,
 `tests/demangle.rs`. Wiring into the ELF driver is a later integration step.
+
+---
+
+## W16: M2 exit criteria (real-world builds)
+
+**Goal:** make ROADMAP M2's exit criteria pass: coreutils, curl, openssl,
+zlib, Python, the Rust compiler and LLVM/clang build with qld as the system
+linker and pass their test suites; qld-built shared objects load under glibc
+and musl `ld.so`. Every bug found gets a minimal regression fixture.
+
+**Owns:** `src/elf/**`, `tests/projects/**` (build scripts), new fixtures.
 
 ---
 
