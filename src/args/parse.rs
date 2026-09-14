@@ -845,6 +845,10 @@ impl GnuParser {
             ZAction::MarkPlt(on) => o.mark_plt = on,
             ZAction::SectionHeader(on) => o.section_header = on,
             ZAction::MemorySeal(on) => o.memory_seal = on,
+            ZAction::DeadRelocInNonalloc => {
+                let (glob, value) = crate::debug::tombstone::parse_rule(value).ok_or_else(bad)?;
+                o.dead_reloc_in_nonalloc.push((glob.to_owned(), value));
+            }
         }
         Ok(())
     }
