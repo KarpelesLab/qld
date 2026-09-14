@@ -1,0 +1,14 @@
+# Regression: a non-allocated SHT_NOTE input section (glibc's .note.stapsdt on
+# Ubuntu) was written out as PROGBITS because its output had zero flags.
+description = "non-allocated NOTE section keeps its type"
+compile = ["as -o start.o start.s"]
+link = "-static -o out start.o"
+run = "./out"
+expect.exit = 3
+expect.readelf = [".note.stapsdt     NOTE", "!.note.stapsdt     PROGBITS"]
+targets = ["x86_64-linux-gnu"]
+determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does), and does
+# not yet carry over the x86 "ISA used"/"feature used" GNU properties that GNU
+# as emits (tracked in docs/workstreams.md follow-ups).
+diff.ignore = [".comment", ".note.gnu.property"]

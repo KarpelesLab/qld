@@ -1,11 +1,11 @@
 //! Integration tests for the output writer (workstream W5).
 
 use qld::args::BuildId;
+#[cfg(unix)]
+use qld::output::FileMode;
 use qld::output::build_id::{BLOCK_SIZE, compute_build_id};
 use qld::output::hash::{Md5, Sha1, xxh64};
-use qld::output::{
-    Backing, ChunkRange, FileMode, OutputFile, OutputOptions, ReplaceStrategy, WritePhase,
-};
+use qld::output::{Backing, ChunkRange, OutputFile, OutputOptions, ReplaceStrategy, WritePhase};
 use qld::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};

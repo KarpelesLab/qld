@@ -229,6 +229,23 @@ a file `a.o,`). Deliberate differences:
 
 Errors are reported GNU-style as `file:line:column: message`.
 
+### Demangled names
+
+Diagnostics, map files and `--print-*` output demangle names unless
+`--no-demangle` is given.
+
+- Itanium C++ output is byte-identical to `c++filt` from binutils 2.46 on
+  every name it accepts (checked on 880k names from this machine's
+  libraries). qld also demangles forms `c++filt` rejects: Mach-O `__Z`/`__R`
+  prefixes, clone suffixes on data symbols (`_ZL3foo.llvm.123`),
+  `_GLOBAL__sub_I_<file>` (shown as "global constructors keyed to"), and
+  Clang's template-parameter declarations in template arguments.
+- Rust names: the legacy `17h<hash>E` suffix is hidden by default, as
+  `rustfilt` does. Rust v0 constants wider than 64 bits print as correct hex,
+  where `c++filt` garbles them.
+- Not yet demangled (left as-is): C++20 `requires` clauses and a few other
+  recent Itanium extensions that `llvm-cxxfilt` handles.
+
 ## ld64 flavor notes
 
 - Single-dash long options only (`-dylib`, `-framework Foo`, `-arch arm64`).

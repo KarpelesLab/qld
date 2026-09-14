@@ -542,6 +542,25 @@ fn addr2line(
     Some(lines)
 }
 
+/// The `(major, minor)` version of a GNU binutils tool, from `--version`.
+fn binutils_version(tool: &Path) -> Option<(u32, u32)> {
+    let output = Command::new(tool).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let first = text.lines().next()?;
+    if !first.contains("GNU") {
+        return None;
+    }
+    let version = first.split_whitespace().last()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts
+        .next()?
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .ok()?;
+    Some((major, minor))
+}
+
 /// Compiles the line test program in many configurations and compares
 /// qld's line lookup with `addr2line` at every few bytes of every code
 /// section.
@@ -553,6 +572,11 @@ fn line_lookup_matches_addr2line() {
     let Some(tool) = find_program("addr2line") else {
         return skip("addr2line not found");
     };
+    // GNU addr2line from binutils 2.42 (Ubuntu 24.04) numbers DWARF 5 file
+    // entries off by one: it reports `lines.c` where the line program says
+    // file 1 (`lines.h`). 2.46 is correct. The exact fixed release isn't
+    // pinned down, so DWARF 5 objects are only compared against 2.44+.
+    let dwarf5_reliable = binutils_version(&tool).is_some_and(|v| v >= (2, 44));
     let dir = scratch_dir("lines");
     std::fs::write(dir.join("lines.h"), LINES_HEADER).unwrap();
     let mut configs: Vec<(String, Vec<&str>)> = Vec::new();
@@ -630,6 +654,10 @@ fn line_lookup_matches_addr2line() {
             continue;
         }
         built += 1;
+        if !dwarf5_reliable && flags.iter().any(|f| f == "-gdwarf-5") {
+            println!("{label}: addr2line older than 2.44 misreads DWARF 5 file numbers, skipped");
+            continue;
+        }
         let data = std::fs::read(&obj).unwrap();
         let is_32 = data[4] == 1;
         fn check<F: ElfFormat>(data: &[u8], obj: &Path, tool: &Path, label: &str) -> usize {
