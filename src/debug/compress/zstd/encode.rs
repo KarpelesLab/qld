@@ -263,8 +263,13 @@ impl FrameEncoder {
 
 /// A forward, least-significant-bit-first bit writer. A backward reader
 /// returns the fields in reverse order.
+///
+/// Hot loops call [`put`](Self::put) for up to 56 bits between calls to
+/// [`flush`](Self::flush), which stores whole bytes with one fixed-size
+/// copy into a buffer kept at least eight bytes longer than the output.
 struct BitWriter {
-    out: Vec<u8>,
+    buf: Vec<u8>,
+    pos: usize,
     acc: u64,
     count: u32,
 }
@@ -272,34 +277,67 @@ struct BitWriter {
 impl BitWriter {
     fn new(capacity: usize) -> Self {
         Self {
-            out: Vec::with_capacity(capacity),
+            buf: vec![0; capacity + 16],
+            pos: 0,
             acc: 0,
             count: 0,
         }
     }
 
-    /// Appends the low `bits` (at most 32) bits of `value`.
+    /// Appends the low `bits` (at most 32) bits of `value` without
+    /// flushing; the caller keeps the pending bits at most 64.
     #[inline(always)]
-    fn add(&mut self, value: u64, bits: u32) {
+    fn put(&mut self, value: u64, bits: u32) {
         let masked = value & ((1u64 << bits) - 1);
         self.acc |= masked << self.count;
         self.count += bits;
+    }
+
+    /// Moves the whole pending bytes to the buffer.
+    #[inline(always)]
+    fn flush(&mut self) {
+        if self.pos + 8 > self.buf.len() {
+            self.buf.resize(self.buf.len() * 2 + 16, 0);
+        }
+        self.buf[self.pos..self.pos + 8].copy_from_slice(&self.acc.to_le_bytes());
+        let bytes = self.count >> 3;
+        self.pos += bytes as usize;
+        self.acc = if bytes == 8 {
+            0
+        } else {
+            self.acc >> (bytes * 8)
+        };
+        self.count &= 7;
+    }
+
+    /// Appends the low `bits` (at most 32) bits of `value`.
+    #[inline(always)]
+    fn add(&mut self, value: u64, bits: u32) {
+        self.put(value, bits);
         if self.count >= 32 {
-            self.out.extend_from_slice(&(self.acc as u32).to_le_bytes());
-            self.acc >>= 32;
-            self.count -= 32;
+            self.flush();
         }
     }
 
     /// Adds the end marker and returns the bytes.
     fn close(mut self) -> Vec<u8> {
         self.add(1, 1);
-        while self.count > 0 {
-            self.out.push(self.acc as u8);
-            self.acc >>= 8;
-            self.count = self.count.saturating_sub(8);
+        self.flush();
+        if self.count > 0 {
+            self.flush_partial();
         }
-        self.out
+        self.buf.truncate(self.pos);
+        self.buf
+    }
+
+    fn flush_partial(&mut self) {
+        if self.pos + 8 > self.buf.len() {
+            self.buf.resize(self.buf.len() + 16, 0);
+        }
+        self.buf[self.pos] = self.acc as u8;
+        self.pos += 1;
+        self.acc = 0;
+        self.count = 0;
     }
 }
 
@@ -627,7 +665,17 @@ fn huffman_literals(literals: &[u8]) -> Option<Vec<u8>> {
     let four = n > 1023;
     let stream = |segment: &[u8]| {
         let mut w = BitWriter::new(segment.len());
-        for &b in segment.iter().rev() {
+        // Literals go in reverse order, four codes of at most 11 bits per
+        // flush; `as_rchunks` leaves the odd bytes at the front.
+        let (head, quads) = segment.as_rchunks::<4>();
+        for quad in quads.iter().rev() {
+            for &b in quad.iter().rev() {
+                let (code, len) = codes[usize::from(b)];
+                w.put(u64::from(code), len);
+            }
+            w.flush();
+        }
+        for &b in head.iter().rev() {
             let (code, len) = codes[usize::from(b)];
             w.add(u64::from(code), len);
         }
@@ -772,6 +820,32 @@ fn code_for(bases: &[u32], value: u32) -> usize {
     bases.partition_point(|&b| b <= value).saturating_sub(1)
 }
 
+/// Literal length code: a table below 64, then one code per power of two
+/// (as zstd's `ZSTD_LLcode`).
+#[inline(always)]
+fn ll_code(lit_len: u32) -> usize {
+    static TABLE: OnceLock<[u8; 64]> = OnceLock::new();
+    if lit_len >= 64 {
+        return (31 - lit_len.leading_zeros() + 19) as usize;
+    }
+    let table = TABLE.get_or_init(|| std::array::from_fn(|v| code_for(&LL_BASE, v as u32) as u8));
+    usize::from(table[lit_len as usize])
+}
+
+/// Match length code for a match of `match_len` (at least 3) bytes (as
+/// zstd's `ZSTD_MLcode`).
+#[inline(always)]
+fn ml_code(match_len: u32) -> usize {
+    static TABLE: OnceLock<[u8; 128]> = OnceLock::new();
+    let base = match_len - 3;
+    if base >= 128 {
+        return (31 - base.leading_zeros() + 36) as usize;
+    }
+    let table =
+        TABLE.get_or_init(|| std::array::from_fn(|v| code_for(&ML_BASE, v as u32 + 3) as u8));
+    usize::from(table[base as usize])
+}
+
 /// The offset value to send for `offset` and how the repeat offsets
 /// change, mirroring the decoder.
 fn offset_value(rep: &mut [u32; 3], offset: u32, lit_len: u32) -> u32 {
@@ -825,8 +899,8 @@ fn encode_sequences(sequences: &[Sequence], rep: &mut [u32; 3], out: &mut Vec<u8
         .map(|s| {
             let ov = offset_value(rep, s.offset, s.lit_len);
             let of = 31 - ov.leading_zeros();
-            let ll = code_for(&LL_BASE, s.lit_len);
-            let ml = code_for(&ML_BASE, s.match_len);
+            let ll = ll_code(s.lit_len);
+            let ml = ml_code(s.match_len);
             Coded {
                 ll: ll as u8,
                 ml: ml as u8,
@@ -838,15 +912,18 @@ fn encode_sequences(sequences: &[Sequence], rep: &mut [u32; 3], out: &mut Vec<u8
         })
         .collect();
 
-    // Option 1: predefined tables.
-    let predefined = predefined_tables();
-    let mut best = vec![0u8];
-    best.extend_from_slice(&write_sequences(
-        &coded,
-        [&predefined[0], &predefined[1], &predefined[2]],
-    ));
-
-    // Option 2: tables fitted to this block.
+    // Small blocks try the predefined tables, large ones fitted tables
+    // (whose description then costs little); in between, both are encoded
+    // and the smaller kept.
+    let mut best: Vec<u8> = Vec::new();
+    if n < 1024 {
+        let predefined = predefined_tables();
+        best.push(0);
+        best.extend_from_slice(&write_sequences(
+            &coded,
+            [&predefined[0], &predefined[1], &predefined[2]],
+        ));
+    }
     if n >= 16 {
         let mut modes = 0u8;
         let mut descriptions = Vec::new();
@@ -871,7 +948,7 @@ fn encode_sequences(sequences: &[Sequence], rep: &mut [u32; 3], out: &mut Vec<u8
             }
         }
         let bits = write_sequences(&coded, [&tables[0], &tables[1], &tables[2]]);
-        if 1 + descriptions.len() + bits.len() < best.len() {
+        if best.is_empty() || 1 + descriptions.len() + bits.len() < best.len() {
             best.clear();
             best.push(modes);
             best.extend_from_slice(&descriptions);
@@ -904,9 +981,13 @@ fn write_sequences(coded: &[Coded], [ll, of, ml]: [&CTable; 3]) -> Vec<u8> {
         of.encode(&mut w, &mut of_state, c.of);
         ml.encode(&mut w, &mut ml_state, c.ml);
         ll.encode(&mut w, &mut ll_state, c.ll);
-        w.add(u64::from(c.ll_extra), u32::from(LL_BITS[usize::from(c.ll)]));
-        w.add(u64::from(c.ml_extra), u32::from(ML_BITS[usize::from(c.ml)]));
-        w.add(u64::from(c.of_extra), u32::from(c.of));
+        // At most 31 bits are pending after `encode`; the two lengths add
+        // at most 32 more, and the offset (after a flush) at most 31.
+        w.put(u64::from(c.ll_extra), u32::from(LL_BITS[usize::from(c.ll)]));
+        w.put(u64::from(c.ml_extra), u32::from(ML_BITS[usize::from(c.ml)]));
+        w.flush();
+        w.put(u64::from(c.of_extra), u32::from(c.of));
+        w.flush();
     }
     ml.flush(&mut w, ml_state);
     of.flush(&mut w, of_state);
@@ -957,6 +1038,20 @@ mod tests {
         let random = noise(300_000, 1);
         let z = roundtrip(&random, DEFAULT_CHUNK_SIZE);
         assert!(z.len() < random.len() + 64);
+    }
+
+    #[test]
+    fn length_codes_match_the_tables() {
+        // Every length a 128 KiB block can hold.
+        for v in 0..131_072u32 {
+            assert_eq!(ll_code(v), code_for(&LL_BASE, v), "literal length {v}");
+            assert_eq!(
+                ml_code(v + 3),
+                code_for(&ML_BASE, v + 3),
+                "match length {}",
+                v + 3
+            );
+        }
     }
 
     #[test]
