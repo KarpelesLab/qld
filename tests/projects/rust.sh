@@ -2,7 +2,8 @@
 # Bootstrap rustc (stage 1) with qld as the host linker, then run a subset of
 # the test suite with the stage 1 compiler (which also links with qld).
 # Usage: tests/projects/rust.sh /path/to/qld /path/to/scratch [test paths...]
-# Default test paths: tests/ui library/std. Set LLVM_CONFIG to use an
+# Default test paths: tests/ui library/std. Set RUST_CLEAN=1 to rebuild
+# stage 1 from scratch (a rerun is otherwise incremental). Set LLVM_CONFIG to use an
 # external LLVM (default: the system LLVM 22, to avoid building LLVM).
 QLD=$1
 SCRATCH=$2
@@ -48,6 +49,12 @@ cxx = "clang++"
 linker = "$QLD_BIN/qclang"
 default-linker-linux-override = "off"
 EOF
+
+# RUST_CLEAN=1 rebuilds (and relinks) stage 1 from scratch.
+if [ -n "${RUST_CLEAN:-}" ]; then
+  rm -rf build/x86_64-unknown-linux-gnu/stage1 build/x86_64-unknown-linux-gnu/stage1-*
+fi
+: > "$QLD_LINK_LOG"
 
 t0=$(now)
 python3 x.py build --stage 1 > build.log 2>&1
