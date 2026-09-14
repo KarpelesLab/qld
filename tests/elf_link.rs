@@ -1425,3 +1425,45 @@ fn relocatable_output_uses_extended_section_numbering() {
     qld_ok(&dir, &["-o", "out", "combined.o"]);
     assert_eq!(exit_code(&dir, "out"), 99);
 }
+
+#[test]
+fn gnu_property_notes_merge_used_and_needed_bits() {
+    require!("as", "readelf");
+    let dir = scratch("property-notes");
+    fs::write(dir.join("start.s"), EXIT_42).unwrap();
+    fs::write(dir.join("other.s"), ".globl other\n.text\nother:\n ret\n").unwrap();
+    for (object, source, used) in [
+        ("start.o", "start.s", "yes"),
+        ("used.o", "other.s", "yes"),
+        ("unused.o", "other.s", "no"),
+    ] {
+        run_ok(
+            &dir,
+            "as",
+            &[
+                "--64",
+                &format!("-mx86-used-note={used}"),
+                "-o",
+                object,
+                source,
+            ],
+        );
+    }
+    qld_ok(
+        &dir,
+        &["-o", "both", "start.o", "used.o", "-z", "x86-64-v2"],
+    );
+    let notes = readelf(&dir, &["-n", "both"]);
+    assert!(notes.contains("x86 ISA used"), "{notes}");
+    assert!(notes.contains("x86 feature used"), "{notes}");
+    assert!(notes.contains("x86 ISA needed: x86-64-v2"), "{notes}");
+    assert_eq!(exit_code(&dir, "both"), 42);
+
+    // "Used" bits survive only when every input has them.
+    qld_ok(&dir, &["-o", "mixed", "start.o", "unused.o"]);
+    let notes = readelf(&dir, &["-n", "mixed"]);
+    assert!(!notes.contains("x86 ISA used"), "{notes}");
+    qld_ok(&dir, &["-r", "-o", "combined.o", "start.o", "used.o"]);
+    let notes = readelf(&dir, &["-n", "combined.o"]);
+    assert!(notes.contains("x86 ISA used"), "{notes}");
+}

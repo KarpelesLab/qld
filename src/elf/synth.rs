@@ -27,9 +27,10 @@ use rayon::prelude::*;
 
 use crate::args::{BuildId, LinkOptions};
 use crate::elf::read::consts::{
-    GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_FEATURE_1_IBT,
-    GNU_PROPERTY_X86_FEATURE_1_SHSTK, GNU_PROPERTY_X86_ISA_1_NEEDED, NT_GNU_BUILD_ID,
-    NT_GNU_PROPERTY_TYPE_0,
+    GNU_PROPERTY_1_NEEDED, GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_FEATURE_1_IBT,
+    GNU_PROPERTY_X86_FEATURE_1_SHSTK, GNU_PROPERTY_X86_FEATURE_2_NEEDED,
+    GNU_PROPERTY_X86_FEATURE_2_USED, GNU_PROPERTY_X86_ISA_1_NEEDED, GNU_PROPERTY_X86_ISA_1_USED,
+    NT_GNU_BUILD_ID, NT_GNU_PROPERTY_TYPE_0,
 };
 use crate::ids::SymbolId;
 use crate::output::build_id::build_id_size;
@@ -800,22 +801,43 @@ pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
         || input_features(files) & GNU_PROPERTY_X86_FEATURE_1_IBT != 0
 }
 
-/// Merges the inputs' GNU properties into the output note: x86 feature bits
-/// are ANDed across inputs (an input without the note has none), ISA levels
-/// needed are ORed. Shared libraries do not take part.
+/// Merges the inputs' GNU properties into the output note, as GNU ld does:
+///
+/// - x86 feature bits (`FEATURE_1_AND`) are ANDed across inputs (an input
+///   without the note has none), plus `-z ibt` and `-z shstk`;
+/// - "needed" bits (`GNU_PROPERTY_1_NEEDED`, x86 `ISA_1_NEEDED` and
+///   `FEATURE_2_NEEDED`) are ORed, plus the `-z x86-64-vN` level;
+/// - "used" bits (x86 `ISA_1_USED` and `FEATURE_2_USED`) are ORed, but kept
+///   only when every input has them.
+///
+/// Properties are written in type order; zero values are left out. Shared
+/// libraries do not take part.
 #[must_use]
 pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Option<Vec<u8>> {
+    let mut needed_1 = 0u32;
     let mut isa_needed = 0u32;
+    let mut feature_2_needed = 0u32;
+    let mut isa_used: Option<u32> = None;
+    let mut feature_2_used: Option<u32> = None;
+    let mut all_used = (true, true);
     let mut any = false;
     for file in files {
         let Some(object) = &file.object else {
             continue;
         };
         any = true;
-        isa_needed |= object
-            .properties
-            .and_then(|p| p.x86_isa_1_needed)
-            .unwrap_or(0);
+        let properties = object.properties.unwrap_or_default();
+        needed_1 |= properties.needed_1.unwrap_or(0);
+        isa_needed |= properties.x86_isa_1_needed.unwrap_or(0);
+        feature_2_needed |= properties.x86_feature_2_needed.unwrap_or(0);
+        match properties.x86_isa_1_used {
+            Some(bits) => isa_used = Some(isa_used.unwrap_or(0) | bits),
+            None => all_used.0 = false,
+        }
+        match properties.x86_feature_2_used {
+            Some(bits) => feature_2_used = Some(feature_2_used.unwrap_or(0) | bits),
+            None => all_used.1 = false,
+        }
     }
     if !any {
         return None;
@@ -830,13 +852,21 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     if options.x86.isa_level > 0 {
         isa_needed |= 1u32 << (options.x86.isa_level.saturating_sub(1).min(31));
     }
-    let mut properties: Vec<(u32, u32)> = Vec::new();
-    if features != 0 {
-        properties.push((GNU_PROPERTY_X86_FEATURE_1_AND, features));
-    }
-    if isa_needed != 0 {
-        properties.push((GNU_PROPERTY_X86_ISA_1_NEEDED, isa_needed));
-    }
+    let used = |merged: Option<u32>, all: bool| if all { merged.unwrap_or(0) } else { 0 };
+    let properties: Vec<(u32, u32)> = [
+        (GNU_PROPERTY_1_NEEDED, needed_1),
+        (GNU_PROPERTY_X86_FEATURE_1_AND, features),
+        (GNU_PROPERTY_X86_FEATURE_2_NEEDED, feature_2_needed),
+        (GNU_PROPERTY_X86_ISA_1_NEEDED, isa_needed),
+        (
+            GNU_PROPERTY_X86_FEATURE_2_USED,
+            used(feature_2_used, all_used.1),
+        ),
+        (GNU_PROPERTY_X86_ISA_1_USED, used(isa_used, all_used.0)),
+    ]
+    .into_iter()
+    .filter(|&(_, value)| value != 0)
+    .collect();
     if properties.is_empty() {
         return None;
     }
