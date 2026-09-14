@@ -2,10 +2,11 @@
 # without --eh-frame-hdr. The unwinder then walks .eh_frame from
 # __EH_FRAME_BEGIN__ (registered by crtbeginT.o) up to a zero terminator, so
 # the output .eh_frame must have no alignment padding between input sections.
+# --no-eh-frame-hdr overrides the --eh-frame-hdr that clang always passes.
 description = "static C++: exceptions in threads, no .eh_frame_hdr"
 compile = ["c++ -O2 -c main.cpp"]
 driver = "c++"
-link = "-static -pthread -o out main.o"
+link = "-static -pthread -Wl,--no-eh-frame-hdr -o out main.o"
 run = "./out"
 expect.stdout = """
 caught three
