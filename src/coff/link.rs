@@ -233,6 +233,11 @@ pub fn link_with(
             (contents, applied)
         };
 
+        let symbols = if options.strip >= StripMode::All {
+            super::symtab::SymbolTable::default()
+        } else {
+            super::symtab::build(&addresses, &plan)
+        };
         let subsystem = subsystem(&addresses, pe);
         let entry = entry_rva(&addresses, options, pe, subsystem, diagnostics);
         let mut directories = write::section_directories(&plan);
@@ -247,6 +252,7 @@ pub fn link_with(
                 directories,
                 generated: &generated,
                 emit_base_relocs: emit_relocs,
+                symbols: &symbols,
             },
             &contents,
         )?;
@@ -307,11 +313,6 @@ fn check_supported(options: &LinkOptions, pe: &PeOptions) -> Result<()> {
     }
     if !options.defsym.is_empty() {
         return unimplemented("--defsym");
-    }
-    if options.strip < StripMode::All {
-        // The COFF symbol table is not written yet; the image is complete
-        // without it, so this is a warning-free silent difference recorded in
-        // docs/compatibility.md rather than an error.
     }
     Ok(())
 }

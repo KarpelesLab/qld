@@ -937,3 +937,76 @@ fn short_import_library_and_direct_dll() {
         );
     }
 }
+
+/// The image carries a COFF symbol table, and the symbols it shares with GNU
+/// `ld`'s image sit at the same addresses.
+#[test]
+fn symbol_table_matches_gnu_ld() {
+    if tool(&format!("{PREFIX}gcc")).is_none() || tool(&format!("{PREFIX}nm")).is_none() {
+        skip("the MinGW toolchain is not available");
+        return;
+    }
+    let dir = scratch("symbol-table");
+    let Some(object) = compile(&dir, "hello", HELLO, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(&dir, &[object.as_str(), "-o", "gnu.exe", "-fno-lto"]) else {
+        return;
+    };
+    if run(
+        &format!("{PREFIX}gcc"),
+        &[object.as_str(), "-o", "gnu.exe", "-fno-lto"],
+        &dir,
+    )
+    .is_none()
+    {
+        return;
+    }
+    let options = options_from(&argv, &dir.join("qld.exe"));
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link:\n{error}");
+    }
+    let symbols = |file: &str| -> Vec<(String, String)> {
+        let Some(output) = run(&format!("{PREFIX}nm"), &[file], &dir) else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let address = parts.next()?.to_string();
+                let kind = parts.next()?;
+                let name = parts.next()?.to_string();
+                // Only global definitions; `U` entries have no address.
+                "TtDdBbRr".contains(kind).then_some((name, address))
+            })
+            .collect()
+    };
+    let ours = symbols("qld.exe");
+    let theirs: std::collections::HashMap<String, String> =
+        symbols("gnu.exe").into_iter().collect();
+    if ours.is_empty() || theirs.is_empty() {
+        return;
+    }
+    assert!(
+        ours.len() > 50,
+        "qld wrote no useful symbol table: {} entries",
+        ours.len()
+    );
+    // The entry point, `main` and a global live where GNU ld puts them.
+    for name in ["main", "mainCRTStartup", "global_counter", "message"] {
+        let ours = ours
+            .iter()
+            .find(|(symbol, _)| symbol == name)
+            .map(|(_, address)| address.clone());
+        let Some(theirs) = theirs.get(name) else {
+            continue;
+        };
+        assert_eq!(
+            ours.as_deref(),
+            Some(theirs.as_str()),
+            "{name} is not where GNU ld puts it"
+        );
+    }
+}

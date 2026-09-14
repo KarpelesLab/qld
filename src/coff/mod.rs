@@ -18,12 +18,13 @@
 //! | [`layout`] | Output sections, grouped-section ordering, RVAs |
 //! | [`defined`] | The symbols MinGW's C runtime expects the linker to define |
 //! | [`reloc`] | Symbol addresses, relocation application, base relocations |
+//! | [`symtab`] | The image's COFF symbol table |
 //! | [`write`] | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
 //!
 //! Not implemented yet: auto-import and runtime pseudo-relocations, `-r`,
-//! `--gc-sections`, the COFF symbol table in the output, and architectures
-//! other than x86-64.
+//! `--gc-sections`, local symbols in the output symbol table, and
+//! architectures other than x86-64.
 
 pub mod defined;
 pub mod directives;
@@ -38,6 +39,7 @@ pub mod options;
 pub mod read;
 pub mod reloc;
 pub mod resolve;
+pub mod symtab;
 pub mod write;
 
 pub use link::{link, link_with};

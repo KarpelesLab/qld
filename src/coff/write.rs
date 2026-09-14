@@ -21,7 +21,7 @@ use super::read::consts::{
     IMAGE_DLLCHARACTERISTICS_NX_COMPAT, IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE,
     IMAGE_DLLCHARACTERISTICS_WDM_DRIVER, IMAGE_FILE_DEBUG_STRIPPED, IMAGE_FILE_DLL,
     IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE, IMAGE_FILE_LINE_NUMS_STRIPPED,
-    IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE,
+    IMAGE_FILE_LOCAL_SYMS_STRIPPED, IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE,
 };
 use super::reloc::{self, Addresses, Applied};
 
@@ -85,6 +85,8 @@ pub struct WriteInput<'i, 'a> {
     pub generated: &'i [(Vec<u8>, Vec<u8>)],
     /// Whether `.reloc` is filled in from the relocation pass.
     pub emit_base_relocs: bool,
+    /// The image's COFF symbol table, appended after the sections.
+    pub symbols: &'i super::symtab::SymbolTable,
 }
 
 /// The result of writing: the base relocations the pass found, so the caller
@@ -203,7 +205,9 @@ fn sort_pdata(bytes: &mut [u8]) {
 /// [`Error::Limit`] if the image is too large for PE.
 pub fn write(input: &WriteInput<'_, '_>, contents: &[Vec<u8>]) -> Result<()> {
     let layout = input.addresses.layout;
-    let size = align_up64(layout.file_size, u64::from(input.options.file_alignment));
+    let symbol_table = u64::try_from(input.symbols.bytes.len()).unwrap_or(0);
+    let size = align_up64(layout.file_size, u64::from(input.options.file_alignment))
+        .saturating_add(symbol_table);
     let mut output = OutputFile::create(
         input.path,
         size,
@@ -227,6 +231,14 @@ pub fn write(input: &WriteInput<'_, '_>, contents: &[Vec<u8>]) -> Result<()> {
                 return Err(Error::Limit("section past the end of the output".into()));
             };
             slot.copy_from_slice(data);
+        }
+        if !input.symbols.is_empty() {
+            let start = usize::try_from(layout.file_size).unwrap_or(0);
+            let end = start.saturating_add(input.symbols.bytes.len());
+            match bytes.get_mut(start..end) {
+                Some(slot) => slot.copy_from_slice(&input.symbols.bytes),
+                None => return Err(Error::Limit("symbol table past the output".into())),
+            }
         }
         let checksum = compute_checksum(bytes, checksum_offset());
         if let Some(slot) = bytes
@@ -262,6 +274,9 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
         .map_err(|_| Error::Limit("too many output sections".into()))?;
     let mut characteristics =
         IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LINE_NUMS_STRIPPED | IMAGE_FILE_DEBUG_STRIPPED;
+    if input.symbols.is_empty() {
+        characteristics |= IMAGE_FILE_LOCAL_SYMS_STRIPPED;
+    }
     if options.large_address_aware {
         characteristics |= IMAGE_FILE_LARGE_ADDRESS_AWARE;
     }
@@ -271,8 +286,16 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
     w.u16(options.machine)?;
     w.u16(count)?;
     w.u32(0)?; // TimeDateStamp; deterministic unless --insert-timestamp.
-    w.u32(0)?; // PointerToSymbolTable
-    w.u32(0)?; // NumberOfSymbols
+    if input.symbols.is_empty() {
+        w.u32(0)?; // PointerToSymbolTable
+        w.u32(0)?; // NumberOfSymbols
+    } else {
+        w.u32(
+            u32::try_from(layout.file_size)
+                .map_err(|_| Error::Limit("output file too large for a symbol table".into()))?,
+        )?;
+        w.u32(input.symbols.count)?;
+    }
     w.u16(u16::try_from(OPTIONAL_HEADER_SIZE_64).unwrap_or(0))?;
     w.u16(characteristics)?;
 
