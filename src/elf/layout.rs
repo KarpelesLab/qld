@@ -289,6 +289,20 @@ pub struct LayoutInput<'l, 'a> {
     pub exec_stack: bool,
     /// The output mode.
     pub mode: Mode,
+    /// Output sections written compressed (`--compress-debug-sections`).
+    pub compressed: &'l [CompressedOutput],
+}
+
+/// The compressed size of an output section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressedOutput {
+    /// The output section, by index in [`Placement::outputs`].
+    pub output: u32,
+    /// Its size with the compression header.
+    pub size: u64,
+    /// The legacy `zlib-gnu` format: renamed `.zdebug_*`, no
+    /// `SHF_COMPRESSED`.
+    pub gnu: bool,
 }
 
 fn align_up(value: u64, align: u64) -> Result<u64> {
@@ -543,6 +557,26 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             name_offset: 0,
             name_prefix: b"",
         });
+    }
+
+    // Compressed debug sections: their input sections keep their offsets in
+    // the uncompressed data, only the section shrinks.
+    for compressed in input.compressed {
+        let Some(section) = out_sections
+            .iter_mut()
+            .find(|s| s.output == compressed.output)
+        else {
+            continue;
+        };
+        section.size = compressed.size;
+        if compressed.gnu {
+            section.name_prefix = b".z";
+            section.name = section.name.get(1..).unwrap_or(section.name);
+            section.align = 1;
+        } else {
+            section.flags |= crate::elf::read::consts::SHF_COMPRESSED;
+            section.align = 8;
+        }
     }
 
     // Trailers. With `--emit-relocs`, the symbol table starts with a section

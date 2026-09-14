@@ -57,6 +57,7 @@ enum Chunk {
     Strtab,
     Shstrtab,
     EmitRelocs(u32),
+    Prerendered(usize),
     SectionHeaders,
 }
 
@@ -82,8 +83,23 @@ pub struct WriteInput<'w, 'x, 'a> {
     pub relr: &'w [u64],
     /// The entry address.
     pub entry: u64,
+    /// Output sections rendered ahead of the write (compressed debug
+    /// sections, and those compression did not shrink).
+    pub prerendered: &'w [Prerendered],
     /// Diagnostics.
     pub diagnostics: &'w dyn DiagnosticSink,
+}
+
+/// An output section whose final bytes were produced before the write.
+#[derive(Clone, Debug)]
+pub struct Prerendered {
+    /// Its position in [`Layout::sections`].
+    pub position: u32,
+    /// The bytes written for it.
+    pub bytes: Vec<u8>,
+    /// Whether `bytes` is the compressed form (the section's layout size
+    /// then is the compressed size).
+    pub compressed: bool,
 }
 
 /// Writes the output file and applies the build-id.
@@ -99,8 +115,19 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(0)),
     );
     chunks.push((ChunkRange::new(0, headers), Chunk::Headers));
-    for section in &layout.sections {
+    for (position, section) in layout.sections.iter().enumerate() {
         if !section.has_file_bytes() || section.size == 0 {
+            continue;
+        }
+        if let Some(index) = input
+            .prerendered
+            .iter()
+            .position(|p| p.position as usize == position)
+        {
+            chunks.push((
+                ChunkRange::new(section.offset, section.size),
+                Chunk::Prerendered(index),
+            ));
             continue;
         }
         match section.trailer {
@@ -168,6 +195,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         tombstones: input.tombstones,
         relr: input.relr,
         entry: input.entry,
+        prerendered: input.prerendered,
         diagnostics: &collected,
     };
     file.write_chunks(&ranges, |index, out| {
@@ -176,6 +204,17 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         };
         write_chunk(&local, chunk, out)
     })?;
+    emit_collected(collected, input)?;
+    if let Some((_, offset, _)) = layout.synthetic(Synthetic::BuildId) {
+        file.apply_build_id(&input.options.build_id, offset.saturating_add(16))?;
+    }
+    file.finish()?;
+    Ok(())
+}
+
+/// Emits the problems chunks reported, in input order; fails the link on
+/// errors (unless `--noinhibit-exec`).
+fn emit_collected(collected: Collect, input: &WriteInput<'_, '_, '_>) -> Result<()> {
     let mut problems = collected.take_sorted();
     problems.sort_by(|a, b| {
         let key = |d: &Diagnostic| {
@@ -198,11 +237,86 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     if errors > 0 && !input.options.noinhibit_exec {
         return Err(Error::Reported { errors });
     }
-    if let Some((_, offset, _)) = layout.synthetic(Synthetic::BuildId) {
-        file.apply_build_id(&input.options.build_id, offset.saturating_add(16))?;
-    }
-    file.finish()?;
     Ok(())
+}
+
+/// Renders the non-allocated `.debug*` output sections and compresses them
+/// for `--compress-debug-sections`. A section keeps its uncompressed bytes
+/// when compression does not make it smaller, as with GNU ld; either way
+/// its bytes are returned, so the write does not relocate it again.
+///
+/// # Errors
+///
+/// Returns [`Error::Reported`] when relocations in the sections failed, and
+/// [`Error::Internal`] for layout bugs.
+pub fn prerender_debug_sections(
+    input: &WriteInput<'_, '_, '_>,
+    compression: crate::debug::section::OutputCompression,
+) -> Result<Vec<Prerendered>> {
+    let layout = input.addresses.layout;
+    let collected = Collect::new();
+    let local = WriteInput {
+        diagnostics: &collected,
+        ..*input
+    };
+    let mut out = Vec::new();
+    for (position, section) in layout.sections.iter().enumerate() {
+        if section.trailer != Trailer::None
+            || section.is_alloc()
+            || !section.has_file_bytes()
+            || section.size == 0
+            || !section.name.starts_with(b".debug")
+        {
+            continue;
+        }
+        let size = usize::try_from(section.size)
+            .map_err(|_| Error::Limit("debug section larger than memory".into()))?;
+        let mut bytes = vec![0u8; size];
+        let mut chunks: Vec<(ChunkRange, Chunk)> = Vec::new();
+        for placed in &section.members {
+            if placed.size == 0 {
+                continue;
+            }
+            let chunk = match placed.member {
+                Member::Input(id) => Chunk::Input(id),
+                Member::Merge(group) => Chunk::Merge(group),
+                Member::Synthetic(kind) => Chunk::Synthetic(kind),
+            };
+            chunks.push((ChunkRange::new(placed.offset, placed.size), chunk));
+        }
+        chunks.sort_by_key(|(range, _)| range.offset);
+        let ranges: Vec<ChunkRange> = chunks.iter().map(|(range, _)| *range).collect();
+        let slices = crate::output::split_chunks(&mut bytes, &ranges)
+            .map_err(|e| Error::Internal(format!("debug section layout: {e}")))?;
+        let results: Vec<Result<()>> = slices
+            .into_par_iter()
+            .zip(chunks.par_iter())
+            .map(|(slice, &(_, chunk))| write_chunk(&local, chunk, slice))
+            .collect();
+        results.into_iter().collect::<Result<()>>()?;
+        let compressed = crate::debug::section::compress_section::<crate::elf::read::Elf64Le>(
+            &bytes,
+            compression,
+            section.align,
+        );
+        let position =
+            u32::try_from(position).map_err(|_| Error::Limit("too many output sections".into()))?;
+        if compressed.len() < bytes.len() {
+            out.push(Prerendered {
+                position,
+                bytes: compressed,
+                compressed: true,
+            });
+        } else {
+            out.push(Prerendered {
+                position,
+                bytes,
+                compressed: false,
+            });
+        }
+    }
+    emit_collected(collected, input)?;
+    Ok(out)
 }
 
 fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> Result<()> {
@@ -232,6 +346,12 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             .map_err(Error::from),
         Chunk::Synthetic(kind) => write_synthetic(input, kind, out),
         Chunk::EmitRelocs(target) => super::emit::write(input, target, out),
+        Chunk::Prerendered(index) => {
+            if let Some(prerendered) = input.prerendered.get(index) {
+                copy_into(out, &prerendered.bytes);
+            }
+            Ok(())
+        }
         Chunk::Input(id) => write_input(input, id, out),
     }
 }

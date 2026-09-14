@@ -795,6 +795,76 @@ fn undefined_symbols_get_hints_and_demangled_names() {
 }
 
 #[test]
+fn compressed_debug_sections_hold_the_same_dwarf() {
+    require!("cc", "readelf");
+    let dir = scratch("compress-debug");
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\nstruct point_qld { int x, y; };\n\
+         static int add_qld(struct point_qld p) { return p.x + p.y; }\n\
+         int main(void) { struct point_qld p = {1, 2}; printf(\"%d\\n\", add_qld(p)); return 0; }\n",
+        &["-g", "-O1", "-fPIE"],
+    );
+    cc_link_ok(&dir, &["-o", "plain", "main.o"]);
+    let plain = readelf(&dir, &["--debug-dump=info", "plain"]);
+    for (format, flag) in [("zlib", "C"), ("zstd", "C"), ("zlib-gnu", "")] {
+        let out = format!("out-{format}");
+        cc_link_ok(
+            &dir,
+            &[
+                "-o",
+                &out,
+                "main.o",
+                &format!("-Wl,--compress-debug-sections={format}"),
+                "-Wl,--threads=3",
+            ],
+        );
+        assert_eq!(stdout_of(&dir, &out), "3\n");
+        let headers = readelf(&dir, &["-S", &out]);
+        let info = headers
+            .lines()
+            .find(|l| l.contains("debug_info"))
+            .unwrap_or_else(|| panic!("{headers}"));
+        if format == "zlib-gnu" {
+            assert!(info.contains(".zdebug_info"), "{headers}");
+        } else {
+            assert!(
+                info.split_whitespace().any(|f| f.contains(flag)),
+                "{headers}"
+            );
+        }
+        if format != "zstd" || readelf(&dir, &["--help"]).contains("zstd") {
+            let dump = readelf(&dir, &["--debug-dump=info", &out]);
+            let strip = |text: &str| -> Vec<String> {
+                text.lines()
+                    .filter(|l| l.contains("DW_AT_name") || l.contains("DW_TAG"))
+                    .map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "))
+                    .collect()
+            };
+            assert_eq!(strip(&dump), strip(&plain), "{format}");
+        }
+        // The output does not depend on the thread count.
+        let again = format!("again-{format}");
+        cc_link_ok(
+            &dir,
+            &[
+                "-o",
+                &again,
+                "main.o",
+                &format!("-Wl,--compress-debug-sections={format}"),
+                "-Wl,--threads=1",
+            ],
+        );
+        assert_eq!(
+            fs::read(dir.join(&out)).unwrap(),
+            fs::read(dir.join(&again)).unwrap(),
+            "{format}"
+        );
+    }
+}
+
+#[test]
 fn gc_sections_drops_imports_only_dead_code_uses() {
     require!("cc", "readelf");
     let dir = scratch("gc-imports");

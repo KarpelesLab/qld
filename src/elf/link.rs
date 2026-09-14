@@ -134,12 +134,13 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     {
         return unimplemented(&format!("--oformat {format}"), "M3");
     }
-    if options
-        .compress_debug_sections
-        .as_deref()
-        .is_some_and(|c| c != "none")
+    if options.kind == OutputKind::Relocatable
+        && options
+            .compress_debug_sections
+            .as_deref()
+            .is_some_and(|c| c != "none")
     {
-        return unimplemented("--compress-debug-sections", "M5");
+        return unimplemented("--compress-debug-sections with -r", "M5");
     }
     for (name, expr) in &options.defsym {
         if inputs::parse_defsym(expr).is_none() {
@@ -445,6 +446,7 @@ fn link_inputs<'a>(
         trailers,
         exec_stack,
         mode,
+        compressed: &[],
     })?;
     // `.relr.dyn`'s size depends on the addresses it encodes: lay out with an
     // estimate, and again with the real size while it does not fit (growth
@@ -486,6 +488,7 @@ fn link_inputs<'a>(
                 trailers,
                 exec_stack,
                 mode,
+                compressed: &[],
             })?;
         }
     }
@@ -493,10 +496,6 @@ fn link_inputs<'a>(
 
     let mut plan = plan;
     plan.add_section_symbols(layout.section_symbols as usize);
-    let addresses = Addresses::new(
-        refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
-    );
-    let entry = entry_address(&addresses, options, mode, diagnostics);
     let tombstones = Tombstones::new(TombstoneStyle::Lld)
         .with_rules(
             options
@@ -505,6 +504,79 @@ fn link_inputs<'a>(
                 .map(|(glob, value)| (glob.as_bytes(), *value)),
         )
         .map_err(|e| Error::Option(e.0))?;
+
+    // --compress-debug-sections: render and compress the debug sections
+    // with the final addresses, then lay out again with their new sizes
+    // (they follow every allocated section, so no address moves).
+    let compression = options
+        .compress_debug_sections
+        .as_deref()
+        .and_then(|value| {
+            let level = if options.optimize >= 2 {
+                crate::debug::compress::deflate::Level::DEFAULT
+            } else {
+                crate::debug::compress::deflate::Level::FASTEST
+            };
+            crate::debug::section::OutputCompression::from_option(value, level)
+        });
+    let mut prerendered = Vec::new();
+    if let Some(compression) = compression {
+        let addresses = Addresses::new(
+            refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
+        );
+        prerendered = write::prerender_debug_sections(
+            &WriteInput {
+                options,
+                addresses: &addresses,
+                symtab: &plan,
+                linker: &linker,
+                dynamic: &dynamic,
+                scan: &scan,
+                context,
+                tombstones: &tombstones,
+                relr: &relr,
+                entry: 0,
+                prerendered: &[],
+                diagnostics,
+            },
+            compression,
+        )?;
+        let sizes: Vec<layout::CompressedOutput> = prerendered
+            .iter()
+            .filter(|p| p.compressed)
+            .filter_map(|p| {
+                let section = layout.sections.get(p.position as usize)?;
+                Some(layout::CompressedOutput {
+                    output: section.output,
+                    size: u64::try_from(p.bytes.len()).ok()?,
+                    gnu: !compression.is_gabi(),
+                })
+            })
+            .collect();
+        drop(addresses);
+        if !sizes.is_empty() {
+            layout = layout::layout(&LayoutInput {
+                options,
+                rules: &rule_set,
+                files,
+                sections: &sections,
+                placement: &placement,
+                merged: &merged,
+                eh_frames: &eh_frames,
+                synth: &synth,
+                trailers,
+                exec_stack,
+                mode,
+                compressed: &sizes,
+            })?;
+        }
+        lap("compress");
+    }
+
+    let addresses = Addresses::new(
+        refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
+    );
+    let entry = entry_address(&addresses, options, mode, diagnostics);
     write::write(&WriteInput {
         options,
         addresses: &addresses,
@@ -516,6 +588,7 @@ fn link_inputs<'a>(
         tombstones: &tombstones,
         relr: &relr,
         entry,
+        prerendered: &prerendered,
         diagnostics,
     })?;
     map::write(options, &addresses, &plan, cref.as_deref())?;
