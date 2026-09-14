@@ -279,6 +279,19 @@ fn console_hello_world() {
             || imports.to_ascii_lowercase().contains("kernel32.dll"),
         "{imports}"
     );
+
+    // `coff::link` is what `crate::link` will call once the PE target is
+    // wired into it: it must produce the same image as `link_with` does
+    // with the derived options.
+    let mut plain = options.clone();
+    plain.output = Some(dir.join("plain.exe"));
+    let sink = Collect::new();
+    qld::coff::link(&plain, &sink).expect("coff::link");
+    assert_eq!(
+        std::fs::read(dir.join("plain.exe")).unwrap().len(),
+        std::fs::read(dir.join("qld.exe")).unwrap().len(),
+        "coff::link and link_with disagree"
+    );
 }
 
 /// The output section set and their characteristics match GNU `ld`'s.
