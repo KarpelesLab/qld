@@ -835,3 +835,105 @@ fn unimplemented_options_are_refused() {
         );
     }
 }
+
+/// A short (MSVC-style) import library from `llvm-dlltool`, and a DLL named
+/// directly on the command line: both become the same `.idata$N` objects a
+/// `dlltool` library holds.
+#[test]
+fn short_import_library_and_direct_dll() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    if tool("llvm-dlltool").is_none() {
+        skip("llvm-dlltool not found");
+        return;
+    }
+    let dir = scratch("short-import-library");
+    // A DLL to import from, built with qld.
+    let Some(library_object) = compile(&dir, "library", LIBRARY, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(
+        &dir,
+        &[
+            "-shared",
+            library_object.as_str(),
+            "-o",
+            "sample.dll",
+            "-fno-lto",
+        ],
+    ) else {
+        return;
+    };
+    let mut options = options_from(&argv, &dir.join("sample.dll"));
+    options.kind = qld::args::OutputKind::Shared;
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link the DLL:\n{error}");
+    }
+
+    // A short import library for the same DLL.
+    std::fs::write(
+        dir.join("short.def"),
+        "LIBRARY sample.dll\nEXPORTS\n  add_one\n  greet\n  exported_data DATA\n",
+    )
+    .unwrap();
+    if run(
+        "llvm-dlltool",
+        &[
+            "-m",
+            "i386:x86-64",
+            "-d",
+            "short.def",
+            "-l",
+            "sample-short.lib",
+        ],
+        &dir,
+    )
+    .is_none()
+    {
+        return;
+    }
+
+    let Some(client_object) = compile(&dir, "client", CLIENT, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(&dir, &[client_object.as_str(), "-o", "out.exe", "-fno-lto"]) else {
+        return;
+    };
+    for (name, input) in [
+        ("short import library", dir.join("sample-short.lib")),
+        ("the DLL itself", dir.join("sample.dll")),
+    ] {
+        let output = dir.join(format!("client-{}.exe", name.replace(' ', "-")));
+        let mut options = options_from(&argv, &output);
+        options.inputs.push(InputSpec {
+            kind: InputKind::File(input),
+            attrs: InputAttrs::default(),
+            position: options.inputs.len(),
+        });
+        let pe = PeOptions::from_link_options(&options);
+        if let Err(error) = qld_link(&options, &pe) {
+            panic!("qld failed to link against {name}:\n{error}");
+        }
+        let file = output.file_name().unwrap().to_str().unwrap();
+        let Some(imports) = readobj(&dir, file, &["--coff-imports"]) else {
+            return;
+        };
+        let entry: Vec<String> = imports
+            .lines()
+            .skip_while(|line| !line.contains("sample.dll"))
+            .skip(1)
+            .skip_while(|line| !line.trim().starts_with("Symbol:"))
+            .take_while(|line| line.trim().starts_with("Symbol:"))
+            .map(|line| line.trim().to_string())
+            .collect();
+        assert!(
+            entry.iter().any(|line| line.contains("add_one"))
+                && entry.iter().any(|line| line.contains("exported_data"))
+                && entry.iter().any(|line| line.contains("greet")),
+            "{name}: {imports}"
+        );
+    }
+}

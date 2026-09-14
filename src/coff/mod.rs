@@ -14,14 +14,14 @@
 //! | [`directives`] | `.drectve` directives the link acts on |
 //! | [`edata`] | The export directory |
 //! | [`implib`] | `--out-implib` and `--output-def` |
+//! | [`imports`] | Short import libraries and directly linked DLLs |
 //! | [`layout`] | Output sections, grouped-section ordering, RVAs |
 //! | [`defined`] | The symbols MinGW's C runtime expects the linker to define |
 //! | [`reloc`] | Symbol addresses, relocation application, base relocations |
 //! | [`write`] | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
 //!
-//! Not implemented yet: short import objects and direct `.dll` inputs,
-//! auto-import and runtime pseudo-relocations, resources, `-r`,
+//! Not implemented yet: auto-import and runtime pseudo-relocations, `-r`,
 //! `--gc-sections`, the COFF symbol table in the output, and architectures
 //! other than x86-64.
 
@@ -29,6 +29,7 @@ pub mod defined;
 pub mod directives;
 pub mod edata;
 pub mod implib;
+pub mod imports;
 pub mod inputs;
 pub mod layout;
 pub mod link;

@@ -66,16 +66,22 @@ pub fn build(path: &Path, exports: &Exports, machine: u16) -> Result<Vec<u8>> {
         if export.private {
             continue;
         }
-        let name = &export.name;
-        let imp = [b"__imp_".as_slice(), name].concat();
-        let mut defined = vec![imp.clone()];
-        if !export.data {
-            defined.push(name.clone());
-        }
+        let import = Import {
+            symbol: export.name.clone(),
+            name: if export.noname {
+                ImportName::Ordinal(export.ordinal)
+            } else {
+                ImportName::Name {
+                    hint: 0,
+                    name: export.name.clone(),
+                }
+            },
+            data: export.data,
+        };
         members.push(Member {
             name: format!("{}s{index:05}.o", String::from_utf8_lossy(&id)),
-            data: symbol_member(machine, export, &head_symbol)?,
-            defines: defined,
+            data: import_member(machine, &import, &head_symbol)?,
+            defines: import.defines(),
         });
     }
     members.push(Member {
@@ -339,68 +345,133 @@ fn tail_member(machine: u16, iname_symbol: &[u8], dll_name: &[u8]) -> Result<Vec
     object(machine, &sections, &symbols)
 }
 
+/// What an import refers to in the DLL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportName {
+    /// Import by ordinal: no name appears in the image.
+    Ordinal(u16),
+    /// Import by name, with the hint the loader starts its search at.
+    Name {
+        /// The hint.
+        hint: u16,
+        /// The name the DLL exports.
+        name: Vec<u8>,
+    },
+}
+
+/// One import to generate a member (or a synthetic object) for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    /// The symbol the image refers to (without `__imp_`).
+    pub symbol: Vec<u8>,
+    /// What it refers to in the DLL.
+    pub name: ImportName,
+    /// Data imports define only `__imp_<symbol>`; code imports also define
+    /// `<symbol>` as a jump thunk.
+    pub data: bool,
+}
+
+impl Import {
+    /// The symbols the member defines, for an archive symbol index or for a
+    /// lazy input's name list.
+    #[must_use]
+    pub fn defines(&self) -> Vec<Vec<u8>> {
+        let mut names = vec![[b"__imp_".as_slice(), &self.symbol].concat()];
+        if !self.data {
+            names.push(self.symbol.clone());
+        }
+        names
+    }
+}
+
 /// One import: the thunk, the two table entries and the hint/name.
-fn symbol_member(
-    machine: u16,
-    export: &super::edata::Export,
-    head_symbol: &[u8],
-) -> Result<Vec<u8>> {
-    let name = &export.name;
-    let imp = [b"__imp_".as_slice(), name].concat();
+///
+/// The sections are numbered as `dlltool` numbers them — 1 `.text`,
+/// 2 `.data`, 3 `.bss`, 4 `.idata$7`, 5 `.idata$5`, 6 `.idata$4`,
+/// 7 `.idata$6` — and the symbols 0 `.idata$6`, 1 `<symbol>`,
+/// 2 `__imp_<symbol>`, 3 the head symbol, because the relocations refer to
+/// those indices.
+///
+/// # Errors
+///
+/// Returns [`Error::Limit`] if the member does not fit the COFF format.
+pub fn import_member(machine: u16, import: &Import, head_symbol: &[u8]) -> Result<Vec<u8>> {
+    let symbol = &import.symbol;
+    let imp = [b"__imp_".as_slice(), symbol].concat();
     let mut sections = boilerplate();
-    let by_ordinal = export.noname;
-    // Sections 4..: `.idata$7`, `.idata$5`, `.idata$4`, and `.idata$6` for
-    // a name import.
     sections.push(idata(
         b".idata$7",
         vec![0u8; 4],
         vec![(0, 3, IMAGE_REL_AMD64_ADDR32NB)],
     ));
-    let (entry, entry_relocs) = if by_ordinal {
-        // The high bit marks an ordinal import, and the ordinal is stored
-        // in the entry itself.
-        let mut bytes = vec![0u8; 8];
-        let value = (1u64 << 63) | u64::from(export.ordinal);
-        if let Some(slot) = bytes.first_chunk_mut::<8>() {
-            *slot = value.to_le_bytes();
+    let (entry, entry_relocs) = match &import.name {
+        ImportName::Ordinal(ordinal) => {
+            // The high bit marks an ordinal import, and the ordinal is
+            // stored in the entry itself.
+            let mut bytes = vec![0u8; 8];
+            let value = (1u64 << 63) | u64::from(*ordinal);
+            if let Some(slot) = bytes.first_chunk_mut::<8>() {
+                *slot = value.to_le_bytes();
+            }
+            (bytes, Vec::new())
         }
-        (bytes, Vec::new())
-    } else {
-        (vec![0u8; 8], vec![(0u32, 0u32, IMAGE_REL_AMD64_ADDR32NB)])
+        ImportName::Name { .. } => (vec![0u8; 8], vec![(0u32, 0u32, IMAGE_REL_AMD64_ADDR32NB)]),
     };
     sections.push(idata(b".idata$5", entry.clone(), entry_relocs.clone()));
     sections.push(idata(b".idata$4", entry, entry_relocs));
-    if !by_ordinal {
-        let mut hint = Vec::with_capacity(name.len().saturating_add(4));
-        hint.extend_from_slice(&0u16.to_le_bytes());
-        hint.extend_from_slice(name);
-        hint.push(0);
-        if !hint.len().is_multiple_of(2) {
-            hint.push(0);
+    if let ImportName::Name { hint, name } = &import.name {
+        let mut bytes = Vec::with_capacity(name.len().saturating_add(4));
+        bytes.extend_from_slice(&hint.to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        if !bytes.len().is_multiple_of(2) {
+            bytes.push(0);
         }
-        sections.push(idata(b".idata$6", hint, Vec::new()));
+        sections.push(idata(b".idata$6", bytes, Vec::new()));
     }
-    if !export.data {
-        // `jmp *__imp_<name>(%rip)`, relocated against the address table.
+    if !import.data {
+        // `jmp *__imp_<symbol>(%rip)`, relocated against the address table.
         if let Some(text) = sections.first_mut() {
             text.data = vec![0xff, 0x25, 0, 0, 0, 0, 0x90, 0x90];
             text.relocs = vec![(2, 2, IMAGE_REL_AMD64_REL32)];
         }
     }
-    let idata6_section = if by_ordinal { 0 } else { 7 };
-    // Symbol indices are fixed: the relocations above refer to 0
-    // (`.idata$6`), 2 (`__imp_<name>`) and 3 (the head symbol). A data
-    // import defines no thunk, so its `<name>` slot stays an unused
-    // placeholder rather than an undefined external nobody can satisfy.
+    let idata6_section = if matches!(import.name, ImportName::Ordinal(_)) {
+        0
+    } else {
+        7
+    };
     let mut symbols = vec![static_symbol(b".idata$6", idata6_section)];
-    if export.data {
+    if import.data {
+        // A data import defines no thunk, so slot 1 is an unused
+        // placeholder rather than an undefined external nobody satisfies.
         symbols.push(static_symbol(b".idata$5", 5));
     } else {
-        symbols.push(external(name, 1));
+        symbols.push(external(symbol, 1));
     }
     symbols.push(external(&imp, 5));
     symbols.push(external(head_symbol, 0));
     object(machine, &sections, &symbols)
+}
+
+/// The head object of an import group: it defines `_head_<id>` and refers to
+/// `__<id>_iname`.
+///
+/// # Errors
+///
+/// Returns [`Error::Limit`] if the object does not fit the COFF format.
+pub fn head(machine: u16, head_symbol: &[u8], iname_symbol: &[u8]) -> Result<Vec<u8>> {
+    head_member(machine, head_symbol, iname_symbol)
+}
+
+/// The tail object of an import group: it defines `__<id>_iname` and holds
+/// the DLL name.
+///
+/// # Errors
+///
+/// Returns [`Error::Limit`] if the object does not fit the COFF format.
+pub fn tail(machine: u16, iname_symbol: &[u8], dll_name: &[u8]) -> Result<Vec<u8>> {
+    tail_member(machine, iname_symbol, dll_name)
 }
 
 // ---------------------------------------------------------------------------

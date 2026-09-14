@@ -25,8 +25,9 @@ use crate::input::identify::FileFormat;
 use crate::input::{FileTable, InputFile, LibraryNaming, RealFileSystem, SearchContext, Source};
 use crate::symbols::{InputPosition, ResolveFile, SymbolName, SymbolUse};
 
+use super::imports::{self, Groups};
 use super::object::ParsedObject;
-use super::read::{CoffObject, Source as CoffSource};
+use super::read::{CoffObject, PeImage, ShortImport, Source as CoffSource};
 
 /// What kind of input a [`CoffInput`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +253,8 @@ pub fn collect<'a>(
     }
     let mut walker = Walker {
         table,
+        groups: Groups::new(),
+        machine: None,
         files: vec![CoffInput {
             position: InputPosition::new(0, 0),
             role: InputRole::Internal,
@@ -267,6 +270,7 @@ pub fn collect<'a>(
     for (entry, id) in pending.iter().zip(loaded) {
         walker.add(id?, entry.attrs)?;
     }
+    walker.add_generated_imports()?;
     Ok(Inputs {
         files: walker.files,
     })
@@ -276,6 +280,11 @@ struct Walker<'a> {
     table: &'a FileTable,
     files: Vec<CoffInput<'a>>,
     ordinal: u32,
+    /// Imports collected from short import libraries and from DLLs named on
+    /// the command line, turned into objects once the walk is over.
+    groups: Groups,
+    /// The machine the inputs agree on, for the generated import objects.
+    machine: Option<u16>,
 }
 
 impl<'a> Walker<'a> {
@@ -305,7 +314,8 @@ impl<'a> Walker<'a> {
             return Err(Error::Internal("loaded file missing from table".into()));
         };
         match file.format() {
-            FileFormat::Coff(_) => {
+            FileFormat::Coff(ident) => {
+                self.machine.get_or_insert(ident.machine);
                 let number = self.next_position()?;
                 let mut input = self.input(InputPosition::new(number, 0), InputRole::Object);
                 input.file = Some(file);
@@ -319,10 +329,23 @@ impl<'a> Walker<'a> {
             }
             FileFormat::Archive | FileFormat::ThinArchive => self.add_archive(id, file, attrs),
             FileFormat::Empty => Ok(()),
-            FileFormat::Pe(_) => Err(Error::Unimplemented(format!(
-                "linking directly against the DLL {} (roadmap M7)",
-                file.path().display()
-            ))),
+            FileFormat::CoffImport(ident) => {
+                self.machine.get_or_insert(ident.machine);
+                let number = self.next_position()?;
+                let import = ShortImport::parse(file.data(), source_of(file))?;
+                self.groups.add_short_import(&import, number);
+                Ok(())
+            }
+            FileFormat::Pe(ident) => {
+                self.machine.get_or_insert(ident.machine);
+                let number = self.next_position()?;
+                let image = PeImage::parse(file.data(), source_of(file))?;
+                let fallback = file
+                    .path()
+                    .file_name()
+                    .map_or(b"".as_slice(), |name| name.as_encoded_bytes());
+                self.groups.add_dll(&image, number, fallback)
+            }
             _ => Err(Error::malformed(
                 file.path(),
                 0,
@@ -342,13 +365,40 @@ impl<'a> Walker<'a> {
         let number = self.next_position()?;
         let first = self.files.len();
         let mut by_offset: Vec<(u64, usize)> = Vec::new();
+        // Members that became imports rather than link inputs; the symbol
+        // index still names them.
+        let mut consumed: Vec<u64> = Vec::new();
         for (ordinal, member) in archive.members().enumerate() {
             let member = member?;
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| Error::Limit("too many archive members".into()))?;
-            let mut input = self.input(InputPosition::new(number, ordinal), InputRole::Member);
             let member_id = self.table.add_member(id, &member)?;
-            input.file = self.table.get(member_id);
+            let Some(member_file) = self.table.get(member_id) else {
+                continue;
+            };
+            // A short import member becomes a generated `.idata$N` object,
+            // not a link input of its own.
+            if let FileFormat::CoffImport(ident) = member_file.format() {
+                self.machine.get_or_insert(ident.machine);
+                let import = ShortImport::parse(member_file.data(), source_of(member_file))?;
+                self.groups.add_short_import(&import, number);
+                consumed.push(member.header_offset);
+                continue;
+            }
+            if let FileFormat::Coff(ident) = member_file.format() {
+                self.machine.get_or_insert(ident.machine);
+                // The helper objects an MSVC-style import library carries
+                // (`__IMPORT_DESCRIPTOR_*`, `__NULL_IMPORT_DESCRIPTOR`,
+                // `*_NULL_THUNK_DATA`) describe the same import directory
+                // qld generates from the short import objects, so they are
+                // dropped rather than linked twice.
+                if is_import_helper(member_file)? {
+                    consumed.push(member.header_offset);
+                    continue;
+                }
+            }
+            let mut input = self.input(InputPosition::new(number, ordinal), InputRole::Member);
+            input.file = Some(member_file);
             input.live_at_start = attrs.whole_archive;
             by_offset.push((member.header_offset, self.files.len()));
             self.files.push(input);
@@ -368,6 +418,7 @@ impl<'a> Walker<'a> {
                         .and_then(|&(_, slot)| self.files.get_mut(slot));
                     match found {
                         Some(input) => input.lazy_names.push(SymbolName::new(symbol.name)),
+                        None if consumed.contains(&symbol.member_offset) => {}
                         None => {
                             return Err(Error::malformed(
                                 file.path(),
@@ -392,6 +443,80 @@ impl<'a> Walker<'a> {
         }
         Ok(())
     }
+}
+
+impl<'a> Walker<'a> {
+    /// Turns the collected import groups into lazy COFF objects.
+    fn add_generated_imports(&mut self) -> Result<()> {
+        if self.groups.is_empty() {
+            return Ok(());
+        }
+        let machine = self
+            .machine
+            .unwrap_or(super::read::consts::IMAGE_FILE_MACHINE_AMD64);
+        imports::check_machine(machine)?;
+        for generated in imports::generate(self.table, &self.groups, machine)? {
+            let Some(file) = self.table.get(generated.id) else {
+                continue;
+            };
+            let mut input = self.input(
+                InputPosition::new(generated.position, generated.ordinal),
+                InputRole::Member,
+            );
+            input.file = Some(file);
+            input.exclude_from_implib = true;
+            input.lazy_names = generated
+                .defines
+                .iter()
+                .filter_map(|name| {
+                    // The names live in the generated object's own string
+                    // table, so they last as long as the link.
+                    find_name(file.data(), name).map(SymbolName::new)
+                })
+                .collect();
+            self.files.push(input);
+        }
+        Ok(())
+    }
+}
+
+/// Whether an archive member is one of the helper objects an MSVC-style
+/// short import library carries alongside its import objects.
+///
+/// They hold the null import descriptor and the null thunk terminators that
+/// qld generates itself from the short import objects, so linking them as
+/// well would produce the directory twice.
+fn is_import_helper(file: &InputFile) -> Result<bool> {
+    let object = CoffObject::parse(file.data(), source_of(file))?;
+    let mut helper = false;
+    for symbol in object.symbols().iter() {
+        let symbol = symbol?;
+        if !symbol.is_defined_external() {
+            continue;
+        }
+        let name = symbol.name;
+        if name.starts_with(b"__IMPORT_DESCRIPTOR_")
+            || name == b"__NULL_IMPORT_DESCRIPTOR"
+            || name.ends_with(b"_NULL_THUNK_DATA")
+        {
+            helper = true;
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(helper)
+}
+
+/// Finds `name` inside `data`, returning the slice with the file's lifetime.
+///
+/// The generated objects hold every symbol name in their own string table,
+/// so the lazy name list can borrow from the mapped bytes rather than from a
+/// temporary.
+fn find_name<'a>(data: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let end = name.len();
+    data.windows(end.saturating_add(1))
+        .position(|window| window.get(..end) == Some(name) && window.get(end) == Some(&0))
+        .and_then(|at| data.get(at..at.saturating_add(end)))
 }
 
 /// The external symbols a COFF object defines, for an archive without a
