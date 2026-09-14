@@ -12,8 +12,10 @@
 //! - [`compress`]: zlib/DEFLATE and Zstandard codecs, implemented in-crate.
 //! - [`section`]: `SHF_COMPRESSED` and `.zdebug_*` input sections, and
 //!   compressed output sections.
+//! - [`tombstone`]: values for relocations whose target was discarded.
 
 #![deny(clippy::arithmetic_side_effects)]
 
 pub mod compress;
 pub mod section;
+pub mod tombstone;

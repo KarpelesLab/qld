@@ -454,6 +454,136 @@ fn compressed_output_sections_accepted_by_binutils() {
 }
 
 // ---------------------------------------------------------------------------
+// Tombstones
+// ---------------------------------------------------------------------------
+
+const GC_SOURCE: &str = r#"
+int used_var = 1;
+int unused_var = 2;
+int sink;
+__attribute__((noinline)) int used(int x) {
+  int y = x * 3;
+  for (int i = 0; i < x; i++) y += i * sink;
+  sink = y;
+  return y + used_var;
+}
+__attribute__((noinline)) int unused(int x) {
+  int y = x * 5;
+  for (int i = 0; i < x; i++) y ^= i * sink;
+  sink = y;
+  return y + unused_var;
+}
+void _start(void) { sink = used(sink); for (;;) ; }
+"#;
+
+/// Links an object with `ld --gc-sections` and checks that every relocation
+/// from a debug section into a collected section holds the value
+/// `Style::Gnu` predicts, then that the lld rules differ exactly where
+/// documented.
+#[test]
+fn tombstones_match_gnu_ld() {
+    use qld::debug::tombstone::{DeadTarget, Style, Tombstones, truncate};
+    use qld::elf::read::{ElfFile, SectionIndex};
+
+    let Some(ld) = find_program("ld.bfd").or_else(|| find_program("ld")) else {
+        return skip("GNU ld not found");
+    };
+    let dir = scratch_dir("tombstones");
+    let gnu = Tombstones::new(Style::Gnu);
+    let lld = Tombstones::new(Style::Lld);
+    let mut seen_sections = std::collections::BTreeSet::new();
+    for version in [2, 4, 5] {
+        let flags = [
+            "-g",
+            &format!("-gdwarf-{version}"),
+            "-gz=none",
+            "-O1",
+            "-fno-inline",
+            "-fno-ipa-cp",
+            "-fno-ipa-sra",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-fno-asynchronous-unwind-tables",
+        ];
+        let Some(obj) = compile(&dir, &format!("gc{version}"), GC_SOURCE, &flags) else {
+            return skip("no C compiler");
+        };
+        let exe = dir.join(format!("gc{version}"));
+        let output = Command::new(&ld)
+            .args(["--gc-sections", "--print-gc-sections", "-e", "_start", "-o"])
+            .arg(&exe)
+            .arg(&obj)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            return skip(format!(
+                "ld failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let removed: Vec<String> = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|l| l.split('\'').nth(1).map(str::to_string))
+            .collect();
+        assert!(removed.iter().any(|s| s == ".text.unused"), "{removed:?}");
+
+        let obj_data = std::fs::read(&obj).unwrap();
+        let exe_data = std::fs::read(&exe).unwrap();
+        let object = ObjectFile::<Elf64Le>::parse(&obj_data, Source::new(&obj)).unwrap();
+        let exe_elf = ElfFile::<Elf64Le>::parse(&exe_data, Source::new(&exe)).unwrap();
+        for rel in object.relocation_sections() {
+            let rel = rel.unwrap();
+            let target = object.section_header(rel.target).unwrap();
+            let name = String::from_utf8_lossy(object.section_name(&target).unwrap()).into_owned();
+            if !name.starts_with(".debug") || name == ".debug_str" || name == ".debug_line_str" {
+                continue;
+            }
+            let (_, out_header) = exe_elf.section_by_name(name.as_bytes()).unwrap();
+            let qld::elf::read::Relocations::Rela(relas) = rel.relocations else {
+                panic!("x86-64 uses RELA");
+            };
+            for r in relas.iter() {
+                let symbol = object.symbols().get(r.symbol as usize).unwrap();
+                let SectionIndex::Section(index) = symbol.section else {
+                    continue;
+                };
+                let section = object.section_header(index).unwrap();
+                let section_name = String::from_utf8_lossy(object.section_name(&section).unwrap());
+                if !removed.iter().any(|s| *s == section_name) {
+                    continue;
+                }
+                let width = match r.r_type {
+                    1 => 8,       // R_X86_64_64
+                    10 | 11 => 4, // R_X86_64_32, R_X86_64_32S
+                    other => panic!("unexpected relocation type {other} in {name}"),
+                };
+                let at = (out_header.sh_offset + r.offset) as usize;
+                let mut bytes = [0u8; 8];
+                bytes[..width].copy_from_slice(&exe_data[at..at + width]);
+                let actual = u64::from_le_bytes(bytes);
+                let expected = truncate(
+                    gnu.value(name.as_bytes(), DeadTarget::Discarded).unwrap(),
+                    width,
+                );
+                assert_eq!(
+                    actual, expected,
+                    "DWARF {version}: {name}+{:#x} against {section_name}",
+                    r.offset
+                );
+                seen_sections.insert(name.clone());
+            }
+        }
+    }
+    println!("GNU ld tombstones verified in {seen_sections:?}");
+    assert!(seen_sections.contains(".debug_ranges"));
+    assert!(seen_sections.contains(".debug_loc"));
+    assert!(seen_sections.contains(".debug_info"));
+    // Where lld differs from GNU ld.
+    assert_eq!(gnu.value(b".debug_loc", DeadTarget::Discarded), Some(0));
+    assert_eq!(lld.value(b".debug_loc", DeadTarget::Discarded), Some(1));
+}
+
+// ---------------------------------------------------------------------------
 // zstd
 // ---------------------------------------------------------------------------
 
