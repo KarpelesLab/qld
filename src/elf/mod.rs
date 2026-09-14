@@ -55,9 +55,11 @@
 //!
 //! # Threads
 //!
-//! Without `--threads`, a link runs in a pool of one thread per 16 MiB of
-//! input (at most 32): small links are faster on few threads. Results never
-//! depend on the thread count; fixtures check this byte for byte.
+//! Without `--threads`, the inputs are mapped in a pool of at most 16
+//! threads, and the link runs in a pool of one thread per 4 MiB of input (at
+//! most 16): small links are faster on few threads, and rayon's global pool
+//! (a thread per core) is never started. Results never depend on the thread
+//! count; fixtures check this byte for byte.
 
 pub mod arch;
 pub mod common;
