@@ -16,3 +16,5 @@ expect.readelf = [
 ]
 targets = ["aarch64-linux-gnu"]
 determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]

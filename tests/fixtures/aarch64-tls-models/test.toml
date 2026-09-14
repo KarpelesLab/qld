@@ -31,3 +31,7 @@ expect.readelf_files."out-trad" = [
 ]
 targets = ["aarch64-linux-gnu"]
 determinism = true
+# GNU ld 2.42 (Ubuntu 24.04) does not relax the traditional general-dynamic
+# sequences to local-exec in an executable, so it leaves a __tls_get_addr PLT
+# entry and fails these checks; 2.46 does relax them, as qld does.
+gnu_ld_min_version = "2.44"

@@ -1070,7 +1070,7 @@ fn tombstones_match_gnu_ld() {
             }
             let (_, out_header) = exe_elf.section_by_name(name.as_bytes()).unwrap();
             let qld::elf::read::Relocations::Rela(relas) = rel.relocations else {
-                panic!("x86-64 uses RELA");
+                panic!("this test expects RELA relocations");
             };
             for r in relas.iter() {
                 let symbol = object.symbols().get(r.symbol as usize).unwrap();
@@ -1082,10 +1082,16 @@ fn tombstones_match_gnu_ld() {
                 if !removed.iter().any(|s| *s == section_name) {
                     continue;
                 }
-                let width = match r.r_type {
-                    1 => 8,       // R_X86_64_64
-                    10 | 11 => 4, // R_X86_64_32, R_X86_64_32S
-                    other => panic!("unexpected relocation type {other} in {name}"),
+                // The host's absolute data relocations: x86-64 and AArch64
+                // number them differently, and CI runs this on both.
+                let width = match (exe_elf.header().e_machine, r.r_type) {
+                    (62, 1) => 8,          // EM_X86_64, R_X86_64_64
+                    (62, 10 | 11) => 4,    // R_X86_64_32, R_X86_64_32S
+                    (183, 257) => 8,       // EM_AARCH64, R_AARCH64_ABS64
+                    (183, 258 | 259) => 4, // R_AARCH64_ABS32, ABS32_NOOVERFLOW
+                    (machine, other) => {
+                        panic!("unexpected relocation type {other} for machine {machine} in {name}")
+                    }
                 };
                 let at = (out_header.sh_offset + r.offset) as usize;
                 let mut bytes = [0u8; 8];

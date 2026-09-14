@@ -84,6 +84,11 @@ pub struct Fixture {
     pub diff_skip: Option<String>,
     /// Skip this fixture everywhere, with a reason.
     pub skip: Option<String>,
+    /// Skip the GNU ld comparison when GNU ld is older than this
+    /// `major.minor`: linker behaviour changes between binutils releases, and
+    /// a fixture pinning newer behaviour would otherwise fail the validation
+    /// and differential runs on older distributions.
+    pub gnu_ld_min_version: Option<(u32, u32)>,
     /// Skip unless at least one of these paths exists. `*` matches within one
     /// path component, so `/usr/lib/llvm*/lib*/LLVMgold.so` covers the
     /// different places distributions put a plugin.
@@ -125,6 +130,7 @@ impl Fixture {
             diff_skip: None,
             skip: None,
             requires_files: Vec::new(),
+            gnu_ld_min_version: None,
             timeout: Duration::from_secs(60),
         };
 
@@ -172,6 +178,17 @@ impl Fixture {
                 ["targets"] => fixture.targets = strings()?,
                 ["skip"] => fixture.skip = Some(string()?),
                 ["requires_files"] => fixture.requires_files = strings()?,
+                ["gnu_ld_min_version"] => {
+                    let text = string()?;
+                    let mut parts = text.split('.');
+                    let parsed = parts
+                        .next()
+                        .and_then(|major| major.parse().ok())
+                        .zip(parts.next().and_then(|minor| minor.parse().ok()));
+                    fixture.gnu_ld_min_version = Some(
+                        parsed.ok_or_else(|| at(format!("expected major.minor, found {text}")))?,
+                    );
+                }
                 ["determinism"] => match entry.value {
                     Value::Bool(b) => fixture.determinism = b,
                     ref other => {
@@ -290,6 +307,44 @@ impl Fixture {
 
 /// Keeps the fixtures selected by `QLD_FIXTURE` (comma-separated substrings
 /// of fixture names). Everything is selected when it is unset.
+/// The `(major, minor)` version of a GNU binutils tool, from `--version`.
+#[must_use]
+pub fn binutils_version(tool: &Path) -> Option<(u32, u32)> {
+    let output = std::process::Command::new(tool)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let first = text.lines().next()?;
+    if !first.contains("GNU") {
+        return None;
+    }
+    let version = first.split_whitespace().last()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts
+        .next()?
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .ok()?;
+    Some((major, minor))
+}
+
+/// Skips a fixture whose `gnu_ld_min_version` is newer than `ld`.
+pub fn check_gnu_ld_version(fixture: &Fixture, ld: &Path) -> Result<(), Status> {
+    let Some(wanted) = fixture.gnu_ld_min_version else {
+        return Ok(());
+    };
+    match binutils_version(ld) {
+        Some(have) if have >= wanted => Ok(()),
+        Some((major, minor)) => Err(Status::skip(format!(
+            "needs GNU ld {}.{} or newer, found {major}.{minor}",
+            wanted.0, wanted.1
+        ))),
+        None => Err(Status::skip("cannot read GNU ld's version".to_string())),
+    }
+}
+
 /// Skips the fixture unless one of its `requires_files` patterns matches an
 /// existing path. `*` matches within a single path component, which is enough
 /// for the version directories distributions use (`/usr/lib/llvm*/lib*/…`).
@@ -1051,6 +1106,9 @@ fn run_job_inner(
             .map_err(|e| Status::Fail(format!("cannot snapshot {}: {e}", work.display())))?;
     }
 
+    if options.linker == Linker::GnuLd {
+        check_gnu_ld_version(fixture, &options.linker.binary(&env)?)?;
+    }
     let expect_gnu_failure =
         options.linker == Linker::GnuLd && fixture.gnu_ld == GnuLdExpectation::Fail;
     match link(fixture, &env, &options.linker, &work, &[], log) {

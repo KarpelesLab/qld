@@ -115,6 +115,11 @@ fn diff_inner(
         ));
     }
     let env = TargetEnv::resolve(None)?;
+    for linker in [reference, candidate] {
+        if *linker == Linker::GnuLd {
+            fixture::check_gnu_ld_version(fixture, &linker.binary(&env)?)?;
+        }
+    }
     if !fixture.targets.is_empty()
         && !fixture
             .targets
