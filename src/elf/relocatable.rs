@@ -123,6 +123,29 @@ pub fn revive_sections(files: &[ElfInput<'_>], sections: &mut Sections, options:
     }
 }
 
+/// Marks live the ignored sections named `name` (for `--emit-relocs`,
+/// which keeps `.note.GNU-stack` as GNU ld does).
+pub fn revive_named(files: &[ElfInput<'_>], sections: &mut Sections, name: &[u8]) {
+    for (file_index, file) in files.iter().enumerate() {
+        let Some(object) = &file.object else {
+            continue;
+        };
+        for (index, section) in object.sections.iter().enumerate() {
+            if section.kind != SectionKind::Ignored || section.name != name {
+                continue;
+            }
+            let Ok(index) = u32::try_from(index) else {
+                break;
+            };
+            if let Some(id) = sections.id(file_index, index)
+                && let Some(live) = sections.live.get_mut(id.index())
+            {
+                *live = true;
+            }
+        }
+    }
+}
+
 /// What a relocatable link writes.
 pub struct RelocatableInput<'r, 'a> {
     /// Options.

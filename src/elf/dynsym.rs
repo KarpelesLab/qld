@@ -258,7 +258,10 @@ pub struct PlanInput<'p, 'r, 'a> {
 }
 
 /// The version of a symbol defined by a shared object: `(file, name)`.
-fn import_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<(usize, &'a [u8])> {
+/// For a symbol a shared library defines under a non-base version, the
+/// library's file index and the version name.
+#[must_use]
+pub fn import_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<(usize, &'a [u8])> {
     let def = refs.symbols.definition(id);
     if def.kind != DefinitionKind::Shared {
         return None;

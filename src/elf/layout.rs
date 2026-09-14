@@ -94,6 +94,9 @@ pub enum Trailer {
     Strtab,
     /// `.shstrtab`.
     Shstrtab,
+    /// `--emit-relocs`: the input relocations of the output section at this
+    /// position in [`Layout::sections`].
+    Rela(u32),
 }
 
 /// An output section after layout.
@@ -127,6 +130,9 @@ pub struct OutSection<'a> {
     pub members: Vec<Placed>,
     /// Offset of the name in `.shstrtab`.
     pub name_offset: u32,
+    /// Written before the name in `.shstrtab` (`.rela` for
+    /// [`Trailer::Rela`]).
+    pub name_prefix: &'static [u8],
 }
 
 impl OutSection<'_> {
@@ -237,6 +243,9 @@ pub struct Layout<'a> {
     pub bss_start: u64,
     /// End of the image (`_end`).
     pub end: u64,
+    /// Number of section symbols at the start of `.symtab`
+    /// (`--emit-relocs`).
+    pub section_symbols: u32,
 }
 
 impl Layout<'_> {
@@ -481,7 +490,11 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         if placed.is_empty() {
             continue;
         }
-        if size == 0 {
+        // GNU ld keeps empty output sections with input sections when
+        // relocations are emitted: they may name the section's symbol.
+        let keep_empty = input.options.emit_relocs
+            && placed.iter().any(|p| matches!(p.member, Member::Input(_)));
+        if size == 0 && !keep_empty {
             // Dropped, but symbols in its (empty) input sections still need
             // an address: the location counter where it would have been.
             dropped.push((output_index, placed));
@@ -522,16 +535,55 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             info: 0,
             members: placed,
             name_offset: 0,
+            name_prefix: b"",
         });
     }
 
-    // Trailers.
+    // Trailers. With `--emit-relocs`, the symbol table starts with a section
+    // symbol for every output section (whose header index is its position
+    // plus one, as trailers come last), and every output section with input
+    // relocations gets a `.rela` section.
+    let mut section_symbols = 0u32;
+    if input.options.emit_relocs && input.trailers.symtab > 0 {
+        let regular = out_sections.len();
+        section_symbols =
+            u32::try_from(regular).map_err(|_| Error::Limit("too many output sections".into()))?;
+        for position in 0..regular {
+            let Some(target) = out_sections.get(position) else {
+                break;
+            };
+            let count = super::emit::count(
+                input.files,
+                input.sections,
+                input.eh_frames,
+                &target.members,
+            )?;
+            if count == 0 {
+                continue;
+            }
+            let mut rela = trailer(
+                target.name,
+                Trailer::Rela(u32::try_from(position).unwrap_or(NONE)),
+                crate::elf::read::consts::SHT_RELA,
+                count.saturating_mul(24),
+                8,
+            );
+            rela.name_prefix = b".rela";
+            rela.flags = crate::elf::read::consts::SHF_INFO_LINK;
+            rela.entsize = 24;
+            rela.info = u32::try_from(position.saturating_add(1)).unwrap_or(0);
+            out_sections.push(rela);
+        }
+    }
     if input.trailers.symtab > 0 {
         out_sections.push(trailer(
             b".symtab",
             Trailer::Symtab,
             SHT_SYMTAB,
-            input.trailers.symtab,
+            input
+                .trailers
+                .symtab
+                .saturating_add(u64::from(section_symbols).saturating_mul(24)),
             8,
         ));
         out_sections.push(trailer(
@@ -549,23 +601,29 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     for section in &mut out_sections {
         section.name_offset = u32::try_from(shstrtab.len())
             .map_err(|_| Error::Limit("section name table larger than 4 GiB".into()))?;
+        shstrtab.extend_from_slice(section.name_prefix);
         shstrtab.extend_from_slice(section.name);
         shstrtab.push(0);
     }
     let shstrtab_len = u64::try_from(shstrtab.len()).unwrap_or(u64::MAX);
-    let strtab_position = out_sections
-        .iter()
-        .position(|s| s.trailer == Trailer::Strtab);
+    let header_of = |kind: Trailer| {
+        out_sections
+            .iter()
+            .position(|s| s.trailer == kind)
+            .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
+            .unwrap_or(0)
+    };
+    let strtab_index = header_of(Trailer::Strtab);
+    let symtab_index = header_of(Trailer::Symtab);
     for section in &mut out_sections {
         match section.trailer {
             Trailer::Shstrtab => section.size = shstrtab_len,
             Trailer::Symtab => {
-                section.link = strtab_position
-                    .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
-                    .unwrap_or(0);
-                section.info = input.trailers.first_global;
+                section.link = strtab_index;
+                section.info = input.trailers.first_global.saturating_add(section_symbols);
                 section.entsize = 24;
             }
+            Trailer::Rela(_) => section.link = symtab_index,
             _ => {}
         }
     }
@@ -1066,6 +1124,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         edata,
         bss_start,
         end,
+        section_symbols,
     })
 }
 
@@ -1187,13 +1246,7 @@ fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
     }
 }
 
-fn trailer(
-    name: &'static [u8],
-    kind: Trailer,
-    sh_type: u32,
-    size: u64,
-    align: u64,
-) -> OutSection<'static> {
+fn trailer(name: &[u8], kind: Trailer, sh_type: u32, size: u64, align: u64) -> OutSection<'_> {
     OutSection {
         name,
         output: NONE,
@@ -1209,6 +1262,7 @@ fn trailer(
         info: 0,
         members: Vec::new(),
         name_offset: 0,
+        name_prefix: b"",
     }
 }
 

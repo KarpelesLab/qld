@@ -131,9 +131,6 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     {
         return unimplemented(&format!("--oformat {format}"), "M3");
     }
-    if options.emit_relocs {
-        return unimplemented("--emit-relocs", "M2");
-    }
     if options
         .compress_debug_sections
         .as_deref()
@@ -201,6 +198,9 @@ fn link_inputs<'a>(
     let relocatable = options.kind == OutputKind::Relocatable;
     if relocatable {
         relocatable::revive_sections(files, &mut sections, options);
+    } else if options.emit_relocs {
+        // GNU ld keeps `.note.GNU-stack` as an output section with -q.
+        relocatable::revive_named(files, &mut sections, b".note.GNU-stack");
     }
     resolve::deduplicate_comdat(files, &mut sections);
     resolve::redirect_discarded(&symbols, &rules, files, &resolution, &sections);
@@ -475,6 +475,8 @@ fn link_inputs<'a>(
     }
     lap("layout");
 
+    let mut plan = plan;
+    plan.add_section_symbols(layout.section_symbols as usize);
     let addresses = Addresses::new(
         refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
     );

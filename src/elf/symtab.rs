@@ -58,6 +58,8 @@ pub struct SymtabPlan {
     pub count: usize,
     /// String table size.
     pub strtab_size: usize,
+    /// Section symbols at the start of the table (`--emit-relocs`).
+    pub section_symbols: usize,
 }
 
 fn keep_local(name: &[u8], raw: &RawSymbol, discard: DiscardMode) -> bool {
@@ -80,6 +82,38 @@ fn global_visibility(refs: &Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) 
         };
     }
     target.raw.map_or(STV_DEFAULT, |raw| raw.visibility())
+}
+
+/// Which local symbols of `file` the relocations of its live sections
+/// name, by symbol index.
+fn referenced_locals(
+    refs: &Refs<'_, '_>,
+    file_index: usize,
+    object: &super::object::ObjectInput<'_>,
+) -> Vec<bool> {
+    let mut referenced = vec![false; object.first_global];
+    for (index, section) in object.sections.iter().enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
+        if section.relocs == 0 || !refs.sections.is_live_in(file_index, index) {
+            continue;
+        }
+        let Some(Ok(Some(relocations))) = object
+            .section(section.relocs)
+            .map(|r| object.elf.relocation_section(section.relocs, &r.header))
+        else {
+            continue;
+        };
+        if let crate::elf::read::Relocations::Rela(relas) = relocations.relocations {
+            for rel in relas.iter() {
+                if let Some(slot) = referenced.get_mut(rel.symbol as usize) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    referenced
 }
 
 /// Plans the symbol table. Returns an empty plan for `-s`.
@@ -108,6 +142,12 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                 return (kept, names);
             }
             let symbols = object.elf.symbols();
+            // With --emit-relocs, locals that relocations name stay symbols.
+            let referenced = if options.emit_relocs {
+                referenced_locals(refs, file_index, object)
+            } else {
+                Vec::new()
+            };
             for index in 1..object.first_global {
                 let Some(raw) = symbols.get_raw(index) else {
                     break;
@@ -115,7 +155,11 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                 let Ok(name) = symbols.name(index, &raw) else {
                     continue;
                 };
-                if !keep_local(name, &raw, discard) {
+                let wanted = keep_local(name, &raw, discard)
+                    || (referenced.get(index).copied().unwrap_or(false)
+                        && raw.kind() != STT_SECTION
+                        && !name.is_empty());
+                if !wanted {
                     continue;
                 }
                 let live = match symbols.section(index, &raw) {
@@ -169,7 +213,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
             if hidden && discard == DiscardMode::All {
                 return None;
             }
-            let len = name_len(symbols.name(id)).saturating_add(1);
+            let len = global_name_len(refs, id).saturating_add(1);
             Some((id, hidden, len))
         })
         .collect();
@@ -209,6 +253,39 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
 }
 
 impl SymtabPlan {
+    /// Puts `count` section symbols (one per output section, in header
+    /// order) after the null symbol, moving every other symbol up.
+    pub fn add_section_symbols(&mut self, count: usize) {
+        if self.is_empty() || count == 0 {
+            return;
+        }
+        for base in &mut self.local_base {
+            *base = base.saturating_add(count);
+        }
+        self.hidden_base = self.hidden_base.saturating_add(count);
+        self.first_global = self.first_global.saturating_add(count);
+        self.count = self.count.saturating_add(count);
+        self.section_symbols = self.section_symbols.saturating_add(count);
+    }
+
+    /// The table index of local symbol `symbol` of `file`, if it is kept.
+    #[must_use]
+    pub fn local_index(&self, file: usize, symbol: u32) -> Option<usize> {
+        let kept = self.locals.get(file)?;
+        let at = kept.binary_search(&symbol).ok()?;
+        self.local_base.get(file)?.checked_add(at)
+    }
+
+    /// The table index of global symbol `id`, if it is in the table.
+    #[must_use]
+    pub fn global_index(&self, id: SymbolId) -> Option<usize> {
+        if let Ok(at) = self.hidden.binary_search(&id) {
+            return self.hidden_base.checked_add(at);
+        }
+        let at = self.globals.binary_search(&id).ok()?;
+        self.first_global.checked_add(at)
+    }
+
     /// `.symtab` size in bytes.
     #[must_use]
     pub fn symtab_size(&self) -> u64 {
@@ -224,6 +301,26 @@ impl SymtabPlan {
 
 /// The length of a symbol's name in `.strtab`: `name@version` for
 /// versioned symbols.
+/// The version a symbol imported from a shared library is written with
+/// (`name@VERSION`, as GNU ld does), unless its name already has one.
+fn import_suffix<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<&'a [u8]> {
+    if refs.symbols.definition_kind(id) != DefinitionKind::Shared
+        || refs.symbols.name(id).version().is_some()
+    {
+        return None;
+    }
+    super::dynsym::import_version(refs, id).map(|(_, version)| version)
+}
+
+/// The length of a global symbol's name in `.strtab`.
+fn global_name_len(refs: &Refs<'_, '_>, id: SymbolId) -> usize {
+    let len = name_len(refs.symbols.name(id));
+    match import_suffix(refs, id) {
+        Some(version) => len.saturating_add(1).saturating_add(version.len()),
+        None => len,
+    }
+}
+
 fn name_len(name: crate::symbols::SymbolName<'_>) -> usize {
     match name.version() {
         Some(version) => name
@@ -287,8 +384,30 @@ pub fn write_symtab(
 ) {
     let refs = &addresses.refs;
     let (entries, _) = out.as_chunks_mut::<SYM_SIZE>();
-    let (_, rest) = entries.split_at_mut(1.min(entries.len()));
-    let local_count = plan.hidden_base.saturating_sub(1);
+    let (head, rest) =
+        entries.split_at_mut(plan.section_symbols.saturating_add(1).min(entries.len()));
+    for (position, (entry, section)) in head
+        .iter_mut()
+        .skip(1)
+        .zip(&addresses.layout.sections)
+        .enumerate()
+    {
+        let shndx = u16::try_from(position.saturating_add(1))
+            .unwrap_or(crate::elf::read::consts::SHN_XINDEX);
+        put_sym(
+            entry,
+            0,
+            (STB_LOCAL << 4) | STT_SECTION,
+            0,
+            shndx,
+            section.addr,
+            0,
+        );
+    }
+    let local_count = plan
+        .hidden_base
+        .saturating_sub(1)
+        .saturating_sub(plan.section_symbols);
     let (locals, rest) = rest.split_at_mut(local_count.min(rest.len()));
     let (hidden, globals) = rest.split_at_mut(plan.hidden.len().min(rest.len()));
 
@@ -436,7 +555,7 @@ pub fn write_symtab(
     for &id in &plan.hidden {
         offsets.push(offset);
         offset = offset
-            .saturating_add(name_len(refs.symbols.name(id)))
+            .saturating_add(global_name_len(refs, id))
             .saturating_add(1);
     }
     hidden
@@ -450,7 +569,7 @@ pub fn write_symtab(
     for &id in &plan.globals {
         offsets.push(offset);
         offset = offset
-            .saturating_add(name_len(refs.symbols.name(id)))
+            .saturating_add(global_name_len(refs, id))
             .saturating_add(1);
     }
     globals
@@ -489,7 +608,19 @@ pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
                 }
                 cursor = put_name(out, end.saturating_add(1), version);
             }
-            None => cursor = put_name(out, cursor, name.bytes()),
+            None => match import_suffix(refs, id) {
+                Some(version) => {
+                    let end = cursor.saturating_add(name.bytes().len());
+                    if let Some(dest) = out.get_mut(cursor..end) {
+                        dest.copy_from_slice(name.bytes());
+                    }
+                    if let Some(at) = out.get_mut(end) {
+                        *at = b'@';
+                    }
+                    cursor = put_name(out, end.saturating_add(1), version);
+                }
+                None => cursor = put_name(out, cursor, name.bytes()),
+            },
         }
     }
 }

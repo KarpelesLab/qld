@@ -20,7 +20,6 @@ use crate::elf::read::consts::{
 use crate::ids::SectionId;
 
 use super::inputs::ElfInput;
-use super::object::SectionKind;
 use super::rules::{OrphanClass, RuleSet, Synthetic, orphan_class};
 use super::sections::{NONE, Sections, split_per_file};
 
@@ -115,7 +114,9 @@ pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -
                     else {
                         break;
                     };
-                    if !*live || section.kind == SectionKind::Ignored {
+                    // Ignored sections are live only when a mode revives
+                    // them (`.note.GNU-stack` with --emit-relocs).
+                    if !*live {
                         continue;
                     }
                     let header = &section.header;

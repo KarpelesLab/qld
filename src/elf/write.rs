@@ -56,6 +56,7 @@ enum Chunk {
     Symtab,
     Strtab,
     Shstrtab,
+    EmitRelocs(u32),
     SectionHeaders,
 }
 
@@ -113,6 +114,12 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                 chunks.push((
                     ChunkRange::new(section.offset, section.size),
                     Chunk::Shstrtab,
+                ));
+            }
+            Trailer::Rela(target) => {
+                chunks.push((
+                    ChunkRange::new(section.offset, section.size),
+                    Chunk::EmitRelocs(target),
                 ));
             }
             Trailer::None => {
@@ -224,6 +231,7 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             .write_group(group as usize, out)
             .map_err(Error::from),
         Chunk::Synthetic(kind) => write_synthetic(input, kind, out),
+        Chunk::EmitRelocs(target) => super::emit::write(input, target, out),
         Chunk::Input(id) => write_input(input, id, out),
     }
 }

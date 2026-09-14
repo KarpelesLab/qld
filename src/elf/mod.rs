@@ -35,6 +35,7 @@
 //! | [`layout`] | 10: output section contents, segments (RELRO included), addresses |
 //! | [`values`] | Symbol, section, GOT and PLT addresses after layout |
 //! | [`write`](mod@write) | 11: parallel chunked writing, relocation in place, `.rela.dyn`, `.eh_frame_hdr` |
+//! | [`emit`] | `--emit-relocs`: input relocations rewritten into `.rela` trailers |
 //! | [`map`] | `-Map` and `-M` |
 //! | [`relocatable`] | 10–11 for `-r`: combined sections, groups, symbol table and rewritten relocations |
 //! | [`arch`] | Per-architecture relocation classification, relaxation and PLT encodings (x86-64) |
@@ -63,6 +64,7 @@ pub mod defined;
 pub mod dso;
 pub mod dynsym;
 pub mod ehframe;
+pub mod emit;
 pub mod export;
 pub mod gc;
 pub mod icf;
