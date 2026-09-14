@@ -18,6 +18,7 @@
 use rayon::prelude::*;
 
 use crate::args::LinkOptions;
+use crate::debug::tombstone::{DeadTarget, SectionTombstone, Tombstones};
 use crate::diag::{Collect, Diagnostic, DiagnosticSink, Severity};
 use crate::elf::read::Relocations;
 use crate::elf::read::consts::x86_64::{
@@ -74,6 +75,8 @@ pub struct WriteInput<'w, 'x, 'a> {
     pub scan: &'w ScanResult,
     /// Relocation decision context.
     pub context: Context,
+    /// Tombstone values for debug relocations to discarded code.
+    pub tombstones: &'w Tombstones,
     /// The entry address.
     pub entry: u64,
     /// Diagnostics.
@@ -153,6 +156,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         dynamic: input.dynamic,
         scan: input.scan,
         context: input.context,
+        tombstones: input.tombstones,
         entry: input.entry,
         diagnostics: &collected,
     };
@@ -918,16 +922,29 @@ fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
     }
 }
 
-/// Tombstone value for relocations from non-allocated sections to discarded
-/// code: 1 in `.debug_ranges`/`.debug_loc` (where 0 ends a list), 0
-/// elsewhere. W10 will replace this with the canonical rules in
-/// `crate::debug`.
-fn tombstone(section_name: &[u8]) -> u64 {
-    if section_name == b".debug_ranges" || section_name == b".debug_loc" {
-        1
-    } else {
-        0
+/// The byte width of a relocation field.
+fn width_bytes(width: x86_64::Width) -> usize {
+    use x86_64::Width as W;
+    match width {
+        W::None => 0,
+        W::W64 => 8,
+        W::U32 | W::I32 => 4,
+        W::Any16 | W::I16 => 2,
+        W::Any8 | W::I8 => 1,
     }
+}
+
+/// Why a relocation's target section is not in the output, if it is not.
+fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
+    let id = refs.target_section(target)?;
+    if refs.sections.is_live(id) {
+        return None;
+    }
+    Some(if refs.sections.resolve(id).is_some() {
+        DeadTarget::Folded
+    } else {
+        DeadTarget::Discarded
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -949,7 +966,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
     let section = object
         .section(section_index)
         .ok_or_else(|| Error::Internal("unknown section in output".into()))?;
-    let data = object.elf.section_data(&section.header)?;
+    let data = object.section_data(section)?;
     let base = addresses.section_address(id).unwrap_or(0);
 
     if section.kind == SectionKind::EhFrame {
@@ -978,6 +995,11 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         return Ok(());
     };
     let alloc = section.header.sh_flags & SHF_ALLOC != 0;
+    let tombstone = if alloc {
+        SectionTombstone::default()
+    } else {
+        input.tombstones.for_section(section.name)
+    };
     let executable = input.context.mode.executable() || !input.context.mode.dynamic;
     let order = file.position.raw();
     let mut skip = false;
@@ -1016,6 +1038,15 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         }
         let place = base.wrapping_add(rel.offset);
         let owner = Addresses::owner(&target, file_index, rel.symbol);
+        if !alloc
+            && matches!(class.kind, Kind::Abs | Kind::DtpOff)
+            && let Some(dead) = dead_target(refs, &target)
+            && let Some(value) = tombstone.get(dead)
+        {
+            let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
+            let _ = x86_64::write_value(out, rel.offset, class.width, value);
+            continue;
+        }
         let resolved = addresses.symbol_address(&target, rel.addend);
         let (mut s, a) = match resolved {
             Some(value) => value,
@@ -1027,7 +1058,8 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                     ));
                     continue;
                 }
-                let value = tombstone(section.name);
+                let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
+                let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
                 let _ = x86_64::write_value(out, rel.offset, class.width, value);
                 continue;
             }

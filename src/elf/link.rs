@@ -20,6 +20,7 @@
 use std::time::Instant;
 
 use crate::args::{LinkOptions, MagicMode, OutputKind, StripMode};
+use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
@@ -89,6 +90,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     let config = ParseConfig {
         strip_debug: options.strip >= StripMode::Debug,
         wrap: &wrap,
+        table: &table,
     };
     let mut inputs = inputs::collect(options, &table, &internal, config)?;
     lap("inputs");
@@ -407,6 +409,14 @@ fn link_inputs<'a>(
         refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
     );
     let entry = entry_address(&addresses, options, mode, diagnostics);
+    let tombstones = Tombstones::new(TombstoneStyle::Lld)
+        .with_rules(
+            options
+                .dead_reloc_in_nonalloc
+                .iter()
+                .map(|(glob, value)| (glob.as_bytes(), *value)),
+        )
+        .map_err(|e| Error::Option(e.0))?;
     write::write(&WriteInput {
         options,
         addresses: &addresses,
@@ -415,6 +425,7 @@ fn link_inputs<'a>(
         dynamic: &dynamic,
         scan: &scan,
         context,
+        tombstones: &tombstones,
         entry,
         diagnostics,
     })?;
@@ -471,6 +482,10 @@ fn report_undefined(
         .collect();
     all.sort_unstable_by_key(|r| (r.symbol, r.file, r.section, r.offset));
     let mut errors = 0usize;
+    let mut line_tables: std::collections::BTreeMap<
+        usize,
+        Option<crate::debug::dwarf::LineLookup>,
+    > = std::collections::BTreeMap::new();
     let mut groups: Vec<&[UndefinedRef]> = all.chunk_by(|a, b| a.symbol == b.symbol).collect();
     groups.sort_by_key(|group| group.first().map(|r| (r.file, r.section, r.offset)));
     let ignore = matches!(
@@ -501,12 +516,20 @@ fn report_undefined(
         };
         diagnostic = diagnostic.order(order);
         for reference in group.iter().take(MAX_REFERENCES) {
-            diagnostic = diagnostic.at(scan::location(
-                refs,
-                reference.file,
-                reference.section,
-                reference.offset,
-            ));
+            let mut location =
+                scan::location(refs, reference.file, reference.section, reference.offset);
+            // The source line, from the object's DWARF line table, parsed
+            // once per file and only when an error is reported.
+            let lookup = line_tables.entry(reference.file).or_insert_with(|| {
+                refs.files
+                    .get(reference.file)
+                    .and_then(|f| f.object.as_ref())
+                    .and_then(|o| crate::debug::dwarf::LineLookup::parse(&o.elf).ok())
+            });
+            if let Some(lookup) = lookup {
+                location.source = lookup.find(reference.section, reference.offset);
+            }
+            diagnostic = diagnostic.at(location);
         }
         if group.len() > MAX_REFERENCES {
             diagnostic = diagnostic.note(format!(

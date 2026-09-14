@@ -16,8 +16,13 @@ use crate::elf::read::consts::{
     SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NULL, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
     SHT_SYMTAB_SHNDX, STB_LOCAL, STB_WEAK,
 };
+use std::sync::Arc;
+
+use crate::debug::section::{CompressedSection, ZDEBUG_PREFIX};
+use crate::elf::read::consts::SHF_COMPRESSED;
 use crate::elf::read::{Elf64Le, GnuProperties, ObjectFile, SectionHeader, SectionIndex, Source};
 use crate::error::{Error, Result};
+use crate::input::FileTable;
 use crate::passes::merge::{MergeKind, SplitSection, split_section};
 use crate::symbols::{DefinitionKind, SymbolName, SymbolUse};
 
@@ -55,6 +60,9 @@ pub struct InputSection<'a> {
     /// For [`SectionKind::Merge`], the index of its split in
     /// [`ObjectInput::splits`].
     pub split: u32,
+    /// The decompressed contents of a compressed section, whose header then
+    /// describes the decompressed data.
+    pub contents: Option<&'a [u8]>,
 }
 
 impl InputSection<'_> {
@@ -141,6 +149,79 @@ pub struct ParseConfig<'a> {
     pub strip_debug: bool,
     /// `--wrap` redirections.
     pub wrap: &'a WrapTable,
+    /// Where decompressed section contents are kept for the link.
+    pub table: &'a FileTable,
+}
+
+/// Known `.zdebug_*` names and the names of their decompressed sections.
+const ZDEBUG_NAMES: &[(&[u8], &[u8])] = &[
+    (b".zdebug_abbrev", b".debug_abbrev"),
+    (b".zdebug_addr", b".debug_addr"),
+    (b".zdebug_aranges", b".debug_aranges"),
+    (b".zdebug_frame", b".debug_frame"),
+    (b".zdebug_info", b".debug_info"),
+    (b".zdebug_line", b".debug_line"),
+    (b".zdebug_line_str", b".debug_line_str"),
+    (b".zdebug_loc", b".debug_loc"),
+    (b".zdebug_loclists", b".debug_loclists"),
+    (b".zdebug_macinfo", b".debug_macinfo"),
+    (b".zdebug_macro", b".debug_macro"),
+    (b".zdebug_names", b".debug_names"),
+    (b".zdebug_pubnames", b".debug_pubnames"),
+    (b".zdebug_pubtypes", b".debug_pubtypes"),
+    (b".zdebug_ranges", b".debug_ranges"),
+    (b".zdebug_rnglists", b".debug_rnglists"),
+    (b".zdebug_str", b".debug_str"),
+    (b".zdebug_str_offsets", b".debug_str_offsets"),
+    (b".zdebug_types", b".debug_types"),
+];
+
+/// A decompressed section: its patched header, output name and contents.
+type Decompressed<'a> = (SectionHeader, &'a [u8], &'a [u8]);
+
+/// Decompresses a compressed non-allocated section into the file table.
+fn decompress_section<'a>(
+    elf: &ObjectFile<'a, Elf64Le>,
+    header: &SectionHeader,
+    name: &'a [u8],
+    config: &ParseConfig<'a>,
+) -> Result<Option<Decompressed<'a>>> {
+    let Some(compressed) = CompressedSection::detect(elf, header)? else {
+        return Ok(None);
+    };
+    let source = elf.source();
+    let data = compressed.decompress(source)?;
+    let label = match source.member {
+        Some(member) => format!(
+            "{}({member}) decompressed section at {:#x}",
+            source.path.display(),
+            header.sh_offset
+        ),
+        None => format!(
+            "{} decompressed section at {:#x}",
+            source.path.display(),
+            header.sh_offset
+        ),
+    };
+    let id = config.table.add_bytes(label, Arc::from(data))?;
+    let contents = config
+        .table
+        .get(id)
+        .map(crate::input::InputFile::data)
+        .ok_or_else(|| Error::Internal("decompressed section missing from table".into()))?;
+    let mut patched = *header;
+    patched.sh_size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+    patched.sh_addralign = compressed.align.max(1);
+    patched.sh_flags &= !SHF_COMPRESSED;
+    let name = if compressed.zdebug {
+        ZDEBUG_NAMES
+            .iter()
+            .find(|(z, _)| *z == name)
+            .map_or(name, |&(_, plain)| plain)
+    } else {
+        name
+    };
+    Ok(Some((patched, name, contents)))
 }
 
 /// A parsed input object.
@@ -206,7 +287,26 @@ impl<'a> ObjectInput<'a> {
         let mut addrsig = 0u32;
         let mut warnings = Vec::new();
         for (index, header) in elf.elf().enumerate_sections() {
-            let name = elf.section_name(&header)?;
+            let mut name = elf.section_name(&header)?;
+            let mut header = header;
+            let mut contents = None;
+            let stripped =
+                config.strip_debug && header.sh_flags & SHF_ALLOC == 0 && is_debug_name(name);
+            if !stripped && (header.is_compressed() || name.starts_with(ZDEBUG_PREFIX)) {
+                if header.sh_flags & SHF_ALLOC != 0 {
+                    return Err(source.malformed(
+                        elf.elf().section_header_offset(index),
+                        "section flags (SHF_COMPRESSED on an allocated section)",
+                    ));
+                }
+                if let Some((patched, output_name, data)) =
+                    decompress_section(&elf, &header, name, config)?
+                {
+                    header = patched;
+                    name = output_name;
+                    contents = Some(data);
+                }
+            }
             let flags = header.sh_flags;
             let kind = match header.sh_type {
                 SHT_NULL | SHT_SYMTAB | SHT_STRTAB | SHT_REL | SHT_RELA | SHT_GROUP
@@ -233,17 +333,6 @@ impl<'a> ObjectInput<'a> {
                 _ if config.strip_debug && flags & SHF_ALLOC == 0 && is_debug_name(name) => {
                     SectionKind::Ignored
                 }
-                _ if header.is_compressed() => {
-                    return Err(Error::Unimplemented(format!(
-                        "compressed section {} in {} (workstream W10: DWARF, \
-                         roadmap M5; link with -S to drop debug sections)",
-                        String::from_utf8_lossy(name),
-                        match source.member {
-                            Some(member) => format!("{}({member})", source.path.display()),
-                            None => source.path.display().to_string(),
-                        }
-                    )));
-                }
                 _ if elf.is_eh_frame(&header)? && flags & SHF_ALLOC != 0 => SectionKind::EhFrame,
                 _ if flags & SHF_MERGE != 0
                     && header.sh_entsize != 0
@@ -257,7 +346,9 @@ impl<'a> ObjectInput<'a> {
             if kind != SectionKind::Ignored {
                 // Layout trusts the sizes of copied sections: check now that
                 // their contents lie inside the file.
-                elf.section_data(&header)?;
+                if contents.is_none() {
+                    elf.section_data(&header)?;
+                }
                 if header.sh_addralign > 1 && !header.sh_addralign.is_power_of_two() {
                     return Err(source.malformed(
                         elf.elf().section_header_offset(index),
@@ -272,6 +363,7 @@ impl<'a> ObjectInput<'a> {
                 relocs: 0,
                 group: 0,
                 split: 0,
+                contents,
             });
         }
 
@@ -354,7 +446,10 @@ impl<'a> ObjectInput<'a> {
                 section.kind = SectionKind::Regular;
                 continue;
             };
-            let data = elf.section_data(&section.header)?;
+            let data = match section.contents {
+                Some(contents) => contents,
+                None => elf.section_data(&section.header)?,
+            };
             let alignment = section.header.sh_addralign.max(1);
             if !alignment.is_power_of_two() {
                 section.kind = SectionKind::Regular;
@@ -457,6 +552,18 @@ impl<'a> ObjectInput<'a> {
         let name = symbols.name(index, &raw).ok()?;
         let at = name.windows(2).position(|w| w == b"@@")?;
         name.get(at.checked_add(2)?..)
+    }
+
+    /// The contents of `section`: decompressed for compressed sections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Malformed`] if the contents lie outside the file.
+    pub fn section_data(&self, section: &InputSection<'a>) -> Result<&'a [u8]> {
+        match section.contents {
+            Some(contents) => Ok(contents),
+            None => self.elf.section_data(&section.header),
+        }
     }
 
     /// The object's source, for diagnostics.
