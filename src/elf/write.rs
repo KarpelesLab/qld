@@ -59,6 +59,10 @@ enum Chunk {
     EmitRelocs(u32),
     Prerendered(usize),
     SectionHeaders,
+    /// Script padding: section position, index in its fills.
+    Fill(u32, u32),
+    /// Script data: section position, index in its data.
+    Data(u32, u32),
 }
 
 /// Inputs to the writer.
@@ -110,8 +114,18 @@ pub struct Prerendered {
 /// [`Error::Internal`] for layout bugs.
 pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     let layout = input.addresses.layout;
+    if !input.options.no_warnings {
+        for warning in &layout.warnings {
+            input.diagnostics.emit(warning.clone());
+        }
+    }
+    let raw = input
+        .options
+        .output_format
+        .as_deref()
+        .and_then(super::rawout::Format::from_name);
     let mut chunks: Vec<(ChunkRange, Chunk)> = Vec::new();
-    let headers = EHDR_SIZE.saturating_add(
+    let headers = layout.phoff.max(EHDR_SIZE).saturating_add(
         PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(0)),
     );
     chunks.push((ChunkRange::new(0, headers), Chunk::Headers));
@@ -150,6 +164,24 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                 ));
             }
             Trailer::None => {
+                let position32 = u32::try_from(position).unwrap_or(u32::MAX);
+                for (index, &(offset, size, _)) in section.fills.iter().enumerate() {
+                    if size > 0 {
+                        chunks.push((
+                            ChunkRange::new(section.offset.saturating_add(offset), size),
+                            Chunk::Fill(position32, u32::try_from(index).unwrap_or(u32::MAX)),
+                        ));
+                    }
+                }
+                for (index, (offset, bytes)) in section.data.iter().enumerate() {
+                    let size = u64::try_from(bytes.len()).unwrap_or(0);
+                    if size > 0 {
+                        chunks.push((
+                            ChunkRange::new(section.offset.saturating_add(*offset), size),
+                            Chunk::Data(position32, u32::try_from(index).unwrap_or(u32::MAX)),
+                        ));
+                    }
+                }
                 for placed in &section.members {
                     if placed.size == 0 {
                         continue;
@@ -176,11 +208,15 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     let ranges: Vec<ChunkRange> = chunks.iter().map(|(range, _)| *range).collect();
 
     let path = input.options.output_path();
-    let mut file = OutputFile::create(
-        &path,
-        layout.file_size,
-        &crate::output::OutputOptions::default(),
-    )?;
+    let mut file = if raw.is_some() {
+        OutputFile::in_memory(layout.file_size)?
+    } else {
+        OutputFile::create(
+            &path,
+            layout.file_size,
+            &crate::output::OutputOptions::default(),
+        )?
+    };
     // Chunks report into a collector; problems are emitted afterwards in
     // input order, so the diagnostics do not depend on scheduling.
     let collected = Collect::new();
@@ -207,6 +243,21 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     emit_collected(collected, input)?;
     if let Some((_, offset, _)) = layout.synthetic(Synthetic::BuildId) {
         file.apply_build_id(&input.options.build_id, offset.saturating_add(16))?;
+    }
+    if let Some(format) = raw {
+        let name = path.as_os_str().as_encoded_bytes().to_vec();
+        let bytes = super::rawout::render(format, layout, file.as_slice(), input.entry, &name)?;
+        drop(file);
+        let mut options = crate::output::OutputOptions::default();
+        if format != super::rawout::Format::Binary {
+            options.mode = crate::output::FileMode::Regular;
+        }
+        let size = u64::try_from(bytes.len())
+            .map_err(|_| Error::Limit("raw output larger than the address space".into()))?;
+        let mut out = OutputFile::create(&path, size, &options)?;
+        out.as_mut_slice().copy_from_slice(&bytes);
+        out.finish()?;
+        return Ok(());
     }
     file.finish()?;
     Ok(())
@@ -353,6 +404,31 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             Ok(())
         }
         Chunk::Input(id) => write_input(input, id, out),
+        Chunk::Fill(position, index) => {
+            let pattern = layout
+                .sections
+                .get(position as usize)
+                .and_then(|s| s.fills.get(index as usize))
+                .and_then(|&(_, _, pattern)| layout.fill_patterns.get(pattern as usize));
+            if let Some(pattern) = pattern
+                && !pattern.is_empty()
+            {
+                for (slot, byte) in out.iter_mut().zip(pattern.iter().cycle()) {
+                    *slot = *byte;
+                }
+            }
+            Ok(())
+        }
+        Chunk::Data(position, index) => {
+            if let Some((_, bytes)) = layout
+                .sections
+                .get(position as usize)
+                .and_then(|s| s.data.get(index as usize))
+            {
+                copy_into(out, bytes);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -376,10 +452,16 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     header[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[24..32].copy_from_slice(&input.entry.to_le_bytes());
-    header[32..40].copy_from_slice(&EHDR_SIZE.to_le_bytes());
+    let phoff = if layout.segments.is_empty() {
+        0
+    } else {
+        layout.phoff
+    };
+    header[32..40].copy_from_slice(&phoff.to_le_bytes());
     header[40..48].copy_from_slice(&layout.shoff.to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());
-    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    let phentsize: u16 = if layout.segments.is_empty() { 0 } else { 56 };
+    header[54..56].copy_from_slice(&phentsize.to_le_bytes());
     let phnum = u16::try_from(layout.segments.len())
         .map_err(|_| Error::Limit("too many program headers".into()))?;
     header[56..58].copy_from_slice(&phnum.to_le_bytes());
@@ -392,7 +474,8 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     header[60..62].copy_from_slice(&shnum_field.to_le_bytes());
     header[62..64].copy_from_slice(&shstrndx.to_le_bytes());
 
-    let phdrs = out.get_mut(64..).ok_or_else(too_small)?;
+    let table_start = usize::try_from(phoff.max(64).saturating_sub(0)).unwrap_or(64);
+    let phdrs = out.get_mut(table_start..).ok_or_else(too_small)?;
     for (segment, entry) in layout
         .segments
         .iter()
@@ -402,7 +485,7 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         entry[4..8].copy_from_slice(&segment.flags.to_le_bytes());
         entry[8..16].copy_from_slice(&segment.offset.to_le_bytes());
         entry[16..24].copy_from_slice(&segment.vaddr.to_le_bytes());
-        entry[24..32].copy_from_slice(&segment.vaddr.to_le_bytes());
+        entry[24..32].copy_from_slice(&segment.paddr.unwrap_or(segment.vaddr).to_le_bytes());
         entry[32..40].copy_from_slice(&segment.filesz.to_le_bytes());
         entry[40..48].copy_from_slice(&segment.memsz.to_le_bytes());
         entry[48..56].copy_from_slice(&segment.align.to_le_bytes());

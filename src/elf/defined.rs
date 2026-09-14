@@ -18,10 +18,11 @@ use crate::symbols::{
     Definition, DefinitionKind, InputPosition, SymbolFlags, SymbolName, SymbolTable,
 };
 
-use super::inputs::{DefsymExpr, parse_defsym};
+use super::inputs::{DefsymExpr, ElfInput, parse_defsym};
 use super::place::Placement;
 use super::refs::LINKER_FILE;
 use super::rules::is_c_identifier;
+use super::script_layout::{ResolvedSymbols, ScriptPlacement, SymbolDef};
 
 /// What a linker-defined symbol's value is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +57,14 @@ pub enum Value {
     Dynamic,
     /// `--defsym`, by index in the options.
     Defsym(usize),
+    /// A linker script symbol, by slot in the script placement's symbol
+    /// names.
+    Script {
+        /// The slot.
+        slot: u32,
+        /// `HIDDEN` or `PROVIDE_HIDDEN`.
+        hidden: bool,
+    },
 }
 
 /// Whether a symbol gets hidden visibility (`PROVIDE_HIDDEN`).
@@ -70,6 +79,7 @@ pub fn is_hidden(value: Value) -> bool {
             | Value::RelaIpltEnd
             | Value::GotBase
             | Value::Dynamic
+            | Value::Script { hidden: true, .. }
     )
 }
 
@@ -147,6 +157,7 @@ fn wanted(symbols: &SymbolTable<'_>, id: SymbolId) -> bool {
 /// Names in `always` are defined even when nothing refers to them.
 pub fn register(
     symbols: &SymbolTable<'_>,
+    files: &[ElfInput<'_>],
     placement: &Placement<'_>,
     options: &LinkOptions,
     dynamic: bool,
@@ -167,8 +178,15 @@ pub fn register(
         );
         result.entries.push((id, value));
     };
+    let script = placement.script.as_deref();
     for &(name, value) in FIXED {
         if dynamic && matches!(value, Value::RelaIpltStart | Value::RelaIpltEnd) {
+            continue;
+        }
+        // Under a linker script, only the symbols the ELF backend itself
+        // defines; the others come from the default script.
+        if script.is_some() && !matches!(value, Value::EhdrStart | Value::GotBase | Value::Dynamic)
+        {
             continue;
         }
         if !dynamic && value == Value::Dynamic {
@@ -224,6 +242,10 @@ pub fn register(
     result.start_stop_outputs.sort_unstable();
     result.start_stop_outputs.dedup();
 
+    if let Some(script) = script {
+        register_script(symbols, files, script, &mut result, &define);
+    }
+
     // --defsym: resolution already made the internal file the definition.
     for (index, (name, expr)) in options.defsym.iter().enumerate() {
         if let Some(id) = symbols.lookup(&SymbolName::new(name.as_bytes()))
@@ -236,6 +258,99 @@ pub fn register(
         }
     }
     result
+}
+
+/// Defines the symbols linker scripts assign and records where the symbols
+/// they read are defined.
+fn register_script(
+    symbols: &SymbolTable<'_>,
+    files: &[ElfInput<'_>],
+    script: &ScriptPlacement,
+    result: &mut LinkerSymbols,
+    define: &dyn Fn(SymbolId, Value, &mut LinkerSymbols),
+) {
+    let mut needed = Vec::with_capacity(script.symbol_names.len());
+    let mut hidden = Vec::with_capacity(script.symbol_names.len());
+    for (slot, name) in script.symbol_names.iter().enumerate() {
+        let (provide, is_hidden) = script
+            .symbol_kinds
+            .get(slot)
+            .copied()
+            .unwrap_or((false, false));
+        hidden.push(is_hidden);
+        let id = symbols.lookup(&SymbolName::new(name));
+        let apply = match id {
+            Some(id) if provide => {
+                matches!(
+                    symbols.definition_kind(id),
+                    DefinitionKind::Undefined | DefinitionKind::Lazy | DefinitionKind::Shared
+                ) && (wanted(symbols, id) || script.referenced.iter().any(|r| r == name))
+            }
+            Some(_) => true,
+            None => !provide,
+        };
+        needed.push(apply);
+        if apply && let Some(id) = id {
+            let slot = u32::try_from(slot).unwrap_or(u32::MAX);
+            define(
+                id,
+                Value::Script {
+                    slot,
+                    hidden: is_hidden,
+                },
+                result,
+            );
+        }
+    }
+    let mut defs: Vec<(Vec<u8>, SymbolDef)> = Vec::with_capacity(script.referenced.len());
+    for name in &script.referenced {
+        let def = match symbols.lookup(&SymbolName::new(name)) {
+            Some(id) => symbol_def(symbols, files, id),
+            None => SymbolDef::Undefined,
+        };
+        defs.push((name.clone(), def));
+    }
+    defs.sort_by(|a, b| a.0.cmp(&b.0));
+    let _ = script.resolved.set(ResolvedSymbols {
+        defs,
+        needed,
+        hidden,
+    });
+}
+
+/// Where symbol `id` is defined, for script expressions.
+fn symbol_def(symbols: &SymbolTable<'_>, files: &[ElfInput<'_>], id: SymbolId) -> SymbolDef {
+    use crate::elf::read::SectionIndex;
+    let def = symbols.definition(id);
+    match def.kind {
+        DefinitionKind::Undefined | DefinitionKind::Lazy => SymbolDef::Undefined,
+        DefinitionKind::Shared | DefinitionKind::Common => SymbolDef::Other,
+        DefinitionKind::Regular | DefinitionKind::Weak => {
+            if def.file == LINKER_FILE {
+                return SymbolDef::Linker;
+            }
+            let file = def.file.index();
+            let Some(object) = files.get(file).and_then(|f| f.object.as_ref()) else {
+                return SymbolDef::Other;
+            };
+            let table = object.elf.symbols();
+            let Some(index) = (def.index as usize).checked_add(object.first_global) else {
+                return SymbolDef::Undefined;
+            };
+            let Some(raw) = table.get_raw(index) else {
+                return SymbolDef::Undefined;
+            };
+            match table.section(index, &raw) {
+                Ok(SectionIndex::Section(section)) => SymbolDef::Section {
+                    file,
+                    section,
+                    value: raw.st_value,
+                },
+                Ok(SectionIndex::Absolute) => SymbolDef::Absolute(raw.st_value),
+                _ => SymbolDef::Other,
+            }
+        }
+    }
 }
 
 /// Backend flag: the symbol's value is an absolute number, not an address

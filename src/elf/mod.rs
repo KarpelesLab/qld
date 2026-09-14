@@ -22,6 +22,8 @@
 //! | [`refs`] | Relocation targets: from a symbol index in a file to its definition |
 //! | [`rules`] | GNU ld's default x86-64 layout as data (a `SECTIONS` script can replace it, M3) |
 //! | [`place`] | 10a: output section assignment and orphan placement |
+//! | [`script_layout`] | Linker-script-driven placement, address assignment and segments (M3) |
+//! | [`binary_input`] | `-b binary` inputs wrapped as objects |
 //! | [`defined`] | Linker-defined symbols (`_end`, `_DYNAMIC`, `__start_SEC`, `--defsym`, …) |
 //! | [`ehframe`] | `.eh_frame` records: GC edges, FDE liveness, CIE deduplication |
 //! | [`gc`] | 7: `--gc-sections` graph and roots, `--print-gc-sections`, `--why-live` |
@@ -38,6 +40,7 @@
 //! | [`write`](mod@write) | 11: parallel chunked writing, relocation in place, `.rela.dyn`, `.eh_frame_hdr` |
 //! | [`emit`] | `--emit-relocs`: input relocations rewritten into `.rela` trailers |
 //! | [`map`] | `-Map` and `-M`, and where the `--cref` table goes |
+//! | [`rawout`] | `--oformat binary`, `ihex` and `srec` images |
 //! | [`relocatable`] | 10–11 for `-r`: combined sections, groups, symbol table and rewritten relocations |
 //! | [`arch`] | Per-architecture relocation classification, relaxation and PLT encodings (x86-64) |
 //!
@@ -62,6 +65,7 @@
 //! count; fixtures check this byte for byte.
 
 pub mod arch;
+pub mod binary_input;
 pub mod common;
 pub mod defined;
 pub mod dso;
@@ -78,6 +82,7 @@ pub mod map;
 pub mod merge;
 pub mod object;
 pub mod place;
+pub mod rawout;
 pub mod read;
 pub mod refs;
 pub mod reloc;
@@ -85,6 +90,7 @@ pub mod relocatable;
 pub mod resolve;
 pub mod rules;
 pub mod scan;
+pub mod script_layout;
 pub mod sections;
 pub mod symtab;
 pub mod synth;

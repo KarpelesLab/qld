@@ -24,7 +24,7 @@
 
 use std::time::Instant;
 
-use crate::args::{LinkOptions, MagicMode, OutputKind, StripMode};
+use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
@@ -74,6 +74,8 @@ const MAX_REFERENCES: usize = 3;
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
     // `-plugin` needs no check here: compiler drivers always pass it, and
     // an IR input is reported as Unimplemented (M6) when it is loaded.
+    let prepared = super::script_layout::prepare(options)?;
+    let options = &prepared.options;
     check_supported(options)?;
     let timing = std::env::var_os("QLD_TIMING").is_some();
     let start = Instant::now();
@@ -87,7 +89,9 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     };
 
     let wrap = WrapTable::new(&options.wrap);
-    let internal = InternalNames::new(options);
+    let mut internal = InternalNames::new(options);
+    prepared.add_internal_names(&mut internal.names);
+    let script = prepared.script.as_ref();
     let table = FileTable::new();
     let config = ParseConfig {
         strip_debug: options.strip >= StripMode::Debug,
@@ -109,8 +113,8 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
 
     match input_sized_threads(options, &table, own_pools) {
         Some(threads) => thread_pool(threads)?
-            .install(|| link_inputs(options, diagnostics, &mut inputs, &internal, &lap)),
-        None => link_inputs(options, diagnostics, &mut inputs, &internal, &lap),
+            .install(|| link_inputs(options, diagnostics, &mut inputs, &internal, script, &lap)),
+        None => link_inputs(options, diagnostics, &mut inputs, &internal, script, &lap),
     }
 }
 
@@ -138,22 +142,13 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
             "{what} (roadmap {milestone})"
         )))
     };
-    if !options.section_starts.is_empty() {
-        return unimplemented("--section-start, -Ttext, -Tdata and -Tbss", "M3");
-    }
-    if options.rodata_segment.is_some() || options.ldata_segment.is_some() {
-        return unimplemented("-Trodata-segment and -Tldata-segment", "M3");
-    }
-    if options.magic != MagicMode::Normal {
-        return unimplemented("-n/--nmagic and -N/--omagic", "M3");
-    }
-    if options.default_script.is_some() {
-        return unimplemented("--default-script", "M3");
-    }
     if let Some(format) = &options.output_format
-        && !matches!(format.as_str(), "elf64-x86-64" | "elf64-x86_64")
+        && !matches!(
+            format.as_str(),
+            "elf64-x86-64" | "elf64-x86_64" | "binary" | "ihex" | "srec"
+        )
     {
-        return unimplemented(&format!("--oformat {format}"), "M3");
+        return unimplemented(&format!("--oformat {format}"), "M4");
     }
     if options.kind == OutputKind::Relocatable
         && options
@@ -209,9 +204,10 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
 #[allow(clippy::too_many_lines)]
 fn link_inputs<'a>(
     options: &LinkOptions,
-    diagnostics: &dyn DiagnosticSink,
+    diagnostics: &'a dyn DiagnosticSink,
     inputs: &mut inputs::Inputs<'a>,
     internal: &InternalNames,
+    script: Option<&'a super::script_layout::LayoutScript>,
     lap: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     let rules = ElfRules {
@@ -272,10 +268,20 @@ fn link_inputs<'a>(
         &[]
     };
 
-    let rule_set = RuleSet::default_rules();
-    let mut placement = place::place(&rule_set, files, &sections);
-    let linker = defined::register(&symbols, &placement, options, mode.dynamic, always);
-    let (version_script, dynamic_patterns) = export::read_scripts(options)?;
+    let rule_set = RuleSet::for_link(script, diagnostics);
+    let mut placement = place::place(&rule_set, files, &sections, options);
+    for id in &placement.discarded {
+        if let Some(slot) = sections.live.get_mut(id.index()) {
+            *slot = false;
+        }
+    }
+    let linker = defined::register(&symbols, files, &placement, options, mode.dynamic, always);
+    let (mut version_script, dynamic_patterns) = export::read_scripts(options)?;
+    if version_script.is_none()
+        && let Some(nodes) = script.map(|s| &s.version).filter(|v| !v.is_empty())
+    {
+        version_script = Some(export::VersionScript::new(nodes)?);
+    }
     let exports = export::plan(
         files,
         &symbols,
@@ -645,7 +651,7 @@ fn link_relocatable<'a>(
             ));
         }
         let rule_set = RuleSet::default_rules();
-        let placement = place::place(&rule_set, files, &sections);
+        let placement = place::place(&rule_set, files, &sections, options);
         let eh_frames = ehframe::split(files, &sections)?;
         let refs = Refs {
             files,
