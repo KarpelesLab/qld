@@ -204,9 +204,9 @@ impl<'a> Symbol<'a> {
             && self.section_number > 0
     }
 
-    /// The name of a section symbol (`.text`) and of a section definition
-    /// can be the section's; this reports whether the symbol names the
-    /// section it is in, with value 0 and a section definition aux record.
+    /// A section symbol, such as `.text`: `STATIC`, value 0, defined in a
+    /// section, not a function, with a section definition aux record. COMDAT
+    /// sections carry their selection in this record.
     #[inline]
     #[must_use]
     pub fn is_section_symbol(&self) -> bool {
