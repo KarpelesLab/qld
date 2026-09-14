@@ -506,3 +506,332 @@ fn dll_with_import_library() {
         );
     }
 }
+
+const CXX: &str = r#"
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+struct Guard {
+    const char* what;
+    explicit Guard(const char* w) : what(w) {}
+    ~Guard() { std::printf("unwound %s\n", what); }
+};
+static int deep(int n) {
+    Guard g("deep");
+    if (n == 0) throw std::runtime_error("boom");
+    return deep(n - 1) + 1;
+}
+int main() {
+    try {
+        Guard g("main");
+        return deep(3);
+    } catch (const std::exception& e) {
+        std::printf("caught %s\n", e.what());
+    }
+    return 0;
+}
+"#;
+
+/// A C++ program with exceptions: the SEH unwind data (`.pdata`/`.xdata`)
+/// must be present, and `.pdata` sorted by address.
+///
+/// RUN ON WINDOWS: the image should print three `unwound deep` lines, then
+/// `unwound main`, then `caught boom`, and exit 0.
+#[test]
+fn cxx_exceptions_and_seh_unwind_data() {
+    if tool(&format!("{PREFIX}g++")).is_none() {
+        skip("x86_64-w64-mingw32-g++ not found");
+        return;
+    }
+    let dir = scratch("cxx-exceptions");
+    std::fs::write(dir.join("throw.cpp"), CXX).unwrap();
+    if run(
+        &format!("{PREFIX}g++"),
+        &["-c", "-fno-lto", "throw.cpp", "-o", "throw.o"],
+        &dir,
+    )
+    .is_none()
+    {
+        return;
+    }
+    let object = dir.join("throw.o").to_str().unwrap().to_string();
+    let Some(argv) = gxx_link_argv(&dir, &[object.as_str(), "-o", "gnu.exe", "-fno-lto"]) else {
+        return;
+    };
+    let options = options_from(&argv, &dir.join("qld.exe"));
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link a C++ program with exceptions:\n{error}");
+    }
+    let Some(headers) = readobj(&dir, "qld.exe", &["--file-headers"]) else {
+        return;
+    };
+    assert!(!headers.contains("ExceptionTableRVA: 0x0"), "{headers}");
+    let Some(sections) = readobj(&dir, "qld.exe", &["--sections"]) else {
+        return;
+    };
+    assert!(sections.contains(".pdata"), "{sections}");
+    assert!(sections.contains(".xdata"), "{sections}");
+    assert!(pdata_is_sorted(&dir, "qld.exe"), ".pdata is not sorted");
+}
+
+/// The `RUNTIME_FUNCTION` table of `file`, checked for ascending
+/// `BeginAddress`, which the Windows unwinder's binary search needs.
+fn pdata_is_sorted(dir: &Path, file: &str) -> bool {
+    let Some(text) = readobj(dir, file, &["--sections"]) else {
+        return true;
+    };
+    let mut offset = 0usize;
+    let mut size = 0usize;
+    let mut in_pdata = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("Name: .pdata") {
+            in_pdata = true;
+        } else if in_pdata {
+            if let Some(value) = line.strip_prefix("RawDataSize: ") {
+                size = value.trim().parse().unwrap_or(0);
+            } else if let Some(value) = line.strip_prefix("PointerToRawData: 0x") {
+                offset = usize::from_str_radix(value.trim(), 16).unwrap_or(0);
+                break;
+            }
+        }
+    }
+    if size == 0 {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(dir.join(file)) else {
+        return true;
+    };
+    let table = bytes
+        .get(offset..offset.saturating_add(size))
+        .unwrap_or(&[]);
+    let mut previous = 0u32;
+    for record in table.as_chunks::<12>().0 {
+        let begin = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        if begin == 0 {
+            break;
+        }
+        if begin < previous {
+            return false;
+        }
+        previous = begin;
+    }
+    true
+}
+
+/// The linker command line `g++` would use.
+fn gxx_link_argv(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let mut full = vec!["-###"];
+    full.extend_from_slice(args);
+    let output = run(&format!("{PREFIX}g++"), &full, dir)?;
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    let line = text
+        .lines()
+        .rfind(|line| line.contains("collect2") || line.contains("/ld"))?;
+    let mut argv = Vec::new();
+    for word in split_words(line) {
+        if word.starts_with("-plugin") || word.contains("collect2") || word.contains("liblto") {
+            continue;
+        }
+        argv.push(word);
+    }
+    if !argv.is_empty() {
+        argv.remove(0);
+    }
+    Some(argv)
+}
+
+const TLS: &str = r#"
+#include <stdio.h>
+__thread int tls_counter = 7;
+int main(void) {
+    tls_counter += 1;
+    printf("%d\n", tls_counter);
+    return tls_counter - 8;
+}
+"#;
+
+/// Thread-local storage: the TLS data directory must point at `_tls_used`.
+///
+/// RUN ON WINDOWS: the image should print `8` and exit 0.
+#[test]
+fn thread_local_storage() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    let dir = scratch("thread-local-storage");
+    let Some(object) = compile(&dir, "tls", TLS, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(&dir, &[object.as_str(), "-o", "gnu.exe", "-fno-lto"]) else {
+        return;
+    };
+    let options = options_from(&argv, &dir.join("qld.exe"));
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link a TLS program:\n{error}");
+    }
+    let Some(headers) = readobj(&dir, "qld.exe", &["--file-headers"]) else {
+        return;
+    };
+    assert!(!headers.contains("TLSTableRVA: 0x0"), "{headers}");
+    let Some(sections) = readobj(&dir, "qld.exe", &["--sections"]) else {
+        return;
+    };
+    assert!(sections.contains(".tls"), "{sections}");
+}
+
+const RESOURCE: &str = r#"
+STRINGTABLE
+BEGIN
+  1 "hello resource"
+END
+"#;
+
+/// A resource object from `windres`: the `.rsrc` section and the resource
+/// data directory must survive the link.
+///
+/// RUN ON WINDOWS: `LoadString` should find string 1.
+#[test]
+fn windres_resources() {
+    if tool(&format!("{PREFIX}windres")).is_none() {
+        skip("x86_64-w64-mingw32-windres not found");
+        return;
+    }
+    let dir = scratch("windres-resources");
+    std::fs::write(dir.join("app.rc"), RESOURCE).unwrap();
+    if run(
+        &format!("{PREFIX}windres"),
+        &["app.rc", "-O", "coff", "-o", "app-rc.o"],
+        &dir,
+    )
+    .is_none()
+    {
+        return;
+    }
+    let Some(object) = compile(&dir, "res", HELLO, &[]) else {
+        return;
+    };
+    let resource = dir.join("app-rc.o").to_str().unwrap().to_string();
+    let Some(argv) = link_argv(
+        &dir,
+        &[
+            object.as_str(),
+            resource.as_str(),
+            "-o",
+            "gnu.exe",
+            "-fno-lto",
+        ],
+    ) else {
+        return;
+    };
+    let options = options_from(&argv, &dir.join("qld.exe"));
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link a resource object:\n{error}");
+    }
+    let Some(headers) = readobj(&dir, "qld.exe", &["--file-headers"]) else {
+        return;
+    };
+    assert!(!headers.contains("ResourceTableRVA: 0x0"), "{headers}");
+    let Some(sections) = readobj(&dir, "qld.exe", &["--sections"]) else {
+        return;
+    };
+    assert!(sections.contains(".rsrc"), "{sections}");
+}
+
+const DEF_LIBRARY: &str = r#"
+int by_def(int value) { return value * 2; }
+int also_by_def(void) { return 3; }
+int hidden(void) { return 4; }
+"#;
+
+/// Exports named by a `.def` file, with an explicit ordinal.
+#[test]
+fn def_file_exports() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    let dir = scratch("def-file-exports");
+    std::fs::write(
+        dir.join("sample.def"),
+        "LIBRARY defsample.dll\nEXPORTS\n  by_def @7\n  also_by_def\n",
+    )
+    .unwrap();
+    let Some(object) = compile(&dir, "deflib", DEF_LIBRARY, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(
+        &dir,
+        &[
+            "-shared",
+            object.as_str(),
+            "-o",
+            "defsample.dll",
+            "-fno-lto",
+        ],
+    ) else {
+        return;
+    };
+    let mut options = options_from(&argv, &dir.join("defsample.dll"));
+    options.kind = qld::args::OutputKind::Shared;
+    let mut pe = PeOptions::from_link_options(&options);
+    pe.def_file = Some(dir.join("sample.def"));
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link with a .def file:\n{error}");
+    }
+    let Some(exports) = readobj(&dir, "defsample.dll", &["--coff-exports"]) else {
+        return;
+    };
+    assert!(exports.contains("by_def"), "{exports}");
+    assert!(exports.contains("also_by_def"), "{exports}");
+    assert!(
+        !exports.contains("hidden"),
+        "a .def file must limit the exports:\n{exports}"
+    );
+    assert!(exports.contains("Ordinal: 7"), "{exports}");
+}
+
+/// Options a later milestone covers are refused, not silently ignored.
+#[test]
+fn unimplemented_options_are_refused() {
+    let dir = scratch("unimplemented-options");
+    let base = LinkOptions {
+        target: Some(pe_target()),
+        output: Some(dir.join("out.exe")),
+        ..LinkOptions::default()
+    };
+    for (name, options) in [
+        (
+            "-r",
+            LinkOptions {
+                kind: qld::args::OutputKind::Relocatable,
+                ..base.clone()
+            },
+        ),
+        (
+            "--gc-sections",
+            LinkOptions {
+                gc_sections: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "--icf",
+            LinkOptions {
+                icf: Some("all".into()),
+                ..base.clone()
+            },
+        ),
+    ] {
+        let pe = PeOptions::from_link_options(&options);
+        let error = qld_link(&options, &pe).unwrap_err();
+        assert!(
+            error.contains("not implemented") || error.contains("PE/COFF"),
+            "{name}: {error}"
+        );
+    }
+}

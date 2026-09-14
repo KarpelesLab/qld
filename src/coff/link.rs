@@ -418,7 +418,7 @@ fn alias_table<'a>(
         ) else {
             continue;
         };
-        if symbols.definition_kind(alias) == DefinitionKind::Undefined {
+        if is_unresolved(symbols, alias) {
             aliases.insert(alias, target);
         }
     }
@@ -437,7 +437,7 @@ fn alias_table<'a>(
             let Some(&id) = ids.get(slot) else {
                 continue;
             };
-            if symbols.definition_kind(id) != DefinitionKind::Undefined {
+            if !is_unresolved(symbols, id) {
                 continue;
             }
             // The tag is a symbol record index; map it to a global.
@@ -452,6 +452,19 @@ fn alias_table<'a>(
         }
     }
     aliases
+}
+
+/// Whether a symbol ends the link without a definition in the image.
+///
+/// A [`DefinitionKind::Lazy`] best definition means the only candidate is an
+/// archive member nothing extracted, which is what a COFF weak external with
+/// `IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY` leaves behind: the fallback applies,
+/// and the member stays out of the link, as GNU `ld` does.
+fn is_unresolved(symbols: &SymbolTable<'_>, id: SymbolId) -> bool {
+    matches!(
+        symbols.definition_kind(id),
+        DefinitionKind::Undefined | DefinitionKind::Lazy
+    )
 }
 
 /// Common symbols, in symbol ID order so the `.bss` layout is deterministic.

@@ -168,9 +168,30 @@ pub fn render(
                 }
             }
         }
+        if section.name == b".pdata" {
+            sort_pdata(&mut bytes);
+        }
         contents.push(bytes);
     }
     (contents, applied)
+}
+
+/// Size of an x86-64 `RUNTIME_FUNCTION`.
+const RUNTIME_FUNCTION_SIZE: usize = 12;
+
+/// Sorts the `.pdata` table by `BeginAddress`.
+///
+/// The Windows unwinder binary-searches the exception table, so its entries
+/// must be in ascending address order. Concatenating each object's `.pdata`
+/// happens to produce that order when the linker keeps the objects' `.text`
+/// order, but qld does not promise that order, so it sorts.
+fn sort_pdata(bytes: &mut [u8]) {
+    let (records, _) = bytes.as_chunks_mut::<RUNTIME_FUNCTION_SIZE>();
+    records.sort_unstable_by_key(|record| {
+        record
+            .first_chunk::<4>()
+            .map_or(0, |begin| u32::from_le_bytes(*begin))
+    });
 }
 
 /// Writes the image described by `input`, with `contents` as the section
