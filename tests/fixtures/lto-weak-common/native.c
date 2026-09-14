@@ -4,6 +4,8 @@ __attribute__((weak)) const char *ir_strong_lto_qld(void) { return "weak native"
 
 const char *native_weak_caller_lto_qld(void) { return ir_strong_lto_qld(); }
 
+const char *(*native_overridden_ptr_lto_qld(void))(void) { return overridden_lto_qld; }
+
 int common_counter_lto_qld;
 char common_buffer_lto_qld[64];
 
