@@ -263,6 +263,9 @@ pub struct Layout<'a> {
     pub warnings: Vec<crate::diag::Diagnostic>,
     /// File offset of the program header table.
     pub phoff: u64,
+    /// Header space (ELF header and program headers) addresses were
+    /// computed with.
+    pub headers_reserved: u64,
 }
 
 impl Layout<'_> {
@@ -1119,6 +1122,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         script_symbols: Vec::new(),
         warnings: Vec::new(),
         phoff: EHDR_SIZE,
+        headers_reserved: 0,
     })
 }
 

@@ -512,6 +512,9 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
             .find(|(name, _)| name.as_bytes() == stmt.name.as_slice())
             .map(|(_, address)| *address);
         let has_address = explicit_start.is_some() || stmt.address.is_some();
+        // In GNU ld's final assignment pass, which gives symbols their
+        // values, sections that are not output leave `.` alone.
+        let dot_before = self.dot;
         if let Some(address) = explicit_start {
             self.dot = address;
         } else if let Some(expr) = &stmt.address {
@@ -522,6 +525,7 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
         }
         let exists = self.outs.get(index as usize).is_some_and(|o| o.exists);
         if !exists {
+            self.dot = dot_before;
             return;
         }
         let emit_relocs = self.emit_relocs();
@@ -768,6 +772,7 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
             reg.last_os = Some(index);
         }
         if ignored {
+            self.dot = dot_before;
             return;
         }
         if alloc {
@@ -1590,6 +1595,27 @@ pub fn layout<'a>(
     script: &LayoutScript,
     placed: &ScriptPlacement,
 ) -> Result<Layout<'a>> {
+    let layout = layout_with(input, script, placed, None)?;
+    // GNU ld lays out again when the program headers outgrow the space
+    // SIZEOF_HEADERS estimated.
+    let needed = EHDR_SIZE.saturating_add(
+        PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(u64::MAX)),
+    );
+    if script.phdrs.is_none()
+        && engine_used_sizeof_headers(script, placed)
+        && layout.headers_reserved < needed
+    {
+        return layout_with(input, script, placed, Some(needed));
+    }
+    Ok(layout)
+}
+
+fn layout_with<'a>(
+    input: &LayoutInput<'_, 'a>,
+    script: &LayoutScript,
+    placed: &ScriptPlacement,
+    headers_override: Option<u64>,
+) -> Result<Layout<'a>> {
     let placement = input.placement;
     let options = input.options;
     let entries = build_entries(input, script, placed)?;
@@ -1699,7 +1725,9 @@ pub fn layout<'a>(
         .min(max_page);
 
     // SIZEOF_HEADERS: GNU's estimate of the program header count.
-    let headers_size = if raw_output {
+    let headers_size = if let Some(size) = headers_override {
+        size
+    } else if raw_output {
         0
     } else if let Some(phdrs) = &script.phdrs {
         EHDR_SIZE.saturating_add(PHDR_SIZE.saturating_mul(u64::try_from(phdrs.len()).unwrap_or(0)))
@@ -2447,6 +2475,7 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         script_symbols,
         warnings,
         phoff: result.phoff,
+        headers_reserved: engine.headers_size,
     })
 }
 

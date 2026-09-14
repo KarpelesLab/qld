@@ -183,10 +183,15 @@ impl ScriptPlacement {
     }
 }
 
-/// The names GNU ld gives a linker-generated section.
+/// The names GNU ld gives a linker-generated section. Without dynamic
+/// linking, the PLT, its GOT and its relocations hold only IFUNC entries,
+/// which GNU ld names `.iplt`, `.igot.plt` and `.rela.iplt`.
 #[must_use]
-pub fn synthetic_names(kind: Synthetic) -> &'static [&'static [u8]] {
+pub fn synthetic_names(kind: Synthetic, dynamic: bool) -> &'static [&'static [u8]] {
     match kind {
+        Synthetic::RelaPlt if !dynamic => &[b".rela.iplt"],
+        Synthetic::Plt if !dynamic => &[b".iplt"],
+        Synthetic::GotPlt if !dynamic => &[b".igot.plt"],
         Synthetic::None | Synthetic::EhFrameEnd | Synthetic::Comment => &[],
         Synthetic::BuildId => &[b".note.gnu.build-id"],
         Synthetic::Interp => &[b".interp"],
@@ -198,9 +203,9 @@ pub fn synthetic_names(kind: Synthetic) -> &'static [&'static [u8]] {
         Synthetic::VerDef => &[b".gnu.version_d"],
         Synthetic::VerNeed => &[b".gnu.version_r"],
         Synthetic::RelaDyn => &[b".rela.dyn"],
-        Synthetic::RelaPlt => &[b".rela.plt", b".rela.iplt"],
+        Synthetic::RelaPlt => &[b".rela.plt"],
         Synthetic::RelrDyn => &[b".relr.dyn"],
-        Synthetic::Plt => &[b".plt", b".iplt"],
+        Synthetic::Plt => &[b".plt"],
         Synthetic::PltGot => &[b".plt.got"],
         Synthetic::PltSec => &[b".plt.sec"],
         Synthetic::EhFrameHdr => &[b".eh_frame_hdr"],
@@ -208,7 +213,7 @@ pub fn synthetic_names(kind: Synthetic) -> &'static [&'static [u8]] {
         Synthetic::DynRelro => &[b".data.rel.ro"],
         Synthetic::Dynamic => &[b".dynamic"],
         Synthetic::Got => &[b".got", b".igot"],
-        Synthetic::GotPlt => &[b".got.plt", b".igot.plt"],
+        Synthetic::GotPlt => &[b".got.plt"],
         Synthetic::DynBss => &[b".dynbss"],
         Synthetic::Common => &[b"COMMON"],
     }
@@ -997,8 +1002,10 @@ pub fn place<'a>(
     // 4. Linker-generated sections.
     let mut synthetic = Vec::new();
     let mut synthetic_orphans = Vec::new();
+    let dynamic =
+        crate::elf::export::Mode::new(options, files.iter().any(|f| f.shared.is_some())).dynamic;
     for &kind in SYNTHETIC_KINDS {
-        let names = synthetic_names(kind);
+        let names = synthetic_names(kind, dynamic);
         let (sh_flags, sh_type) = crate::elf::layout::synthetic_flags(kind);
         let found = descs.iter().find(|d| {
             names
@@ -1072,7 +1079,7 @@ pub fn place<'a>(
         }
     }
     for (kind, sh_flags, sh_type) in synthetic_orphans {
-        let Some(&name) = synthetic_names(kind).first() else {
+        let Some(&name) = synthetic_names(kind, dynamic).first() else {
             continue;
         };
         orphan_list.push(Orphan {
