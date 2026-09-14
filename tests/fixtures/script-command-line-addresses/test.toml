@@ -1,0 +1,39 @@
+# M3: command-line layout options run through the default script:
+# -Ttext/-Tdata/-Tbss/--section-start give sections explicit addresses (and
+# sections with explicit addresses keep their own segments), -Ttext-segment
+# moves the first segment, and -N makes one RWX segment. GNU ld's addresses.
+description = "-Ttext, -Tdata, -Tbss, --section-start, -Ttext-segment and -N"
+compile = ["as -o start.o start.s"]
+link = [
+  "-static -Ttext=0x500000 -Tdata=0x600000 -Tbss=0x680000 --section-start=.mysec=0x640000 -o out start.o",
+  "-static -Ttext-segment=0x800000 -Tbss=0x900000 -o out2 start.o",
+  "-static -N -Ttext=0x700000 --no-warn-rwx-segments -o out3 start.o",
+]
+output = "out"
+# out3 is not runnable: -N does not align file offsets to pages.
+run = "./out; a=$?; ./out2; echo $a $?"
+expect.stdout = "42 42\n"
+expect.readelf = [
+  "Entry point address:               0x500000",
+  ".text             PROGBITS        0000000000500000 001000 000029",
+  ".data             PROGBITS        0000000000600000 003000 000004",
+  ".bss              NOBITS          0000000000680000 005000 000008",
+  ".mysec            PROGBITS        0000000000640000 004000 000004",
+  "LOAD           0x004000 0x0000000000640000 0x0000000000640000 0x000004 0x000004 RW  0x1000",
+]
+expect.readelf_files."out2" = [
+  "LOAD           0x000000 0x0000000000800000 0x0000000000800000",
+  ".text             PROGBITS        0000000000801000 001000 000029",
+  ".bss              NOBITS          0000000000900000",
+  "   .data .mysec ",
+]
+expect.readelf_files."out3" = [
+  ".text             PROGBITS        0000000000700000",
+  " WAX ",
+  " RWE ",
+  "!R E ",
+]
+targets = ["x86_64-linux-gnu"]
+determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]

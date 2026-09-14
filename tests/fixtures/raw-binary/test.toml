@@ -1,0 +1,19 @@
+# M3: `--oformat binary` writes the load image as flat bytes, starting at the
+# lowest load address: `AT>` places .data after .rodata, the fill pattern
+# pads inside .text, zero bytes pad between sections, and NOBITS .bss is
+# left out. The bytes are GNU ld's.
+description = "flat binary output from a ROM linker script"
+compile = ["as -o image.o image.s"]
+link = "-T rom.ld --oformat binary -o out.bin image.o"
+run = "od -An -tx1 -v out.bin"
+expect.stdout = """
+ b8 00 80 00 00 8b 00 c3 cc cc cc cc cc cc cc cc
+ 72 61 77 21 00 80 00 00 1c 10 00 00 44 33 22 11
+ ef be 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ ee
+"""
+targets = ["x86_64-linux-gnu"]
+determinism = true
+# The differential runner reads outputs with readelf; raw outputs are not ELF.
+# `run` compares their bytes with GNU ld's instead.
+diff.skip = "raw (non-ELF) outputs"

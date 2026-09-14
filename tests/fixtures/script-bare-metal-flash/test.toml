@@ -1,0 +1,27 @@
+# M3: a bare-metal image laid out by a linker script, as microcontroller
+# firmware is: MEMORY regions, `>REGION AT> REGION` load addresses, KEEP,
+# SORT_BY_INIT_PRIORITY, fill patterns, data commands, NOLOAD, LOADADDR,
+# PROVIDE_HIDDEN, ASSERT and /DISCARD/. Addresses are GNU ld's.
+description = "linker script with MEMORY regions and flash load addresses"
+compile = ["as -o start.o start.s", "as -o main.o main.s"]
+link = "-T flash.ld -z max-page-size=0x1000 --no-warn-rwx-segments -o out start.o main.o"
+expect.readelf = [
+  "Entry point address:               0x8000020",
+  ".isr_vector       PROGBITS        0000000008000000 001000 000018",
+  ".text             PROGBITS        0000000008000020 001020 000058",
+  ".rodata           PROGBITS        0000000008000078 001078 000028",
+  ".init_array       INIT_ARRAY      00000000080000a0 0010a0 000010",
+  ".data             PROGBITS        0000000020000000 002000 000020",
+  ".bss              NOBITS          0000000020000040 002040 000180",
+  "LOAD           0x001000 0x0000000008000000 0x0000000008000000 0x0000b0 0x0000b0",
+  "LOAD           0x002000 0x0000000020000000 0x00000000080000b0 0x000020 0x000020",
+  "0x0000000020000040 0x00000000080000d0 0x000000 0x000180",
+  "00000000080000b0     0 NOTYPE  GLOBAL DEFAULT  ABS _sidata",
+  "00000000200001c0     0 NOTYPE  GLOBAL DEFAULT    6 _ebss",
+  "0000000020004000     0 NOTYPE  GLOBAL DEFAULT",
+  "!.note.gnu.property",
+  "!__init_array_start",
+  "!INTERP",
+]
+targets = ["x86_64-linux-gnu"]
+determinism = true

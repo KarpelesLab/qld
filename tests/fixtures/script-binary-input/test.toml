@@ -1,0 +1,18 @@
+# M3: `-b binary` wraps a file's bytes in a writable .data section and defines
+# _binary_<mangled path>_start, _end and (absolute) _size, as GNU ld does;
+# `-b elf64-x86-64` switches back for later inputs.
+description = "-b binary input symbols"
+compile = ["as -o start.o start.s"]
+link = "-static -o out start.o -b binary blob.txt -b elf64-x86-64"
+run = "./out"
+expect.stdout = "embedded with -b binary\n"
+expect.exit = 24
+expect.readelf = [
+  "0000000000000018     0 NOTYPE  GLOBAL DEFAULT  ABS _binary_blob_txt_size",
+  "GLOBAL DEFAULT    2 _binary_blob_txt_start",
+  ".data             PROGBITS",
+]
+targets = ["x86_64-linux-gnu"]
+determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]
