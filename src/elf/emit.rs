@@ -25,7 +25,7 @@
 use rayon::prelude::*;
 
 use crate::elf::read::consts::x86_64::{
-    R_X86_64_32, R_X86_64_32S, R_X86_64_GOTPCRELX, R_X86_64_NONE, R_X86_64_PC32,
+    R_X86_64_32, R_X86_64_32S, R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_NONE, R_X86_64_PC32,
     R_X86_64_REX_GOTPCRELX,
 };
 use crate::elf::read::{Elf64Le, RelaSlice, Relocation, Relocations};
@@ -189,7 +189,10 @@ fn output_type(
     data: &[u8],
     rel: &Relocation,
 ) -> u32 {
-    if !matches!(rel.r_type, R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX) {
+    if !matches!(
+        rel.r_type,
+        R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
+    ) {
         return rel.r_type;
     }
     let refs = &input.addresses.refs;

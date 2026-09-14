@@ -149,6 +149,9 @@ pub struct ClassifyContext {
     /// How local-dynamic accesses are linked: by the kind of output, not
     /// the variable.
     pub tls_ld: TlsMode,
+    /// The relocated section holds code (`SHF_EXECINSTR`), so a plain
+    /// `R_X86_64_GOTPCREL` on a `mov` can be relaxed as GNU ld does.
+    pub code: bool,
 }
 
 impl ClassifyContext {
@@ -160,6 +163,7 @@ impl ClassifyContext {
             pic: false,
             tls: TlsMode::LocalExec,
             tls_ld: TlsMode::LocalExec,
+            code: false,
         }
     }
 }
@@ -248,7 +252,22 @@ pub fn classify(
         R_X86_64_PC32 | R_X86_64_PLT32 => class(K::Pc, W::I32),
         R_X86_64_PC16 => class(K::Pc, W::I16),
         R_X86_64_PC8 => class(K::Pc, W::I8),
-        R_X86_64_GOTPCREL => class(K::GotPc, W::I32),
+        R_X86_64_GOTPCREL => {
+            // GNU ld also turns `mov foo@GOTPCREL(%rip), %reg` into `lea`
+            // when the relocation predates GOTPCRELX (rustc emits these).
+            let op = byte_before(data, offset, 2);
+            let modrm = byte_before(data, offset, 1);
+            if relax_got
+                && context.code
+                && addend == -4
+                && op == Some(0x8b)
+                && modrm.is_some_and(|m| m & 0xc7 == 0x05)
+            {
+                class(K::RelaxGotPc, W::I32)
+            } else {
+                class(K::GotPc, W::I32)
+            }
+        }
         R_X86_64_GOTPCREL64 => class(K::GotPc, W::W64),
         R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
             let op = byte_before(data, offset, 2);
@@ -749,6 +768,29 @@ mod tests {
     }
 
     #[test]
+    fn plain_gotpcrel_relaxes_only_mov_in_code() {
+        let code_context = ClassifyContext {
+            code: true,
+            ..ClassifyContext::static_exec(true)
+        };
+        let mov = [0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        let class = classify(R_X86_64_GOTPCREL, -4, &mov, 3, code_context).unwrap();
+        assert_eq!(class.kind, Kind::RelaxGotPc);
+        let data = classify(
+            R_X86_64_GOTPCREL,
+            -4,
+            &mov,
+            3,
+            ClassifyContext::static_exec(true),
+        )
+        .unwrap();
+        assert_eq!(data.kind, Kind::GotPc);
+        let call = [0xff, 0x15, 0, 0, 0, 0];
+        let class = classify(R_X86_64_GOTPCREL, -4, &call, 2, code_context).unwrap();
+        assert_eq!(class.kind, Kind::GotPc);
+    }
+
+    #[test]
     fn relaxes_call_and_jmp() {
         let mut call = vec![0xff, 0x15, 0, 0, 0, 0];
         let class = classify(
@@ -807,6 +849,7 @@ mod tests {
             pic: true,
             tls: TlsMode::Dynamic,
             tls_ld: TlsMode::Dynamic,
+            code: true,
         };
         let kept = classify(R_X86_64_TLSGD, -4, &code, 4, shared).unwrap();
         assert_eq!(kept.kind, Kind::TlsGd);

@@ -170,6 +170,7 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
         } else {
             TlsMode::LocalExec
         },
+        code: false,
     }
 }
 
@@ -188,7 +189,8 @@ pub fn decide(
     flags: SymbolFlags,
     section_flags: u64,
 ) -> Result<Decision, ClassifyError> {
-    let classify = classify_context(context, target, flags);
+    let mut classify = classify_context(context, target, flags);
+    classify.code = section_flags & crate::elf::read::consts::SHF_EXECINSTR != 0;
     let class = x86_64::classify(rel.r_type, rel.addend, data, rel.offset, classify)?;
     let p = props(target, flags);
     let mode = context.mode;
