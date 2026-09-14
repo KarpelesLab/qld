@@ -7,7 +7,7 @@
 //! and friends, and `..` stands for `::`.
 //!
 //! By default the hash is hidden, as `rustfilt` does; with
-//! [`Options::rust_hash`](super::Options::rust_hash) it is printed as the
+//! [`Options::verbose`](super::Options::verbose) it is printed as the
 //! last path segment, as `c++filt` does. Trailing `.suffix` parts (such as
 //! `.llvm.123`) are dropped.
 

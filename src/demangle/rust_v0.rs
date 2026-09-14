@@ -5,7 +5,7 @@
 //! the reference, so they cannot loop; they can still expand exponentially,
 //! which the bounded [`Output`] stops.
 //!
-//! With [`Options::rust_hash`](super::Options::rust_hash), crate
+//! With [`Options::verbose`](super::Options::verbose), crate
 //! disambiguators (`core[2e27404414be4892]`) and the types of constants
 //! (`5: usize`) are printed, as `c++filt` does; without it they are hidden,
 //! as `rustfilt` does. Trailing `.suffix` parts are dropped.
@@ -860,7 +860,11 @@ fn punycode_decode(ascii: &[u8], punycode: &[u8]) -> Option<String> {
             delta = delta.checked_div(35)?;
             k = k.checked_add(BASE)?;
         }
-        bias = k.checked_add(36u64.checked_mul(delta)?.checked_div(delta.checked_add(SKEW)?)?)?;
+        bias = k.checked_add(
+            36u64
+                .checked_mul(delta)?
+                .checked_div(delta.checked_add(SKEW)?)?,
+        )?;
 
         n = n.checked_add(i.checked_div(len)?)?;
         i = i.checked_rem(len)?;
