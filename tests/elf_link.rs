@@ -1921,3 +1921,62 @@ code_qld:
     let ndx = line.split_whitespace().nth(6).unwrap_or_default();
     assert_eq!(ndx, index, "{line}\n{sections}");
 }
+
+/// An executable exports the definitions that a dependency of its libraries
+/// (not itself on the command line) defines or references, as GNU ld does:
+/// LLVM's BUILD_SHARED_LIBS tools left template instances unexported, and a
+/// callback looked up by an indirect dependency was not found at run time.
+#[test]
+fn transitive_dependencies_see_executable_definitions() {
+    require!("cc", "readelf");
+    let dir = scratch("transitive-exports");
+    compile_with(
+        &dir,
+        "base",
+        "int callback_qld(void);\nint tmpl_qld(void) __attribute__((weak));\n\
+         int tmpl_qld(void) { return 1; }\n\
+         int base_call(void) { return callback_qld() + tmpl_qld(); }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "mid",
+        "int base_call(void);\nint mid_call(void) { return base_call(); }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\nint mid_call(void);\nint callback_qld(void) { return 40; }\n\
+         int tmpl_qld(void) __attribute__((weak));\nint tmpl_qld(void) { return 2; }\n\
+         int main(void) { printf(\"%d\\n\", mid_call() + tmpl_qld() - 2); return 0; }\n",
+        &["-fPIE"],
+    );
+    cc_link_ok(&dir, &["-shared", "-o", "libbase.so", "base.o"]);
+    cc_link_ok(
+        &dir,
+        &["-shared", "-o", "libmid.so", "mid.o", "-L.", "-lbase"],
+    );
+    cc_link_ok(
+        &dir,
+        &[
+            "-pie",
+            "-o",
+            "out",
+            "main.o",
+            "-L.",
+            "-lmid",
+            "-Wl,-rpath-link,.",
+        ],
+    );
+    let dynsym = readelf(&dir, &["--dyn-syms", "out"]);
+    let exported = |name: &str| {
+        dynsym
+            .lines()
+            .any(|l| l.ends_with(&format!(" {name}")) && !l.contains(" UND "))
+    };
+    assert!(exported("callback_qld"), "{dynsym}");
+    assert!(exported("tmpl_qld"), "{dynsym}");
+    // libbase's own references bind to the executable's definitions.
+    assert_eq!(stdout_of(&dir, "out"), "42\n");
+}

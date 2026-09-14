@@ -23,7 +23,9 @@
 //! must be defined by the link or by the libraries' own dependencies, which
 //! are found, as GNU ld finds them, through `-rpath-link`, `-rpath`, the
 //! libraries' `DT_RUNPATH`/`DT_RPATH`, `LD_LIBRARY_PATH`, the default
-//! directories and `-L`.
+//! directories and `-L`. The same dependencies are read by
+//! [`mark_dependency_symbols`] for an executable: what they define or
+//! reference is exported from it, as with the libraries on the command line.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -40,6 +42,7 @@ use crate::elf::read::consts::{
 use crate::elf::read::{Elf64Le, SharedObject, Source as ElfSource, VersionKind};
 use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
+use crate::input::FileTable;
 use crate::symbols::{
     Definition, DefinitionKind, Resolution, SymbolFlags, SymbolName, SymbolTable, SymbolUse,
     takes_precedence,
@@ -517,9 +520,11 @@ fn expand_origin(entry: &str, library: &Path) -> PathBuf {
     )
 }
 
-/// A dependency loaded only to check undefined symbols.
+/// A dependency of the needed libraries that is not in the link, loaded to
+/// check undefined symbols and to find what it defines and references.
 struct Dependency {
-    data: Vec<u8>,
+    /// The mapped file, in the caller's [`FileTable`].
+    id: crate::ids::FileId,
     path: PathBuf,
     /// The library whose `DT_NEEDED` list named it.
     needed_by: PathBuf,
@@ -532,6 +537,7 @@ fn load_dependencies(
     files: &[ElfInput<'_>],
     needed: &Needed,
     options: &LinkOptions,
+    table: &FileTable,
     diagnostics: &dyn DiagnosticSink,
 ) -> (Vec<Dependency>, Vec<usize>) {
     let mut known: HashSet<Vec<u8>, foldhash::fast::FixedState> =
@@ -581,19 +587,21 @@ fn load_dependencies(
         }
         dirs.extend(base_dirs.iter().cloned());
         let found = if text.contains('/') {
-            std::fs::read(&text)
-                .ok()
-                .map(|data| (data, PathBuf::from(&text)))
+            let path = PathBuf::from(&text);
+            table.load_path(&path).ok().map(|id| (id, path))
         } else {
             dirs.iter().find_map(|dir| {
                 let path = dir.join(&text);
-                let data = std::fs::read(&path).ok()?;
-                let ok = SharedObject::<Elf64Le>::parse(&data, ElfSource::new(&path))
+                if !path.is_file() {
+                    return None;
+                }
+                let id = table.load_path(&path).ok()?;
+                let ok = SharedObject::<Elf64Le>::parse(table.data(id), ElfSource::new(&path))
                     .is_ok_and(|so| so.elf().header().e_machine == EM_X86_64);
-                ok.then_some((data, path))
+                ok.then_some((id, path))
             })
         };
-        let Some((data, path)) = found else {
+        let Some((id, path)) = found else {
             diagnostics.emit(Diagnostic::warning(format!(
                 "{text}, needed by {}, not found (try using -rpath or -rpath-link)",
                 requester.display()
@@ -603,14 +611,14 @@ fn load_dependencies(
             }
             continue;
         };
-        if let Ok(so) = SharedObject::<Elf64Le>::parse(&data, ElfSource::new(&path)) {
+        if let Ok(so) = SharedObject::<Elf64Le>::parse(table.data(id), ElfSource::new(&path)) {
             let run_path = SharedInputView(&so).search_path().map(<[u8]>::to_vec);
             for dependency in so.needed().filter_map(|n| n.ok()) {
                 queue.push((dependency.to_vec(), path.clone(), run_path.clone(), owner));
             }
         }
         loaded.push(Dependency {
-            data,
+            id,
             path,
             needed_by: requester,
         });
@@ -637,7 +645,8 @@ pub fn defined_in_dependencies(
     // Missing dependencies were already reported by the shared library
     // check, or will be.
     let silent = crate::diag::Collect::new();
-    let (dependencies, _) = load_dependencies(files, needed, options, &silent);
+    let table = FileTable::new();
+    let (dependencies, _) = load_dependencies(files, needed, options, &table, &silent);
     let mut wanted: Vec<(&[u8], usize)> = names
         .iter()
         .enumerate()
@@ -645,9 +654,10 @@ pub fn defined_in_dependencies(
         .collect();
     wanted.sort_unstable();
     for dependency in &dependencies {
-        let Ok(so) =
-            SharedObject::<Elf64Le>::parse(&dependency.data, ElfSource::new(&dependency.path))
-        else {
+        let Ok(so) = SharedObject::<Elf64Le>::parse(
+            table.data(dependency.id),
+            ElfSource::new(&dependency.path),
+        ) else {
             continue;
         };
         for symbol in so.symbols().iter().flatten() {
@@ -668,6 +678,79 @@ pub fn defined_in_dependencies(
         }
     }
     found
+}
+
+/// Marks [`REF_DYNAMIC`] the symbols a regular object of an executable
+/// defines that a dependency of the needed libraries (one not itself in the
+/// link) also defines or references, so that they are exported.
+///
+/// GNU ld loads these dependencies (unless undefined symbols of shared
+/// libraries are ignored) and treats their symbols like those of the
+/// libraries on the command line: an executable's definition that a
+/// transitive dependency defines too, or uses, goes into `.dynsym`, so the
+/// dependency binds to the executable's copy. Without this, a C++ template
+/// instance or inline variable defined in both got two addresses, and a
+/// callback a dependency looks up in the executable was not found. Returns
+/// the number of dependencies loaded.
+pub fn mark_dependency_symbols(
+    files: &[ElfInput<'_>],
+    symbols: &SymbolTable<'_>,
+    needed: &Needed,
+    options: &LinkOptions,
+) -> usize {
+    let ignored = options.allow_shlib_undefined == Some(true)
+        || matches!(
+            options.unresolved_symbols,
+            Some(
+                crate::args::UnresolvedSymbols::IgnoreAll
+                    | crate::args::UnresolvedSymbols::IgnoreInSharedLibs
+            )
+        );
+    if ignored || !needed.any() {
+        return 0;
+    }
+    // Missing dependencies are reported by the shared library check.
+    let silent = crate::diag::Collect::new();
+    let table = FileTable::new();
+    let (dependencies, _) = load_dependencies(files, needed, options, &table, &silent);
+    dependencies.par_iter().for_each(|dependency| {
+        let Ok(so) = SharedObject::<Elf64Le>::parse(
+            table.data(dependency.id),
+            ElfSource::new(&dependency.path),
+        ) else {
+            return;
+        };
+        let table = so.symbols();
+        for index in table.first_global().max(1)..table.len() {
+            let Some(raw) = table.get_raw(index) else {
+                break;
+            };
+            if raw.binding() == STB_LOCAL {
+                continue;
+            }
+            if raw.st_shndx != SHN_UNDEF {
+                // A hidden (non-default) version does not define the name.
+                let hidden = so
+                    .symbol_version(index)
+                    .is_ok_and(|v| v.index == VER_NDX_LOCAL || v.hidden);
+                if hidden {
+                    continue;
+                }
+            }
+            let Ok(name) = table.name(index, &raw) else {
+                continue;
+            };
+            if let Some(id) = symbols.lookup(&SymbolName::new(name))
+                && matches!(
+                    symbols.definition_kind(id),
+                    DefinitionKind::Regular | DefinitionKind::Weak | DefinitionKind::Common
+                )
+            {
+                symbols.set_flags(id, REF_DYNAMIC);
+            }
+        }
+    });
+    dependencies.len()
 }
 
 /// Run path lookup on a bare [`SharedObject`].
@@ -738,14 +821,17 @@ pub fn check_shlib_undefined(
     if missing.is_empty() {
         return 0;
     }
-    let (dependencies, incomplete) = load_dependencies(files, needed, options, diagnostics);
+    let table = FileTable::new();
+    let (dependencies, incomplete) = load_dependencies(files, needed, options, &table, diagnostics);
     // Symbols of every library in the link, needed or not, and of the
     // dependencies loaded for the check.
     let mut defined: HashSet<&[u8], foldhash::fast::FixedState> =
         HashSet::with_hasher(foldhash::fast::FixedState::with_seed(0x756e_6466));
     let parsed: Vec<SharedObject<'_, Elf64Le>> = dependencies
         .iter()
-        .filter_map(|d| SharedObject::<Elf64Le>::parse(&d.data, ElfSource::new(&d.path)).ok())
+        .filter_map(|d| {
+            SharedObject::<Elf64Le>::parse(table.data(d.id), ElfSource::new(&d.path)).ok()
+        })
         .collect();
     let in_link = files
         .iter()

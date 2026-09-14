@@ -236,6 +236,9 @@ fn link_inputs<'a>(
 
     let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
     let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
+    if mode.dynamic && !mode.shared {
+        dso::mark_dependency_symbols(files, &symbols, &needed, options);
+    }
     let always: &[&str] = if mode.dynamic && mode.executable() && options.export_dynamic {
         for name in defined::ALWAYS_DEFINED {
             symbols.intern(SymbolName::new(name.as_bytes()));
