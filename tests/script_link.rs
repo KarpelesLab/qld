@@ -36,6 +36,27 @@ fn tool(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// The GNU ld whose layout qld is compared against, when it is recent
+/// enough. Layout details changed between binutils releases (2.42 orders
+/// some orphan sections differently from 2.46, gives an empty `PT_LOAD` a
+/// different file offset, and evaluates `NEXT` against another page size),
+/// so comparisons only run against 2.44 or newer. qld's own assertions run
+/// either way.
+fn comparable_gnu_ld() -> Option<PathBuf> {
+    let ld = gnu_ld()?;
+    let out = Command::new(&ld).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text.lines().next()?.split_whitespace().last()?;
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts
+        .next()?
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .ok()?;
+    ((major, minor) >= (2, 44)).then_some(ld)
+}
+
 /// GNU ld, when installed: `ld.bfd`, or `ld` if it says it is GNU ld.
 fn gnu_ld() -> Option<PathBuf> {
     if let Some(bfd) = tool("ld.bfd") {
@@ -172,8 +193,8 @@ fn summarize(dir: &Path, file: &str) -> Summary {
 /// the layouts are the same. Returns false (after printing `SKIPPED`) when
 /// GNU ld is not installed.
 fn compare(dir: &Path, args: &[&str]) -> bool {
-    let Some(ld) = gnu_ld() else {
-        println!("SKIPPED: GNU ld not found");
+    let Some(ld) = comparable_gnu_ld() else {
+        println!("SKIPPED: no GNU ld 2.44 or newer to compare against");
         return false;
     };
     let mut gnu_args = args.to_vec();
