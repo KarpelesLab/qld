@@ -7,7 +7,8 @@ systems can use it with no other changes. It is also a Rust library, so tools
 can link programs in-process.
 
 > **Status: pre-alpha.** qld links **x86-64 Linux ELF** (roadmap milestones
-> M1, M2, M3 and M6 complete): static and dynamic executables, PIE and static PIE,
+> M1, M2, M3 and M6 complete, M4 and M7 in progress): static and dynamic
+> executables, PIE and static PIE,
 > shared libraries and relocatable (`-r`) output, with symbol versioning,
 > RELRO, `DT_RELR`, `--gc-sections`, `--icf`, compressed debug sections and
 > `--build-id`, linker-script-driven layout (`-T`, `MEMORY`, `PHDRS`), raw
@@ -16,7 +17,8 @@ can link programs in-process.
 > boots in QEMU. Used as the system linker, it builds and passes the test
 > suites of coreutils, curl, OpenSSL, Python, LLVM/clang/lld and the Rust
 > compiler, with dynamic symbol tables identical to GNU ld's. Other
-> architectures and formats are not supported yet.
+> AArch64 ELF and Windows PE32+ (MinGW) links work too; other architectures
+> and formats are not supported yet.
 >
 > | Link (64 cores) | qld | GNU ld |
 > | --- | --- | --- |

@@ -55,7 +55,7 @@ survive GC.
 | Architecture | Emulation(s) | Milestone | Notable work |
 | --- | --- | --- | --- |
 | x86-64 | `elf_x86_64` | M1–M2 | GOTPCRELX relaxation, TLS relaxation, CET/IBT PLT |
-| AArch64 | `aarch64linux`, `aarch64elf` | M4 | range thunks, TLSDESC, BTI/PAC, erratum 843419 |
+| AArch64 | `aarch64linux`, `aarch64elf` | M4 (linking works) | range thunks, TLSDESC, BTI; 64 KiB default max page size, TLS variant I; ADRP relaxations and erratum workarounds outstanding |
 | RISC-V 64/32 | `elf64lriscv`, `elf32lriscv` | M4 | size-changing relaxation, GP relaxation, attributes |
 | i386 | `elf_i386` | M4 | GOT-relative relocations |
 | ARM | `armelf_linux_eabi` | M4 | interworking, veneers, `.ARM.exidx` |

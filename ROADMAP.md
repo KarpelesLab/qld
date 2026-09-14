@@ -172,8 +172,13 @@ binary.
 In priority order. Each one needs its relocations, thunks and relaxations,
 and TLS models.
 
-- [ ] **AArch64**: range extension thunks, ADRP/ADD relaxation, TLSDESC,
-      BTI/PAC properties, `-z force-bti`, erratum 843419 workaround
+- [~] **AArch64**: done — the static and dynamic relocation set, range
+      extension thunks, PLT/GOT, all four TLS models with TLSDESC and the TLS
+      relaxations, BTI properties, `-r`, and script layout. Outstanding:
+      ADRP+LDR→ADRP+ADD and ADRP+ADD→ADR+NOP relaxations (need relocation
+      lookahead), the Cortex-A53 erratum workarounds and `-z pac-plt` (both
+      rejected with a clear error), `-z force-bti` (needs an option), and the
+      lazy TLSDESC PLT (qld binds eagerly, as lld does)
 - [ ] **RISC-V 64/32**: linker relaxation with section shrinking (iterative
       layout), `__global_pointer$`, attribute section merging
 - [ ] **i386**: GOT-relative relocations, `-z ibtplt`, TLS GNU dialect
@@ -184,6 +189,13 @@ and TLS models.
 - [ ] **LoongArch64**, **s390x**
 - [ ] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths)
+
+**Status:** AArch64 is the second architecture. Validation without an arm64
+machine: every fixture links with qld and with `aarch64-unknown-linux-gnu-ld`,
+and the relocated code is compared symbol by symbol from `objdump -d` (all
+symbols identical except padding splits in the static glibc links). The
+`arm64-linux` CI job runs the fixtures natively on an `ubuntu-24.04-arm`
+runner.
 
 **Exit criteria:** For each architecture, the fixture suite passes under
 `qemu-user`, and a Debian or Alpine userland package set builds with qld as

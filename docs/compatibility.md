@@ -257,6 +257,19 @@ succeed. The error message names the missing search path.
 - A fatal plugin message ends the link. The `qld` binary exits inside the
   plugin's callback as GNU ld does; a library caller gets an error instead.
 
+### AArch64
+
+- TLSDESC is bound eagerly through `.rela.dyn`, as lld does; GNU ld uses a
+  lazy TLSDESC PLT (`DT_TLSDESC_PLT`/`DT_TLSDESC_GOT`). Both work under glibc.
+- A preemptible function that also has a GOT entry goes through `.plt.got`,
+  which GNU ld's AArch64 port does not have, so `.plt` has one fewer entry.
+- Only the PLT header gets a `bti c` landing pad, as in GNU ld: entries are
+  reached by direct branches.
+- `-z separate-code` is off by default, matching GNU ld.
+- Range-extension thunks are pooled per output section, so a single output
+  section holding more than 128 MiB of code reports a relocation overflow
+  instead of splitting the pool.
+
 ### Linker scripts
 
 qld's script parser follows GNU ld's grammar and tokenization (including its
