@@ -515,12 +515,16 @@ impl<'a> LoadCommand<'a> {
             .ok_or_else(|| self.error("truncated"))
     }
 
-    /// Reads an `lc_str` whose offset is stored at `field`.
-    fn lc_str(&self, field: usize) -> Result<&'a [u8]> {
+    /// Reads an `lc_str` whose offset is stored at `field`. The string must
+    /// start after the command's `fixed` bytes of fixed fields.
+    fn lc_str(&self, field: usize, fixed: usize) -> Result<&'a [u8]> {
         let offset = self.u32_at(field)?;
+        if self.data.len() < fixed {
+            return Err(self.error("truncated"));
+        }
         usize::try_from(offset)
             .ok()
-            .filter(|&o| o >= field.saturating_add(4))
+            .filter(|&o| o >= fixed)
             .and_then(|o| self.data.get(o..))
             .and_then(cstr)
             .ok_or_else(|| self.error("string offset or terminator"))
@@ -715,7 +719,7 @@ impl<'a> LoadCommand<'a> {
         }
         Ok(DylibCommand {
             cmd: self.cmd,
-            name: self.lc_str(8)?,
+            name: self.lc_str(8, 24)?,
             timestamp: self.u32_at(12)?,
             current_version: PackedVersion(self.u32_at(16)?),
             compatibility_version: PackedVersion(self.u32_at(20)?),
@@ -731,7 +735,7 @@ impl<'a> LoadCommand<'a> {
     ///
     /// Returns `Error::Malformed` if the string is not inside the command.
     pub fn string(&self) -> Result<&'a [u8]> {
-        self.lc_str(8)
+        self.lc_str(8, 12)
     }
 
     /// Decodes `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY`.

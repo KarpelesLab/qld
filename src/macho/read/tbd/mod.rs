@@ -6,7 +6,9 @@
 //! - **v3** (`--- !tapi-tbd-v3`) and **v4** (`--- !tapi-tbd` with
 //!   `tbd-version: 4`) are YAML, parsed by the hand-written [`yaml`] module.
 //!   A file can hold several documents: the first describes the library,
-//!   the others the libraries it inlines (usually its re-exports).
+//!   the others the libraries it inlines (usually its re-exports). The older
+//!   v1 (untagged or `!tapi-tbd-v1`) and v2 (`!tapi-tbd-v2`) share v3's
+//!   layout and are read too.
 //! - **v5** is JSON (`"tapi_tbd_version": 5`), parsed by [`json`], with the
 //!   inlined libraries under `"libraries"`.
 //!
@@ -184,7 +186,7 @@ pub struct StubFlags {
 /// One library described by a `.tbd` file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StubLibrary {
-    /// Format version: 3, 4 or 5.
+    /// Format version: 1 to 5.
     pub tbd_version: u32,
     /// Targets the library supports.
     pub targets: Vec<StubTarget>,
@@ -349,8 +351,8 @@ impl TextStub {
     /// # Errors
     ///
     /// Returns `Error::Malformed` with the byte offset of the problem for
-    /// invalid UTF-8, YAML or JSON syntax errors, unsupported versions (v1,
-    /// v2), and missing or ill-typed required keys (targets, install name).
+    /// invalid UTF-8, YAML or JSON syntax errors, unknown versions, and
+    /// missing or ill-typed required keys (targets, install name).
     pub fn parse(data: &[u8], source: Source<'_>) -> Result<Self> {
         let text = std::str::from_utf8(data).map_err(|e| {
             source.malformed(
@@ -507,13 +509,13 @@ fn from_yaml(document: &yaml::Document) -> Extract<StubLibrary> {
             }
             from_v4(root)
         }
-        Some("!tapi-tbd-v3") => from_v3(root),
-        Some(tag @ ("!tapi-tbd-v2" | "!tapi-tbd-v1")) => Err((
-            offset,
-            format!("unsupported format {tag} (v3 and later are supported)"),
-        )),
-        // v1 files have no tag.
-        _ => Err((offset, "missing or unknown document tag".to_owned())),
+        Some("!tapi-tbd-v3") => from_v3(root, 3),
+        Some("!tapi-tbd-v2") => from_v3(root, 2),
+        // The first format had no tag.
+        Some("!tapi-tbd-v1") => from_v3(root, 1),
+        None if root.get("archs").is_some() => from_v3(root, 1),
+        Some(tag) => Err((offset, format!("unknown document tag {tag}"))),
+        None => Err((offset, "missing document tag".to_owned())),
     }
 }
 
@@ -610,8 +612,23 @@ fn v3_platform(platform: u32, arch: &str) -> u32 {
     }
 }
 
-fn from_v3(root: &Node) -> Extract<StubLibrary> {
-    let mut lib = new_library(3);
+/// Reads v1, v2 and v3 documents, which share one layout: architectures
+/// and a platform at the top, target lists synthesized from them.
+fn from_v3(root: &Node, version: u32) -> Extract<StubLibrary> {
+    let mut lib = new_library(version);
+    // Before v3, Objective-C class and ivar names carried the leading
+    // underscore of their symbol names.
+    let objc_names = |item: &Node, key: &str| -> Extract<Vec<String>> {
+        let mut names = optional_strings(item, key)?;
+        if version < 3 {
+            for name in &mut names {
+                if let Some(stripped) = name.strip_prefix('_') {
+                    *name = stripped.to_owned();
+                }
+            }
+        }
+        Ok(names)
+    };
     let archs_node = root
         .get("archs")
         .ok_or((root.offset, "missing 'archs'".to_owned()))?;
@@ -651,7 +668,9 @@ fn from_v3(root: &Node) -> Extract<StubLibrary> {
     lib.compatibility_version =
         version_of(root.get("compatibility-version"), "compatibility-version")?;
     lib.swift_abi_version = swift_abi_of(root.get("swift-abi-version"))?;
-    flags_of(&optional_strings(root, "flags")?, &mut lib.flags);
+    if version > 1 {
+        flags_of(&optional_strings(root, "flags")?, &mut lib.flags);
+    }
     if let Some(umbrella) = root.get("parent-umbrella") {
         lib.parent_umbrellas.push(Scoped {
             targets: Vec::new(),
@@ -673,7 +692,8 @@ fn from_v3(root: &Node) -> Extract<StubLibrary> {
             let section_archs = optional_strings(item, "archs")?;
             let targets = synthesize(&section_archs);
             if key == "exports" {
-                let clients = optional_strings(item, "allowable-clients")?;
+                let mut clients = optional_strings(item, "allowable-clients")?;
+                clients.extend(optional_strings(item, "allowed-clients")?);
                 if !clients.is_empty() {
                     lib.allowable_clients.push(Scoped {
                         targets: targets.clone(),
@@ -699,9 +719,9 @@ fn from_v3(root: &Node) -> Extract<StubLibrary> {
                 symbols: optional_strings(item, "symbols")?,
                 weak_symbols: optional_strings(item, weak_key)?,
                 thread_local_symbols: optional_strings(item, "thread-local-symbols")?,
-                objc_classes: optional_strings(item, "objc-classes")?,
+                objc_classes: objc_names(item, "objc-classes")?,
                 objc_eh_types: optional_strings(item, "objc-eh-types")?,
-                objc_ivars: optional_strings(item, "objc-ivars")?,
+                objc_ivars: objc_names(item, "objc-ivars")?,
             });
         }
     }
@@ -928,7 +948,9 @@ mod tests {
             );
         }
         for bad in [
-            "--- !tapi-tbd-v2\narchs: [ x86_64 ]\nplatform: macosx\ninstall-name: /x\n",
+            "--- !tapi-tbd-v9\narchs: [ x86_64 ]\nplatform: macosx\ninstall-name: /x\n",
+            "--- !tapi-tbd-v3\narchs: [ x86_64 ]\nplatform: plan9\ninstall-name: /x\n",
+            "--- !tapi-tbd-v3\nplatform: macosx\ninstall-name: /x\n",
             "--- !tapi-tbd\ntbd-version: 5\ntargets: [ arm64-macos ]\ninstall-name: /x\n",
             "--- !tapi-tbd\ntbd-version: 4\ninstall-name: /x\n",
             "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos ]\n",
@@ -941,6 +963,41 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn v1_and_v2() {
+        let v2 = "--- !tapi-tbd-v2\narchs: [ armv7, arm64 ]\nplatform: ios\n\
+                  flags: [ flat_namespace ]\ninstall-name: /u/l/libfoo.dylib\n\
+                  exports:\n  - archs: [ arm64 ]\n    symbols: [ _sym ]\n    \
+                  objc-classes: [ _NSFoo ]\n    objc-ivars: [ _NSFoo.bar ]\n...\n";
+        let stub = TextStub::parse(v2.as_bytes(), Source::new(Path::new("v2.tbd"))).unwrap();
+        let lib = stub.main().unwrap();
+        assert_eq!(lib.tbd_version, 2);
+        assert!(lib.flags.flat_namespace);
+        let names: Vec<_> = lib
+            .exports_for(&StubTarget::parse("arm64-ios").unwrap())
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "_OBJC_CLASS_$_NSFoo",
+                "_OBJC_IVAR_$_NSFoo.bar",
+                "_OBJC_METACLASS_$_NSFoo",
+                "_sym"
+            ]
+        );
+        let v1 = "---\narchs: [ x86_64 ]\nplatform: macosx\nflags: [ flat_namespace ]\n\
+                  install-name: /u/l/libbar.dylib\nexports:\n  - archs: [ x86_64 ]\n    \
+                  allowed-clients: [ Client ]\n    symbols: [ _bar ]\n";
+        let stub = TextStub::parse(v1.as_bytes(), Source::new(Path::new("v1.tbd"))).unwrap();
+        let lib = stub.main().unwrap();
+        assert_eq!(lib.tbd_version, 1);
+        assert!(!lib.flags.flat_namespace);
+        let macos = StubTarget::parse("x86_64-macos").unwrap();
+        assert_eq!(lib.allowable_clients_for(&macos), ["Client"]);
     }
 
     #[test]

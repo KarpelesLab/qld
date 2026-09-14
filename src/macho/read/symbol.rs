@@ -18,7 +18,7 @@ pub enum SymbolKind {
     Section,
     /// `N_PBUD`: prebound undefined.
     PreboundUndefined,
-    /// `N_INDR`: alias of another symbol, named by [`Symbol::indirect_name`].
+    /// `N_INDR`: alias of another symbol, named by [`SymbolTable::indirect_name`].
     Indirect,
     /// A value not defined by the ABI.
     Unknown(u8),
