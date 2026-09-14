@@ -1,0 +1,101 @@
+--- !mach-o
+# Mach-O reader fixture: an x86_64 dylib with LC_DYLD_EXPORTS_TRIE and
+# LC_DYLD_CHAINED_FIXUPS (three imports, one weak from flat lookup).
+# Build: yaml2obj libchained.yaml -o libchained-x86_64.dylib
+FileHeader:
+  magic:           0xFEEDFACF
+  cputype:         0x1000007
+  cpusubtype:      0x3
+  filetype:        0x6
+  ncmds:           6
+  sizeofcmds:      432
+  flags:           0x100085
+  reserved:        0x0
+LoadCommands:
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         152
+    segname:         __TEXT
+    vmaddr:          0
+    vmsize:          4096
+    fileoff:         0
+    filesize:        4096
+    maxprot:         5
+    initprot:        5
+    nsects:          1
+    flags:           0
+    Sections:
+      - sectname:        __text
+        segname:         __TEXT
+        addr:            0xFF0
+        size:            8
+        offset:          0xFF0
+        align:           0
+        reloff:          0x0
+        nreloc:          0
+        flags:           0x80000400
+        reserved1:       0x0
+        reserved2:       0x0
+        reserved3:       0x0
+        content:         31C0C3CCB8010000
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         72
+    segname:         __LINKEDIT
+    vmaddr:          4096
+    vmsize:          4096
+    fileoff:         4096
+    filesize:        128
+    maxprot:         1
+    initprot:        1
+    nsects:          0
+    flags:           0
+  - cmd:             LC_ID_DYLIB
+    cmdsize:         56
+    dylib:
+      name:            24
+      timestamp:       1
+      current_version: 327680
+      compatibility_version: 65536
+    Content:         '/usr/lib/libchained.dylib'
+    ZeroPadBytes:    7
+  - cmd:             LC_DYLD_CHAINED_FIXUPS
+    cmdsize:         16
+    dataoff:         4096
+    datasize:        80
+  - cmd:             LC_DYLD_EXPORTS_TRIE
+    cmdsize:         16
+    dataoff:         4176
+    datasize:        24
+  - cmd:             LC_LOAD_DYLIB
+    cmdsize:         56
+    dylib:
+      name:            24
+      timestamp:       2
+      current_version: 87556096
+      compatibility_version: 65536
+    Content:         '/usr/lib/libSystem.B.dylib'
+    ZeroPadBytes:    6
+LinkEditData:
+  ChainedFixups:   [ 0x0, 0x0, 0x0, 0x0, 0x1C, 0x0, 0x0, 0x0, 0x28, 0x0, 0x0, 0x0,
+                     0x34, 0x0, 0x0, 0x0, 0x3, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0,
+                     0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+                     0x0, 0x0, 0x0, 0x0, 0x1, 0x2, 0x0, 0x0, 0x1, 0x12, 0x0, 0x0,
+                     0xFE, 0x1F, 0x0, 0x0, 0x0, 0x5F, 0x6D, 0x61, 0x6C, 0x6C, 0x6F,
+                     0x63, 0x0, 0x5F, 0x66, 0x72, 0x65, 0x65, 0x0, 0x5F, 0x77, 0x65,
+                     0x61, 0x6B, 0x5F, 0x74, 0x68, 0x69, 0x6E, 0x67, 0x0, 0x0 ]
+  ExportTrie:
+    TerminalSize:    0
+    NodeOffset:      0
+    Name:            ''
+    Flags:           0x0
+    Address:         0x0
+    Other:           0x0
+    ImportName:      ''
+    Children:
+      - TerminalSize:    3
+        NodeOffset:      12
+        Name:            _chained
+        Flags:           0x0
+        Address:         0xFF0
+        Other:           0x0
+        ImportName:      ''
+...
