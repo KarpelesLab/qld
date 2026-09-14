@@ -197,6 +197,9 @@ struct Engine<'e, 'l, 'a> {
     max_page: u64,
     common_page: u64,
     raw_output: bool,
+    /// `-z relro`, dropped as GNU ld does when no section with contents
+    /// lies between `DATA_SEGMENT_ALIGN` and `DATA_SEGMENT_RELRO_END`.
+    relro: bool,
     span: Span,
     /// Output statements by name, first enabled one.
     by_name: HashMap<&'e [u8], u32, foldhash::fast::FixedState>,
@@ -548,19 +551,38 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
         let section_align = member_align_max.max(attr_align).max(1);
 
         let alloc = self.alloc_of(index);
-        let mut region = None;
+        let region;
         let mut newdot = self.dot;
         let mut used_align = attr_align;
         if !has_address {
-            let r = match stmt.region.as_deref().and_then(|n| self.region_named(n)) {
+            let explicit = stmt.region.as_deref().and_then(|n| self.region_named(n));
+            let r = match explicit {
                 Some(r) => r,
                 None => self.default_region_for(index),
             };
+            if r == self.default_region
+                && self.default_region > 0
+                && alloc
+                && !self.is_tbss(index)
+                && !ignored
+                && self.final_pass
+            {
+                let name = String::from_utf8_lossy(&stmt.name).into_owned();
+                self.errors.push((
+                    Span::default(),
+                    format!("error: no memory region specified for loadable section `{name}'"),
+                ));
+            }
             region = Some(r);
             newdot = self.regions.get(r).map_or(self.dot, |reg| reg.current);
             used_align = section_align;
-        } else if let Some(r) = stmt.region.as_deref().and_then(|n| self.region_named(n)) {
-            region = Some(r);
+        } else {
+            region = Some(
+                stmt.region
+                    .as_deref()
+                    .and_then(|n| self.region_named(n))
+                    .unwrap_or(self.default_region),
+            );
         }
         let before_align = newdot;
         newdot = align_up(newdot, used_align);
@@ -822,7 +844,7 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
             }
         };
         self.current = previous;
-        if pattern.is_empty() || pattern.iter().all(|&b| b == 0) {
+        if pattern.is_empty() {
             return None;
         }
         Some(self.fill_index(pattern))
@@ -1114,7 +1136,7 @@ impl EvalContext for Engine<'_, '_, '_> {
                 }
             }
             _ => {
-                if !self.input.options.relro {
+                if !self.relro {
                     value = value.wrapping_add(dot & max_page_size.wrapping_sub(1));
                 }
                 if seg.phase == SegPhase::None {
@@ -1421,7 +1443,14 @@ fn build_entries(
             continue;
         }
         let (size, align) = input.synth.size_align(place.kind);
-        if size == 0 {
+        // Raw formats link through BFD's generic linker, which makes no ELF
+        // notes.
+        let raw = input
+            .options
+            .output_format
+            .as_deref()
+            .is_some_and(|f| crate::elf::rawout::Format::from_name(f).is_some());
+        if size == 0 || (raw && matches!(place.kind, Synthetic::GnuProperty | Synthetic::BuildId)) {
             continue;
         }
         let class = if place.kind == Synthetic::Common {
@@ -1724,6 +1753,8 @@ fn layout_with<'a>(
         .unwrap_or(crate::elf::layout::DEFAULT_PAGE)
         .min(max_page);
 
+    let relro_effective = options.relro && has_relro_section(input, script, placed, &entries);
+
     // SIZEOF_HEADERS: GNU's estimate of the program header count.
     let headers_size = if let Some(size) = headers_override {
         size
@@ -1742,7 +1773,7 @@ fn layout_with<'a>(
         if by_name.contains_key(&b".dynamic"[..]) && synth_exists(Synthetic::Dynamic) {
             segs = segs.saturating_add(1);
         }
-        if options.relro {
+        if relro_effective {
             segs = segs.saturating_add(1);
         }
         if input.synth.eh_frame_hdr && input.synth.fde_count > 0 {
@@ -1858,6 +1889,7 @@ fn layout_with<'a>(
         max_page,
         common_page,
         raw_output,
+        relro: relro_effective,
         span: Span::default(),
         by_name,
         lma_regions: Vec::new(),
@@ -1900,7 +1932,7 @@ fn layout_with<'a>(
     if stable {
         if engine.dataseg.phase == SegPhase::EndSeen {
             let mut reset = false;
-            if options.relro && engine.dataseg.relro_end != 0 {
+            if engine.relro && engine.dataseg.relro_end != 0 {
                 let initial = engine.dataseg.base;
                 let expected = relro_adjust(&mut engine);
                 engine.run_pass(false)?;
@@ -1930,7 +1962,7 @@ fn layout_with<'a>(
             }
             previous = Some(snapshot);
         }
-        if options.relro && engine.dataseg.relro_end != 0 {
+        if engine.relro && engine.dataseg.relro_end != 0 {
             relro = Some((engine.dataseg.base, engine.dataseg.relro_end));
         }
     }
@@ -1971,6 +2003,65 @@ fn layout_with<'a>(
         return Err(fail(input, script, &errors));
     }
     assemble(engine, relro)
+}
+
+/// GNU's `lang_find_relro_sections`: whether a non-empty allocated input
+/// section lies between the `DATA_SEGMENT_ALIGN` assignment and the
+/// `DATA_SEGMENT_RELRO_END` one.
+fn has_relro_section(
+    input: &LayoutInput<'_, '_>,
+    script: &LayoutScript,
+    placed: &ScriptPlacement,
+    entries: &[Vec<Entry>],
+) -> bool {
+    let contains = |statement: &Statement, want: fn(&Expr) -> bool| {
+        let mut found = false;
+        let mut check = |expr: &Expr| walk_expr(expr, &mut |e| found |= want(e));
+        match statement {
+            Statement::Assign { assignment, .. } => check(&assignment.expr),
+            Statement::Assert { .. } => {}
+            Statement::Output(index) => {
+                if let Some(stmt) = placed.stmt(script, *index) {
+                    for item in &stmt.items {
+                        if let Item::Assign { assignment, .. } = item {
+                            check(&assignment.expr);
+                        }
+                    }
+                }
+            }
+        }
+        found
+    };
+    let Some(start) = placed
+        .statements
+        .iter()
+        .position(|s| contains(s, |e| matches!(e, Expr::DataSegmentAlign(..))))
+    else {
+        return false;
+    };
+    for statement in placed.statements.iter().skip(start) {
+        if contains(statement, |e| matches!(e, Expr::DataSegmentRelroEnd(..))) {
+            break;
+        }
+        let Statement::Output(index) = statement else {
+            continue;
+        };
+        let Some(output) = input.placement.outputs.get(*index as usize) else {
+            continue;
+        };
+        let tbss = output.flags & SHF_TLS != 0 && output.sh_type == SHT_NOBITS;
+        let alloc = output.flags & SHF_ALLOC != 0;
+        if tbss {
+            continue;
+        }
+        if entries.get(*index as usize).is_some_and(|list| {
+            list.iter()
+                .any(|e| e.size > 0 && (alloc || matches!(e.member, Member::Synthetic(_))))
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// GNU's `lang_propagate_lma_regions`: an output section with no load
@@ -2088,11 +2179,26 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
     let mut section_phdrs: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut section_regions: Vec<Option<usize>> = Vec::new();
     let mut last_phdrs: Vec<Vec<u8>> = Vec::new();
+    // Section header order is statement order, except that sections given
+    // an address on the command line come first: GNU ld creates them
+    // before reading the script.
+    let mut order: Vec<u32> = Vec::new();
+    for (name, _) in &options.section_starts {
+        if let Some(&index) = engine.by_name.get(name.as_bytes())
+            && !order.contains(&index)
+        {
+            order.push(index);
+        }
+    }
+    let early = order.len();
     for statement in &placed.statements {
-        let Statement::Output(index) = statement else {
-            continue;
-        };
-        let index = *index;
+        if let Statement::Output(index) = statement
+            && !order.get(..early).unwrap_or_default().contains(index)
+        {
+            order.push(*index);
+        }
+    }
+    for index in order {
         let (Some(out), Some(output), Some(stmt)) = (
             engine.outs.get(index as usize),
             placement.outputs.get(index as usize),
@@ -2174,6 +2280,14 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
                 }
             }
             OutputSectionType::Normal => {}
+        }
+        if output.name == b".text" {
+            // GNU ld forces `.text` read-only, except with -N.
+            if options.magic == MagicMode::Omagic {
+                flags |= SHF_WRITE;
+            } else {
+                flags &= !SHF_WRITE;
+            }
         }
         let alloc = flags & SHF_ALLOC != 0;
         let position = u32::try_from(out_sections.len()).unwrap_or(NONE);

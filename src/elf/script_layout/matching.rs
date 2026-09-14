@@ -383,6 +383,10 @@ struct Orphan<'a> {
     name: &'a [u8],
     sh_type: u32,
     flags: u32,
+    align: u64,
+    /// A linker-generated section that may turn out empty: it gets a
+    /// statement but does not steer later orphans.
+    tentative: bool,
     what: OrphanWhat,
     display: String,
 }
@@ -410,6 +414,10 @@ struct Placer<'p, 'a> {
     /// Orphans added to existing statements get this `sub`.
     appended_sub: Vec<u16>,
     executable: bool,
+    /// Largest input alignment of each output.
+    aligns: Vec<u64>,
+    /// GNU's `first_orphan_note`.
+    first_orphan_note: Option<u32>,
 }
 
 impl<'a> Placer<'_, 'a> {
@@ -604,7 +612,7 @@ impl<'a> Placer<'_, 'a> {
                 .copied()
                 .unwrap_or(false);
             if !has_input || (f ^ orphan.flags) & (LOAD | ALLOC) == 0 {
-                return self.append(output, orphan.flags);
+                return self.append(output, orphan.flags, orphan.tentative);
             }
         }
         // .gnu.warning.SYMBOL goes into .text.
@@ -612,7 +620,7 @@ impl<'a> Placer<'_, 'a> {
             && orphan.name.starts_with(b".gnu.warning.")
             && let Some(text) = self.find(b".text")
         {
-            return self.append(text, orphan.flags);
+            return self.append(text, orphan.flags, orphan.tentative);
         }
         let flags = orphan.flags;
         let hold = if flags & (ALLOC | DEBUGGING) == 0 {
@@ -640,7 +648,7 @@ impl<'a> Placer<'_, 'a> {
         } else {
             Some(Hold::Text)
         };
-        let at = match hold {
+        let mut at = match hold {
             None => self.statements.len(),
             Some(hold) => {
                 let slot = hold.index();
@@ -667,6 +675,9 @@ impl<'a> Placer<'_, 'a> {
                 }
             }
         };
+        if hold.is_some() && flags & LOAD != 0 && !orphan.tentative {
+            at = self.note_position(orphan, at);
+        }
         // The statement: region and program headers follow the anchor.
         let anchor = self.statements.get(..at).and_then(|before| {
             before.iter().rev().find_map(|s| match s {
@@ -705,9 +716,11 @@ impl<'a> Placer<'_, 'a> {
             .unwrap_or(NONE);
         self.orphans.push(stmt);
         self.orphan_names.push(name_static_or(orphan.name, name));
-        self.flags.push(flags);
-        self.types.push(Some(orphan.sh_type));
-        self.has_input.push(true);
+        self.flags.push(if orphan.tentative { 0 } else { flags });
+        self.types
+            .push((!orphan.tentative).then_some(orphan.sh_type));
+        self.aligns.push(orphan.align);
+        self.has_input.push(!orphan.tentative);
         self.enabled.push(true);
         self.appended_sub.push(0);
         let at = at.min(self.statements.len());
@@ -718,6 +731,72 @@ impl<'a> Placer<'_, 'a> {
             *slot = Some(index);
         }
         (index, 0)
+    }
+
+    fn is_note(&self, output: u32) -> bool {
+        let i = output as usize;
+        self.has_input.get(i).copied().unwrap_or(false)
+            && self.types.get(i).copied().flatten() == Some(SHT_NOTE)
+            && self.flags.get(i).copied().unwrap_or(0) & sec::LOAD != 0
+    }
+
+    /// GNU's grouping of loaded note sections in `lang_insert_orphan`:
+    /// notes are kept together and sorted by alignment, and other orphans
+    /// are not placed among them.
+    fn note_position(&mut self, orphan: &Orphan<'_>, at: usize) -> usize {
+        let outputs: Vec<(usize, u32)> = self
+            .statements
+            .iter()
+            .enumerate()
+            .filter_map(|(p, s)| match s {
+                Statement::Output(i)
+                    if self.has_input.get(*i as usize).copied().unwrap_or(false) =>
+                {
+                    Some((p, *i))
+                }
+                _ => None,
+            })
+            .collect();
+        if orphan.sh_type == SHT_NOTE {
+            self.first_orphan_note = None;
+            let mut after = None;
+            for &(position, output) in &outputs {
+                if self.is_note(output) {
+                    if self.first_orphan_note.is_none() {
+                        self.first_orphan_note = Some(output);
+                    }
+                    if self.aligns.get(output as usize).copied().unwrap_or(1) >= orphan.align {
+                        after = Some((position, output));
+                    }
+                } else if self.first_orphan_note.is_some() {
+                    break;
+                }
+            }
+            return match (after, self.first_orphan_note) {
+                (Some((_, output)), _) => self.insert_position(output),
+                (None, Some(first)) => self.position_of(first).unwrap_or(at),
+                (None, None) => at,
+            };
+        }
+        if self.first_orphan_note.is_none() {
+            return at;
+        }
+        // After the section at the insertion point, or the last note after it.
+        let Some(&(_, next)) = outputs.iter().find(|(p, _)| *p >= at) else {
+            return at;
+        };
+        let mut after = next;
+        let mut seen = false;
+        for &(_, output) in &outputs {
+            if output == next {
+                seen = true;
+                continue;
+            }
+            if seen && self.is_note(output) {
+                after = output;
+            }
+        }
+        self.insert_position(after)
     }
 
     fn find_rel(&self, rela: bool) -> Option<u32> {
@@ -735,8 +814,11 @@ impl<'a> Placer<'_, 'a> {
         found
     }
 
-    fn append(&mut self, output: u32, flags: u32) -> (u32, u16) {
+    fn append(&mut self, output: u32, flags: u32, tentative: bool) -> (u32, u16) {
         let sub = self.appended_sub.get(output as usize).copied().unwrap_or(0);
+        if tentative {
+            return (output, sub);
+        }
         if let Some(f) = self.flags.get_mut(output as usize) {
             *f |= flags;
         }
@@ -949,6 +1031,7 @@ pub fn place<'a>(
     let mut flags = vec![0u32; output_count];
     let mut has_input = vec![false; output_count];
     let mut types: Vec<Option<u32>> = vec![None; output_count];
+    let mut aligns: Vec<u64> = vec![1; output_count];
     for (file_index, file) in files.iter().enumerate() {
         let Some(object) = &file.object else {
             continue;
@@ -983,6 +1066,9 @@ pub fn place<'a>(
             }
             if let Some(slot) = has_input.get_mut(o) {
                 *slot = true;
+            }
+            if let Some(slot) = aligns.get_mut(o) {
+                *slot = (*slot).max(section.header.sh_addralign);
             }
             if let Some(slot) = types.get_mut(o)
                 && slot.is_none()
@@ -1045,11 +1131,38 @@ pub fn place<'a>(
             .map(|o| u16::try_from(o.input_count()).unwrap_or(u16::MAX))
             .collect(),
         executable,
+        aligns,
+        first_orphan_note: None,
     };
     let handling = options.orphan_handling.as_deref().unwrap_or("place");
     let mut reports = Vec::new();
     let mut discarded_all: Vec<SectionId> = Vec::new();
     let mut orphan_list: Vec<Orphan<'a>> = Vec::new();
+    let mut synthetic_pending = Some(synthetic_orphans);
+    let mode = crate::elf::export::Mode::new(options, files.iter().any(|f| f.shared.is_some()));
+    let has_properties = files
+        .iter()
+        .filter_map(|f| f.object.as_ref())
+        .any(|o| o.properties.is_some());
+    // Which linker-generated sections are known to exist before their
+    // sizes are planned.
+    let synthetic_exists = |kind: Synthetic| match kind {
+        Synthetic::BuildId => options.build_id != crate::args::BuildId::None,
+        Synthetic::Interp => mode.interp,
+        Synthetic::GnuProperty => {
+            has_properties
+                && !options
+                    .output_format
+                    .as_deref()
+                    .is_some_and(|f| crate::elf::rawout::Format::from_name(f).is_some())
+        }
+        Synthetic::Hash
+        | Synthetic::GnuHash
+        | Synthetic::DynSym
+        | Synthetic::DynStr
+        | Synthetic::Dynamic => mode.dynamic,
+        _ => false,
+    };
     for (file_index, (orphans, discarded)) in per_file.into_iter().enumerate() {
         discarded_all.extend(discarded);
         let Some(file) = files.get(file_index) else {
@@ -1058,6 +1171,7 @@ pub fn place<'a>(
         let Some(object) = &file.object else {
             continue;
         };
+        let first_object = synthetic_pending.is_some();
         for index in orphans {
             let Some(section) = object.section(index) else {
                 continue;
@@ -1073,22 +1187,19 @@ pub fn place<'a>(
                     section.header.sh_type,
                     section.name,
                 ),
+                align: section.header.sh_addralign.max(1),
+                tentative: false,
                 what: OrphanWhat::Section(id),
                 display: file.display(),
             });
         }
+        // Linker-generated sections belong to the first input object.
+        if first_object && let Some(list) = synthetic_pending.take() {
+            push_synthetic_orphans(&mut orphan_list, list, dynamic, &synthetic_exists);
+        }
     }
-    for (kind, sh_flags, sh_type) in synthetic_orphans {
-        let Some(&name) = synthetic_names(kind, dynamic).first() else {
-            continue;
-        };
-        orphan_list.push(Orphan {
-            name,
-            sh_type,
-            flags: gnu_flags(sh_flags, sh_type, name),
-            what: OrphanWhat::Synthetic(kind),
-            display: "<internal>".to_string(),
-        });
+    if let Some(list) = synthetic_pending.take() {
+        push_synthetic_orphans(&mut orphan_list, list, dynamic, &synthetic_exists);
     }
     let mut orphan_ids: Vec<(SectionId, u32, u16)> = Vec::new();
     for orphan in &orphan_list {
@@ -1110,11 +1221,13 @@ pub fn place<'a>(
         // COMMON goes to .bss.
         let (output, orphan_sub) = if synthetic_kind == Some(Synthetic::Common) {
             match placer.find(b".bss") {
-                Some(bss) => placer.append(bss, orphan.flags),
+                Some(bss) => placer.append(bss, orphan.flags, orphan.tentative),
                 None => placer.place(&Orphan {
                     name: b".bss",
                     sh_type: SHT_NOBITS,
                     flags: orphan.flags,
+                    align: 8,
+                    tentative: orphan.tentative,
                     what: orphan.what,
                     display: String::new(),
                 }),
@@ -1223,6 +1336,34 @@ pub fn place<'a>(
     };
     placement.compute_flags(files, sections);
     placement
+}
+
+fn push_synthetic_orphans<'a>(
+    list: &mut Vec<Orphan<'a>>,
+    kinds: Vec<(Synthetic, u64, u32)>,
+    dynamic: bool,
+    exists: &dyn Fn(Synthetic) -> bool,
+) {
+    for (kind, sh_flags, sh_type) in kinds {
+        let Some(&name) = synthetic_names(kind, dynamic).first() else {
+            continue;
+        };
+        let align = match kind {
+            Synthetic::BuildId => 4,
+            Synthetic::Interp | Synthetic::DynStr => 1,
+            Synthetic::VerSym => 2,
+            _ => 8,
+        };
+        list.push(Orphan {
+            name,
+            sh_type,
+            flags: gnu_flags(sh_flags, sh_type, name),
+            align,
+            tentative: !exists(kind),
+            what: OrphanWhat::Synthetic(kind),
+            display: "<internal>".to_string(),
+        });
+    }
 }
 
 /// The symbols the statements assign, in order of first assignment.

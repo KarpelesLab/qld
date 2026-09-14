@@ -134,6 +134,45 @@ fn sniff(path: &Path) -> Option<FileFormat> {
     Some(crate::input::identify(&head))
 }
 
+/// The file names input section descriptions spell without wildcards or
+/// `archive:member` syntax, in script order and without duplicates.
+fn literal_file_names(script: &Script) -> Vec<Vec<u8>> {
+    use crate::script::{OutputSectionCommandKind, SectionsCommandKind};
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut add = |commands: &[crate::script::OutputSectionCommand]| {
+        for command in commands {
+            if let OutputSectionCommandKind::Input(description) = &command.kind {
+                let pattern = &description.file.pattern;
+                let text = pattern.as_bytes();
+                if !pattern.is_wildcard()
+                    && !text.contains(&b':')
+                    && !names.iter().any(|n| n == text)
+                {
+                    names.push(text.to_vec());
+                }
+            }
+        }
+    };
+    for command in &script.commands {
+        let (CommandKind::Sections(list) | CommandKind::OverwriteSections(list)) = &command.kind
+        else {
+            continue;
+        };
+        for item in list {
+            match &item.kind {
+                SectionsCommandKind::OutputSection(section) => add(&section.commands),
+                SectionsCommandKind::Overlay(overlay) => {
+                    for section in &overlay.sections {
+                        add(&section.commands);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
 /// Renders an `INPUT`/`GROUP`/`LIB` list as script text.
 fn input_list(keyword: &str, list: &[InputFile], out: &mut Vec<u8>) -> Result<()> {
     out.extend_from_slice(keyword.as_bytes());
@@ -278,6 +317,9 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
             position,
         });
     }
+    // Files a `-T` script names literally, which GNU ld loads when it
+    // reaches the script: (insertion point, names).
+    let mut moves: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
     for spec in specs {
         match &spec.kind {
             InputKind::Script(path) => {
@@ -292,6 +334,10 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
                 })?;
                 let data = read_file(&found)?;
                 let script = loader.parse(&data, &found)?;
+                let named = literal_file_names(&script);
+                if !named.is_empty() {
+                    moves.push((loader.out.inputs.len(), named));
+                }
                 if let Some(text) = loader.absorb(&script, &found)? {
                     loader.out.inputs.push(InputSpec {
                         kind: InputKind::Bytes {
@@ -342,6 +388,22 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
                 loader.scripts.push((script, false));
             }
             _ => loader.out.inputs.push(spec.clone()),
+        }
+    }
+    // Move later command-line files a script names to the script's place,
+    // in the order the script names them.
+    for (at, names) in moves {
+        let mut at = at;
+        for name in names {
+            let found = loader.out.inputs.iter().enumerate().skip(at).find_map(|(i, s)| {
+                matches!(&s.kind, InputKind::File(p) if p.as_os_str().as_encoded_bytes() == name.as_slice())
+                    .then_some(i)
+            });
+            if let Some(from) = found {
+                let spec = loader.out.inputs.remove(from);
+                loader.out.inputs.insert(at, spec);
+                at = at.saturating_add(1);
+            }
         }
     }
     for (offset, path) in loader.startup.iter().enumerate() {

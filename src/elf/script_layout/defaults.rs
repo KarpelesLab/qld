@@ -22,6 +22,8 @@ pub fn default_script(options: &LinkOptions) -> String {
     );
     let shared = options.kind == OutputKind::Shared;
     let paged = options.magic == MagicMode::Normal;
+    // -n keeps the data segment alignment; -N drops it.
+    let data_segment = options.magic != MagicMode::Omagic;
     let separate =
         paged && options.separate_code.unwrap_or(SeparateCode::Code) != SeparateCode::None;
     let base = if pic { "0" } else { "0x400000" };
@@ -173,7 +175,7 @@ PROVIDE (etext = .);
 .note.openbsd.ident : { *(.note.openbsd.ident) }
 ",
     );
-    if paged {
+    if data_segment {
         s.push_str(". = DATA_SEGMENT_ALIGN (CONSTANT (MAXPAGESIZE), CONSTANT (COMMONPAGESIZE));\n");
     } else {
         s.push_str(". = .;\n");
@@ -236,12 +238,12 @@ PROVIDE (etext = .);
     );
     if options.bind_now && options.relro {
         s.push_str(".got : { *(.got.plt) *(.igot.plt) *(.got) *(.igot) }\n");
-        if paged {
+        if data_segment {
             s.push_str(". = DATA_SEGMENT_RELRO_END (0, .);\n");
         }
     } else {
         s.push_str(".got : { *(.got) *(.igot) }\n");
-        if paged {
+        if data_segment {
             s.push_str(". = DATA_SEGMENT_RELRO_END (SIZEOF (.got.plt) >= 24 ? 24 : 0, .);\n");
         }
         s.push_str(".got.plt : { *(.got.plt) *(.igot.plt) }\n");
@@ -278,19 +280,11 @@ PROVIDE (etext = .);
 . = SEGMENT_START(\"ldata-segment\", .);
 ",
     );
-    if paged {
-        s.push_str(
-            ".lrodata ALIGN(CONSTANT (MAXPAGESIZE)) + (. & (CONSTANT (MAXPAGESIZE) - 1)) : { *(.lrodata .lrodata.* .gnu.linkonce.lr.*) }
+    s.push_str(
+        ".lrodata ALIGN(CONSTANT (MAXPAGESIZE)) + (. & (CONSTANT (MAXPAGESIZE) - 1)) : { *(.lrodata .lrodata.* .gnu.linkonce.lr.*) }
 .ldata ALIGN(CONSTANT (MAXPAGESIZE)) + (. & (CONSTANT (MAXPAGESIZE) - 1)) : { *(.ldata .ldata.* .gnu.linkonce.l.*) . = ALIGN(. != 0 ? 64 / 8 : 1); }
 ",
-        );
-    } else {
-        s.push_str(
-            ".lrodata : { *(.lrodata .lrodata.* .gnu.linkonce.lr.*) }
-.ldata : { *(.ldata .ldata.* .gnu.linkonce.l.*) . = ALIGN(. != 0 ? 64 / 8 : 1); }
-",
-        );
-    }
+    );
     s.push_str(". = ALIGN(64 / 8);\n");
     if shared {
         s.push_str("PROVIDE (_end = .);\n");
@@ -298,7 +292,7 @@ PROVIDE (etext = .);
         s.push_str("_end = .;\n");
     }
     s.push_str("PROVIDE (end = .);\n");
-    if paged {
+    if data_segment {
         s.push_str(". = DATA_SEGMENT_END (.);\n");
     }
     s.push_str(

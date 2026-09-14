@@ -25,7 +25,7 @@ use crate::elf::read::consts::x86_64::{
     R_X86_64_COPY, R_X86_64_DTPMOD64, R_X86_64_IRELATIVE, R_X86_64_JUMP_SLOT, R_X86_64_PLT32,
     R_X86_64_PLT32_BND, R_X86_64_RELATIVE,
 };
-use crate::elf::read::consts::{EM_X86_64, ET_DYN, ET_EXEC, SHF_ALLOC, reloc_name};
+use crate::elf::read::consts::{EM_X86_64, ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR, reloc_name};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::output::{ChunkRange, OutputFile};
@@ -63,6 +63,70 @@ enum Chunk {
     Fill(u32, u32),
     /// Script data: section position, index in its data.
     Data(u32, u32),
+    /// Padding between the contents of a code section: no-op instructions.
+    Nop,
+}
+
+/// Adds no-op padding for the gaps of an executable section that nothing
+/// else fills, as BFD's x86 default fill does.
+fn push_code_padding(
+    section: &super::layout::OutSection<'_>,
+    _position: u32,
+    chunks: &mut Vec<(ChunkRange, Chunk)>,
+) {
+    let mut covered: Vec<(u64, u64)> = section
+        .members
+        .iter()
+        .filter(|p| p.size > 0)
+        .map(|p| (p.offset, p.size))
+        .chain(section.fills.iter().map(|&(o, size, _)| (o, size)))
+        .chain(
+            section
+                .data
+                .iter()
+                .map(|(o, b)| (*o, u64::try_from(b.len()).unwrap_or(0))),
+        )
+        .collect();
+    covered.sort_unstable();
+    let mut cursor = 0u64;
+    for (offset, size) in covered.into_iter().chain([(section.size, 0)]) {
+        if offset > cursor && cursor < section.size {
+            let end = offset.min(section.size);
+            chunks.push((
+                ChunkRange::new(
+                    section.offset.saturating_add(cursor),
+                    end.saturating_sub(cursor),
+                ),
+                Chunk::Nop,
+            ));
+        }
+        cursor = cursor.max(offset.saturating_add(size));
+    }
+}
+
+/// Fills `out` with the longest x86 no-op instructions, as BFD's
+/// `bfd_arch_i386_fill` does.
+fn write_nops(out: &mut [u8]) {
+    const NOPS: [&[u8]; 10] = [
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    let mut rest = out;
+    while !rest.is_empty() {
+        let n = rest.len().min(10);
+        let nop = NOPS.get(n.saturating_sub(1)).copied().unwrap_or(&[0x90]);
+        let (head, tail) = rest.split_at_mut(n.min(nop.len()));
+        head.copy_from_slice(nop.get(..head.len()).unwrap_or_default());
+        rest = tail;
+    }
 }
 
 /// Inputs to the writer.
@@ -195,6 +259,9 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                     let range =
                         ChunkRange::new(section.offset.saturating_add(placed.offset), placed.size);
                     chunks.push((range, chunk));
+                }
+                if section.flags & SHF_EXECINSTR != 0 {
+                    push_code_padding(section, position32, &mut chunks);
                 }
             }
         }
@@ -417,6 +484,10 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
                     *slot = *byte;
                 }
             }
+            Ok(())
+        }
+        Chunk::Nop => {
+            write_nops(out);
             Ok(())
         }
         Chunk::Data(position, index) => {

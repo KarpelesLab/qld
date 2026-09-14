@@ -229,6 +229,15 @@ fn link_inputs<'a>(
         // GNU ld keeps `.note.GNU-stack` as an output section with -q.
         relocatable::revive_named(files, &mut sections, b".note.GNU-stack");
     }
+    if options
+        .output_format
+        .as_deref()
+        .is_some_and(|f| super::rawout::Format::from_name(f).is_some())
+    {
+        // Raw formats link through BFD's generic linker, which copies
+        // property notes rather than merging them.
+        relocatable::revive_named(files, &mut sections, b".note.gnu.property");
+    }
     resolve::deduplicate_comdat(files, &mut sections);
     let mut errors =
         resolve::report_duplicates(files, &resolution, &sections, options.demangle, diagnostics);
