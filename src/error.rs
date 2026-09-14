@@ -27,6 +27,9 @@ pub enum Error {
         /// What was wrong, phrased as a noun ("section header table").
         what: String,
     },
+    /// A linker script could not be parsed or evaluated. Renders as
+    /// `file:line:column: message`, the form GNU tools use.
+    Script(Box<crate::script::ScriptError>),
     /// An I/O operation failed.
     Io {
         /// The path being operated on, if any.
@@ -96,6 +99,7 @@ impl fmt::Display for Error {
                 source,
             } => write!(f, "{}: {source}", path.display()),
             Self::Io { path: None, source } => write!(f, "{source}"),
+            Self::Script(error) => write!(f, "{error}"),
             Self::Option(message) | Self::NotFound(message) => write!(f, "{message}"),
             Self::Limit(message) => write!(f, "limit exceeded: {message}"),
             Self::Internal(message) => write!(f, "internal error: {message}"),
@@ -110,6 +114,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::Script(error) => Some(error.as_ref()),
             _ => None,
         }
     }

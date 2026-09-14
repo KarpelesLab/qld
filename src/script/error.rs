@@ -68,23 +68,9 @@ impl From<Box<ScriptError>> for ScriptError {
 }
 
 impl From<ScriptError> for crate::Error {
-    /// Converts into [`crate::Error::Malformed`]. The line and column are kept
-    /// in the description, because `Malformed` has no field for them.
+    /// Converts into [`crate::Error::Script`], keeping the line and column.
     fn from(error: ScriptError) -> Self {
-        let what = if error.line == 0 {
-            format!("linker script ({})", error.message)
-        } else {
-            format!(
-                "linker script at line {}, column {} ({})",
-                error.line, error.column, error.message
-            )
-        };
-        crate::Error::Malformed {
-            file: error.file,
-            member: None,
-            offset: error.offset,
-            what,
-        }
+        crate::Error::Script(Box::new(error))
     }
 }
 
@@ -171,9 +157,8 @@ mod tests {
         let error = ScriptError::new("a.ld", 3, 7, 42, "syntax error");
         assert_eq!(error.to_string(), "a.ld:3:7: syntax error");
         let converted: crate::Error = error.into();
-        let text = converted.to_string();
-        assert!(text.contains("line 3, column 7"), "{text}");
-        assert!(text.contains("0x2a"), "{text}");
+        assert!(matches!(converted, crate::Error::Script(_)));
+        assert_eq!(converted.to_string(), "a.ld:3:7: syntax error");
 
         let error = ScriptError::new("b.ld", 0, 0, 0, "cannot open");
         assert_eq!(error.to_string(), "b.ld: cannot open");
