@@ -26,7 +26,10 @@ disagree, fix one of them.
    diagnostic.
 5. **Monomorphize the hot paths.** ELF class and endianness (`Elf64Le`,
    `Elf32Be`, …) and the target architecture are type parameters. The inner
-   loops that apply relocations never branch on format at run time.
+   loops that apply relocations never branch on format at run time. (The
+   COFF and Mach-O readers use runtime flags instead: their inputs are
+   effectively always 64-bit little-endian, and a non-generic file type is
+   simpler for the linker to store.)
 6. **Share infrastructure, not semantics.** ELF, PE/COFF and Mach-O disagree
    on symbol precedence, COMDAT/weak semantics, namespaces and layout. lld
    showed that forcing one format-neutral symbol model on all of them costs

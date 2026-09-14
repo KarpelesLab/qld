@@ -230,6 +230,18 @@ succeed. The error message names the missing search path.
   that barely compresses can end up stored uncompressed where GNU ld
   compresses it, or the reverse.
 
+### LTO plugins
+
+- qld reports GNU ld version 2.44 to plugins and sends no gold version (GCC's
+  plugin changes behaviour when it believes it runs under gold). It
+  negotiates plugin API level 1, which GNU ld 2.46 does not offer.
+- Plugins are not `dlclose`d, and a plugin library serves one link per
+  process.
+- The plugin `message` callback formats integer and string arguments;
+  floating-point arguments are shown unformatted.
+- A fatal plugin message ends the link with an error. Used as a library, qld
+  returns the error instead of exiting, and the plugin is not called again.
+
 ### Linker scripts
 
 qld's script parser follows GNU ld's grammar and tokenization (including its
@@ -294,5 +306,10 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - `-arch` may be given several times. qld then links each architecture
   (in parallel) and writes a universal binary. This is an extension:
   ld-prime requires `lipo` for this.
+- **Atomization** for `-dead_strip` follows lld: `N_ALT_ENTRY` symbols don't
+  start atoms, and ld64's special handling of `L`/`l` labels is not
+  reproduced (clang does not put those labels in the symbol table).
+- Selecting `x86_64` from a universal input also accepts a lone `x86_64h`
+  slice.
 - `-lto_library` is accepted. Mach-O LTO uses `libLTO` through the plugin
   layer, not the GNU plugin API. See [optimizations.md](optimizations.md#lto).

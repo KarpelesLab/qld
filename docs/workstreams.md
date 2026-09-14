@@ -55,7 +55,8 @@ can work at the same time without colliding.
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | merged |
 | W16 | M2 exit criteria: real-world builds | `src/elf/**`, `tests/projects/**` | W11 | in progress |
 | W14 | PE/COFF reading | `src/coff/**` | — | merged |
-| W15 | Mach-O reading | `src/macho/**` | — | in progress |
+| W17 | LTO plugin host | `src/plugin/**` | — | merged |
+| W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
 
@@ -354,6 +355,18 @@ the per-atom information dead stripping needs (`.subsections_via_symbols`).
 
 ---
 
+## W17: LTO plugin host
+
+**Goal:** the linker half of the GNU linker plugin API (`-plugin`,
+`-plugin-opt`), loading GCC's `liblto_plugin.so` and LLVM's `LLVMgold.so`,
+as a standalone API: claim IR inputs, report their symbols, take
+resolutions, and collect the native objects the plugin produces. Wiring it
+into the ELF driver's resolution rounds is a later integration step.
+
+**Owns:** `src/plugin/**`, `tests/plugin.rs`, `tests/data/plugin/`.
+
+---
+
 ## Integration follow-ups
 
 Changes requested by merged workstreams that need a frozen shared file, or
@@ -382,10 +395,12 @@ that cross workstream boundaries. The integrator does these between merges.
 | W13 | Call `hints::Hinter` from the ELF driver's undefined-symbol report (integration code in W13's report: collect `LinkedLibrary` with `--as-needed`/`-Bstatic` state, then `hints::attach`), and demangle symbol names in diagnostics with `hints::display_symbol` | done (W11) |
 | W13 | Duplicate-definition explanations (which reference extracted which member) need an extraction trace from `symbols` | open |
 | CI | Merge x86 `GNU_PROPERTY_X86_ISA_1_USED` / `FEATURE_2_USED` properties (OR-AND semantics: kept only if every input has them) instead of dropping them; GNU `as` emits them and GNU ld keeps them | done (W11) |
+| W17 | Integrate `plugin::Session` into the ELF driver: claim IR inputs in `RoundHook::after_load` (deterministic order), feed claimed symbols to resolution (arena-owned names), settle `LDPR_*` resolutions after the fixpoint, re-resolve with `LtoOutput::files`/`libraries`, `finish` after writing (sketch in W17's report) | open, after W16 |
+| W17 | `Error::Plugin(String)` variant; a "referenced from a non-IR file" symbol flag for `PREVAILING_DEF` vs `_IRONLY` | open |
 | W12 | Adopt `RoundHook` + `GroupClaims` for COMDAT in `src/elf/` (claim before insertion; delete `redirect_discarded`) | done (W11) |
 | W10 | Fill `Location::source` for undefined-symbol diagnostics with `debug::dwarf::LineLookup` | done (W11) |
 | W8 | `ifunc-static` fixture prints "same address: no" when built with clang, under GNU ld too: fixture/toolchain issue | open |
-| W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | open, investigate |
+| W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | done: two tests raced on the shared `basic.o`; it is now built once |
 | W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |
 
 ## Launching an agent

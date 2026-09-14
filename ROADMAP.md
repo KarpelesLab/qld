@@ -192,10 +192,12 @@ every benchmark.
 
 ## M6: Link-time optimization
 
-- [ ] GNU linker plugin API host (`-plugin`, `-plugin-opt`, `--plugin-opt=`),
-      dynamically loading `liblto_plugin.so` (GCC) and `LLVMgold.so` (LLVM)
-- [ ] Claim-file handling, symbol resolution reporting (`LDPR_*`), adding
-      compiled objects back into the link, archives containing IR members
+- [x] GNU linker plugin API host (`-plugin`, `-plugin-opt`, `--plugin-opt=`),
+      dynamically loading `liblto_plugin.so` (GCC 13–15) and `LLVMgold.so`
+      (LLVM 18–22): standalone `plugin::Session` API
+- [~] Claim-file handling, symbol resolution reporting (`LDPR_*`), adding
+      compiled objects back into the link, archives containing IR members:
+      done in the host API; ELF driver integration pending
 - [ ] ThinLTO options passthrough: jobs, cache directory and pruning policy,
       `thinlto-index-only`
 - [ ] Clean fallback and a clear diagnostic when an IR input has no plugin
@@ -232,8 +234,8 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 
 - [ ] ld64 argv flavor: `-arch`, `-platform_version`, `-syslibroot`,
       `-framework`, `-dylib`, `-bundle`, `-dead_strip`, `-undefined`, `-exported_symbols_list`
-- [ ] Mach-O object parsing including `.subsections_via_symbols` atomization
-- [ ] `.tbd` text stubs (v3/v4/v5) and dylib inputs, two-level namespace, re-exports
+- [x] Mach-O object parsing including `.subsections_via_symbols` atomization (reader)
+- [~] `.tbd` text stubs (v1–v5) and dylib inputs read; two-level namespace and re-export resolution pending
 - [ ] arm64 and x86_64: stubs, GOT, thunks (arm64), TLV
 - [ ] `LC_DYLD_CHAINED_FIXUPS` and legacy `LC_DYLD_INFO_ONLY` output
 - [ ] Compact unwind (`__unwind_info`) synthesis, `__eh_frame`
