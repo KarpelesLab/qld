@@ -19,7 +19,7 @@
 
 use std::time::Instant;
 
-use crate::args::{LinkOptions, OutputKind, StripMode};
+use crate::args::{LinkOptions, MagicMode, OutputKind, StripMode};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
@@ -78,14 +78,9 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
             ));
         }
     }
-    if !options.plugins.is_empty()
-        && options
-            .plugins
-            .iter()
-            .any(|(_, opts)| opts.iter().any(|o| o == "-fresolution="))
-    {
-        return Err(Error::Unimplemented("LTO plugins (roadmap M6)".into()));
-    }
+    // `-plugin` needs no check here: compiler drivers always pass it, and
+    // an IR input is reported as Unimplemented (M6) when it is loaded.
+    check_supported(options)?;
     let timing = std::env::var_os("QLD_TIMING").is_some();
     let start = Instant::now();
     let lap = |what: &str| {
@@ -117,6 +112,52 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         }
         None => link_inputs(options, diagnostics, &mut inputs, &internal, &lap),
     }
+}
+
+/// Rejects options whose effect is not implemented yet, rather than
+/// silently producing a different binary.
+fn check_supported(options: &LinkOptions) -> Result<()> {
+    let unimplemented = |what: &str, milestone: &str| {
+        Err(Error::Unimplemented(format!(
+            "{what} (roadmap {milestone})"
+        )))
+    };
+    if !options.section_starts.is_empty() {
+        return unimplemented("--section-start, -Ttext, -Tdata and -Tbss", "M3");
+    }
+    if options.rodata_segment.is_some() || options.ldata_segment.is_some() {
+        return unimplemented("-Trodata-segment and -Tldata-segment", "M3");
+    }
+    if options.magic != MagicMode::Normal {
+        return unimplemented("-n/--nmagic and -N/--omagic", "M3");
+    }
+    if options.default_script.is_some() {
+        return unimplemented("--default-script", "M3");
+    }
+    if let Some(format) = &options.output_format
+        && !matches!(format.as_str(), "elf64-x86-64" | "elf64-x86_64")
+    {
+        return unimplemented(&format!("--oformat {format}"), "M3");
+    }
+    if options.emit_relocs {
+        return unimplemented("--emit-relocs", "M2");
+    }
+    if options
+        .compress_debug_sections
+        .as_deref()
+        .is_some_and(|c| c != "none")
+    {
+        return unimplemented("--compress-debug-sections", "M5");
+    }
+    for (name, expr) in &options.defsym {
+        if inputs::parse_defsym(expr).is_none() {
+            return unimplemented(
+                &format!("--defsym {name}={expr}: expressions beyond `symbol+offset`"),
+                "M3",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Input bytes per worker thread when `--threads` is not given.
