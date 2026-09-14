@@ -32,6 +32,7 @@
 
 mod ast;
 mod error;
+mod eval;
 mod lexer;
 mod parser;
 mod pattern;
@@ -45,6 +46,10 @@ pub use ast::{
     VersionPattern,
 };
 pub use error::{EvalError, ScriptError};
+pub use eval::{
+    EvalContext, Value, ValueSection, align_up, eval, eval_absolute, eval_dot_assignment,
+    eval_symbol_assignment, fill_pattern, log2_ceil,
+};
 pub use parser::{
     FsReader, NoIncludes, ScriptReader, parse_defsym, parse_expression, parse_script,
     parse_version_script,
