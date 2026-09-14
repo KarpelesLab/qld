@@ -10,8 +10,8 @@
 //! size. Because the whole output is one buffer, the window is simply
 //! everything decoded so far in the current frame.
 //!
-//! Layout: [`bits`] (bit readers), [`fse`] (FSE tables), [`huffman`]
-//! (literals), [`sequences`] (sequence decoding and execution).
+//! Layout: `bits` (bit readers), `fse` (FSE tables), `huffman`
+//! (literals), `sequences` (sequence decoding and execution).
 
 mod bits;
 mod fse;

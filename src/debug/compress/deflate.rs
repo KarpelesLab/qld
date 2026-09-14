@@ -9,7 +9,7 @@
 //! the stream byte-aligned. The raw chunk outputs therefore concatenate into
 //! one valid DEFLATE stream. The zlib header goes in front, and the Adler-32
 //! trailer is combined from per-chunk checksums with
-//! [`adler32_combine`](super::adler32_combine). Chunks never refer to each
+//! [`super::adler32_combine`]. Chunks never refer to each
 //! other's data, so the output depends only on the input, the level and the
 //! chunk size, never on the thread count.
 //!

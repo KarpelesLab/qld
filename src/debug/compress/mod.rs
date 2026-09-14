@@ -6,12 +6,12 @@
 //!   dictionaries.
 //! - [`deflate`]: DEFLATE encoding with parallel, concatenable chunks, the
 //!   way lld compresses `--compress-debug-sections=zlib` output.
-//! - [`adler32`], [`adler32_combine`]: the zlib checksum.
+//! - [`adler32()`], [`adler32_combine`]: the zlib checksum.
 //!
 //! Decoders write into a caller-provided buffer whose size is known from
 //! the section header, and fail with a [`DecodeError`] (an input offset and
 //! a static description) that the caller turns into
-//! [`Error::Malformed`](crate::Error::Malformed) with
+//! [`crate::Error::Malformed`] with
 //! [`DecodeError::into_error`].
 //!
 //! [`Codec`] is the only place that dispatches on the algorithm, so swapping
