@@ -1,0 +1,8 @@
+; COFF reader fixture: exports of testdll.dll.
+LIBRARY testdll.dll
+EXPORTS
+  dll_function @1
+  dll_data @2 DATA
+  dll_rodata @3 DATA
+  dll_hidden_by_ordinal @5 NONAME
+  forwarded_sleep = kernel32.Sleep @6
