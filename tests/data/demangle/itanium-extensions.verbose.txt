@@ -1,0 +1,18 @@
+# Names c++filt rejects that qld demangles (see docs/compatibility.md).
+_ZN4llvmL14OperandInfo193E.llvm.1276244268417773485	llvm::OperandInfo193 [clone .llvm.1276244268417773485]
+_ZN4llvmL14OperandInfo400E.llvm.11268957317724077719	llvm::OperandInfo400 [clone .llvm.11268957317724077719]
+_ZN4llvm12_GLOBAL__N_126DQuad_with_dsub_3_in_DPR_8E.llvm.7293668265161812887	llvm::(anonymous namespace)::DQuad_with_dsub_3_in_DPR_8 [clone .llvm.7293668265161812887]
+_ZN4llvmL14OperandInfo143E.llvm.13528370267607833279	llvm::OperandInfo143 [clone .llvm.13528370267607833279]
+_ZN4llvmL14OperandInfo254E.llvm.17102046929323971433	llvm::OperandInfo254 [clone .llvm.17102046929323971433]
+_ZN4llvm12_GLOBAL__N_15SPILLE.llvm.2296672676253975844	llvm::(anonymous namespace)::SPILL [clone .llvm.2296672676253975844]
+_ZN4llvmL14OperandInfo336E.llvm.17102046929323971433	llvm::OperandInfo336 [clone .llvm.17102046929323971433]
+_ZN4llvmL14OperandInfo590E.llvm.10965323070160734508	llvm::OperandInfo590 [clone .llvm.10965323070160734508]
+_GLOBAL__sub_I_DCE.cpp.cold	global constructors keyed to DCE.cpp.cold
+_ZL44InitializeAssignmentTrackingAnalysisPassFlag.llvm.14533338409298966930	InitializeAssignmentTrackingAnalysisPassFlag [clone .llvm.14533338409298966930]
+_ZN4llvmL16QQPRSuperclassesE.llvm.9904546919160222224	llvm::QQPRSuperclasses [clone .llvm.9904546919160222224]
+__ZN3foo3barEv	foo::bar()
+_GLOBAL__sub_I_foo.cpp	global constructors keyed to foo.cpp
+_GLOBAL__sub_I__ZN3fooEv	global constructors keyed to foo()
+__RNvCs1234_7mycrate3foo	mycrate[3c1c0]::foo
+_ZGR1x_	reference temporary #0 for x
+_ZL10parseFieldIhTnMN4llvm6AMDGPU19AMDGPUMCKernelCodeTET_XadL_ZNS2_14wavefront_sizeEEEEbRS2_RNS0_11MCAsmParserERNS0_11raw_ostreamE	bool parseField<unsigned char, &llvm::AMDGPU::AMDGPUMCKernelCodeT::wavefront_size>(llvm::AMDGPU::AMDGPUMCKernelCodeT&, llvm::MCAsmParser&, llvm::raw_ostream&)
