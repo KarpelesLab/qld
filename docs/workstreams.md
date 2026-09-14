@@ -53,7 +53,7 @@ can work at the same time without colliding.
 | W11 | Dynamic ELF on x86-64 (M2) | `src/elf/**` | W8 | merged (M2) |
 | W12 | Symbol resolution follow-ups | `src/symbols/**` | W4 | merged |
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | merged |
-| W16 | M2 exit criteria: real-world builds | `src/elf/**`, `tests/projects/**` | W11 | in progress |
+| W16 | M2 exit criteria: real-world builds | `src/elf/**`, `tests/projects/**` | W11 | merged (M2 met) |
 | W14 | PE/COFF reading | `src/coff/**` | — | merged |
 | W17 | LTO plugin host | `src/plugin/**` | — | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |

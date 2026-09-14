@@ -9,3 +9,5 @@ perf.data*
 
 # Agent worktrees
 /.claude/worktrees/
+__pycache__/
+*.pyc

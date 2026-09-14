@@ -6,16 +6,21 @@ their command lines, so compiler drivers (`gcc`, `clang`, `rustc`) and build
 systems can use it with no other changes. It is also a Rust library, so tools
 can link programs in-process.
 
-> **Status: pre-alpha.** qld links **x86-64 Linux ELF**: static and dynamic
-> executables, PIE and static PIE, shared libraries and relocatable (`-r`)
-> output, with symbol versioning, RELRO, `DT_RELR`, `--gc-sections`, `--icf`,
-> compressed debug sections and `--build-id`. The M1 and M2 feature lists are
-> implemented; M2's exit criteria (coreutils, openssl, Python, rustc, LLVM)
-> have not been run yet. So far it builds and passes the test suites of zlib,
-> lua, bzip2, jansson, gzip, grep, expat and cmark, and qld's own test suite
-> linked by qld. Other architectures and formats are not supported yet. Dynamic linking
-> (PIE, shared libraries) is next (M2); everything else below describes where
-> qld is going, not what it does today. See [ROADMAP.md](ROADMAP.md).
+> **Status: pre-alpha.** qld links **x86-64 Linux ELF** (roadmap milestones
+> M1 and M2 complete): static and dynamic executables, PIE and static PIE,
+> shared libraries and relocatable (`-r`) output, with symbol versioning,
+> RELRO, `DT_RELR`, `--gc-sections`, `--icf`, compressed debug sections and
+> `--build-id`. Used as the system linker, it builds and passes the test
+> suites of coreutils, curl, OpenSSL, Python, LLVM/clang/lld and the Rust
+> compiler, with dynamic symbol tables identical to GNU ld's. Other
+> architectures and formats are not supported yet.
+>
+> | Link (64 cores) | qld | GNU ld |
+> | --- | --- | --- |
+> | clang | 0.26 s | 2.00 s |
+> | librustc_driver.so | 0.38 s | 3.03 s |
+> | libclang-cpp.so | 0.39 s | 2.20 s |
+> | libcrypto.so.3 | 0.03 s | 0.10 s |
 
 ## Goals
 

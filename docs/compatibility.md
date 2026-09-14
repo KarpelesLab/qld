@@ -146,19 +146,12 @@ GNU ld makes in all of the links it accepts. A future
 `--warn-backrefs` option (as in lld) will report links that GNU ld would
 reject.
 
-**Shared library versus archive member:** a definition in a shared library
-always beats a lazy archive member, wherever each appears. GNU ld and lld
-extract the member when its archive comes first on the command line. qld
-does not, because deciding by position would make whether a member is pulled
-in depend on command-line order again.
-
-### Shared libraries beat archive members
-
-If a symbol is defined both by a shared library and by an archive member that
-has not been extracted, qld uses the shared library's definition, wherever the
-two appear on the command line. GNU ld and lld extract the member when the
-archive comes first. To force the static definition, name the object directly
-or wrap the archive in `--whole-archive`.
+**Shared library versus archive member:** as in GNU ld, an archive listed
+before a shared library that defines the same symbol has its member
+extracted (gcc's `-lgcc --as-needed -lgcc_s` relies on this); a symbol only
+referenced weakly still binds to the shared library. The one remaining
+difference is the order-independence above: a member of an earlier archive
+is also extracted when only a later object refers to it.
 
 ### Default library search paths
 
@@ -182,9 +175,17 @@ succeed. The error message names the missing search path.
   `--build-id=fast` is an 8-byte xxHash64 tree hash. Values are stable
   across platforms and thread counts.
 - **Threads.** Parallel by default. `--threads=N`, `--no-threads` and
-  `--thread-count=N` (gold) are honored. Without them, the thread count is
-  sized from the input (one thread per 16 MiB, at most 32), because small
-  links run faster on few threads. Output never depends on the thread count.
+  `--thread-count=N` (gold) are honored. Without them, inputs are mapped
+  with at most 16 threads and the rest of the link uses one thread per 4 MiB
+  of input, at most 16, because small links run faster on few threads. A
+  library caller's own rayon pool is respected. Output never depends on the
+  thread count.
+- **TLS relaxation in executables.** Initial-exec accesses to thread-local
+  symbols that the executable defines and exports are relaxed to local-exec;
+  GNU ld keeps `R_X86_64_TPOFF64` dynamic relocations for them.
+- **`--help`** lists `supported targets` and `supported emulations` only for
+  what qld links today (libtool reads the first line to enable shared
+  libraries).
 - **Executable stack.** An object without a `.note.GNU-stack` section does not
   make the stack executable (lld's choice); GNU ld treats such objects as
   needing one. Use `-z execstack` to request it.

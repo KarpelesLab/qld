@@ -113,6 +113,13 @@ Everything a typical Linux distribution build needs.
       hints, "did you mean" for near-miss names
       ([optimizations.md](docs/optimizations.md#intelligent-library-symbol-matching))
 
+**Status: exit criteria met** (W16). coreutils 9.11, curl 8.22, OpenSSL 3.6,
+Python 3.14 (shared and static), LLVM/clang/lld 23.1 (static and
+`BUILD_SHARED_LIBS`), the rustc 1.98 stage-1 bootstrap with `tests/ui`, zlib,
+and musl 1.2.5 shared-object tests all pass with qld as the linker; every
+remaining test failure reproduces with GNU ld on the same machine. Build
+scripts and notes are in `tests/projects/`.
+
 **Exit criteria:** Used as the system linker (`-fuse-ld=qld`), qld builds and
 passes the test suites of coreutils, curl, openssl, zlib, Python, Rust
 (`rustc` bootstrap), and LLVM/clang. The shared objects it produces load in

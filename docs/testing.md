@@ -9,7 +9,7 @@
 | Fixtures | Small C/C++/asm/Rust programs compiled with the host toolchain, linked by qld, **executed**, and their output checked | `tests/fixtures/` | every commit |
 | Differential | The same link done by qld and GNU ld (and lld where available); normalized `readelf`/`objdump` output compared | `tests/differential.rs` | every commit |
 | Cross-arch | Fixtures cross-compiled and run under `qemu-user` | `tests/fixtures/` + CI matrix | every commit (x86-64, aarch64, riscv64); nightly (others) |
-| Real projects | Build and test suites of external projects with qld as the linker | `tests/projects/` scripts | nightly |
+| Real projects | Build and test suites of external projects with qld as the linker, with `.dynsym`/`DT_*` comparison against GNU ld relinks | `tests/projects/*.sh` (see `tests/projects/README.md`) | manual / nightly |
 | Fuzzing | `cargo fuzz` targets for every parser and the linker script evaluator | `fuzz/` | continuous / nightly |
 | Determinism | Each fixture and benchmark linked with 1, 2 and N threads; outputs must be byte-identical | harness option | every commit |
 
