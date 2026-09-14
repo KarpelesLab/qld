@@ -6,3 +6,6 @@
 /tests/scratch/
 /benches/corpus/
 perf.data*
+
+# Agent worktrees
+/.claude/worktrees/
