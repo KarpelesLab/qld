@@ -470,6 +470,8 @@ fn expand_origin(entry: &str, library: &Path) -> PathBuf {
 struct Dependency {
     data: Vec<u8>,
     path: PathBuf,
+    /// The library whose `DT_NEEDED` list named it.
+    needed_by: PathBuf,
 }
 
 /// Loads the transitive dependencies of the needed libraries that are not
@@ -556,11 +558,65 @@ fn load_dependencies(
                 queue.push((dependency.to_vec(), path.clone(), run_path.clone(), owner));
             }
         }
-        loaded.push(Dependency { data, path });
+        loaded.push(Dependency {
+            data,
+            path,
+            needed_by: requester,
+        });
     }
     incomplete.sort_unstable();
     incomplete.dedup();
     (loaded, incomplete)
+}
+
+/// For each of `names` (undefined symbols of the link), a dependency of the
+/// needed libraries that is not itself in the link and defines it, with the
+/// library that needs it: GNU ld's "DSO missing from command line" case.
+#[must_use]
+pub fn defined_in_dependencies(
+    files: &[ElfInput<'_>],
+    needed: &Needed,
+    options: &LinkOptions,
+    names: &[&[u8]],
+) -> Vec<Option<(PathBuf, PathBuf)>> {
+    let mut found = vec![None; names.len()];
+    if names.is_empty() || !needed.any() {
+        return found;
+    }
+    // Missing dependencies were already reported by the shared library
+    // check, or will be.
+    let silent = crate::diag::Collect::new();
+    let (dependencies, _) = load_dependencies(files, needed, options, &silent);
+    let mut wanted: Vec<(&[u8], usize)> = names
+        .iter()
+        .enumerate()
+        .map(|(index, &name)| (name, index))
+        .collect();
+    wanted.sort_unstable();
+    for dependency in &dependencies {
+        let Ok(so) =
+            SharedObject::<Elf64Le>::parse(&dependency.data, ElfSource::new(&dependency.path))
+        else {
+            continue;
+        };
+        for symbol in so.symbols().iter().flatten() {
+            if symbol.is_undefined() || symbol.is_local() {
+                continue;
+            }
+            let start = wanted.partition_point(|(name, _)| *name < symbol.name);
+            for &(name, index) in wanted.get(start..).unwrap_or_default() {
+                if name != symbol.name {
+                    break;
+                }
+                if let Some(slot) = found.get_mut(index)
+                    && slot.is_none()
+                {
+                    *slot = Some((dependency.path.clone(), dependency.needed_by.clone()));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Run path lookup on a bare [`SharedObject`].

@@ -16,6 +16,7 @@
 //! | [`object`] | 4: per-object symbols for resolution, section classes, merge splitting, COMDAT groups, notes |
 //! | [`dso`] | 4–5: shared object symbols, `DT_NEEDED` and `--as-needed`, undefined symbols of shared libraries |
 //! | [`resolve`] | 5: ELF precedence rules, COMDAT deduplication, duplicate symbol diagnostics |
+//! | [`xref`] | 5: `-y`/`--trace-symbol`, `--warn-common` and the `--cref` table |
 //! | [`export`] | 5: output mode, merged visibility, exports, preemptibility, version scripts |
 //! | [`sections`] | Dense input section numbering, liveness and the ICF fold map |
 //! | [`refs`] | Relocation targets: from a symbol index in a file to its definition |
@@ -87,5 +88,6 @@ pub mod symtab;
 pub mod synth;
 pub mod values;
 pub mod write;
+pub mod xref;
 
 pub use link::link;

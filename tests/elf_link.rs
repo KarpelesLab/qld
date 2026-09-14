@@ -943,6 +943,112 @@ fn transitive_dependencies_are_found_through_rpath_link() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+
+    // A program that calls the dependency itself must name it.
+    compile_with(
+        &dir,
+        "direct",
+        "int base_value(void); int middle_value(void);\nint main(void) { return base_value() + middle_value(); }\n",
+        &["-fPIE"],
+    );
+    let output = cc_link(
+        &dir,
+        &[
+            "-o",
+            "direct",
+            "direct.o",
+            "-L.",
+            "-lmiddle",
+            "-Wl,-rpath-link,deps",
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("undefined symbol: base_value"), "{stderr}");
+    assert!(stderr.contains("DSO missing from command line"), "{stderr}");
+    assert!(stderr.contains("libbase.so, which"), "{stderr}");
+}
+
+#[test]
+fn trace_symbols_common_warnings_and_cross_references() {
+    require!("cc");
+    let dir = scratch("xref");
+    compile_with(
+        &dir,
+        "main",
+        "int comm_qld;\nint lib_qld(void);\nint main(void) { return lib_qld() + comm_qld; }\n",
+        &["-fcommon", "-fPIE"],
+    );
+    compile_with(
+        &dir,
+        "lib",
+        "int comm_qld;\nint lib_qld(void) { return 0; }\n",
+        &["-fcommon", "-fPIE"],
+    );
+    compile_with(&dir, "big", "long comm_qld;\n", &["-fcommon", "-fPIE"]);
+    run_ok(&dir, "ar", &["rcs", "liblib.a", "lib.o"]);
+    let stderr = cc_link_ok(
+        &dir,
+        &[
+            "-o",
+            "out",
+            "main.o",
+            "-L.",
+            "-llib",
+            "-Wl,-y,lib_qld",
+            "-Wl,--trace-symbol=comm_qld",
+        ],
+    );
+    let main_ref = stderr
+        .find("main.o: reference to lib_qld")
+        .unwrap_or(usize::MAX);
+    let lib_def = stderr
+        .find("liblib.a(lib.o): definition of lib_qld")
+        .unwrap_or(usize::MAX);
+    assert!(main_ref < lib_def && lib_def != usize::MAX, "{stderr}");
+    assert!(
+        stderr.contains("main.o: definition of comm_qld"),
+        "{stderr}"
+    );
+
+    let stderr = cc_link_ok(
+        &dir,
+        &["-o", "out", "main.o", "lib.o", "big.o", "-Wl,--warn-common"],
+    );
+    assert!(
+        stderr.contains("lib.o and main.o: multiple common of `comm_qld'"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("big.o: common of `comm_qld' overriding smaller common from main.o"),
+        "{stderr}"
+    );
+
+    let output = cc_link(&dir, &["-o", "out", "main.o", "-L.", "-llib", "-Wl,--cref"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Cross Reference Table"), "{stdout}");
+    let row = stdout
+        .lines()
+        .position(|l| l.starts_with("lib_qld "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines[row].ends_with("liblib.a(lib.o)"), "{stdout}");
+    assert!(lines[row + 1].trim() == "main.o", "{stdout}");
+    cc_link_ok(
+        &dir,
+        &[
+            "-o",
+            "out",
+            "main.o",
+            "lib.o",
+            "-Wl,--cref",
+            "-Wl,-Map,out.map",
+        ],
+    );
+    let map = fs::read_to_string(dir.join("out.map")).unwrap();
+    assert!(map.contains("Cross Reference Table"), "{map}");
+    assert!(map.contains(".text"), "{map}");
 }
 
 #[test]

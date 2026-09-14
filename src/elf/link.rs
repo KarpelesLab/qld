@@ -55,6 +55,7 @@ use super::symtab;
 use super::synth::{self, Synth};
 use super::values::Addresses;
 use super::write::{self, WriteInput};
+use super::xref;
 
 /// At most this many references are listed per undefined symbol.
 const MAX_REFERENCES: usize = 3;
@@ -206,12 +207,15 @@ fn link_inputs<'a>(
     resolve::redirect_discarded(&symbols, &rules, files, &resolution, &sections);
     let mut errors = resolve::report_duplicates(files, &resolution, &sections, diagnostics);
     report_gnu_warnings(files, &symbols, diagnostics);
+    xref::trace_symbols(files, &resolution, options, diagnostics);
+    xref::warn_common(files, &resolution, options, diagnostics);
+    let cref = xref::cross_reference(files, &symbols, &resolution, options);
 
     if relocatable {
         if errors > 0 && !options.noinhibit_exec {
             return Err(Error::Reported { errors });
         }
-        return link_relocatable(
+        link_relocatable(
             options,
             diagnostics,
             files,
@@ -220,7 +224,8 @@ fn link_inputs<'a>(
             sections,
             internal,
             lap,
-        );
+        )?;
+        return map::write_cref(options, cref.as_deref());
     }
 
     let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
@@ -295,7 +300,14 @@ fn link_inputs<'a>(
             errors = errors.saturating_add(1);
         }
     }
-    errors = errors.saturating_add(report_undefined(&refs, &scan, options, mode, diagnostics));
+    errors = errors.saturating_add(report_undefined(
+        &refs,
+        &scan,
+        options,
+        mode,
+        &needed,
+        diagnostics,
+    ));
     errors = errors.saturating_add(dso::check_shlib_undefined(
         files,
         &symbols,
@@ -502,7 +514,7 @@ fn link_inputs<'a>(
         entry,
         diagnostics,
     })?;
-    map::write(options, &addresses, &plan)?;
+    map::write(options, &addresses, &plan, cref.as_deref())?;
     lap("write");
     Ok(())
 }
@@ -607,6 +619,7 @@ fn report_undefined(
     scan: &scan::ScanResult,
     options: &LinkOptions,
     mode: Mode,
+    needed: &dso::Needed,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
     // A shared object may leave symbols for the dynamic linker to find,
@@ -634,7 +647,19 @@ fn report_undefined(
                 | crate::args::UnresolvedSymbols::IgnoreInObjectFiles
         )
     );
-    for group in groups {
+    // Symbols that a library's own dependency defines: that library is
+    // missing from the command line.
+    let names: Vec<&[u8]> = groups
+        .iter()
+        .filter_map(|g| g.first())
+        .map(|r| refs.symbols.name(r.symbol).bytes())
+        .collect();
+    let in_dependencies = if names.is_empty() || ignore {
+        Vec::new()
+    } else {
+        dso::defined_in_dependencies(refs.files, needed, options, &names)
+    };
+    for (group_index, group) in groups.into_iter().enumerate() {
         let Some(first) = group.first() else {
             continue;
         };
@@ -674,6 +699,15 @@ fn report_undefined(
             diagnostic = diagnostic.note(format!(
                 "referenced {} more times",
                 group.len().saturating_sub(MAX_REFERENCES)
+            ));
+        }
+        if let Some(Some((library, needed_by))) = in_dependencies.get(group_index) {
+            diagnostic = diagnostic.note(format!(
+                "'{}' is defined in {}, which {} needs but which is not in the link \
+                 (DSO missing from command line); add it to the command line",
+                name.display(),
+                library.display(),
+                needed_by.display()
             ));
         }
         diagnostics.emit(diagnostic);
