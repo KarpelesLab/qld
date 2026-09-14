@@ -150,6 +150,15 @@ impl<'a> ShortImport<'a> {
         self.import_type == IMPORT_CONST
     }
 
+    /// Whether the import defines [`symbol_name`](Self::symbol_name) itself
+    /// besides `__imp_<symbol_name>`: a jump thunk for code, or (as lld
+    /// does) a second name for the address table entry for constants. Data
+    /// imports define only the `__imp_` symbol.
+    #[must_use]
+    pub fn defines_symbol_name(&self) -> bool {
+        self.import_type != IMPORT_DATA
+    }
+
     /// The name or ordinal to import, derived from the name type as LLVM
     /// and lld do:
     ///
@@ -342,8 +351,28 @@ pub fn classify_long_import<'a>(object: &CoffObject<'a>) -> Result<Option<LongIm
     }) else {
         return Ok(None);
     };
-    let import = match idata.idata6 {
+    // An ordinal import stores the ordinal, with the high bit set, in the
+    // address table entry itself (and may still have an empty `.idata$6`);
+    // a name import has a zero entry relocated against `.idata$6`.
+    let ordinal = match idata.idata5 {
         Some(number) => {
+            let section = object.section(number)?;
+            let data = object.section_data(&section.header)?;
+            match data.len() {
+                8 => u64_at(data, 0)
+                    .filter(|entry| entry >> 63 != 0)
+                    .map(|entry| entry & 0xffff),
+                4 => u32_at(data, 0)
+                    .filter(|entry| entry >> 31 != 0)
+                    .map(|entry| u64::from(entry & 0xffff)),
+                _ => None,
+            }
+        }
+        None => None,
+    };
+    let import = match (ordinal.and_then(|o| u16::try_from(o).ok()), idata.idata6) {
+        (Some(ordinal), _) => ImportName::Ordinal(ordinal),
+        (None, Some(number)) => {
             let section = object.section(number)?;
             let data = object.section_data(&section.header)?;
             let hint = u16_at(data, 0).unwrap_or(0);
@@ -353,26 +382,7 @@ pub fn classify_long_import<'a>(object: &CoffObject<'a>) -> Result<Option<LongIm
                 name: c_string(tail).unwrap_or(tail),
             }
         }
-        None => {
-            let Some(number) = idata.idata5 else {
-                return Ok(None);
-            };
-            let section = object.section(number)?;
-            let data = object.section_data(&section.header)?;
-            let ordinal = match data.len() {
-                8 => u64_at(data, 0)
-                    .filter(|entry| entry >> 63 != 0)
-                    .map(|entry| entry & 0xffff),
-                4 => u32_at(data, 0)
-                    .filter(|entry| entry >> 31 != 0)
-                    .map(|entry| u64::from(entry & 0xffff)),
-                _ => None,
-            };
-            let Some(ordinal) = ordinal.and_then(|o| u16::try_from(o).ok()) else {
-                return Ok(None);
-            };
-            ImportName::Ordinal(ordinal)
-        }
+        (None, None) => return Ok(None),
     };
     let thunk_symbol = defined_in_code(object, code_sections)?;
     Ok(Some(LongImportMember::Symbol(LongImportSymbol {

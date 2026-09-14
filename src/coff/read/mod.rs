@@ -3,6 +3,8 @@
 //! **Workstream W14.** The input side of the PE/COFF backend (M7), the
 //! counterpart of [`elf::read`](crate::elf::read):
 //!
+//! - [`CoffFile`]: parses any binary input, dispatching on its leading
+//!   bytes to one of the readers below.
 //! - [`CoffObject`]: relocatable objects, regular and `/bigobj`
 //!   ([`FileHeader`]): sections ([`SectionHeader`], long names through
 //!   `/<n>` and `//<base64>`, alignment, COMDAT flags), symbols
@@ -57,6 +59,7 @@ pub mod consts;
 pub mod def;
 pub mod directives;
 pub mod export;
+pub mod file;
 pub mod header;
 pub mod import;
 pub mod object;
@@ -73,6 +76,7 @@ pub use directives::{
     DRECTVE_SECTION, Directive, Directives, Token, Tokens, parse_directives, tokenize,
 };
 pub use export::ExportSpec;
+pub use file::CoffFile;
 pub use header::FileHeader;
 pub use import::{
     IMP_PREFIX, ImportName, LongImportDlls, LongImportMember, LongImportSymbol, ShortImport,

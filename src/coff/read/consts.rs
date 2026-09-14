@@ -376,6 +376,10 @@ pub const IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY: u32 = 4;
 
 /// The object is compatible with SafeSEH (i386 `/SAFESEH`).
 pub const FEAT00_SAFESEH: u32 = 0x1;
+/// The object was compiled with `/GS` (security cookies).
+pub const FEAT00_GUARD_STACK: u32 = 0x100;
+/// The object was compiled with `/sdl`.
+pub const FEAT00_SDL: u32 = 0x200;
 /// The object was compiled with Control Flow Guard (`/guard:cf`).
 pub const FEAT00_GUARD_CF: u32 = 0x800;
 /// The object was compiled with EH continuation metadata (`/guard:ehcont`).

@@ -2,7 +2,8 @@
 
 use super::addrsig::{ADDRSIG_SECTION, AddrsigIter};
 use super::consts::{
-    FEAT00_GUARD_CF, FEAT00_GUARD_EHCONT, FEAT00_KERNEL, FEAT00_SAFESEH, machine_architecture,
+    FEAT00_GUARD_CF, FEAT00_GUARD_EHCONT, FEAT00_GUARD_STACK, FEAT00_KERNEL, FEAT00_SAFESEH,
+    FEAT00_SDL, machine_architecture,
 };
 use super::directives::{DRECTVE_SECTION, Directives, parse_directives};
 use super::header::{FileHeader, is_bigobj, is_import_object};
@@ -58,6 +59,18 @@ impl Feat00 {
     #[must_use]
     pub fn safe_seh(self) -> bool {
         self.0 & FEAT00_SAFESEH != 0
+    }
+
+    /// `FEAT00_GUARD_STACK`: compiled with `/GS`.
+    #[must_use]
+    pub fn guard_stack(self) -> bool {
+        self.0 & FEAT00_GUARD_STACK != 0
+    }
+
+    /// `FEAT00_SDL`: compiled with `/sdl`.
+    #[must_use]
+    pub fn sdl(self) -> bool {
+        self.0 & FEAT00_SDL != 0
     }
 
     /// `FEAT00_GUARD_CF`: compiled with Control Flow Guard.

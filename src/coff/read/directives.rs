@@ -16,11 +16,13 @@
 //! without regard to case, with either a `-` or `/` prefix.
 //!
 //! Values are split at `:`, `,` and `=` *outside* quotes, then each part is
-//! unquoted. lld unquotes the whole token first, so the two differ only for
-//! a separator inside quotes (`-export:"a,b"`), where qld follows GNU ld and
-//! keeps the quoted text as one name. Parts are borrowed from the section
-//! when unquoting does not change them or only strips surrounding quotes,
-//! which covers what compilers emit.
+//! unquoted; when a required separator only appears inside quotes (MSVC's
+//! `/FAILIFMISMATCH:"key=value"`), the value is unquoted first and split
+//! after. lld always unquotes the whole token first, so the two differ only
+//! for an optional separator inside quotes (`-export:"a,b"`), where qld
+//! follows GNU ld and keeps the quoted text as one name. Parts are borrowed
+//! from the section when unquoting does not change them or only strips
+//! surrounding quotes, which covers what compilers emit.
 
 use std::borrow::Cow;
 
@@ -407,9 +409,39 @@ fn non_empty(raw: &[u8]) -> Result<Cow<'_, [u8]>, &'static str> {
 type Pair<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 
 fn pair(raw: &[u8], separator: u8) -> Result<Pair<'_>, &'static str> {
-    let (first, second) = split_raw(raw, separator);
-    let second = second.ok_or("missing separator")?;
-    Ok((non_empty(first)?, non_empty(second)?))
+    if let (first, Some(second)) = split_raw(raw, separator) {
+        return Ok((non_empty(first)?, non_empty(second)?));
+    }
+    // The separator is quoted along with the rest, as in MSVC's
+    // `/FAILIFMISMATCH:"key=value"`: unquote first, then split.
+    let (first, second) = match unquote(raw) {
+        Cow::Borrowed(text) => {
+            let at = text
+                .iter()
+                .position(|&c| c == separator)
+                .ok_or("missing separator")?;
+            let (first, second) = text.split_at(at);
+            (
+                Cow::Borrowed(first),
+                Cow::Borrowed(second.get(1..).unwrap_or_default()),
+            )
+        }
+        Cow::Owned(text) => {
+            let at = text
+                .iter()
+                .position(|&c| c == separator)
+                .ok_or("missing separator")?;
+            let (first, second) = text.split_at(at);
+            (
+                Cow::Owned(first.to_vec()),
+                Cow::Owned(second.get(1..).unwrap_or_default().to_vec()),
+            )
+        }
+    };
+    if first.is_empty() || second.is_empty() {
+        return Err("empty value");
+    }
+    Ok((first, second))
 }
 
 /// Parses an `-export:` value, following lld's `parseExport`.
@@ -596,6 +628,20 @@ mod tests {
             Directive::FailIfMismatch {
                 key: Cow::Borrowed(b"_MSC_VER"),
                 value: Cow::Borrowed(b"1900")
+            }
+        );
+        assert_eq!(
+            parse(b"/FAILIFMISMATCH:\"_CRT_STDIO_ISO_WIDE_SPECIFIERS=0\""),
+            Directive::FailIfMismatch {
+                key: Cow::Borrowed(b"_CRT_STDIO_ISO_WIDE_SPECIFIERS"),
+                value: Cow::Borrowed(b"0")
+            }
+        );
+        assert_eq!(
+            parse(b"/alternatename:\"a\\\"=b\""),
+            Directive::AlternateName {
+                alias: Cow::Borrowed(b"a\""),
+                target: Cow::Borrowed(b"b")
             }
         );
         assert_eq!(
