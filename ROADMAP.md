@@ -33,8 +33,8 @@ Set up the project skeleton and the infrastructure every later milestone needs.
   - [ ] Response files (`@file`), `--sysroot` and `=`-prefixed paths
   - [ ] `-v`/`--version` output that autoconf/libtool recognize as GNU-compatible
 - [ ] Flavor selection from `argv[0]` (`ld`, `ld.qld`, `ld64`, …) and `-flavor`
-- [ ] Input file loading: mmap, format detection by magic, `ar` archives
-      (GNU, BSD and thin variants, symbol index)
+- [x] Input file loading: mmap, format detection by magic, `ar` archives
+      (GNU, BSD, COFF and thin variants, symbol index), `-l` library search
 - [ ] Test harness: fixture compilation with the system gcc/clang,
       run-the-output tests, differential comparison against GNU ld
       ([testing.md](docs/testing.md))

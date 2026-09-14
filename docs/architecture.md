@@ -260,8 +260,11 @@ Who works where, and which files each task owns, is in
 | Output writing | disjoint mutable slices from one writable mapping |
 
 Library users can run qld inside their own rayon pool
-(`ThreadPool::install`). qld never creates a global pool implicitly when it is
-used as a library.
+(`ThreadPool::install`). Parallel stages run on whatever pool is current, so a
+call made outside `install` uses (and lazily creates) rayon's global pool. The
+`link()` entry point will install a pool sized by `--threads` for its
+duration, so the CLI and library callers who don't bring a pool get the
+configured thread count.
 
 ## Error handling and diagnostics
 
