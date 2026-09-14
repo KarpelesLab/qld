@@ -80,6 +80,38 @@ impl<'a> BackwardBits<'a> {
         self.container = load(self.data, self.ptr);
     }
 
+    /// Refill for hot loops. If the container can move back over all its
+    /// consumed whole bytes (at least eight more bytes precede it), does
+    /// so, leaving at most 7 bits consumed (57 available), and returns the
+    /// container and consumed count. Otherwise returns `None`.
+    #[inline(always)]
+    pub(super) fn refill_fast(&mut self) -> Option<(u64, u32)> {
+        if self.ptr < 8 || self.consumed > 64 {
+            return None;
+        }
+        self.ptr = self.ptr.wrapping_sub((self.consumed >> 3) as usize);
+        self.consumed &= 7;
+        self.container = load(self.data, self.ptr);
+        Some((self.container, self.consumed))
+    }
+
+    /// Reads `n` bits (at most 57) without any check. Only valid right
+    /// after a successful [`refill_fast`](Self::refill_fast), for reads
+    /// totalling at most 57 bits.
+    #[inline(always)]
+    pub(super) fn read_unchecked(&mut self, n: u32) -> u64 {
+        let value = ((self.container << (self.consumed & 63)) >> 1) >> (63u32.wrapping_sub(n) & 63);
+        self.consumed = self.consumed.wrapping_add(n);
+        value
+    }
+
+    /// Sets the consumed-bit count after a hot loop that worked on the
+    /// values [`refill_fast`](Self::refill_fast) returned.
+    #[inline(always)]
+    pub(super) fn set_consumed(&mut self, consumed: u32) {
+        self.consumed = consumed;
+    }
+
     /// Returns the next `n` bits (at most 56) without consuming them.
     #[inline(always)]
     pub(super) fn peek(&mut self, n: u32) -> u64 {

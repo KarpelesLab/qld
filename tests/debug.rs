@@ -1135,6 +1135,10 @@ fn bench_corpus(size: usize) -> Vec<u8> {
     if let Some(path) = std::env::var_os("QLD_BENCH_FILE") {
         return std::fs::read(path).expect("read QLD_BENCH_FILE");
     }
+    let size = std::env::var("QLD_BENCH_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(size, |mb| mb << 20);
     let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
     let mut out = Vec::with_capacity(size);
     while out.len() < size {
@@ -1216,7 +1220,11 @@ fn bench_zstd() {
     let dir = scratch_dir("bench-zstd");
     let raw = dir.join("corpus.bin");
     std::fs::write(&raw, &data).unwrap();
-    for level in [1, 3, 9, 19] {
+    let levels: Vec<u32> = std::env::var("QLD_BENCH_LEVELS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|l| l.parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 3, 9, 19]);
+    for level in levels {
         let packed = dir.join(format!("corpus.{level}.zst"));
         let ok = Command::new(&zstd)
             .args(["-q", "-f", "-T0", &format!("-{level}"), "-o"])

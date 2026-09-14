@@ -26,6 +26,9 @@ const SKIPPABLE_MASK: u32 = 0xffff_fff0;
 const SKIPPABLE_MAGIC: u32 = 0x184d_2a50;
 /// Largest decompressed block (`Block_Maximum_Size`).
 const BLOCK_MAX: usize = 128 << 10;
+/// Zero bytes after the decoded literals, so that short literal runs can be
+/// copied with a fixed-size move.
+const LITERAL_PADDING: usize = 16;
 
 /// Decompresses Zstandard data into `out`, which must come out exactly
 /// full.
@@ -283,10 +286,14 @@ impl Decoder {
                 self.huffman.decode(data, four, &mut self.literals)?;
             }
         }
+        let lit_count = self.literals.len();
+        self.literals
+            .resize(lit_count.wrapping_add(LITERAL_PADDING), 0);
         sequences::execute(
             &mut self.sequences,
             rest,
             &self.literals,
+            lit_count,
             out,
             o,
             frame_start,

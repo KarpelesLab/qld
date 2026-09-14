@@ -149,13 +149,15 @@ impl State {
     }
 }
 
-/// Decodes the sequences section `data` and executes it: literals come
-/// from `literals`, output goes to `out` at `o`, and matches may reach back
-/// to `frame_start`. Returns the new output position.
+/// Decodes the sequences section `data` and executes it: the literals are
+/// the first `lit_count` bytes of `literals` (which may be longer: padding
+/// allows fixed-size copies), output goes to `out` at `o`, and matches may
+/// reach back to `frame_start`. Returns the new output position.
 pub(super) fn execute(
     state: &mut State,
     data: &[u8],
     literals: &[u8],
+    lit_count: usize,
     out: &mut [u8],
     mut o: usize,
     frame_start: usize,
@@ -168,6 +170,7 @@ pub(super) fn execute(
             if !rest.is_empty() {
                 return Err(BAD);
             }
+            let literals = literals.get(..lit_count).ok_or(BAD)?;
             return copy_literals(literals, out, o).ok_or(TOO_LARGE);
         }
         1..=127 => (usize::from(b0), rest),
@@ -208,17 +211,30 @@ pub(super) fn execute(
         let of_entry = of_table.get(of_state);
         let ml_entry = ml_table.get(ml_state);
 
-        let of_code = u32::from(of_entry.symbol);
-        if of_code > 31 {
-            return Err(BAD);
-        }
-        let offset_value = (1u64 << of_code).wrapping_add(bits.read(of_code)) as usize;
-        let ml_code = usize::from(ml_entry.symbol);
-        let match_len = (*ML_BASE.get(ml_code).ok_or(BAD)? as usize)
-            .wrapping_add(bits.read(u32::from(*ML_BITS.get(ml_code).ok_or(BAD)?)) as usize);
-        let ll_code = usize::from(ll_entry.symbol);
-        let lit_len = (*LL_BASE.get(ll_code).ok_or(BAD)? as usize)
-            .wrapping_add(bits.read(u32::from(*LL_BITS.get(ll_code).ok_or(BAD)?)) as usize);
+        // Table symbols never exceed each kind's maximum (the tables are
+        // validated when built), so clamping only keeps indexing branchless.
+        let of_code = u32::from(of_entry.symbol) & 31;
+        let ml_code = usize::from(ml_entry.symbol).min(Kind::MatchLength.max_symbol());
+        let ll_code = usize::from(ll_entry.symbol).min(Kind::LiteralLength.max_symbol());
+        let ml_bits = u32::from(ML_BITS[ml_code]);
+        let ll_bits = u32::from(LL_BITS[ll_code]);
+
+        // Offset, match length and literal length extra bits, in that
+        // order; unchecked when one refill covers all three.
+        let (offset_extra, ml_extra, ll_extra) = if bits.refill_fast().is_some()
+            && of_code.wrapping_add(ml_bits).wrapping_add(ll_bits) <= 57
+        {
+            let of = bits.read_unchecked(of_code);
+            let ml = bits.read_unchecked(ml_bits);
+            (of, ml, bits.read_unchecked(ll_bits))
+        } else {
+            let of = bits.read(of_code);
+            let ml = bits.read(ml_bits);
+            (of, ml, bits.read(ll_bits))
+        };
+        let offset_value = (1u64 << of_code).wrapping_add(offset_extra) as usize;
+        let match_len = (ML_BASE[ml_code] as usize).wrapping_add(ml_extra as usize);
+        let lit_len = (LL_BASE[ll_code] as usize).wrapping_add(ll_extra as usize);
 
         let offset = if offset_value > 3 {
             let offset = offset_value.wrapping_sub(3);
@@ -248,17 +264,38 @@ pub(super) fn execute(
         };
 
         if i.wrapping_add(1) < count {
-            ll_state = u64::from(ll_entry.base).wrapping_add(bits.read(u32::from(ll_entry.bits)));
-            ml_state = u64::from(ml_entry.base).wrapping_add(bits.read(u32::from(ml_entry.bits)));
-            of_state = u64::from(of_entry.base).wrapping_add(bits.read(u32::from(of_entry.bits)));
+            // State updates take at most 9 + 9 + 8 bits.
+            let (ll, ml, of) = if bits.refill_fast().is_some() {
+                let ll = bits.read_unchecked(u32::from(ll_entry.bits));
+                let ml = bits.read_unchecked(u32::from(ml_entry.bits));
+                (ll, ml, bits.read_unchecked(u32::from(of_entry.bits)))
+            } else {
+                let ll = bits.read(u32::from(ll_entry.bits));
+                let ml = bits.read(u32::from(ml_entry.bits));
+                (ll, ml, bits.read(u32::from(of_entry.bits)))
+            };
+            ll_state = u64::from(ll_entry.base).wrapping_add(ll);
+            ml_state = u64::from(ml_entry.base).wrapping_add(ml);
+            of_state = u64::from(of_entry.base).wrapping_add(of);
         }
 
         let lit_end = lit.checked_add(lit_len).ok_or(BAD)?;
-        let src = literals
-            .get(lit..lit_end)
-            .ok_or("zstd sequence (not enough literals)")?;
+        if lit_end > lit_count {
+            return Err("zstd sequence (not enough literals)");
+        }
         let o_end = o.checked_add(lit_len).ok_or(TOO_LARGE)?;
-        out.get_mut(o..o_end).ok_or(TOO_LARGE)?.copy_from_slice(src);
+        // Short runs copy a fixed 16 bytes when both buffers have room (the
+        // literals are padded); bytes past `o_end` are overwritten later.
+        match (
+            out.get_mut(o..o.wrapping_add(16)),
+            literals.get(lit..lit.wrapping_add(16)),
+        ) {
+            (Some(dst), Some(src)) if lit_len <= 16 => dst.copy_from_slice(src),
+            _ => out
+                .get_mut(o..o_end)
+                .ok_or(TOO_LARGE)?
+                .copy_from_slice(literals.get(lit..lit_end).ok_or(BAD)?),
+        }
         lit = lit_end;
         o = o_end;
 
@@ -271,7 +308,7 @@ pub(super) fn execute(
         return Err("zstd sequence bitstream (bad length)");
     }
     state.repeat = repeat;
-    copy_literals(literals.get(lit..).unwrap_or_default(), out, o).ok_or(TOO_LARGE)
+    copy_literals(literals.get(lit..lit_count).unwrap_or_default(), out, o).ok_or(TOO_LARGE)
 }
 
 fn copy_literals(literals: &[u8], out: &mut [u8], o: usize) -> Option<usize> {

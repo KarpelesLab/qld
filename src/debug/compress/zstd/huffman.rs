@@ -110,7 +110,25 @@ impl Table {
     fn decode_stream(&self, stream: &[u8], out: &mut [u8]) -> Result<(), &'static str> {
         let mut bits = BackwardBits::new(stream)?;
         let max_bits = self.max_bits;
-        for slot in out.iter_mut() {
+        let shift = 64u32.wrapping_sub(max_bits) & 63;
+        // Fast path: one refill leaves 57 bits, enough for four codes of at
+        // most 11 bits.
+        let (quads, _) = out.as_chunks_mut::<4>();
+        let mut done = 0usize;
+        for quad in quads {
+            let Some((container, mut consumed)) = bits.refill_fast() else {
+                break;
+            };
+            for slot in quad {
+                let index = ((container << consumed) >> shift) as usize & (MAX_TABLE - 1);
+                let (symbol, len) = self.entries[index];
+                consumed = consumed.wrapping_add(u32::from(len));
+                *slot = symbol;
+            }
+            bits.set_consumed(consumed);
+            done = done.wrapping_add(4);
+        }
+        for slot in out.get_mut(done..).unwrap_or_default() {
             let (symbol, len) = self.entries[(bits.peek(max_bits) as usize) & (MAX_TABLE - 1)];
             bits.consume(u32::from(len));
             *slot = symbol;
