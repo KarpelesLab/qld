@@ -29,14 +29,15 @@ use rayon::prelude::*;
 
 use crate::args::{ExecStack, LinkOptions, SeparateCode};
 use crate::elf::read::consts::{
-    PF_R, PF_W, PF_X, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_STACK, PT_LOAD, PT_NOTE, PT_TLS,
-    SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS, SHT_STRTAB,
-    SHT_SYMTAB,
+    PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_RELRO, PT_GNU_STACK,
+    PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE,
+    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
 };
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 
 use super::ehframe::EhFrames;
+use super::export::Mode;
 use super::inputs::ElfInput;
 use super::merge::Merged;
 use super::object::SectionKind;
@@ -93,6 +94,9 @@ pub enum Trailer {
     Strtab,
     /// `.shstrtab`.
     Shstrtab,
+    /// `--emit-relocs`: the input relocations of the output section at this
+    /// position in [`Layout::sections`].
+    Rela(u32),
 }
 
 /// An output section after layout.
@@ -126,6 +130,9 @@ pub struct OutSection<'a> {
     pub members: Vec<Placed>,
     /// Offset of the name in `.shstrtab`.
     pub name_offset: u32,
+    /// Written before the name in `.shstrtab` (`.rela` for
+    /// [`Trailer::Rela`]).
+    pub name_prefix: &'static [u8],
 }
 
 impl OutSection<'_> {
@@ -236,6 +243,9 @@ pub struct Layout<'a> {
     pub bss_start: u64,
     /// End of the image (`_end`).
     pub end: u64,
+    /// Number of section symbols at the start of `.symtab`
+    /// (`--emit-relocs`).
+    pub section_symbols: u32,
 }
 
 impl Layout<'_> {
@@ -277,6 +287,22 @@ pub struct LayoutInput<'l, 'a> {
     pub trailers: TrailerSizes,
     /// Whether any input requested an executable stack.
     pub exec_stack: bool,
+    /// The output mode.
+    pub mode: Mode,
+    /// Output sections written compressed (`--compress-debug-sections`).
+    pub compressed: &'l [CompressedOutput],
+}
+
+/// The compressed size of an output section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressedOutput {
+    /// The output section, by index in [`Placement::outputs`].
+    pub output: u32,
+    /// Its size with the compression header.
+    pub size: u64,
+    /// The legacy `zlib-gnu` format: renamed `.zdebug_*`, no
+    /// `SHF_COMPRESSED`.
+    pub gnu: bool,
 }
 
 fn align_up(value: u64, align: u64) -> Result<u64> {
@@ -411,15 +437,15 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
                 })
             });
             let synthetic = output.map_or(Synthetic::None, |o| o.synthetic);
-            let mut list: Vec<Member> = Vec::with_capacity(keys.len().saturating_add(1));
-            // With `-z now` there is no lazy binding, and GNU ld puts the
-            // IFUNC slots (`.igot.plt`) in `.got`.
+            let mut list: Vec<Member> = Vec::with_capacity(keys.len().saturating_add(2));
+            // With `-z now` there is no lazy binding, and GNU ld puts
+            // `.got.plt` at the start of `.got`, inside the RELRO region.
             let bind_now = input.options.bind_now;
             match synthetic {
-                Synthetic::IgotPlt if bind_now => {}
+                Synthetic::GotPlt if bind_now => {}
                 Synthetic::Got if bind_now => {
+                    list.push(Member::Synthetic(Synthetic::GotPlt));
                     list.push(Member::Synthetic(Synthetic::Got));
-                    list.push(Member::Synthetic(Synthetic::IgotPlt));
                 }
                 Synthetic::None => {}
                 kind if !synthetic_goes_last(kind) => list.push(Member::Synthetic(kind)),
@@ -428,6 +454,9 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             list.extend(keys.iter().map(|k| k.member));
             if synthetic_goes_last(synthetic) {
                 list.push(Member::Synthetic(synthetic));
+            }
+            if synthetic == Synthetic::DynBss {
+                list.push(Member::Synthetic(Synthetic::Common));
             }
             let mut offset = 0u64;
             let mut align = 1u64;
@@ -475,7 +504,11 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         if placed.is_empty() {
             continue;
         }
-        if size == 0 {
+        // GNU ld keeps empty output sections with input sections when
+        // relocations are emitted: they may name the section's symbol.
+        let keep_empty = input.options.emit_relocs
+            && placed.iter().any(|p| matches!(p.member, Member::Input(_)));
+        if size == 0 && !keep_empty {
             // Dropped, but symbols in its (empty) input sections still need
             // an address: the location counter where it would have been.
             dropped.push((output_index, placed));
@@ -522,16 +555,75 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             info: 0,
             members: placed,
             name_offset: 0,
+            name_prefix: b"",
         });
     }
 
-    // Trailers.
+    // Compressed debug sections: their input sections keep their offsets in
+    // the uncompressed data, only the section shrinks.
+    for compressed in input.compressed {
+        let Some(section) = out_sections
+            .iter_mut()
+            .find(|s| s.output == compressed.output)
+        else {
+            continue;
+        };
+        section.size = compressed.size;
+        if compressed.gnu {
+            section.name_prefix = b".z";
+            section.name = section.name.get(1..).unwrap_or(section.name);
+            section.align = 1;
+        } else {
+            section.flags |= crate::elf::read::consts::SHF_COMPRESSED;
+            section.align = 8;
+        }
+    }
+
+    // Trailers. With `--emit-relocs`, the symbol table starts with a section
+    // symbol for every output section (whose header index is its position
+    // plus one, as trailers come last), and every output section with input
+    // relocations gets a `.rela` section.
+    let mut section_symbols = 0u32;
+    if input.options.emit_relocs && input.trailers.symtab > 0 {
+        let regular = out_sections.len();
+        section_symbols =
+            u32::try_from(regular).map_err(|_| Error::Limit("too many output sections".into()))?;
+        for position in 0..regular {
+            let Some(target) = out_sections.get(position) else {
+                break;
+            };
+            let count = super::emit::count(
+                input.files,
+                input.sections,
+                input.eh_frames,
+                &target.members,
+            )?;
+            if count == 0 {
+                continue;
+            }
+            let mut rela = trailer(
+                target.name,
+                Trailer::Rela(u32::try_from(position).unwrap_or(NONE)),
+                crate::elf::read::consts::SHT_RELA,
+                count.saturating_mul(24),
+                8,
+            );
+            rela.name_prefix = b".rela";
+            rela.flags = crate::elf::read::consts::SHF_INFO_LINK;
+            rela.entsize = 24;
+            rela.info = u32::try_from(position.saturating_add(1)).unwrap_or(0);
+            out_sections.push(rela);
+        }
+    }
     if input.trailers.symtab > 0 {
         out_sections.push(trailer(
             b".symtab",
             Trailer::Symtab,
             SHT_SYMTAB,
-            input.trailers.symtab,
+            input
+                .trailers
+                .symtab
+                .saturating_add(u64::from(section_symbols).saturating_mul(24)),
             8,
         ));
         out_sections.push(trailer(
@@ -549,28 +641,35 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     for section in &mut out_sections {
         section.name_offset = u32::try_from(shstrtab.len())
             .map_err(|_| Error::Limit("section name table larger than 4 GiB".into()))?;
+        shstrtab.extend_from_slice(section.name_prefix);
         shstrtab.extend_from_slice(section.name);
         shstrtab.push(0);
     }
     let shstrtab_len = u64::try_from(shstrtab.len()).unwrap_or(u64::MAX);
-    let strtab_position = out_sections
-        .iter()
-        .position(|s| s.trailer == Trailer::Strtab);
+    let header_of = |kind: Trailer| {
+        out_sections
+            .iter()
+            .position(|s| s.trailer == kind)
+            .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
+            .unwrap_or(0)
+    };
+    let strtab_index = header_of(Trailer::Strtab);
+    let symtab_index = header_of(Trailer::Symtab);
     for section in &mut out_sections {
         match section.trailer {
             Trailer::Shstrtab => section.size = shstrtab_len,
             Trailer::Symtab => {
-                section.link = strtab_position
-                    .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
-                    .unwrap_or(0);
-                section.info = input.trailers.first_global;
+                section.link = strtab_index;
+                section.info = input.trailers.first_global.saturating_add(section_symbols);
                 section.entsize = 24;
             }
+            Trailer::Rela(_) => section.link = symtab_index,
             _ => {}
         }
     }
 
     // 3. Segment plan (before addresses: the header size depends on it).
+    let mode = input.mode;
     let separate = input.options.separate_code.unwrap_or(SeparateCode::Code);
     let perm = |section: &OutSection<'_>| -> u32 {
         let mut flags = PF_R;
@@ -584,6 +683,15 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             flags |= PF_X;
         }
         flags
+    };
+    let is_relro = |section: &OutSection<'_>| -> bool {
+        input.options.relro
+            && section.flags & SHF_WRITE != 0
+            && placement
+                .outputs
+                .get(section.output as usize)
+                .and_then(|o| input.rules.outputs.get(usize::from(o.rule)))
+                .is_some_and(|rule| rule.relro)
     };
     let alloc: Vec<usize> = out_sections
         .iter()
@@ -609,6 +717,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     let mut note_groups = 0usize;
     let mut last_note_align: Option<u64> = None;
     let mut has_tls = false;
+    let mut has_relro = false;
     for &i in &alloc {
         let Some(section) = out_sections.get(i) else {
             continue;
@@ -622,38 +731,59 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             last_note_align = None;
         }
         has_tls |= section.flags & SHF_TLS != 0;
+        has_relro |= is_relro(section);
     }
+    let has_synthetic = |kind: Synthetic| {
+        out_sections.iter().any(|s| {
+            s.members
+                .iter()
+                .any(|p| p.member == Member::Synthetic(kind))
+        })
+    };
+    let has_interp = has_synthetic(Synthetic::Interp);
+    let has_dynamic = has_synthetic(Synthetic::Dynamic);
     let has_property = input.synth.property_note.is_some();
     let has_eh_hdr = input.synth.eh_frame_hdr && input.synth.fde_count > 0;
     let gnu_stack = input.options.gnu_stack;
     let phnum = load_count
+        .saturating_add(usize::from(has_interp).saturating_mul(2))
+        .saturating_add(usize::from(has_dynamic))
         .saturating_add(note_groups)
         .saturating_add(usize::from(has_tls))
         .saturating_add(usize::from(has_property))
         .saturating_add(usize::from(has_eh_hdr))
-        .saturating_add(usize::from(gnu_stack));
+        .saturating_add(usize::from(gnu_stack))
+        .saturating_add(usize::from(has_relro));
     let phnum_u64 = u64::try_from(phnum).unwrap_or(u64::MAX);
 
-    // 4. Addresses.
+    // 4. Addresses. Each new PT_LOAD starts on a page boundary; a writable
+    // one starts at the next page plus the current page offset (GNU ld's
+    // DATA_SEGMENT_ALIGN) and moves up so the RELRO region ends on a page
+    // boundary. File offsets are congruent to addresses modulo the page
+    // size.
     let page = input
         .options
         .max_page_size
         .filter(|p| p.is_power_of_two())
         .unwrap_or(DEFAULT_PAGE);
+    let default_base = if mode.pic { 0 } else { DEFAULT_BASE };
     let base = input
         .options
         .text_segment
         .or(input.options.image_base)
-        .unwrap_or(DEFAULT_BASE);
+        .unwrap_or(default_base);
     let base = align_up(base, 1)?;
     let headers = add(EHDR_SIZE, PHDR_SIZE.saturating_mul(phnum_u64))?;
     let mut dot = add(base, headers)?;
+    let mut file_end = headers;
+    // Address minus file offset in the current segment.
+    let mut delta = base;
     let mut previous = if separate == SeparateCode::None {
         PF_R | PF_X
     } else {
         PF_R
     };
-    let mut segments: Vec<Segment> = vec![Segment {
+    let mut loads: Vec<Segment> = vec![Segment {
         p_type: PT_LOAD,
         flags: previous,
         offset: 0,
@@ -663,6 +793,8 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         align: page,
     }];
     let mut tls: Option<Tls> = None;
+    let mut relro: Option<(u64, u64)> = None;
+    let mut relro_end: Option<u64> = None;
     let mut etext = dot;
     let mut edata = dot;
     let mut bss_start: Option<u64> = None;
@@ -683,30 +815,57 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             out_iter.next();
         }
     };
-    for &i in &alloc {
+    for (position, &i) in alloc.iter().enumerate() {
         let p = out_sections.get(i).map_or(PF_R, perm);
-        let Some(section) = out_sections.get_mut(i) else {
-            continue;
-        };
-        place_empty_until(section.output, dot, &mut output_places);
+        let starts_relro = out_sections.get(i).is_some_and(is_relro);
         if p != previous {
-            dot = align_up(dot, page)?;
+            let mut vaddr = align_up(dot, page)?;
+            if p & PF_W != 0 {
+                vaddr = add(vaddr, dot & page.wrapping_sub(1))?;
+                if starts_relro {
+                    let (start, end) = relro_start(
+                        &out_sections,
+                        alloc.get(position..).unwrap_or_default(),
+                        vaddr,
+                        page,
+                        &is_relro,
+                    )?;
+                    vaddr = start;
+                    relro_end = Some(end);
+                }
+            }
+            // The smallest offset at or after the file end that is
+            // congruent to the address.
+            let mask = page.wrapping_sub(1);
+            let gap = (vaddr & mask).wrapping_sub(file_end & mask) & mask;
+            let offset = add(file_end, gap)?;
+            dot = vaddr;
+            delta = vaddr.wrapping_sub(offset);
             previous = p;
-            segments.push(Segment {
+            loads.push(Segment {
                 p_type: PT_LOAD,
                 flags: p,
-                offset: dot.wrapping_sub(base),
-                vaddr: dot,
+                offset,
+                vaddr,
                 filesz: 0,
                 memsz: 0,
                 align: page,
             });
         }
+        let Some(section) = out_sections.get_mut(i) else {
+            continue;
+        };
+        if !starts_relro && let Some(end) = relro_end.take() {
+            // The RELRO region ends on its page boundary.
+            dot = dot.max(end);
+            if let Some(region) = &mut relro {
+                region.1 = end;
+            }
+        }
+        place_empty_until(section.output, dot, &mut output_places);
         let address = align_up(dot, section.align)?;
         section.addr = address;
-        section.offset = address
-            .checked_sub(base)
-            .ok_or_else(|| Error::Internal("section below the base address".into()))?;
+        section.offset = address.wrapping_sub(delta);
         let end = add(address, section.size)?;
         let tbss = section.flags & SHF_TLS != 0 && section.sh_type == SHT_NOBITS;
         if section.flags & SHF_TLS != 0 {
@@ -718,9 +877,14 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             t.memsz = end.saturating_sub(t.start);
             t.align = t.align.max(section.align);
         }
-        if let Some(segment) = segments.last_mut() {
+        if starts_relro && p & PF_W != 0 {
+            let region = relro.get_or_insert((address, address));
+            region.1 = if tbss { region.1.max(address) } else { end };
+        }
+        if let Some(segment) = loads.last_mut() {
             if section.has_file_bytes() {
                 segment.filesz = end.saturating_sub(segment.vaddr);
+                file_end = file_end.max(section.offset.saturating_add(section.size));
             }
             if !tbss {
                 segment.memsz = end.saturating_sub(segment.vaddr);
@@ -745,11 +909,12 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     place_empty_until(NONE, dot, &mut output_places);
 
     // Non-allocated sections.
-    let mut file_end = segments
+    let mut file_end = loads
         .iter()
         .map(|s| s.offset.saturating_add(s.filesz))
         .max()
-        .unwrap_or(headers);
+        .unwrap_or(headers)
+        .max(file_end);
     for (i, section) in out_sections.iter_mut().enumerate() {
         if section.is_alloc() {
             continue;
@@ -764,7 +929,57 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     let shoff = align_up(file_end, 8)?;
     let file_size = add(shoff, shnum.saturating_mul(SHDR_SIZE))?;
 
-    // Other program headers.
+    // Program headers, in GNU ld's order.
+    let mut synthetic_places = Vec::new();
+    for section in &out_sections {
+        for placed in &section.members {
+            if let Member::Synthetic(kind) = placed.member {
+                synthetic_places.push((
+                    kind,
+                    section.addr.saturating_add(placed.offset),
+                    section.offset.saturating_add(placed.offset),
+                    placed.size,
+                ));
+            }
+        }
+    }
+    let synthetic_segment = |kind: Synthetic, p_type: u32, flags: u32, align: u64| {
+        synthetic_places
+            .iter()
+            .find(|(k, ..)| *k == kind)
+            .map(|&(_, vaddr, offset, size)| Segment {
+                p_type,
+                flags,
+                offset,
+                vaddr,
+                filesz: size,
+                memsz: size,
+                align,
+            })
+    };
+    let mut segments: Vec<Segment> = Vec::with_capacity(phnum);
+    if has_interp {
+        let size = PHDR_SIZE.saturating_mul(phnum_u64);
+        segments.push(Segment {
+            p_type: PT_PHDR,
+            flags: PF_R,
+            offset: EHDR_SIZE,
+            vaddr: base.saturating_add(EHDR_SIZE),
+            filesz: size,
+            memsz: size,
+            align: 8,
+        });
+        segments.extend(synthetic_segment(Synthetic::Interp, PT_INTERP, PF_R, 1));
+    }
+    segments.extend(loads);
+    if has_dynamic {
+        segments.extend(synthetic_segment(
+            Synthetic::Dynamic,
+            PT_DYNAMIC,
+            PF_R | PF_W,
+            8,
+        ));
+    }
     let mut group: Option<Segment> = None;
     for &i in &alloc {
         let Some(section) = out_sections.get(i) else {
@@ -821,48 +1036,21 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             align: t.align,
         });
     }
-    let mut synthetic_places = Vec::new();
-    for section in &out_sections {
-        for placed in &section.members {
-            if let Member::Synthetic(kind) = placed.member {
-                synthetic_places.push((
-                    kind,
-                    section.addr.saturating_add(placed.offset),
-                    section.offset.saturating_add(placed.offset),
-                    placed.size,
-                ));
-            }
-        }
+    if has_property {
+        segments.extend(synthetic_segment(
+            Synthetic::GnuProperty,
+            PT_GNU_PROPERTY,
+            PF_R,
+            8,
+        ));
     }
-    if has_property
-        && let Some(&(_, addr, offset, size)) = synthetic_places
-            .iter()
-            .find(|(k, ..)| *k == Synthetic::GnuProperty)
-    {
-        segments.push(Segment {
-            p_type: PT_GNU_PROPERTY,
-            flags: PF_R,
-            offset,
-            vaddr: addr,
-            filesz: size,
-            memsz: size,
-            align: 8,
-        });
-    }
-    if has_eh_hdr
-        && let Some(&(_, addr, offset, size)) = synthetic_places
-            .iter()
-            .find(|(k, ..)| *k == Synthetic::EhFrameHdr)
-    {
-        segments.push(Segment {
-            p_type: PT_GNU_EH_FRAME,
-            flags: PF_R,
-            offset,
-            vaddr: addr,
-            filesz: size,
-            memsz: size,
-            align: 4,
-        });
+    if has_eh_hdr {
+        segments.extend(synthetic_segment(
+            Synthetic::EhFrameHdr,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            4,
+        ));
     }
     if gnu_stack {
         let exec = match input.options.exec_stack {
@@ -880,12 +1068,31 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             align: 16,
         });
     }
+    if has_relro {
+        let (start, stop) = relro.unwrap_or((0, 0));
+        let offset = segments
+            .iter()
+            .find(|s| {
+                s.p_type == PT_LOAD && s.vaddr <= start && start <= s.vaddr.saturating_add(s.memsz)
+            })
+            .map_or(0, |s| start.wrapping_sub(s.vaddr).wrapping_add(s.offset));
+        segments.push(Segment {
+            p_type: PT_GNU_RELRO,
+            flags: PF_R,
+            offset,
+            vaddr: start,
+            filesz: stop.saturating_sub(start),
+            memsz: stop.saturating_sub(start),
+            align: 1,
+        });
+    }
     if segments.len() != phnum {
         return Err(Error::Internal(format!(
             "program header count changed during layout ({phnum} planned, {} made)",
             segments.len()
         )));
     }
+    set_links(&mut out_sections, input.synth);
 
     // Per input section addresses.
     let mut section_addr = vec![0u64; sections.len()];
@@ -957,16 +1164,129 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         edata,
         bss_start,
         end,
+        section_symbols,
     })
 }
 
-fn trailer(
-    name: &'static [u8],
-    kind: Trailer,
-    sh_type: u32,
-    size: u64,
-    align: u64,
-) -> OutSection<'static> {
+/// Where a writable segment that can start at `start` begins, and where its
+/// leading RELRO sections (`alloc`, in order) end, so that the end is on a
+/// page boundary: as GNU ld's `DATA_SEGMENT_RELRO_END`, the sections are
+/// placed backwards from the first page boundary after their forward
+/// layout, and the following sections start at that boundary.
+fn relro_start<F: Fn(&OutSection<'_>) -> bool>(
+    sections: &[OutSection<'_>],
+    alloc: &[usize],
+    start: u64,
+    page: u64,
+    is_relro: &F,
+) -> Result<(u64, u64)> {
+    let relro: Vec<&OutSection<'_>> = alloc
+        .iter()
+        .map_while(|&i| sections.get(i).filter(|s| is_relro(s)))
+        .collect();
+    let tbss = |s: &OutSection<'_>| s.flags & SHF_TLS != 0 && s.sh_type == SHT_NOBITS;
+    let mut dot = start;
+    for section in &relro {
+        let address = align_up(dot, section.align)?;
+        if !tbss(section) {
+            dot = add(address, section.size)?;
+        }
+    }
+    let mut end = align_up(dot, page)?;
+    // Backwards from the end; one more page if that would start too early.
+    for _ in 0..2 {
+        let mut position = end;
+        for section in relro.iter().rev() {
+            if tbss(section) {
+                continue;
+            }
+            let align = section.align.max(1);
+            position = position
+                .checked_sub(section.size)
+                .map(|p| p & !align.wrapping_sub(1))
+                .ok_or_else(|| Error::Internal("RELRO region below address 0".into()))?;
+        }
+        if position >= start {
+            return Ok((position, end));
+        }
+        end = add(end, page)?;
+    }
+    Ok((start, align_up(dot, page)?))
+}
+
+/// Sets `sh_link`, `sh_info` and `sh_entsize` of the dynamic linking
+/// sections, which refer to each other by section header index.
+fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
+    let index_of = |sections: &[OutSection<'_>], kind: Synthetic| -> u32 {
+        sections
+            .iter()
+            .position(|s| {
+                s.members
+                    .iter()
+                    .any(|p| p.member == Member::Synthetic(kind))
+            })
+            .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
+            .unwrap_or(0)
+    };
+    let dynsym = index_of(sections, Synthetic::DynSym);
+    let dynstr = index_of(sections, Synthetic::DynStr);
+    let got_plt = index_of(sections, Synthetic::GotPlt);
+    for section in sections.iter_mut() {
+        let kinds: Vec<Synthetic> = section
+            .members
+            .iter()
+            .filter_map(|p| match p.member {
+                Member::Synthetic(kind) => Some(kind),
+                _ => None,
+            })
+            .collect();
+        for kind in kinds {
+            match kind {
+                Synthetic::GnuHash => section.link = dynsym,
+                Synthetic::Hash => {
+                    section.link = dynsym;
+                    section.entsize = 4;
+                }
+                Synthetic::DynSym => {
+                    section.link = dynstr;
+                    section.info = 1;
+                    section.entsize = 24;
+                }
+                Synthetic::VerSym => {
+                    section.link = dynsym;
+                    section.entsize = 2;
+                }
+                Synthetic::VerNeed => {
+                    section.link = dynstr;
+                    section.info = u32::try_from(synth.verneed_count).unwrap_or(0);
+                }
+                Synthetic::VerDef => {
+                    section.link = dynstr;
+                    section.info = u32::try_from(synth.verdef_count).unwrap_or(0);
+                }
+                Synthetic::RelaDyn => {
+                    section.link = dynsym;
+                    section.entsize = 24;
+                }
+                Synthetic::RelaPlt => {
+                    section.link = dynsym;
+                    section.info = got_plt;
+                    section.entsize = 24;
+                }
+                Synthetic::RelrDyn => section.entsize = 8,
+                Synthetic::Dynamic => {
+                    section.link = dynstr;
+                    section.entsize = 16;
+                }
+                Synthetic::Plt | Synthetic::PltSec => section.entsize = 16,
+                Synthetic::PltGot => section.entsize = if synth.ibt { 16 } else { 8 },
+                _ => {}
+            }
+        }
+    }
+}
+
+fn trailer(name: &[u8], kind: Trailer, sh_type: u32, size: u64, align: u64) -> OutSection<'_> {
     OutSection {
         name,
         output: NONE,
@@ -982,19 +1302,38 @@ fn trailer(
         info: 0,
         members: Vec::new(),
         name_offset: 0,
+        name_prefix: b"",
     }
 }
 
 fn synthetic_flags(kind: Synthetic) -> (u64, u32) {
-    use crate::elf::read::consts::{SHF_INFO_LINK, SHT_RELA};
+    use crate::elf::read::consts::{
+        SHF_INFO_LINK, SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_HASH, SHT_GNU_VERDEF, SHT_GNU_VERNEED,
+        SHT_GNU_VERSYM, SHT_HASH, SHT_RELA, SHT_RELR,
+    };
     match kind {
         Synthetic::None => (0, SHT_PROGBITS),
         Synthetic::BuildId | Synthetic::GnuProperty => (SHF_ALLOC, SHT_NOTE),
-        Synthetic::RelaIplt => (SHF_ALLOC | SHF_INFO_LINK, SHT_RELA),
-        Synthetic::Iplt => (SHF_ALLOC | SHF_EXECINSTR, SHT_PROGBITS),
+        Synthetic::Interp => (SHF_ALLOC, SHT_PROGBITS),
+        Synthetic::Hash => (SHF_ALLOC, SHT_HASH),
+        Synthetic::GnuHash => (SHF_ALLOC, SHT_GNU_HASH),
+        Synthetic::DynSym => (SHF_ALLOC, SHT_DYNSYM),
+        Synthetic::DynStr => (SHF_ALLOC, SHT_STRTAB),
+        Synthetic::VerSym => (SHF_ALLOC, SHT_GNU_VERSYM),
+        Synthetic::VerDef => (SHF_ALLOC, SHT_GNU_VERDEF),
+        Synthetic::VerNeed => (SHF_ALLOC, SHT_GNU_VERNEED),
+        Synthetic::RelaDyn => (SHF_ALLOC, SHT_RELA),
+        Synthetic::RelrDyn => (SHF_ALLOC, SHT_RELR),
+        Synthetic::RelaPlt => (SHF_ALLOC | SHF_INFO_LINK, SHT_RELA),
+        Synthetic::Plt | Synthetic::PltGot | Synthetic::PltSec => {
+            (SHF_ALLOC | SHF_EXECINSTR, SHT_PROGBITS)
+        }
         Synthetic::EhFrameHdr | Synthetic::EhFrameEnd => (SHF_ALLOC, SHT_PROGBITS),
-        Synthetic::Got | Synthetic::IgotPlt => (SHF_ALLOC | SHF_WRITE, SHT_PROGBITS),
-        Synthetic::Common => (SHF_ALLOC | SHF_WRITE, SHT_NOBITS),
+        Synthetic::Got | Synthetic::GotPlt | Synthetic::DynRelro => {
+            (SHF_ALLOC | SHF_WRITE, SHT_PROGBITS)
+        }
+        Synthetic::Dynamic => (SHF_ALLOC | SHF_WRITE, SHT_DYNAMIC),
+        Synthetic::Common | Synthetic::DynBss => (SHF_ALLOC | SHF_WRITE, SHT_NOBITS),
         Synthetic::Comment => (
             crate::elf::read::consts::SHF_MERGE | crate::elf::read::consts::SHF_STRINGS,
             SHT_PROGBITS,
@@ -1057,8 +1396,10 @@ fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[Placed]) ->
                     crate::passes::merge::MergeKind::Strings { char_size } => u64::from(char_size),
                     crate::passes::merge::MergeKind::Fixed { entry_size } => entry_size,
                 }),
-            Member::Synthetic(Synthetic::RelaIplt) => 24,
-            Member::Synthetic(Synthetic::Got | Synthetic::IgotPlt) => 8,
+            Member::Synthetic(Synthetic::RelaPlt | Synthetic::RelaDyn | Synthetic::DynSym) => 24,
+            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt | Synthetic::RelrDyn) => 8,
+            Member::Synthetic(Synthetic::Dynamic | Synthetic::Plt | Synthetic::PltSec) => 16,
+            Member::Synthetic(Synthetic::VerSym) => 2,
             Member::Synthetic(Synthetic::Comment) => 1,
             Member::Synthetic(_) => 0,
         };

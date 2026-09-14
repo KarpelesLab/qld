@@ -6,7 +6,9 @@
 //!
 //! 1. [`inputs`]: search paths, archives, input scripts; then the thread
 //!    pool is sized from the input size unless `--threads` was given;
-//! 2. [`resolve_symbols`] with [`ElfRules`], then COMDAT deduplication;
+//! 2. [`resolve_symbols_with`] with [`ElfRules`], claiming COMDAT groups as
+//!    rounds load files ([`resolve::ComdatHook`]), then dropping the
+//!    discarded copies' sections;
 //! 3. [`place`]: output section assignment;
 //! 4. linker-defined symbols ([`defined`]);
 //! 5. `.eh_frame` splitting, `--gc-sections` and `--why-live` ([`gc`]);
@@ -16,28 +18,37 @@
 //! 8. synthetic sections and the symbol table plan;
 //! 9. [`layout`], symbol addresses, [`write`](mod@write), and the link map
 //!    ([`map`]).
+//!
+//! Relocatable output (`-r`) leaves after step 2: optional `--gc-sections`
+//! (which then needs `-e` or `-u` roots), then [`relocatable`].
 
 use std::time::Instant;
 
 use crate::args::{LinkOptions, MagicMode, OutputKind, StripMode};
+use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
 use crate::passes::IcfMode;
-use crate::symbols::{SymbolName, SymbolTable, resolve_symbols};
+use crate::symbols::{SymbolName, SymbolTable, resolve_symbols_with};
 
 use super::common;
 use super::defined;
+use super::dso;
+use super::dynsym;
 use super::ehframe;
+use super::export::{self, Mode};
 use super::gc;
 use super::icf;
 use super::inputs::{self, InternalNames, parse_number};
 use super::layout::{self, LayoutInput, TrailerSizes};
 use super::map;
 use super::merge;
-use super::object::{ParseConfig, WrapTable};
+use super::object::{ParseConfig, SectionKind, WrapTable};
 use super::place;
 use super::refs::{Def, Refs};
+use super::reloc;
+use super::relocatable;
 use super::resolve::{self, ElfRules};
 use super::rules::RuleSet;
 use super::scan::{self, UndefinedRef};
@@ -46,6 +57,7 @@ use super::symtab;
 use super::synth::{self, Synth};
 use super::values::Addresses;
 use super::write::{self, WriteInput};
+use super::xref;
 
 /// At most this many references are listed per undefined symbol.
 const MAX_REFERENCES: usize = 3;
@@ -60,24 +72,6 @@ const MAX_REFERENCES: usize = 3;
 /// [`Error::Reported`] when errors were reported to `diagnostics`, and any
 /// I/O or parse error.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
-    match options.kind {
-        OutputKind::StaticExecutable | OutputKind::Executable => {}
-        OutputKind::Pie | OutputKind::StaticPie => {
-            return Err(Error::Unimplemented(
-                "position-independent executables (roadmap M2: dynamic ELF)".into(),
-            ));
-        }
-        OutputKind::Shared => {
-            return Err(Error::Unimplemented(
-                "shared objects (roadmap M2: dynamic ELF)".into(),
-            ));
-        }
-        OutputKind::Relocatable => {
-            return Err(Error::Unimplemented(
-                "relocatable output (roadmap M2: dynamic ELF)".into(),
-            ));
-        }
-    }
     // `-plugin` needs no check here: compiler drivers always pass it, and
     // an IR input is reported as Unimplemented (M6) when it is loaded.
     check_supported(options)?;
@@ -98,6 +92,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     let config = ParseConfig {
         strip_debug: options.strip >= StripMode::Debug,
         wrap: &wrap,
+        table: &table,
     };
     let mut inputs = inputs::collect(options, &table, &internal, config)?;
     lap("inputs");
@@ -139,15 +134,13 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     {
         return unimplemented(&format!("--oformat {format}"), "M3");
     }
-    if options.emit_relocs {
-        return unimplemented("--emit-relocs", "M2");
-    }
-    if options
-        .compress_debug_sections
-        .as_deref()
-        .is_some_and(|c| c != "none")
+    if options.kind == OutputKind::Relocatable
+        && options
+            .compress_debug_sections
+            .as_deref()
+            .is_some_and(|c| c != "none")
     {
-        return unimplemented("--compress-debug-sections", "M5");
+        return unimplemented("--compress-debug-sections with -r", "M5");
     }
     for (name, expr) in &options.defsym {
         if inputs::parse_defsym(expr).is_none() {
@@ -189,6 +182,7 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable) -> Option<usize
 }
 
 /// Everything after input collection, run in the link's thread pool.
+#[allow(clippy::too_many_lines)]
 fn link_inputs<'a>(
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
@@ -200,19 +194,70 @@ fn link_inputs<'a>(
         allow_multiple_definition: options.allow_multiple_definition,
     };
     let mut symbols = SymbolTable::new();
-    let resolution = resolve_symbols(&mut symbols, &rules, &mut inputs.files)?;
+    let mut comdat = resolve::ComdatHook::default();
+    let resolution = resolve_symbols_with(&mut symbols, &rules, &mut inputs.files, &mut comdat)?;
+    drop(comdat);
     let files = &inputs.files;
     lap("resolution");
 
     let mut sections = Sections::new(files, &resolution)?;
+    let relocatable = options.kind == OutputKind::Relocatable;
+    if relocatable {
+        relocatable::revive_sections(files, &mut sections, options);
+    } else if options.emit_relocs {
+        // GNU ld keeps `.note.GNU-stack` as an output section with -q.
+        relocatable::revive_named(files, &mut sections, b".note.GNU-stack");
+    }
     resolve::deduplicate_comdat(files, &mut sections);
-    resolve::redirect_discarded(&symbols, &rules, files, &resolution, &sections);
-    let mut errors = resolve::report_duplicates(files, &resolution, &sections, diagnostics);
+    let mut errors =
+        resolve::report_duplicates(files, &resolution, &sections, options.demangle, diagnostics);
     report_gnu_warnings(files, &symbols, diagnostics);
+    xref::trace_symbols(files, &resolution, options, diagnostics);
+    xref::warn_common(files, &resolution, options, diagnostics);
+    let cref = xref::cross_reference(files, &symbols, &resolution, options);
+
+    if relocatable {
+        if errors > 0 && !options.noinhibit_exec {
+            return Err(Error::Reported { errors });
+        }
+        link_relocatable(
+            options,
+            diagnostics,
+            files,
+            &symbols,
+            &resolution,
+            sections,
+            internal,
+            lap,
+        )?;
+        return map::write_cref(options, cref.as_deref());
+    }
+
+    let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
+    let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
+    let always: &[&str] = if mode.dynamic && mode.executable() && options.export_dynamic {
+        for name in defined::ALWAYS_DEFINED {
+            symbols.intern(SymbolName::new(name.as_bytes()));
+        }
+        defined::ALWAYS_DEFINED
+    } else {
+        &[]
+    };
 
     let rule_set = RuleSet::default_rules();
-    let placement = place::place(&rule_set, files, &sections);
-    let linker = defined::register(&symbols, &placement, options);
+    let mut placement = place::place(&rule_set, files, &sections);
+    let linker = defined::register(&symbols, &placement, options, mode.dynamic, always);
+    let (version_script, dynamic_patterns) = export::read_scripts(options)?;
+    let exports = export::plan(
+        files,
+        &symbols,
+        &resolution,
+        &needed,
+        options,
+        mode,
+        version_script,
+        &dynamic_patterns,
+    )?;
     lap("placement");
 
     let mut eh_frames = ehframe::split(files, &sections)?;
@@ -238,6 +283,7 @@ fn link_inputs<'a>(
         eh_frames
             .sections
             .retain(|s| sections.live.get(s.id.index()).copied().unwrap_or(false));
+        placement.compute_flags(files, &sections);
         lap("gc");
     }
 
@@ -247,14 +293,47 @@ fn link_inputs<'a>(
         resolution: &resolution,
         sections: &sections,
     };
-    let scan = scan::scan(&refs, options.relax);
+    let context = reloc::Context {
+        mode,
+        relax: options.relax,
+        copy_relocs: options.copy_relocs,
+    };
+    let scan = scan::scan(&refs, &context);
     for file in &scan.files {
         for error in &file.errors {
             diagnostics.emit(error.clone());
             errors = errors.saturating_add(1);
         }
     }
-    errors = errors.saturating_add(report_undefined(&refs, &scan, options, diagnostics));
+    errors = errors.saturating_add(report_undefined(
+        &refs,
+        &scan,
+        options,
+        mode,
+        &needed,
+        diagnostics,
+    ));
+    errors = errors.saturating_add(dso::check_shlib_undefined(
+        files,
+        &symbols,
+        &resolution,
+        &needed,
+        options,
+        diagnostics,
+    ));
+    if scan.text_relocs() && mode.dynamic {
+        let message = if mode.shared {
+            "creating DT_TEXTREL in a shared object"
+        } else {
+            "creating DT_TEXTREL in a PIE"
+        };
+        if options.error_textrel {
+            diagnostics.emit(Diagnostic::error(message.to_string()));
+            errors = errors.saturating_add(1);
+        } else if options.warn_textrel || mode.pic {
+            diagnostics.emit(Diagnostic::warning(message.to_string()));
+        }
+    }
     if errors > 0 && !options.noinhibit_exec {
         return Err(Error::Reported { errors });
     }
@@ -268,12 +347,12 @@ fn link_inputs<'a>(
         Some("safe") => Some(IcfMode::Safe),
         _ => None,
     };
-    if let Some(mode) = icf_mode {
+    if let Some(icf_mode) = icf_mode {
         let fold_into = icf::fold(
             &refs,
             &placement,
             &merged,
-            mode,
+            icf_mode,
             options.print_icf_sections,
             diagnostics,
         )?;
@@ -289,13 +368,57 @@ fn link_inputs<'a>(
     eh_frames.finalize(&refs);
 
     let mut synth = Synth::default();
-    synth.plan_entries(&symbols, &scan);
+    synth.plan_entries(&refs, &scan, mode);
+    // DT_RELR is for position-independent output; GNU ld ignores the
+    // option otherwise.
+    synth.relr = options.pack_relative_relocs && mode.pic;
+    synth.relr_size = synth
+        .relr_count()
+        .div_ceil(32)
+        .saturating_add(8)
+        .saturating_mul(8);
+    synth.ibt = synth::plan_ibt(files, options);
     synth.build_id = synth::plan_build_id(options);
     synth.property_note = synth::plan_property_note(files, options);
+    synth.interp = synth::plan_interp(options, mode);
     synth.fde_count = u64::try_from(eh_frames.live_fdes()).unwrap_or(0);
     synth.eh_frame_hdr = options.eh_frame_hdr && synth.fde_count > 0;
     synth.eh_frame_end = eh_frames.sections.iter().any(|s| s.size > 0);
     synth.common = (commons.size, commons.align);
+
+    let nonempty_outputs = nonempty_outputs(files, &sections, &placement);
+    let has_output = |name: &[u8]| {
+        placement
+            .outputs
+            .iter()
+            .zip(&nonempty_outputs)
+            .any(|(output, &nonempty)| nonempty && output.name == name)
+    };
+    let soname = options
+        .soname
+        .as_ref()
+        .map(|s| s.as_bytes().to_vec())
+        .or_else(|| {
+            options
+                .output_path()
+                .file_name()
+                .map(|n| n.as_encoded_bytes().to_vec())
+        });
+    let dynamic = dynsym::plan(&dynsym::PlanInput {
+        refs: &refs,
+        needed: &needed,
+        mode,
+        options,
+        synth: &synth,
+        exports: &exports,
+        scan: &scan,
+        has_output: &has_output,
+        soname,
+    })?;
+    synth.dynamic_sizes = dynamic.sizes();
+    synth.verneed_count = dynamic.verneed_count;
+    synth.verdef_count = dynamic.verdef_count;
+    lap("dynamic");
 
     let plan = symtab::plan(&refs, &linker, options);
     let trailers = TrailerSizes {
@@ -311,7 +434,7 @@ fn link_inputs<'a>(
         .iter()
         .filter_map(|f| f.object.as_ref())
         .any(|o| o.exec_stack);
-    let layout = layout::layout(&LayoutInput {
+    let mut layout = layout::layout(&LayoutInput {
         options,
         rules: &rule_set,
         files,
@@ -322,24 +445,311 @@ fn link_inputs<'a>(
         synth: &synth,
         trailers,
         exec_stack,
+        mode,
+        compressed: &[],
     })?;
+    // `.relr.dyn`'s size depends on the addresses it encodes: lay out with an
+    // estimate, and again with the real size while it does not fit (growth
+    // rarely moves anything, as the next segment starts on a page boundary).
+    let mut relr = Vec::new();
+    if synth.relr_count() > 0 {
+        // Shrinking to the exact size is tried once; after that a smaller
+        // encoding is padded with empty bitmaps.
+        let mut shrunk = false;
+        for attempt in 0..8 {
+            let addresses = Addresses::new(
+                refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
+            );
+            let places = write::relr_addresses(&addresses, &context, &dynamic, &scan);
+            relr = write::encode_relr(&places);
+            let size = u64::try_from(relr.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(8);
+            if size == synth.relr_size || (size < synth.relr_size && shrunk) {
+                break;
+            }
+            if attempt == 7 {
+                if size <= synth.relr_size {
+                    break;
+                }
+                return Err(Error::Internal(".relr.dyn size did not converge".into()));
+            }
+            shrunk |= size < synth.relr_size;
+            synth.relr_size = size;
+            layout = layout::layout(&LayoutInput {
+                options,
+                rules: &rule_set,
+                files,
+                sections: &sections,
+                placement: &placement,
+                merged: &merged,
+                eh_frames: &eh_frames,
+                synth: &synth,
+                trailers,
+                exec_stack,
+                mode,
+                compressed: &[],
+            })?;
+        }
+    }
     lap("layout");
+
+    let mut plan = plan;
+    plan.add_section_symbols(layout.section_symbols as usize);
+    let tombstones = Tombstones::new(TombstoneStyle::Lld)
+        .with_rules(
+            options
+                .dead_reloc_in_nonalloc
+                .iter()
+                .map(|(glob, value)| (glob.as_bytes(), *value)),
+        )
+        .map_err(|e| Error::Option(e.0))?;
+
+    // --compress-debug-sections: render and compress the debug sections
+    // with the final addresses, then lay out again with their new sizes
+    // (they follow every allocated section, so no address moves).
+    let compression = options
+        .compress_debug_sections
+        .as_deref()
+        .and_then(|value| {
+            let level = if options.optimize >= 2 {
+                crate::debug::compress::deflate::Level::DEFAULT
+            } else {
+                crate::debug::compress::deflate::Level::FASTEST
+            };
+            crate::debug::section::OutputCompression::from_option(value, level)
+        });
+    let mut prerendered = Vec::new();
+    if let Some(compression) = compression {
+        let addresses = Addresses::new(
+            refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
+        );
+        prerendered = write::prerender_debug_sections(
+            &WriteInput {
+                options,
+                addresses: &addresses,
+                symtab: &plan,
+                linker: &linker,
+                dynamic: &dynamic,
+                scan: &scan,
+                context,
+                tombstones: &tombstones,
+                relr: &relr,
+                entry: 0,
+                prerendered: &[],
+                diagnostics,
+            },
+            compression,
+        )?;
+        let sizes: Vec<layout::CompressedOutput> = prerendered
+            .iter()
+            .filter(|p| p.compressed)
+            .filter_map(|p| {
+                let section = layout.sections.get(p.position as usize)?;
+                Some(layout::CompressedOutput {
+                    output: section.output,
+                    size: u64::try_from(p.bytes.len()).ok()?,
+                    gnu: !compression.is_gabi(),
+                })
+            })
+            .collect();
+        drop(addresses);
+        if !sizes.is_empty() {
+            layout = layout::layout(&LayoutInput {
+                options,
+                rules: &rule_set,
+                files,
+                sections: &sections,
+                placement: &placement,
+                merged: &merged,
+                eh_frames: &eh_frames,
+                synth: &synth,
+                trailers,
+                exec_stack,
+                mode,
+                compressed: &sizes,
+            })?;
+        }
+        lap("compress");
+    }
 
     let addresses = Addresses::new(
         refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
     );
-    let entry = entry_address(&addresses, options, diagnostics);
+    let entry = entry_address(&addresses, options, mode, diagnostics);
     write::write(&WriteInput {
         options,
         addresses: &addresses,
         symtab: &plan,
         linker: &linker,
+        dynamic: &dynamic,
+        scan: &scan,
+        context,
+        tombstones: &tombstones,
+        relr: &relr,
         entry,
+        prerendered: &prerendered,
         diagnostics,
     })?;
-    map::write(options, &addresses, &plan)?;
+    map::write(options, &addresses, &plan, cref.as_deref())?;
     lap("write");
     Ok(())
+}
+
+/// The rest of a relocatable (`-r`) link: `--gc-sections` when asked (GNU
+/// ld requires `-e` or `-u` roots for it), then [`relocatable::write`].
+#[allow(clippy::too_many_arguments)]
+fn link_relocatable<'a>(
+    options: &LinkOptions,
+    diagnostics: &dyn DiagnosticSink,
+    files: &[inputs::ElfInput<'a>],
+    symbols: &SymbolTable<'a>,
+    resolution: &crate::symbols::Resolution<'a>,
+    mut sections: Sections,
+    internal: &InternalNames,
+    lap: &(dyn Fn(&str) + Sync),
+) -> Result<()> {
+    if options.gc_sections {
+        if options.entry.is_none() && options.undefined.is_empty() {
+            return Err(Error::Option(
+                "--gc-sections requires a defined symbol root specified by -e or -u".into(),
+            ));
+        }
+        let rule_set = RuleSet::default_rules();
+        let placement = place::place(&rule_set, files, &sections);
+        let eh_frames = ehframe::split(files, &sections)?;
+        let refs = Refs {
+            files,
+            symbols,
+            resolution,
+            sections: &sections,
+        };
+        let linker = defined::LinkerSymbols::default();
+        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
+        if options.print_gc_sections {
+            gc::print_removed(&refs, &removed, diagnostics);
+        }
+        if !options.why_live.is_empty() {
+            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
+        }
+        for &id in &removed {
+            // Sections only relocatable output copies (`.note.GNU-stack`,
+            // non-allocated `SHF_EXCLUDE` sections) are not layout rules'
+            // roots, but GNU ld keeps them.
+            let consumed = sections
+                .locate(id)
+                .and_then(|(file, index)| files.get(file)?.object.as_ref()?.section(index))
+                .is_some_and(|s| s.kind == SectionKind::Ignored && !s.is_alloc());
+            if !consumed && let Some(slot) = sections.live.get_mut(id.index()) {
+                *slot = false;
+            }
+        }
+        lap("gc");
+    }
+    let refs = Refs {
+        files,
+        symbols,
+        resolution,
+        sections: &sections,
+    };
+    let commons = options.define_common.then(|| common::allocate(&refs));
+    relocatable::write(&relocatable::RelocatableInput {
+        options,
+        refs,
+        commons: commons.as_ref(),
+    })?;
+    lap("write");
+    Ok(())
+}
+
+/// Whether each placement output receives a non-empty live input section.
+fn nonempty_outputs(
+    files: &[super::inputs::ElfInput<'_>],
+    sections: &Sections,
+    placement: &place::Placement<'_>,
+) -> Vec<bool> {
+    let mut nonempty = vec![false; placement.outputs.len()];
+    for (file_index, file) in files.iter().enumerate() {
+        let Some(object) = &file.object else {
+            continue;
+        };
+        for (index, section) in object.sections.iter().enumerate() {
+            let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(u32::MAX)) else {
+                continue;
+            };
+            if section.header.sh_size == 0 || !sections.is_live(id) {
+                continue;
+            }
+            if let Some(output) = placement.output_of(id)
+                && let Some(slot) = nonempty.get_mut(output as usize)
+            {
+                *slot = true;
+            }
+        }
+    }
+    nonempty
+}
+
+/// A symbol name for diagnostics: demangled when `demangle` is set, with
+/// its `@VERSION`.
+fn symbol_display(name: SymbolName<'_>, demangle: bool) -> String {
+    let base = crate::hints::display_symbol(name.bytes(), demangle);
+    match name.version() {
+        Some(version) => format!("{base}@{}", String::from_utf8_lossy(version)),
+        None => base.into_owned(),
+    }
+}
+
+/// Library and near-miss hints ([`crate::hints`]) for each group of
+/// undefined references. Runs only when a link has undefined symbols.
+fn undefined_hints(
+    refs: &Refs<'_, '_>,
+    groups: &[&[UndefinedRef]],
+    options: &LinkOptions,
+    needed: &dso::Needed,
+) -> Vec<Vec<crate::hints::Hint>> {
+    use crate::hints::{Hinter, LinkedLibrary, SearchScope, Undefined};
+    let mut linked: Vec<LinkedLibrary> = Vec::new();
+    for (index, file) in refs.files.iter().enumerate() {
+        let library = match file.role {
+            inputs::InputRole::Shared => LinkedLibrary {
+                path: file.path(),
+                dropped_as_needed: !needed.is_needed(index),
+                static_only: false,
+            },
+            inputs::InputRole::Member => LinkedLibrary::new(file.path()),
+            _ => continue,
+        };
+        if !linked.iter().any(|l| l.path == library.path) {
+            linked.push(library);
+        }
+    }
+    let undefined: Vec<Undefined<'_>> = groups
+        .iter()
+        .filter_map(|g| g.first())
+        .map(|r| {
+            let name = refs.symbols.name(r.symbol);
+            match name.version() {
+                Some(version) => Undefined::versioned(name.bytes(), version),
+                None => Undefined::new(name.bytes()),
+            }
+        })
+        .collect();
+    let defined: Vec<&[u8]> = refs
+        .symbols
+        .ids()
+        .filter(|&id| {
+            matches!(
+                refs.symbols.definition_kind(id),
+                crate::symbols::DefinitionKind::Regular
+                    | crate::symbols::DefinitionKind::Weak
+                    | crate::symbols::DefinitionKind::Common
+                    | crate::symbols::DefinitionKind::Shared
+            ) && refs.symbols.name(id).version().is_none()
+        })
+        .map(|id| refs.symbols.name(id).bytes())
+        .collect();
+    Hinter::new(SearchScope::from_options(options), linked).hints(&undefined, &defined)
 }
 
 /// Reports undefined symbols, lld-style. Returns the number of errors.
@@ -347,8 +757,15 @@ fn report_undefined(
     refs: &Refs<'_, '_>,
     scan: &scan::ScanResult,
     options: &LinkOptions,
+    mode: Mode,
+    needed: &dso::Needed,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
+    // A shared object may leave symbols for the dynamic linker to find,
+    // unless `--no-undefined` or `-z defs`.
+    if mode.shared && options.no_undefined != Some(true) {
+        return 0;
+    }
     let mut all: Vec<UndefinedRef> = scan
         .files
         .iter()
@@ -356,6 +773,10 @@ fn report_undefined(
         .collect();
     all.sort_unstable_by_key(|r| (r.symbol, r.file, r.section, r.offset));
     let mut errors = 0usize;
+    let mut line_tables: std::collections::BTreeMap<
+        usize,
+        Option<crate::debug::dwarf::LineLookup>,
+    > = std::collections::BTreeMap::new();
     let mut groups: Vec<&[UndefinedRef]> = all.chunk_by(|a, b| a.symbol == b.symbol).collect();
     groups.sort_by_key(|group| group.first().map(|r| (r.file, r.section, r.offset)));
     let ignore = matches!(
@@ -365,7 +786,24 @@ fn report_undefined(
                 | crate::args::UnresolvedSymbols::IgnoreInObjectFiles
         )
     );
-    for group in groups {
+    // Symbols that a library's own dependency defines: that library is
+    // missing from the command line.
+    let names: Vec<&[u8]> = groups
+        .iter()
+        .filter_map(|g| g.first())
+        .map(|r| refs.symbols.name(r.symbol).bytes())
+        .collect();
+    let in_dependencies = if names.is_empty() || ignore {
+        Vec::new()
+    } else {
+        dso::defined_in_dependencies(refs.files, needed, options, &names)
+    };
+    let hints = if names.is_empty() || ignore {
+        Vec::new()
+    } else {
+        undefined_hints(refs, &groups, options, needed)
+    };
+    for (group_index, group) in groups.into_iter().enumerate() {
         let Some(first) = group.first() else {
             continue;
         };
@@ -379,25 +817,45 @@ fn report_undefined(
             continue;
         }
         let order = refs.files.get(first.file).map_or(0, |f| f.position.raw());
+        let shown = symbol_display(name, options.demangle);
         let mut diagnostic = if options.warn_unresolved_symbols {
-            Diagnostic::warning(format!("undefined symbol: {}", name.display()))
+            Diagnostic::warning(format!("undefined symbol: {shown}"))
         } else {
-            Diagnostic::error(format!("undefined symbol: {}", name.display()))
+            Diagnostic::error(format!("undefined symbol: {shown}"))
         };
         diagnostic = diagnostic.order(order);
         for reference in group.iter().take(MAX_REFERENCES) {
-            diagnostic = diagnostic.at(scan::location(
-                refs,
-                reference.file,
-                reference.section,
-                reference.offset,
-            ));
+            let mut location =
+                scan::location(refs, reference.file, reference.section, reference.offset);
+            // The source line, from the object's DWARF line table, parsed
+            // once per file and only when an error is reported.
+            let lookup = line_tables.entry(reference.file).or_insert_with(|| {
+                refs.files
+                    .get(reference.file)
+                    .and_then(|f| f.object.as_ref())
+                    .and_then(|o| crate::debug::dwarf::LineLookup::parse(&o.elf).ok())
+            });
+            if let Some(lookup) = lookup {
+                location.source = lookup.find(reference.section, reference.offset);
+            }
+            diagnostic = diagnostic.at(location);
         }
         if group.len() > MAX_REFERENCES {
             diagnostic = diagnostic.note(format!(
                 "referenced {} more times",
                 group.len().saturating_sub(MAX_REFERENCES)
             ));
+        }
+        if let Some(Some((library, needed_by))) = in_dependencies.get(group_index) {
+            diagnostic = diagnostic.note(format!(
+                "'{shown}' is defined in {}, which {} needs but which is not in the link \
+                 (DSO missing from command line); add it to the command line",
+                library.display(),
+                needed_by.display()
+            ));
+        }
+        if let Some(hints) = hints.get(group_index) {
+            diagnostic = crate::hints::attach(diagnostic, hints, options.demangle);
         }
         diagnostics.emit(diagnostic);
         if !options.warn_unresolved_symbols {
@@ -459,8 +917,12 @@ fn report_gnu_warnings(
 fn entry_address(
     addresses: &Addresses<'_, '_>,
     options: &LinkOptions,
+    mode: Mode,
     diagnostics: &dyn DiagnosticSink,
 ) -> u64 {
+    if mode.shared && options.entry.is_none() {
+        return 0;
+    }
     let name = options.entry.as_deref().unwrap_or("_start");
     if let Some(value) = parse_number(name) {
         return value;

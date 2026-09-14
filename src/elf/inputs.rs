@@ -35,6 +35,7 @@ use crate::script::{self, CommandKind, InputName};
 use crate::symbols::{DefinitionKind, InputPosition, ResolveFile, SymbolName, SymbolUse};
 use crate::target::{Architecture, Target};
 
+use super::dso::SharedInput;
 use super::object::{ObjectInput, ParseConfig};
 
 /// What kind of link input an [`ElfInput`] is.
@@ -46,6 +47,8 @@ pub enum InputRole {
     Object,
     /// An archive member.
     Member,
+    /// A shared object.
+    Shared,
 }
 
 /// Symbols the linker itself references or defines.
@@ -88,6 +91,8 @@ pub struct ElfInput<'a> {
     pub object: Option<ObjectInput<'a>>,
     /// For the internal file, its symbols.
     pub internal: InternalSymbols<'a>,
+    /// For shared objects, the parsed library.
+    pub shared: Option<SharedInput<'a>>,
     thin: Option<ThinMember<'a>>,
     table: &'a FileTable,
     config: ParseConfig<'a>,
@@ -135,6 +140,9 @@ impl<'a> ResolveFile<'a> for ElfInput<'a> {
     }
 
     fn load(&mut self) -> Result<()> {
+        if let Some(shared) = &mut self.shared {
+            return shared.load_symbols();
+        }
         if self.role == InputRole::Internal || self.object.is_some() {
             return Ok(());
         }
@@ -173,16 +181,18 @@ impl<'a> ResolveFile<'a> for ElfInput<'a> {
     }
 
     fn symbol_names(&self) -> &[SymbolName<'a>] {
-        match &self.object {
-            Some(object) => &object.names,
-            None => &self.internal.names,
+        match (&self.object, &self.shared) {
+            (Some(object), _) => &object.names,
+            (None, Some(shared)) => &shared.names,
+            (None, None) => &self.internal.names,
         }
     }
 
     fn symbol_use(&self, index: usize) -> SymbolUse {
-        let uses = match &self.object {
-            Some(object) => &object.uses,
-            None => &self.internal.uses,
+        let uses = match (&self.object, &self.shared) {
+            (Some(object), _) => &object.uses,
+            (None, Some(shared)) => &shared.uses,
+            (None, None) => &self.internal.uses,
         };
         uses.get(index).copied().unwrap_or(SymbolUse::Ignore)
     }
@@ -215,6 +225,12 @@ impl InternalNames {
                 names.push((entry.as_bytes().to_vec(), reference));
             }
             Some(_) => {}
+            // Shared objects and relocatable output have no entry point
+            // unless one is named.
+            None if matches!(
+                options.kind,
+                crate::args::OutputKind::Shared | crate::args::OutputKind::Relocatable
+            ) => {}
             None => names.push((b"_start".to_vec(), reference)),
         }
         for name in options.undefined.iter().chain(&options.require_defined) {
@@ -307,6 +323,15 @@ struct Pending {
     source: Source,
     attrs: InputAttrs,
     what: String,
+    /// The name a shared object found this way is recorded by in
+    /// `DT_NEEDED` when it has no `DT_SONAME`.
+    found_as: Vec<u8>,
+}
+
+/// The `DT_NEEDED` fallback name of a library found by `-l`: its file name.
+fn base_name_of(path: &Path) -> Vec<u8> {
+    path.file_name()
+        .map_or_else(Vec::new, |n| n.as_encoded_bytes().to_vec())
 }
 
 /// Resolves, loads and expands every input.
@@ -347,13 +372,24 @@ pub fn collect<'a>(
                     source,
                     attrs: spec.attrs,
                     what: format!("-T {}", path.display()),
+                    found_as: Vec::new(),
                 });
             }
-            _ => pending.push(Pending {
-                source: search.resolve(spec)?,
-                attrs: spec.attrs,
-                what: String::new(),
-            }),
+            kind => {
+                let source = search.resolve(spec)?;
+                let found_as = match (kind, &source) {
+                    (InputKind::Library(_), Source::Path(path)) => base_name_of(path),
+                    (InputKind::LibraryExact(name), _) => name.as_bytes().to_vec(),
+                    (InputKind::File(path), _) => path.as_os_str().as_encoded_bytes().to_vec(),
+                    _ => Vec::new(),
+                };
+                pending.push(Pending {
+                    source,
+                    attrs: spec.attrs,
+                    what: String::new(),
+                    found_as,
+                });
+            }
         }
     }
     let sources: Vec<Source> = pending.iter().map(|p| p.source.clone()).collect();
@@ -372,6 +408,7 @@ pub fn collect<'a>(
         lazy_names: Vec::new(),
         object: None,
         internal: internal_symbols,
+        shared: None,
         thin: None,
         table,
         config,
@@ -385,10 +422,15 @@ pub fn collect<'a>(
         ordinal: 0,
         target: options.target,
         depth: 0,
+        sonames: Vec::new(),
+        static_output: matches!(
+            options.kind,
+            crate::args::OutputKind::StaticExecutable | crate::args::OutputKind::StaticPie
+        ),
     };
     for (entry, id) in pending.iter().zip(loaded) {
         let id = id?;
-        walker.add(id, entry.attrs, &entry.what)?;
+        walker.add(id, entry.attrs, &entry.what, &entry.found_as)?;
     }
     let target = walker.target.unwrap_or(Target::X86_64_LINUX);
     if target.arch != Architecture::X86_64 {
@@ -411,6 +453,10 @@ struct Walker<'a, 's> {
     ordinal: u32,
     target: Option<Target>,
     depth: u32,
+    /// `DT_NEEDED` names of the shared objects added so far.
+    sonames: Vec<Vec<u8>>,
+    /// The output is a static executable or static PIE.
+    static_output: bool,
 }
 
 impl<'a> Walker<'a, '_> {
@@ -431,6 +477,7 @@ impl<'a> Walker<'a, '_> {
             lazy_names: Vec::new(),
             object: None,
             internal: InternalSymbols::default(),
+            shared: None,
             thin: None,
             table: self.table,
             config: self.config,
@@ -452,7 +499,7 @@ impl<'a> Walker<'a, '_> {
         }
     }
 
-    fn add(&mut self, id: FileId, attrs: InputAttrs, what: &str) -> Result<()> {
+    fn add(&mut self, id: FileId, attrs: InputAttrs, what: &str, found_as: &[u8]) -> Result<()> {
         let Some(file) = self.table.get(id) else {
             return Err(Error::Internal("loaded file missing from table".into()));
         };
@@ -471,10 +518,7 @@ impl<'a> Walker<'a, '_> {
                 Ok(())
             }
             FileFormat::Elf(ident) if ident.file_type == ET_DYN => {
-                Err(Error::Unimplemented(format!(
-                    "linking against shared object {} (roadmap M2: dynamic ELF)",
-                    file.path().display()
-                )))
+                self.add_shared(file, attrs, found_as)
             }
             FileFormat::Elf(_) => Err(Error::malformed(
                 file.path(),
@@ -494,6 +538,43 @@ impl<'a> Walker<'a, '_> {
                 "file format not recognized",
             )),
         }
+    }
+
+    fn add_shared(
+        &mut self,
+        file: &'a InputFile,
+        attrs: InputAttrs,
+        found_as: &[u8],
+    ) -> Result<()> {
+        if attrs.static_only || self.static_output {
+            return Err(Error::Option(format!(
+                "attempted static link of dynamic object {}",
+                file.path().display()
+            )));
+        }
+        self.infer_target(file);
+        let found_as = if found_as.is_empty() {
+            file.path().as_os_str().as_encoded_bytes()
+        } else {
+            found_as
+        };
+        let shared = SharedInput::parse(
+            file.data(),
+            ElfSource::new(file.path()),
+            found_as,
+            attrs.as_needed,
+        )?;
+        if self.sonames.contains(&shared.needed_name) {
+            return Ok(());
+        }
+        self.sonames.push(shared.needed_name.clone());
+        let input_number = self.next_position()?;
+        let mut input = self.input(InputPosition::new(input_number, 0), InputRole::Shared);
+        input.file = Some(file);
+        input.live_at_start = true;
+        input.shared = Some(shared);
+        self.files.push(input);
+        Ok(())
     }
 
     fn add_archive(&mut self, id: FileId, file: &'a InputFile, attrs: InputAttrs) -> Result<()> {
@@ -576,7 +657,7 @@ impl<'a> Walker<'a, '_> {
         }
         let mut reader = script::NoIncludes;
         let parsed = script::parse_script(file.data(), file.path(), &mut reader)?;
-        let mut entries: Vec<(Source, InputAttrs)> = Vec::new();
+        let mut entries: Vec<(Source, InputAttrs, Vec<u8>)> = Vec::new();
         for command in &parsed.commands {
             let (list, lazy) = match &command.kind {
                 CommandKind::Input(list) | CommandKind::Group(list) => (list, false),
@@ -602,12 +683,17 @@ impl<'a> Walker<'a, '_> {
                 entry_attrs.lazy |= lazy;
                 entry_attrs.as_needed |= entry.as_needed;
                 let source = self.resolve_script_input(&entry.name, file.path(), entry_attrs)?;
-                entries.push((source, entry_attrs));
+                let found_as = match (&entry.name, &source) {
+                    (InputName::Library(_), Source::Path(path)) => base_name_of(path),
+                    (InputName::Path(path), _) => path.clone(),
+                    _ => Vec::new(),
+                };
+                entries.push((source, entry_attrs, found_as));
             }
         }
-        for (source, entry_attrs) in entries {
+        for (source, entry_attrs, found_as) in entries {
             let id = self.table.load(&source)?;
-            self.add(id, entry_attrs, "")?;
+            self.add(id, entry_attrs, "", &found_as)?;
         }
         self.depth = self.depth.saturating_sub(1);
         Ok(())

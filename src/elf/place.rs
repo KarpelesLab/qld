@@ -20,7 +20,6 @@ use crate::elf::read::consts::{
 use crate::ids::SectionId;
 
 use super::inputs::ElfInput;
-use super::object::SectionKind;
 use super::rules::{OrphanClass, RuleSet, Synthetic, orphan_class};
 use super::sections::{NONE, Sections, split_per_file};
 
@@ -115,7 +114,9 @@ pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -
                     else {
                         break;
                     };
-                    if !*live || section.kind == SectionKind::Ignored {
+                    // Ignored sections are live only when a mode revives
+                    // them (`.note.GNU-stack` with --emit-relocs).
+                    if !*live {
                         continue;
                     }
                     let header = &section.header;
@@ -206,56 +207,81 @@ pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -
         }
     }
 
-    // Output types and flags from the inputs.
-    // (flags, first non-NOBITS type, all NOBITS, MERGE/STRINGS bits every
-    // input has).
-    let mut types: Vec<(u64, Option<u32>, bool, u64)> =
-        vec![(0, None, true, SHF_MERGE | SHF_STRINGS); outputs.len()];
-    for (file_index, file) in files.iter().enumerate() {
-        let Some(object) = &file.object else {
-            continue;
-        };
-        for index in 0..object.sections.len() {
-            let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(NONE)) else {
-                continue;
-            };
-            let output = out.get(id.index()).copied().unwrap_or(NONE);
-            let (Some(slot), Some(section)) =
-                (types.get_mut(output as usize), object.sections.get(index))
-            else {
-                continue;
-            };
-            let header = &section.header;
-            slot.0 |= header.sh_flags & OUTPUT_FLAG_MASK;
-            slot.3 &= header.sh_flags;
-            if header.sh_type != SHT_NOBITS {
-                slot.2 = false;
-                if slot.1.is_none() {
-                    slot.1 = Some(header.sh_type);
-                }
-            }
-        }
-    }
-    for (output, (flags, sh_type, all_nobits, merge_bits)) in outputs.iter_mut().zip(types) {
-        // An output is mergeable only if every input section is.
-        let flags = flags & !(SHF_MERGE | SHF_STRINGS) | (flags & merge_bits);
-        output.flags = flags;
-        output.sh_type = match (sh_type, all_nobits && flags != 0) {
-            (_, true) => SHT_NOBITS,
-            (Some(t), false) => t,
-            (None, false) => SHT_PROGBITS,
-        };
-    }
-
-    Placement {
+    let mut placement = Placement {
         outputs,
         out,
         sub,
         keep,
-    }
+    };
+    placement.compute_flags(files, sections);
+    placement
 }
 
 impl Placement<'_> {
+    /// Computes each output section's type and flags from its live input
+    /// sections. Placement does this once; the driver repeats it after
+    /// garbage collection, since GNU ld decides flags from the sections that
+    /// survive it.
+    pub fn compute_flags(&mut self, files: &[ElfInput<'_>], sections: &Sections) {
+        // Output types and flags from the inputs.
+        // (flags, first non-NOBITS type, all NOBITS, MERGE/STRINGS bits kept).
+        // As in GNU ld, the output keeps SHF_MERGE and SHF_STRINGS only if every
+        // input has the same two bits and, when merged, the same entry size.
+        let mut types: Vec<(u64, Option<u32>, bool, u64)> =
+            vec![(0, None, true, SHF_MERGE | SHF_STRINGS); self.outputs.len()];
+        let mut first_merge: Vec<Option<(u64, u64)>> = vec![None; self.outputs.len()];
+        for (file_index, file) in files.iter().enumerate() {
+            let Some(object) = &file.object else {
+                continue;
+            };
+            for index in 0..object.sections.len() {
+                let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(NONE)) else {
+                    continue;
+                };
+                if !sections.is_live(id) {
+                    continue;
+                }
+                let output = self.out.get(id.index()).copied().unwrap_or(NONE);
+                let (Some(slot), Some(section)) =
+                    (types.get_mut(output as usize), object.sections.get(index))
+                else {
+                    continue;
+                };
+                let header = &section.header;
+                slot.0 |= header.sh_flags & OUTPUT_FLAG_MASK;
+                let bits = header.sh_flags & (SHF_MERGE | SHF_STRINGS);
+                let entsize = if bits & SHF_MERGE != 0 {
+                    header.sh_entsize
+                } else {
+                    0
+                };
+                match first_merge.get_mut(output as usize) {
+                    Some(first @ None) => *first = Some((bits, entsize)),
+                    Some(Some(first)) if *first != (bits, entsize) => slot.3 = 0,
+                    _ => {}
+                }
+                slot.3 &= header.sh_flags;
+                if header.sh_type != SHT_NOBITS {
+                    slot.2 = false;
+                    if slot.1.is_none() {
+                        slot.1 = Some(header.sh_type);
+                    }
+                }
+            }
+        }
+        for (output, (flags, sh_type, all_nobits, merge_bits)) in self.outputs.iter_mut().zip(types)
+        {
+            // An output is mergeable only if every input section is.
+            let flags = flags & !(SHF_MERGE | SHF_STRINGS) | (flags & merge_bits);
+            output.flags = flags;
+            output.sh_type = match (sh_type, all_nobits && flags != 0) {
+                (_, true) => SHT_NOBITS,
+                (Some(t), false) => t,
+                (None, false) => SHT_PROGBITS,
+            };
+        }
+    }
+
     /// The output section of `id`, if any.
     #[must_use]
     pub fn output_of(&self, id: SectionId) -> Option<u32> {

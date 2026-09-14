@@ -6,28 +6,44 @@
 //! them in parallel. Input sections are copied from the input mapping and
 //! relocated in place; relocation problems are reported to the diagnostic
 //! sink (every one, not just the first) and fail the link afterwards.
+//!
+//! Dynamic relocations of input sections are written by the `.rela.dyn`
+//! chunk, which runs the same per-relocation decisions
+//! ([`reloc::decide`]) over the sections the scan found to need them, then
+//! sorts the table: relative relocations first, by offset (`-z combreloc`),
+//! then the others by symbol and offset.
 
 #![deny(clippy::arithmetic_side_effects)]
 
+use rayon::prelude::*;
+
 use crate::args::LinkOptions;
+use crate::debug::tombstone::{DeadTarget, SectionTombstone, Tombstones};
 use crate::diag::{Collect, Diagnostic, DiagnosticSink, Severity};
 use crate::elf::read::Relocations;
-use crate::elf::read::consts::{
-    EM_X86_64, ET_EXEC, SHF_ALLOC, reloc_name, x86_64::R_X86_64_IRELATIVE,
+use crate::elf::read::consts::x86_64::{
+    R_X86_64_COPY, R_X86_64_DTPMOD64, R_X86_64_IRELATIVE, R_X86_64_JUMP_SLOT, R_X86_64_PLT32,
+    R_X86_64_PLT32_BND, R_X86_64_RELATIVE,
 };
+use crate::elf::read::consts::{EM_X86_64, ET_DYN, ET_EXEC, SHF_ALLOC, reloc_name};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::output::{ChunkRange, OutputFile};
+use crate::symbols::SymbolFlags;
 
-use super::arch::x86_64::{self, ApplyError, Kind};
+use super::arch::x86_64::{self, ApplyError, Kind, PLT_ENTRY_SIZE};
 use super::defined::LinkerSymbols;
+use super::dynsym::{self, DynamicPlan};
 use super::ehframe::EhSection;
+use super::export::PREEMPTIBLE;
 use super::layout::{EHDR_SIZE, Layout, Member, PHDR_SIZE, SHDR_SIZE, Trailer};
 use super::object::SectionKind;
+use super::refs::Refs;
+use super::reloc::{self, Context, Dynamic};
 use super::rules::Synthetic;
-use super::scan::location;
+use super::scan::{ScanResult, location};
 use super::symtab::{SymtabPlan, write_strtab, write_symtab};
-use super::synth::{Owner, write_build_id_header};
+use super::synth::{GotKind, Owner, SlotReloc, got_slot_relocs, write_build_id_header};
 use super::values::Addresses;
 
 /// What one output chunk holds.
@@ -40,6 +56,8 @@ enum Chunk {
     Symtab,
     Strtab,
     Shstrtab,
+    EmitRelocs(u32),
+    Prerendered(usize),
     SectionHeaders,
 }
 
@@ -53,10 +71,35 @@ pub struct WriteInput<'w, 'x, 'a> {
     pub symtab: &'w SymtabPlan,
     /// Linker-defined symbols.
     pub linker: &'w LinkerSymbols,
+    /// The dynamic symbol table plan.
+    pub dynamic: &'w DynamicPlan,
+    /// The relocation scan (for sections with dynamic relocations).
+    pub scan: &'w ScanResult,
+    /// Relocation decision context.
+    pub context: Context,
+    /// Tombstone values for debug relocations to discarded code.
+    pub tombstones: &'w Tombstones,
+    /// The encoded `.relr.dyn` words ([`encode_relr`]).
+    pub relr: &'w [u64],
     /// The entry address.
     pub entry: u64,
+    /// Output sections rendered ahead of the write (compressed debug
+    /// sections, and those compression did not shrink).
+    pub prerendered: &'w [Prerendered],
     /// Diagnostics.
     pub diagnostics: &'w dyn DiagnosticSink,
+}
+
+/// An output section whose final bytes were produced before the write.
+#[derive(Clone, Debug)]
+pub struct Prerendered {
+    /// Its position in [`Layout::sections`].
+    pub position: u32,
+    /// The bytes written for it.
+    pub bytes: Vec<u8>,
+    /// Whether `bytes` is the compressed form (the section's layout size
+    /// then is the compressed size).
+    pub compressed: bool,
 }
 
 /// Writes the output file and applies the build-id.
@@ -72,8 +115,19 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(0)),
     );
     chunks.push((ChunkRange::new(0, headers), Chunk::Headers));
-    for section in &layout.sections {
+    for (position, section) in layout.sections.iter().enumerate() {
         if !section.has_file_bytes() || section.size == 0 {
+            continue;
+        }
+        if let Some(index) = input
+            .prerendered
+            .iter()
+            .position(|p| p.position as usize == position)
+        {
+            chunks.push((
+                ChunkRange::new(section.offset, section.size),
+                Chunk::Prerendered(index),
+            ));
             continue;
         }
         match section.trailer {
@@ -89,18 +143,25 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                     Chunk::Shstrtab,
                 ));
             }
+            Trailer::Rela(target) => {
+                chunks.push((
+                    ChunkRange::new(section.offset, section.size),
+                    Chunk::EmitRelocs(target),
+                ));
+            }
             Trailer::None => {
                 for placed in &section.members {
                     if placed.size == 0 {
                         continue;
                     }
-                    let range =
-                        ChunkRange::new(section.offset.saturating_add(placed.offset), placed.size);
                     let chunk = match placed.member {
                         Member::Input(id) => Chunk::Input(id),
                         Member::Merge(group) => Chunk::Merge(group),
+                        Member::Synthetic(Synthetic::DynBss | Synthetic::Common) => continue,
                         Member::Synthetic(kind) => Chunk::Synthetic(kind),
                     };
+                    let range =
+                        ChunkRange::new(section.offset.saturating_add(placed.offset), placed.size);
                     chunks.push((range, chunk));
                 }
             }
@@ -128,7 +189,13 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         addresses: input.addresses,
         symtab: input.symtab,
         linker: input.linker,
+        dynamic: input.dynamic,
+        scan: input.scan,
+        context: input.context,
+        tombstones: input.tombstones,
+        relr: input.relr,
         entry: input.entry,
+        prerendered: input.prerendered,
         diagnostics: &collected,
     };
     file.write_chunks(&ranges, |index, out| {
@@ -137,6 +204,17 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         };
         write_chunk(&local, chunk, out)
     })?;
+    emit_collected(collected, input)?;
+    if let Some((_, offset, _)) = layout.synthetic(Synthetic::BuildId) {
+        file.apply_build_id(&input.options.build_id, offset.saturating_add(16))?;
+    }
+    file.finish()?;
+    Ok(())
+}
+
+/// Emits the problems chunks reported, in input order; fails the link on
+/// errors (unless `--noinhibit-exec`).
+fn emit_collected(collected: Collect, input: &WriteInput<'_, '_, '_>) -> Result<()> {
     let mut problems = collected.take_sorted();
     problems.sort_by(|a, b| {
         let key = |d: &Diagnostic| {
@@ -159,11 +237,86 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     if errors > 0 && !input.options.noinhibit_exec {
         return Err(Error::Reported { errors });
     }
-    if let Some((_, offset, _)) = layout.synthetic(Synthetic::BuildId) {
-        file.apply_build_id(&input.options.build_id, offset.saturating_add(16))?;
-    }
-    file.finish()?;
     Ok(())
+}
+
+/// Renders the non-allocated `.debug*` output sections and compresses them
+/// for `--compress-debug-sections`. A section keeps its uncompressed bytes
+/// when compression does not make it smaller, as with GNU ld; either way
+/// its bytes are returned, so the write does not relocate it again.
+///
+/// # Errors
+///
+/// Returns [`Error::Reported`] when relocations in the sections failed, and
+/// [`Error::Internal`] for layout bugs.
+pub fn prerender_debug_sections(
+    input: &WriteInput<'_, '_, '_>,
+    compression: crate::debug::section::OutputCompression,
+) -> Result<Vec<Prerendered>> {
+    let layout = input.addresses.layout;
+    let collected = Collect::new();
+    let local = WriteInput {
+        diagnostics: &collected,
+        ..*input
+    };
+    let mut out = Vec::new();
+    for (position, section) in layout.sections.iter().enumerate() {
+        if section.trailer != Trailer::None
+            || section.is_alloc()
+            || !section.has_file_bytes()
+            || section.size == 0
+            || !section.name.starts_with(b".debug")
+        {
+            continue;
+        }
+        let size = usize::try_from(section.size)
+            .map_err(|_| Error::Limit("debug section larger than memory".into()))?;
+        let mut bytes = vec![0u8; size];
+        let mut chunks: Vec<(ChunkRange, Chunk)> = Vec::new();
+        for placed in &section.members {
+            if placed.size == 0 {
+                continue;
+            }
+            let chunk = match placed.member {
+                Member::Input(id) => Chunk::Input(id),
+                Member::Merge(group) => Chunk::Merge(group),
+                Member::Synthetic(kind) => Chunk::Synthetic(kind),
+            };
+            chunks.push((ChunkRange::new(placed.offset, placed.size), chunk));
+        }
+        chunks.sort_by_key(|(range, _)| range.offset);
+        let ranges: Vec<ChunkRange> = chunks.iter().map(|(range, _)| *range).collect();
+        let slices = crate::output::split_chunks(&mut bytes, &ranges)
+            .map_err(|e| Error::Internal(format!("debug section layout: {e}")))?;
+        let results: Vec<Result<()>> = slices
+            .into_par_iter()
+            .zip(chunks.par_iter())
+            .map(|(slice, &(_, chunk))| write_chunk(&local, chunk, slice))
+            .collect();
+        results.into_iter().collect::<Result<()>>()?;
+        let compressed = crate::debug::section::compress_section::<crate::elf::read::Elf64Le>(
+            &bytes,
+            compression,
+            section.align,
+        );
+        let position =
+            u32::try_from(position).map_err(|_| Error::Limit("too many output sections".into()))?;
+        if compressed.len() < bytes.len() {
+            out.push(Prerendered {
+                position,
+                bytes: compressed,
+                compressed: true,
+            });
+        } else {
+            out.push(Prerendered {
+                position,
+                bytes,
+                compressed: false,
+            });
+        }
+    }
+    emit_collected(collected, input)?;
+    Ok(out)
 }
 
 fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> Result<()> {
@@ -192,6 +345,13 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             .write_group(group as usize, out)
             .map_err(Error::from),
         Chunk::Synthetic(kind) => write_synthetic(input, kind, out),
+        Chunk::EmitRelocs(target) => super::emit::write(input, target, out),
+        Chunk::Prerendered(index) => {
+            if let Some(prerendered) = input.prerendered.get(index) {
+                copy_into(out, &prerendered.bytes);
+            }
+            Ok(())
+        }
         Chunk::Input(id) => write_input(input, id, out),
     }
 }
@@ -210,7 +370,9 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     } else {
         3
     }; // ELFOSABI_GNU
-    header[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+    let pic = input.addresses.synth.mode.is_some_and(|m| m.pic);
+    let e_type = if pic { ET_DYN } else { ET_EXEC };
+    header[16..18].copy_from_slice(&e_type.to_le_bytes());
     header[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[24..32].copy_from_slice(&input.entry.to_le_bytes());
@@ -284,81 +446,92 @@ fn write_section_headers(layout: &Layout<'_>, out: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+fn copy_into(out: &mut [u8], bytes: &[u8]) {
+    if let Some(dest) = out.get_mut(..bytes.len()) {
+        dest.copy_from_slice(bytes);
+    }
+}
+
 fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u8]) -> Result<()> {
     let addresses = input.addresses;
     let synth = addresses.synth;
+    let plan = input.dynamic;
     match kind {
-        Synthetic::None => {}
+        Synthetic::None | Synthetic::EhFrameEnd | Synthetic::Common | Synthetic::DynBss => {}
+        Synthetic::DynRelro => out.fill(0),
         Synthetic::BuildId => {
             write_build_id_header(out, synth.build_id.unwrap_or(0));
         }
         Synthetic::GnuProperty => {
-            if let (Some(note), Some(dest)) = (
-                &synth.property_note,
-                synth
-                    .property_note
-                    .as_ref()
-                    .and_then(|n| out.get_mut(..n.len())),
-            ) {
-                dest.copy_from_slice(note);
+            if let Some(note) = &synth.property_note {
+                copy_into(out, note);
             }
         }
-        Synthetic::Comment => {
-            let text = super::synth::comment();
-            if let Some(dest) = out.get_mut(..text.len()) {
-                dest.copy_from_slice(&text);
+        Synthetic::Interp => {
+            if let Some(interp) = &synth.interp {
+                copy_into(out, interp);
             }
         }
-        Synthetic::EhFrameEnd | Synthetic::Common => {}
-        Synthetic::Got => {
-            for (owner, entry) in synth.got.iter().zip(out.as_chunks_mut::<8>().0.iter_mut()) {
-                let value = owner_value(addresses, owner);
-                entry.copy_from_slice(&value.to_le_bytes());
+        Synthetic::Comment => copy_into(out, &super::synth::comment()),
+        Synthetic::DynStr => copy_into(out, &plan.dynstr),
+        Synthetic::GnuHash => copy_into(out, &plan.gnu_hash),
+        Synthetic::Hash => copy_into(out, &plan.sysv_hash),
+        Synthetic::VerNeed => copy_into(out, &plan.verneed),
+        Synthetic::VerDef => copy_into(out, &plan.verdef),
+        Synthetic::VerSym => {
+            for (value, slot) in plan
+                .versym
+                .iter()
+                .zip(out.as_chunks_mut::<2>().0.iter_mut())
+            {
+                *slot = value.to_le_bytes();
             }
         }
-        Synthetic::IgotPlt => {
-            let reserved = usize::try_from(synth.got_plt_reserved).unwrap_or(0);
-            let slots = out.as_chunks_mut::<8>().0.iter_mut().skip(reserved);
-            for (owner, entry) in synth.iplt.iter().zip(slots) {
-                // Filled by IRELATIVE at startup; hold the resolver address
-                // meanwhile, as GNU ld does.
-                let value = resolver_address(addresses, owner);
-                entry.copy_from_slice(&value.to_le_bytes());
+        Synthetic::DynSym => dynsym::write_dynsym(plan, addresses, out),
+        Synthetic::Dynamic => dynsym::write_dynamic(plan, addresses, out),
+        Synthetic::RelaDyn => write_rela_dyn(input, out)?,
+        Synthetic::RelrDyn => {
+            // Words past the encoding (the section keeps the size layout
+            // planned) are empty bitmaps, which the dynamic linker skips.
+            let mut words = input.relr.iter().copied();
+            for slot in out.as_chunks_mut::<8>().0.iter_mut() {
+                *slot = words.next().unwrap_or(1).to_le_bytes();
             }
         }
-        Synthetic::Iplt => {
+        Synthetic::Got => write_got(input, out),
+        Synthetic::GotPlt => write_got_plt(input, out),
+        Synthetic::Plt => write_plt(input, out)?,
+        Synthetic::PltSec => {
             let (base, ..) = addresses
                 .layout
-                .synthetic(Synthetic::Iplt)
+                .synthetic(Synthetic::PltSec)
                 .unwrap_or_default();
-            for (index, entry) in out
-                .as_chunks_mut::<16>()
-                .0
-                .iter_mut()
-                .enumerate()
-                .take(synth.iplt.len())
-            {
-                let stub =
-                    base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(16));
+            for (index, entry) in out.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                let index64 = u64::try_from(index).unwrap_or(u64::MAX);
+                let address = base.saturating_add(index64.saturating_mul(PLT_ENTRY_SIZE));
                 let slot = addresses.igot_address(index).unwrap_or(0);
-                x86_64::write_iplt(entry, stub, slot)
-                    .map_err(|_| Error::Internal("IFUNC PLT slot out of range".into()))?;
+                x86_64::write_plt_jump(entry, address, slot, true)
+                    .map_err(|_| Error::Internal("PLT slot out of range".into()))?;
             }
         }
-        Synthetic::RelaIplt => {
-            for (index, (owner, entry)) in synth
-                .iplt
-                .iter()
-                .zip(out.as_chunks_mut::<24>().0.iter_mut())
-                .enumerate()
-            {
-                let slot = addresses.igot_address(index).unwrap_or(0);
-                let resolver = resolver_address(addresses, owner);
-                entry[0..8].copy_from_slice(&slot.to_le_bytes());
-                entry[8..16].copy_from_slice(&u64::from(R_X86_64_IRELATIVE).to_le_bytes());
-                entry[16..24].copy_from_slice(&resolver.to_le_bytes());
+        Synthetic::PltGot => {
+            let (base, ..) = addresses
+                .layout
+                .synthetic(Synthetic::PltGot)
+                .unwrap_or_default();
+            let size = if synth.ibt { 16usize } else { 8 };
+            for (index, owner) in synth.plt_got.iter().enumerate() {
+                let start = index.saturating_mul(size);
+                let Some(entry) = out.get_mut(start..start.saturating_add(size)) else {
+                    break;
+                };
+                let address = base.saturating_add(u64::try_from(start).unwrap_or(0));
+                let slot = addresses.got_address(owner).unwrap_or(0);
+                x86_64::write_plt_jump(entry, address, slot, synth.ibt)
+                    .map_err(|_| Error::Internal("PLT GOT slot out of range".into()))?;
             }
         }
+        Synthetic::RelaPlt => write_rela_plt(input, out),
         Synthetic::EhFrameHdr => {
             write_eh_frame_hdr(addresses, out);
         }
@@ -366,11 +539,16 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
     Ok(())
 }
 
-/// The value a GOT entry holds for `owner`.
+/// The value a GOT entry holds for `owner`, before dynamic relocation.
 fn owner_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
     if let Some(stub) = addresses.iplt_address(owner) {
         return stub;
     }
+    symbol_value(addresses, owner)
+}
+
+/// The address of `owner`'s symbol.
+fn symbol_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
     match owner {
         Owner::Global(id) => addresses.globals.get(id.index()).copied().unwrap_or(0),
         Owner::Local { file, symbol } => addresses
@@ -381,16 +559,518 @@ fn owner_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
     }
 }
 
-/// The resolver address of IFUNC `owner`.
-fn resolver_address(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
-    match owner {
-        Owner::Global(id) => addresses.globals.get(id.index()).copied().unwrap_or(0),
-        Owner::Local { file, symbol } => addresses
-            .refs
-            .target(file as usize, symbol as usize)
-            .and_then(|t| addresses.symbol_address(&t, 0))
-            .map_or(0, |(s, _)| s),
+fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+    let addresses = input.addresses;
+    let synth = addresses.synth;
+    let Some((base, ..)) = addresses.layout.synthetic(Synthetic::Got) else {
+        return;
+    };
+    let tls = addresses.layout.tls.unwrap_or_default();
+    let mode = synth.mode;
+    let (words, _) = out.as_chunks_mut::<8>();
+    let mut put = |address: u64, value: u64| {
+        let index = address.wrapping_sub(base) / 8;
+        if let Some(word) = usize::try_from(index).ok().and_then(|i| words.get_mut(i)) {
+            *word = value.to_le_bytes();
+        }
+    };
+    let refs = &addresses.refs;
+    for (list, kind) in [
+        (&synth.got, GotKind::Address),
+        (&synth.tlsgd, GotKind::TlsGd),
+        (&synth.gottpoff, GotKind::TpOff),
+        (&synth.tlsdesc, GotKind::TlsDesc),
+    ] {
+        for owner in list.iter() {
+            let Some(address) = addresses.got_entry_address(owner, kind) else {
+                continue;
+            };
+            let relocs = match mode {
+                Some(mode) => got_slot_relocs(refs, mode, owner, kind),
+                None => [SlotReloc::None; 2],
+            };
+            let value = owner_value(addresses, owner);
+            match kind {
+                GotKind::Address => {
+                    let word = match relocs[0] {
+                        SlotReloc::Symbolic(_) => 0,
+                        _ => value,
+                    };
+                    put(address, word);
+                }
+                GotKind::TpOff => {
+                    let word = match relocs[0] {
+                        SlotReloc::None => value.wrapping_sub(tls.tp()),
+                        _ => 0,
+                    };
+                    put(address, word);
+                }
+                GotKind::TlsGd => {
+                    let (module, offset) = match relocs {
+                        [SlotReloc::None, SlotReloc::None] => (1, value.wrapping_sub(tls.start)),
+                        [_, SlotReloc::None] => (0, value.wrapping_sub(tls.start)),
+                        _ => (0, 0),
+                    };
+                    put(address, module);
+                    put(address.wrapping_add(8), offset);
+                }
+                GotKind::TlsDesc | GotKind::TlsLd => {
+                    put(address, 0);
+                    put(address.wrapping_add(8), 0);
+                }
+            }
+        }
     }
+}
+
+fn write_got_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+    let addresses = input.addresses;
+    let synth = addresses.synth;
+    let (words, _) = out.as_chunks_mut::<8>();
+    let reserved = usize::try_from(synth.got_plt_reserved).unwrap_or(0);
+    if synth.dynamic() {
+        if let Some(first) = words.first_mut() {
+            let dynamic = addresses
+                .layout
+                .synthetic(Synthetic::Dynamic)
+                .map_or(0, |(addr, ..)| addr);
+            *first = dynamic.to_le_bytes();
+        }
+        let slots = words.iter_mut().skip(reserved);
+        for (index, (owner, slot)) in synth
+            .plt
+            .iter()
+            .chain(synth.iplt.iter())
+            .zip(slots)
+            .enumerate()
+        {
+            let index64 = u64::try_from(index).unwrap_or(u64::MAX);
+            let value = if synth.iplt.index(owner).is_some() {
+                symbol_value(addresses, owner)
+            } else {
+                let lazy = addresses.lazy_plt_address(index64).unwrap_or(0);
+                // The lazy entry: with IBT, the whole `.plt` entry; without,
+                // the `push` that follows the jump.
+                if synth.ibt {
+                    lazy
+                } else {
+                    lazy.wrapping_add(6)
+                }
+            };
+            *slot = value.to_le_bytes();
+        }
+        return;
+    }
+    let slots = words.iter_mut().skip(reserved);
+    for (owner, entry) in synth.iplt.iter().zip(slots) {
+        // Filled by IRELATIVE at startup; hold the resolver address
+        // meanwhile, as GNU ld does.
+        let value = symbol_value(addresses, owner);
+        *entry = value.to_le_bytes();
+    }
+}
+
+fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+    let addresses = input.addresses;
+    let synth = addresses.synth;
+    let (base, ..) = addresses
+        .layout
+        .synthetic(Synthetic::Plt)
+        .unwrap_or_default();
+    let range = || Error::Internal("PLT slot out of range".into());
+    if !synth.dynamic() {
+        for (index, entry) in out
+            .as_chunks_mut::<16>()
+            .0
+            .iter_mut()
+            .enumerate()
+            .take(synth.iplt.len())
+        {
+            let stub = base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(16));
+            let slot = addresses.igot_address(index).unwrap_or(0);
+            x86_64::write_iplt(entry, stub, slot).map_err(|_| range())?;
+        }
+        return Ok(());
+    }
+    let got_plt = addresses
+        .layout
+        .synthetic(Synthetic::GotPlt)
+        .map_or(0, |(addr, ..)| addr);
+    let (entries, _) = out.as_chunks_mut::<16>();
+    let Some((header, rest)) = entries.split_first_mut() else {
+        return Ok(());
+    };
+    x86_64::write_plt_header(header, base, got_plt).map_err(|_| range())?;
+    for (index, entry) in rest.iter_mut().enumerate() {
+        let index64 = u64::try_from(index).unwrap_or(u64::MAX);
+        let address = addresses.lazy_plt_address(index64).unwrap_or(0);
+        let slot = addresses.igot_address(index).unwrap_or(0);
+        let reloc_index = u32::try_from(index).map_err(|_| range())?;
+        x86_64::write_plt_entry(entry, address, slot, reloc_index, base, synth.ibt)
+            .map_err(|_| range())?;
+    }
+    Ok(())
+}
+
+fn put_rela(out: &mut [u8], offset: u64, symbol: u32, r_type: u32, addend: i64) {
+    let Some(entry) = out.first_chunk_mut::<24>() else {
+        return;
+    };
+    let info = (u64::from(symbol) << 32) | u64::from(r_type);
+    entry[0..8].copy_from_slice(&offset.to_le_bytes());
+    entry[8..16].copy_from_slice(&info.to_le_bytes());
+    entry[16..24].copy_from_slice(&addend.to_le_bytes());
+}
+
+fn write_rela_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+    let addresses = input.addresses;
+    let synth = addresses.synth;
+    let (entries, _) = out.as_chunks_mut::<24>();
+    if !synth.dynamic() {
+        for (index, (owner, entry)) in synth.iplt.iter().zip(entries.iter_mut()).enumerate() {
+            let slot = addresses.igot_address(index).unwrap_or(0);
+            let resolver = symbol_value(addresses, owner);
+            put_rela(entry, slot, 0, R_X86_64_IRELATIVE, resolver as i64);
+        }
+        return;
+    }
+    for (index, (owner, entry)) in synth
+        .plt
+        .iter()
+        .chain(synth.iplt.iter())
+        .zip(entries.iter_mut())
+        .enumerate()
+    {
+        let slot = addresses.igot_address(index).unwrap_or(0);
+        match owner {
+            Owner::Global(id) if synth.iplt.index(owner).is_none() => {
+                put_rela(
+                    entry,
+                    slot,
+                    input.dynamic.index_of(id),
+                    R_X86_64_JUMP_SLOT,
+                    0,
+                );
+            }
+            _ => {
+                let resolver = symbol_value(addresses, owner);
+                put_rela(entry, slot, 0, R_X86_64_IRELATIVE, resolver as i64);
+            }
+        }
+    }
+}
+
+/// One dynamic relocation before it is encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DynReloc {
+    /// Sort class: relative relocations first, `IRELATIVE` last.
+    class: u8,
+    symbol: u32,
+    offset: u64,
+    r_type: u32,
+    addend: i64,
+    /// A relative relocation that `.relr.dyn` can hold.
+    packable: bool,
+}
+
+fn dyn_reloc(offset: u64, symbol: u32, r_type: u32, addend: i64) -> DynReloc {
+    let class = match r_type {
+        R_X86_64_RELATIVE => 0,
+        R_X86_64_IRELATIVE => 2,
+        _ => 1,
+    };
+    DynReloc {
+        class,
+        symbol,
+        offset,
+        r_type,
+        addend,
+        packable: false,
+    }
+}
+
+/// Every dynamic relocation of the output except `.rela.plt`'s, unsorted:
+/// GOT entries, copy relocations, and input sections (in parallel).
+fn collect_dyn_relocs(
+    addresses: &Addresses<'_, '_>,
+    context: &Context,
+    plan: &DynamicPlan,
+    scan: &ScanResult,
+) -> Vec<DynReloc> {
+    let synth = addresses.synth;
+    let refs = &addresses.refs;
+    let Some(mode) = synth.mode else {
+        return Vec::new();
+    };
+    let tls = addresses.layout.tls.unwrap_or_default();
+    let mut relocs: Vec<DynReloc> = Vec::new();
+    for (list, kind) in [
+        (&synth.got, GotKind::Address),
+        (&synth.tlsgd, GotKind::TlsGd),
+        (&synth.gottpoff, GotKind::TpOff),
+        (&synth.tlsdesc, GotKind::TlsDesc),
+    ] {
+        for owner in list.iter() {
+            let Some(address) = addresses.got_entry_address(owner, kind) else {
+                continue;
+            };
+            let symbol = match owner {
+                Owner::Global(id) => plan.index_of(id),
+                Owner::Local { .. } => 0,
+            };
+            let value = owner_value(addresses, owner);
+            for (word, reloc) in got_slot_relocs(refs, mode, owner, kind)
+                .into_iter()
+                .enumerate()
+            {
+                let at = address.wrapping_add(if word == 0 { 0 } else { 8 });
+                match reloc {
+                    SlotReloc::None => {}
+                    SlotReloc::Relative => {
+                        let mut reloc = dyn_reloc(at, 0, R_X86_64_RELATIVE, value as i64);
+                        reloc.packable = true;
+                        relocs.push(reloc);
+                    }
+                    SlotReloc::Symbolic(r_type) => relocs.push(dyn_reloc(at, symbol, r_type, 0)),
+                    SlotReloc::Module(r_type) => {
+                        let addend = if r_type == R_X86_64_DTPMOD64 {
+                            0
+                        } else {
+                            value.wrapping_sub(tls.start) as i64
+                        };
+                        relocs.push(dyn_reloc(at, 0, r_type, addend));
+                    }
+                }
+            }
+        }
+    }
+    if synth.tlsld
+        && let Some(address) =
+            addresses.got_entry_address(Owner::Local { file: 0, symbol: 0 }, GotKind::TlsLd)
+    {
+        relocs.push(dyn_reloc(address, 0, R_X86_64_DTPMOD64, 0));
+    }
+    for copy in &synth.copies {
+        let address = addresses
+            .globals
+            .get(copy.symbol.index())
+            .copied()
+            .unwrap_or(0);
+        relocs.push(dyn_reloc(
+            address,
+            plan.index_of(copy.symbol),
+            R_X86_64_COPY,
+            0,
+        ));
+    }
+    let sections: Vec<(usize, u32)> = scan
+        .files
+        .iter()
+        .enumerate()
+        .flat_map(|(file, scan)| scan.dyn_sections.iter().map(move |d| (file, d.section)))
+        .collect();
+    let from_sections: Vec<Vec<DynReloc>> = sections
+        .par_iter()
+        .map(|&(file, section)| section_dyn_relocs(addresses, context, plan, file, section))
+        .collect();
+    for list in from_sections {
+        relocs.extend(list);
+    }
+    relocs
+}
+
+fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+    let synth = input.addresses.synth;
+    let mut relocs = collect_dyn_relocs(input.addresses, &input.context, input.dynamic, input.scan);
+    if synth.relr {
+        relocs.retain(|r| !r.packable);
+    }
+    let expected = usize::try_from(synth.rela_dyn_count()).unwrap_or(usize::MAX);
+    if relocs.len() != expected {
+        return Err(Error::Internal(format!(
+            "dynamic relocation count changed after planning ({expected} planned, {} made)",
+            relocs.len()
+        )));
+    }
+    relocs.par_sort_unstable();
+    for (reloc, entry) in relocs.iter().zip(out.as_chunks_mut::<24>().0.iter_mut()) {
+        put_rela(
+            entry,
+            reloc.offset,
+            reloc.symbol,
+            reloc.r_type,
+            reloc.addend,
+        );
+    }
+    Ok(())
+}
+
+/// The addresses of the relative relocations `.relr.dyn` holds, sorted.
+#[must_use]
+pub fn relr_addresses(
+    addresses: &Addresses<'_, '_>,
+    context: &Context,
+    plan: &DynamicPlan,
+    scan: &ScanResult,
+) -> Vec<u64> {
+    let mut places: Vec<u64> = collect_dyn_relocs(addresses, context, plan, scan)
+        .into_iter()
+        .filter(|r| r.packable)
+        .map(|r| r.offset)
+        .collect();
+    places.par_sort_unstable();
+    places.dedup();
+    places
+}
+
+/// Encodes sorted, even relocation addresses as `SHT_RELR` words: an
+/// address entry, then bitmaps of the following 63 words, repeatedly.
+#[must_use]
+pub fn encode_relr(places: &[u64]) -> Vec<u64> {
+    const BITS: u64 = 63;
+    let mut words = Vec::new();
+    let mut i = 0usize;
+    while let Some(&start) = places.get(i) {
+        words.push(start);
+        let mut base = start.wrapping_add(8);
+        i = i.saturating_add(1);
+        loop {
+            let mut bitmap = 0u64;
+            while let Some(&place) = places.get(i) {
+                let delta = place.wrapping_sub(base);
+                if place < base || delta >= BITS * 8 || delta % 8 != 0 {
+                    break;
+                }
+                bitmap |= 1u64 << (delta / 8);
+                i = i.saturating_add(1);
+            }
+            if bitmap == 0 {
+                break;
+            }
+            words.push((bitmap << 1) | 1);
+            base = base.wrapping_add(BITS * 8);
+        }
+    }
+    words
+}
+
+/// The dynamic relocations of section `section` of `file`, by re-running
+/// the scan's decisions.
+fn section_dyn_relocs(
+    addresses: &Addresses<'_, '_>,
+    context: &Context,
+    plan: &DynamicPlan,
+    file_index: usize,
+    section_index: u32,
+) -> Vec<DynReloc> {
+    let refs = &addresses.refs;
+    let mut out = Vec::new();
+    let Some(object) = refs.files.get(file_index).and_then(|f| f.object.as_ref()) else {
+        return out;
+    };
+    let Some(section) = object.section(section_index) else {
+        return out;
+    };
+    let Some(id) = refs.sections.id(file_index, section_index) else {
+        return out;
+    };
+    let data = if section.kind == SectionKind::Merge || section.is_nobits() {
+        &[][..]
+    } else {
+        object.section_data(section).unwrap_or_default()
+    };
+    let Some(Ok(Some(relocations))) = object
+        .section(section.relocs)
+        .map(|r| object.elf.relocation_section(section.relocs, &r.header))
+    else {
+        return out;
+    };
+    let Relocations::Rela(relas) = relocations.relocations else {
+        return out;
+    };
+    let base = addresses.section_address(id).unwrap_or(0);
+    let mut skip = false;
+    for rel in relas.iter() {
+        if skip {
+            skip = false;
+            continue;
+        }
+        let Some(target) = refs.target(file_index, rel.symbol as usize) else {
+            continue;
+        };
+        let flags = target
+            .global
+            .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+        let Ok(decision) =
+            reloc::decide(context, &rel, data, &target, flags, section.header.sh_flags)
+        else {
+            continue;
+        };
+        skip = decision.class.kind.skips_next();
+        if decision.problem.is_some() {
+            continue;
+        }
+        let place = offset_address(addresses, file_index, section_index, base, rel.offset);
+        match decision.dynamic {
+            Dynamic::None => {}
+            Dynamic::Relative => {
+                let owner = Addresses::owner(&target, file_index, rel.symbol);
+                let (s, a) = target_value(addresses, &target, owner, rel.addend);
+                let mut reloc =
+                    dyn_reloc(place, 0, R_X86_64_RELATIVE, s.wrapping_add_signed(a) as i64);
+                reloc.packable = reloc::packable(section.header.sh_addralign, rel.offset);
+                out.push(reloc);
+            }
+            Dynamic::Symbolic(r_type) => {
+                let symbol = target.global.map_or(0, |id| plan.index_of(id));
+                out.push(dyn_reloc(place, symbol, r_type, rel.addend));
+            }
+        }
+    }
+    out
+}
+
+/// The output address of offset `offset` of an input section at `base`
+/// (merge sections map through their pieces).
+fn offset_address(
+    addresses: &Addresses<'_, '_>,
+    file: usize,
+    section: u32,
+    base: u64,
+    offset: u64,
+) -> u64 {
+    let merge = addresses
+        .refs
+        .files
+        .get(file)
+        .and_then(|f| f.object.as_ref())
+        .and_then(|o| o.section(section))
+        .is_some_and(|s| s.kind == SectionKind::Merge);
+    if merge {
+        return addresses
+            .section_offset_address(file, section, offset)
+            .unwrap_or(0);
+    }
+    base.wrapping_add(offset)
+}
+
+/// `(S, A)` for a relocation: IFUNCs resolve to their PLT stub, calls to
+/// preemptible symbols to their PLT entry.
+fn target_value(
+    addresses: &Addresses<'_, '_>,
+    target: &super::refs::Target,
+    owner: Owner,
+    addend: i64,
+) -> (u64, i64) {
+    let (mut s, a) = addresses
+        .symbol_address(target, addend)
+        .unwrap_or((0, addend));
+    if target.is_ifunc()
+        && let Some(stub) = addresses.iplt_address(owner)
+    {
+        s = stub;
+    }
+    (s, a)
 }
 
 fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
@@ -440,18 +1120,32 @@ fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
     }
 }
 
-/// Tombstone value for relocations from non-allocated sections to discarded
-/// code: 1 in `.debug_ranges`/`.debug_loc` (where 0 ends a list), 0
-/// elsewhere. W10 will replace this with the canonical rules in
-/// `crate::debug`.
-fn tombstone(section_name: &[u8]) -> u64 {
-    if section_name == b".debug_ranges" || section_name == b".debug_loc" {
-        1
-    } else {
-        0
+/// The byte width of a relocation field.
+fn width_bytes(width: x86_64::Width) -> usize {
+    use x86_64::Width as W;
+    match width {
+        W::None => 0,
+        W::W64 => 8,
+        W::U32 | W::I32 => 4,
+        W::Any16 | W::I16 => 2,
+        W::Any8 | W::I8 => 1,
     }
 }
 
+/// Why a relocation's target section is not in the output, if it is not.
+fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
+    let id = refs.target_section(target)?;
+    if refs.sections.is_live(id) {
+        return None;
+    }
+    Some(if refs.sections.resolve(id).is_some() {
+        DeadTarget::Folded
+    } else {
+        DeadTarget::Discarded
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) -> Result<()> {
     let addresses = input.addresses;
     let refs = &addresses.refs;
@@ -470,7 +1164,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
     let section = object
         .section(section_index)
         .ok_or_else(|| Error::Internal("unknown section in output".into()))?;
-    let data = object.elf.section_data(&section.header)?;
+    let data = object.section_data(section)?;
     let base = addresses.section_address(id).unwrap_or(0);
 
     if section.kind == SectionKind::EhFrame {
@@ -499,6 +1193,12 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         return Ok(());
     };
     let alloc = section.header.sh_flags & SHF_ALLOC != 0;
+    let tombstone = if alloc {
+        SectionTombstone::default()
+    } else {
+        input.tombstones.for_section(section.name)
+    };
+    let executable = input.context.mode.executable() || !input.context.mode.dynamic;
     let order = file.position.raw();
     let mut skip = false;
     for rel in relas.iter() {
@@ -516,22 +1216,35 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         let Some(target) = refs.target(file_index, rel.symbol as usize) else {
             continue;
         };
-        let is_ifunc = target.is_ifunc();
-        let Ok(class) = x86_64::classify(
-            rel.r_type,
-            rel.addend,
+        let flags = target
+            .global
+            .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+        let Ok(decision) = reloc::decide(
+            &input.context,
+            &rel,
             data,
-            rel.offset,
-            input.options.relax && !is_ifunc,
+            &target,
+            flags,
+            section.header.sh_flags,
         ) else {
             continue; // Reported by the scan.
         };
+        let class = decision.class;
         skip = class.kind.skips_next();
-        if class.kind == Kind::None {
+        if class.kind == Kind::None || (alloc && decision.problem.is_some()) {
             continue;
         }
         let place = base.wrapping_add(rel.offset);
         let owner = Addresses::owner(&target, file_index, rel.symbol);
+        if !alloc
+            && matches!(class.kind, Kind::Abs | Kind::DtpOff)
+            && let Some(dead) = dead_target(refs, &target)
+            && let Some(value) = tombstone.get(dead)
+        {
+            let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
+            let _ = x86_64::write_value(out, rel.offset, class.width, value);
+            continue;
+        }
         let resolved = addresses.symbol_address(&target, rel.addend);
         let (mut s, a) = match resolved {
             Some(value) => value,
@@ -543,36 +1256,64 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                     ));
                     continue;
                 }
-                let value = tombstone(section.name);
+                let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
+                let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
                 let _ = x86_64::write_value(out, rel.offset, class.width, value);
                 continue;
             }
         };
-        if is_ifunc
-            && alloc
-            && let Some(stub) = addresses.iplt_address(owner)
-        {
-            s = stub;
+        if alloc {
+            if target.is_ifunc()
+                && let Some(stub) = addresses.iplt_address(owner)
+            {
+                s = stub;
+            }
+            if class.kind == Kind::Pc
+                && matches!(rel.r_type, R_X86_64_PLT32 | R_X86_64_PLT32_BND)
+                && flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
+                && let Some(plt) = addresses.plt_address(owner)
+            {
+                s = plt;
+            }
         }
         let sa = s.wrapping_add_signed(a);
         let tls = addresses.layout.tls.unwrap_or_default();
+        let got_pc = |kind: GotKind| -> Result<u64, ApplyError> {
+            let entry = addresses
+                .got_entry_address(owner, kind)
+                .ok_or(ApplyError::BadInstruction)?;
+            Ok(entry.wrapping_add_signed(a).wrapping_sub(place))
+        };
         let result = match class.kind {
             Kind::None => Ok(()),
-            Kind::Abs => x86_64::write_value(out, rel.offset, class.width, sa),
+            Kind::Abs => match decision.dynamic {
+                Dynamic::Symbolic(_) => Ok(()),
+                _ => x86_64::write_value(out, rel.offset, class.width, sa),
+            },
             Kind::Pc => x86_64::write_value(out, rel.offset, class.width, sa.wrapping_sub(place)),
-            Kind::GotPc | Kind::GotEntry => match addresses.got_address(owner) {
-                Some(entry) => {
-                    let value = if class.kind == Kind::GotPc {
-                        entry.wrapping_add_signed(a).wrapping_sub(place)
-                    } else {
-                        entry
-                            .wrapping_sub(addresses.got_base())
-                            .wrapping_add_signed(a)
-                    };
-                    x86_64::write_value(out, rel.offset, class.width, value)
-                }
+            Kind::GotPc => got_pc(GotKind::Address)
+                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
+            Kind::GotEntry => match addresses.got_address(owner) {
+                Some(entry) => x86_64::write_value(
+                    out,
+                    rel.offset,
+                    class.width,
+                    entry
+                        .wrapping_sub(addresses.got_base())
+                        .wrapping_add_signed(a),
+                ),
                 None => Err(ApplyError::BadInstruction),
             },
+            Kind::GotTpOff => got_pc(GotKind::TpOff)
+                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
+            Kind::TlsGd => got_pc(GotKind::TlsGd)
+                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
+            Kind::TlsDesc => got_pc(GotKind::TlsDesc)
+                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
+            Kind::TlsLd => got_pc(GotKind::TlsLd)
+                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
+            Kind::GdToIe | Kind::DescToIe => got_pc(GotKind::TpOff)
+                .and_then(|v| x86_64::relax_tls_ie(out, rel.offset, class.kind, v as i64)),
             Kind::RelaxGotPc => {
                 x86_64::relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
             }
@@ -600,7 +1341,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 x86_64::write_value(out, rel.offset, class.width, sa.wrapping_sub(tls.tp()))
             }
             Kind::DtpOff => {
-                let value = if alloc {
+                let value = if alloc && executable {
                     sa.wrapping_sub(tls.tp())
                 } else {
                     sa.wrapping_sub(tls.start)
@@ -637,15 +1378,9 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
     Ok(())
 }
 
-fn symbol_name(refs: &super::refs::Refs<'_, '_>, file: usize, symbol: u32) -> String {
-    refs.files
-        .get(file)
-        .and_then(|f| f.object.as_ref())
-        .and_then(|o| o.elf.symbols().get(symbol as usize).ok())
-        .map_or_else(
-            || format!("symbol {symbol}"),
-            |s| String::from_utf8_lossy(s.name).into_owned(),
-        )
+fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {
+    refs.symbol_name(file, symbol)
+        .unwrap_or_else(|| format!("symbol {symbol}"))
 }
 
 fn write_eh_frame(
@@ -703,8 +1438,13 @@ fn write_eh_frame(
             let Some(target) = refs.target(eh.file, rel.symbol as usize) else {
                 continue;
             };
-            let Ok(class) = x86_64::classify(rel.r_type, rel.addend, eh.data, rel.offset, false)
-            else {
+            let Ok(class) = x86_64::classify(
+                rel.r_type,
+                rel.addend,
+                eh.data,
+                rel.offset,
+                x86_64::ClassifyContext::static_exec(false),
+            ) else {
                 continue;
             };
             let local = rel

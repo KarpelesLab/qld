@@ -114,7 +114,8 @@ fn describe(addresses: &Addresses<'_, '_>, id: SectionId) -> String {
     format!("{}:({name})", input.display())
 }
 
-/// Writes the map requested by `-Map` or `-M`.
+/// Writes the map requested by `-Map` or `-M`, followed by the `--cref`
+/// table when there is one (which goes to standard output without a map).
 ///
 /// # Errors
 ///
@@ -123,11 +124,15 @@ pub fn write(
     options: &LinkOptions,
     addresses: &Addresses<'_, '_>,
     plan: &SymtabPlan,
+    cref: Option<&str>,
 ) -> Result<()> {
     if options.map_file.is_none() && !options.print_map {
-        return Ok(());
+        return write_cref(options, cref);
     }
-    let text = render(addresses, plan);
+    let mut text = render(addresses, plan);
+    if let Some(cref) = cref {
+        text.push_str(cref);
+    }
     if let Some(path) = &options.map_file {
         std::fs::write(path, &text).map_err(|e| Error::io(path, e))?;
     }
@@ -135,4 +140,24 @@ pub fn write(
         print!("{text}");
     }
     Ok(())
+}
+
+/// Writes the `--cref` table alone: into the `-Map` file if one was named,
+/// otherwise to standard output. Used when no map is rendered (relocatable
+/// output, or no `-Map`/`-M`).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the map file cannot be written.
+pub fn write_cref(options: &LinkOptions, cref: Option<&str>) -> Result<()> {
+    let Some(cref) = cref else {
+        return Ok(());
+    };
+    match &options.map_file {
+        Some(path) => std::fs::write(path, cref).map_err(|e| Error::io(path, e)),
+        None => {
+            print!("{cref}");
+            Ok(())
+        }
+    }
 }

@@ -16,8 +16,13 @@ use crate::elf::read::consts::{
     SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NULL, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
     SHT_SYMTAB_SHNDX, STB_LOCAL, STB_WEAK,
 };
+use std::sync::Arc;
+
+use crate::debug::section::{CompressedSection, ZDEBUG_PREFIX};
+use crate::elf::read::consts::SHF_COMPRESSED;
 use crate::elf::read::{Elf64Le, GnuProperties, ObjectFile, SectionHeader, SectionIndex, Source};
 use crate::error::{Error, Result};
+use crate::input::FileTable;
 use crate::passes::merge::{MergeKind, SplitSection, split_section};
 use crate::symbols::{DefinitionKind, SymbolName, SymbolUse};
 
@@ -55,6 +60,9 @@ pub struct InputSection<'a> {
     /// For [`SectionKind::Merge`], the index of its split in
     /// [`ObjectInput::splits`].
     pub split: u32,
+    /// The decompressed contents of a compressed section, whose header then
+    /// describes the decompressed data.
+    pub contents: Option<&'a [u8]>,
 }
 
 impl InputSection<'_> {
@@ -141,6 +149,79 @@ pub struct ParseConfig<'a> {
     pub strip_debug: bool,
     /// `--wrap` redirections.
     pub wrap: &'a WrapTable,
+    /// Where decompressed section contents are kept for the link.
+    pub table: &'a FileTable,
+}
+
+/// Known `.zdebug_*` names and the names of their decompressed sections.
+const ZDEBUG_NAMES: &[(&[u8], &[u8])] = &[
+    (b".zdebug_abbrev", b".debug_abbrev"),
+    (b".zdebug_addr", b".debug_addr"),
+    (b".zdebug_aranges", b".debug_aranges"),
+    (b".zdebug_frame", b".debug_frame"),
+    (b".zdebug_info", b".debug_info"),
+    (b".zdebug_line", b".debug_line"),
+    (b".zdebug_line_str", b".debug_line_str"),
+    (b".zdebug_loc", b".debug_loc"),
+    (b".zdebug_loclists", b".debug_loclists"),
+    (b".zdebug_macinfo", b".debug_macinfo"),
+    (b".zdebug_macro", b".debug_macro"),
+    (b".zdebug_names", b".debug_names"),
+    (b".zdebug_pubnames", b".debug_pubnames"),
+    (b".zdebug_pubtypes", b".debug_pubtypes"),
+    (b".zdebug_ranges", b".debug_ranges"),
+    (b".zdebug_rnglists", b".debug_rnglists"),
+    (b".zdebug_str", b".debug_str"),
+    (b".zdebug_str_offsets", b".debug_str_offsets"),
+    (b".zdebug_types", b".debug_types"),
+];
+
+/// A decompressed section: its patched header, output name and contents.
+type Decompressed<'a> = (SectionHeader, &'a [u8], &'a [u8]);
+
+/// Decompresses a compressed non-allocated section into the file table.
+fn decompress_section<'a>(
+    elf: &ObjectFile<'a, Elf64Le>,
+    header: &SectionHeader,
+    name: &'a [u8],
+    config: &ParseConfig<'a>,
+) -> Result<Option<Decompressed<'a>>> {
+    let Some(compressed) = CompressedSection::detect(elf, header)? else {
+        return Ok(None);
+    };
+    let source = elf.source();
+    let data = compressed.decompress(source)?;
+    let label = match source.member {
+        Some(member) => format!(
+            "{}({member}) decompressed section at {:#x}",
+            source.path.display(),
+            header.sh_offset
+        ),
+        None => format!(
+            "{} decompressed section at {:#x}",
+            source.path.display(),
+            header.sh_offset
+        ),
+    };
+    let id = config.table.add_bytes(label, Arc::from(data))?;
+    let contents = config
+        .table
+        .get(id)
+        .map(crate::input::InputFile::data)
+        .ok_or_else(|| Error::Internal("decompressed section missing from table".into()))?;
+    let mut patched = *header;
+    patched.sh_size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+    patched.sh_addralign = compressed.align.max(1);
+    patched.sh_flags &= !SHF_COMPRESSED;
+    let name = if compressed.zdebug {
+        ZDEBUG_NAMES
+            .iter()
+            .find(|(z, _)| *z == name)
+            .map_or(name, |&(_, plain)| plain)
+    } else {
+        name
+    };
+    Ok(Some((patched, name, contents)))
 }
 
 /// A parsed input object.
@@ -171,6 +252,11 @@ pub struct ObjectInput<'a> {
     /// The pieces of every [`SectionKind::Merge`] section, split at parse
     /// time.
     pub splits: Vec<SplitSection<'a>>,
+    /// Whether some global symbol is named `name@@VERSION`.
+    pub has_default_versions: bool,
+    /// For each of [`groups`](Self::groups), whether another file's copy
+    /// was kept and this one is discarded.
+    pub discarded_groups: Vec<bool>,
 }
 
 /// Whether a section name is debug information that `--strip-debug` drops.
@@ -204,7 +290,26 @@ impl<'a> ObjectInput<'a> {
         let mut addrsig = 0u32;
         let mut warnings = Vec::new();
         for (index, header) in elf.elf().enumerate_sections() {
-            let name = elf.section_name(&header)?;
+            let mut name = elf.section_name(&header)?;
+            let mut header = header;
+            let mut contents = None;
+            let stripped =
+                config.strip_debug && header.sh_flags & SHF_ALLOC == 0 && is_debug_name(name);
+            if !stripped && (header.is_compressed() || name.starts_with(ZDEBUG_PREFIX)) {
+                if header.sh_flags & SHF_ALLOC != 0 {
+                    return Err(source.malformed(
+                        elf.elf().section_header_offset(index),
+                        "section flags (SHF_COMPRESSED on an allocated section)",
+                    ));
+                }
+                if let Some((patched, output_name, data)) =
+                    decompress_section(&elf, &header, name, config)?
+                {
+                    header = patched;
+                    name = output_name;
+                    contents = Some(data);
+                }
+            }
             let flags = header.sh_flags;
             let kind = match header.sh_type {
                 SHT_NULL | SHT_SYMTAB | SHT_STRTAB | SHT_REL | SHT_RELA | SHT_GROUP
@@ -231,17 +336,6 @@ impl<'a> ObjectInput<'a> {
                 _ if config.strip_debug && flags & SHF_ALLOC == 0 && is_debug_name(name) => {
                     SectionKind::Ignored
                 }
-                _ if header.is_compressed() => {
-                    return Err(Error::Unimplemented(format!(
-                        "compressed section {} in {} (workstream W10: DWARF, \
-                         roadmap M5; link with -S to drop debug sections)",
-                        String::from_utf8_lossy(name),
-                        match source.member {
-                            Some(member) => format!("{}({member})", source.path.display()),
-                            None => source.path.display().to_string(),
-                        }
-                    )));
-                }
                 _ if elf.is_eh_frame(&header)? && flags & SHF_ALLOC != 0 => SectionKind::EhFrame,
                 _ if flags & SHF_MERGE != 0
                     && header.sh_entsize != 0
@@ -255,7 +349,9 @@ impl<'a> ObjectInput<'a> {
             if kind != SectionKind::Ignored {
                 // Layout trusts the sizes of copied sections: check now that
                 // their contents lie inside the file.
-                elf.section_data(&header)?;
+                if contents.is_none() {
+                    elf.section_data(&header)?;
+                }
                 if header.sh_addralign > 1 && !header.sh_addralign.is_power_of_two() {
                     return Err(source.malformed(
                         elf.elf().section_header_offset(index),
@@ -270,6 +366,7 @@ impl<'a> ObjectInput<'a> {
                 relocs: 0,
                 group: 0,
                 split: 0,
+                contents,
             });
         }
 
@@ -352,7 +449,10 @@ impl<'a> ObjectInput<'a> {
                 section.kind = SectionKind::Regular;
                 continue;
             };
-            let data = elf.section_data(&section.header)?;
+            let data = match section.contents {
+                Some(contents) => contents,
+                None => elf.section_data(&section.header)?,
+            };
             let alignment = section.header.sh_addralign.max(1);
             if !alignment.is_power_of_two() {
                 section.kind = SectionKind::Regular;
@@ -381,6 +481,7 @@ impl<'a> ObjectInput<'a> {
         let global_count = symbols.len().saturating_sub(first_global);
         let mut names = Vec::with_capacity(global_count);
         let mut uses = Vec::with_capacity(global_count);
+        let mut has_default_versions = false;
         for index in first_global..symbols.len() {
             let Some(raw) = symbols.get_raw(index) else {
                 break;
@@ -418,7 +519,9 @@ impl<'a> ObjectInput<'a> {
             };
             // `redirect` may return a name owned by the wrap table, which
             // lives as long as the link.
-            names.push(SymbolName::new(strip_default_version(name)));
+            let (base, version) = split_version(name);
+            has_default_versions |= version.is_none() && base.len() < name.len();
+            names.push(SymbolName::with_version(base, version));
             uses.push(use_);
         }
 
@@ -435,7 +538,65 @@ impl<'a> ObjectInput<'a> {
             addrsig,
             warnings,
             splits,
+            has_default_versions,
+            discarded_groups: Vec::new(),
         })
+    }
+
+    /// Discards the COMDAT groups flagged in `discarded` (by index in
+    /// [`groups`](Self::groups)): their global definitions stop taking part
+    /// in resolution, so references bind to the kept copy.
+    pub fn discard_groups(&mut self, discarded: Vec<bool>) {
+        let symbols = *self.elf.symbols();
+        for (local, use_) in self.uses.iter_mut().enumerate() {
+            if !matches!(use_, SymbolUse::Definition { .. }) {
+                continue;
+            }
+            let Some(index) = local.checked_add(self.first_global) else {
+                break;
+            };
+            let Some(raw) = symbols.get_raw(index) else {
+                break;
+            };
+            let Ok(SectionIndex::Section(section)) = symbols.section(index, &raw) else {
+                continue;
+            };
+            let group = self
+                .sections
+                .get(section as usize)
+                .and_then(|s| s.group.checked_sub(1));
+            if group.is_some_and(|g| discarded.get(g as usize).copied().unwrap_or(false)) {
+                *use_ = SymbolUse::Ignore;
+            }
+        }
+        self.discarded_groups = discarded;
+    }
+
+    /// For global symbol `local` (an index into [`names`](Self::names)) named
+    /// `name@@VERSION`, the version.
+    #[must_use]
+    pub fn default_version(&self, local: usize) -> Option<&'a [u8]> {
+        if !self.has_default_versions {
+            return None;
+        }
+        let symbols = self.elf.symbols();
+        let index = local.checked_add(self.first_global)?;
+        let raw = symbols.get_raw(index)?;
+        let name = symbols.name(index, &raw).ok()?;
+        let at = name.windows(2).position(|w| w == b"@@")?;
+        name.get(at.checked_add(2)?..)
+    }
+
+    /// The contents of `section`: decompressed for compressed sections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Malformed`] if the contents lie outside the file.
+    pub fn section_data(&self, section: &InputSection<'a>) -> Result<&'a [u8]> {
+        match section.contents {
+            Some(contents) => Ok(contents),
+            None => self.elf.section_data(&section.header),
+        }
     }
 
     /// The object's source, for diagnostics.
@@ -481,10 +642,22 @@ fn definition(weak: bool, comdat: bool) -> SymbolUse {
     }
 }
 
-/// `foo@@VERSION` defines `foo` in a static link.
-fn strip_default_version(name: &[u8]) -> &[u8] {
-    match name.windows(2).position(|w| w == b"@@") {
-        Some(at) => name.get(..at).unwrap_or(name),
-        None => name,
+/// Splits a symbol table name into the name and its explicit version:
+/// `foo@@VERSION` is the default version of `foo` (the plain name, returned
+/// without a version), `foo@VERSION` a distinct, versioned symbol.
+#[must_use]
+pub fn split_version(name: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let Some(at) = name.iter().position(|&b| b == b'@') else {
+        return (name, None);
+    };
+    let base = name.get(..at).unwrap_or(name);
+    if base.is_empty() {
+        return (name, None);
+    }
+    let rest = name.get(at.saturating_add(1)..).unwrap_or_default();
+    match rest.strip_prefix(b"@") {
+        Some(_) => (base, None),
+        None if rest.is_empty() => (name, None),
+        None => (base, Some(rest)),
     }
 }

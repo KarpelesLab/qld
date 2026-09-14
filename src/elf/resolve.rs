@@ -11,28 +11,33 @@
 //!
 //! # COMDAT groups
 //!
-//! Resolution needs every live file's definitions before it can tell which
-//! group copy survives, and archive members are loaded round by round, so
-//! groups are deduplicated right after resolution: for each signature the
-//! copy in the earliest live file (by input position) is kept and the
-//! members of every other copy are discarded. Because a group's symbols are
-//! ranked by the same input position, the definition resolution picked is
-//! normally in the kept copy. The rare exceptions (a symbol that is strong in
-//! a later copy and weak in the kept one) are re-resolved against the
-//! surviving definitions by [`redirect_discarded`].
+//! Groups are claimed while resolution loads files ([`ComdatHook`], a
+//! [`RoundHook`]): for each signature, the copy in the file loaded in the
+//! earliest round wins, and among the files of one round the one with the
+//! lowest input position. A file that loses a claim reports the definitions
+//! in that group's sections as [`SymbolUse::Ignore`](crate::symbols::SymbolUse::Ignore), so they never compete
+//! and its references bind to the kept copy. [`deduplicate_comdat`] then
+//! marks the members of the discarded copies dead.
+//!
+//! GNU ld keeps the first copy it loads. It loads archive members as it
+//! meets them on the command line (rescanning `--start-group` groups), so a
+//! member extracted by a reference from a later file is loaded after that
+//! file; qld's rounds extract members after every file of the previous
+//! round, so a group in such a member can lose to a copy in a later object
+//! where GNU ld keeps the member's. The copies are interchangeable by the
+//! one-definition rule.
 
 #![deny(clippy::arithmetic_side_effects)]
 
 use core::cmp::Ordering;
 
-use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::SectionIndex;
-use crate::ids::{FileId, SymbolId};
+use crate::error::Result;
 use crate::symbols::{
-    Definition, DefinitionKind, Resolution, Resolver, SymbolTable, SymbolUse, takes_precedence,
+    Definition, DefinitionKind, GroupClaims, Resolution, Resolver, RoundFile, RoundHook, SymbolName,
 };
 
 use super::inputs::ElfInput;
@@ -81,12 +86,53 @@ impl Resolver for ElfRules {
     }
 }
 
-/// Keeps the first copy of every COMDAT group (by input order) and marks the
-/// members of the other copies dead in `sections`. Returns the number of
-/// discarded groups.
+/// Claims COMDAT groups as resolution rounds load files; see the [module
+/// documentation](self).
+#[derive(Debug, Default)]
+pub struct ComdatHook<'a> {
+    claims: GroupClaims<'a>,
+}
+
+impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
+    fn after_load(
+        &mut self,
+        _round: usize,
+        files: &mut [RoundFile<'_, ElfInput<'a>>],
+    ) -> Result<()> {
+        let round = self.claims.begin_round();
+        files.par_iter().for_each(|round_file| {
+            let Some(object) = &round_file.file.object else {
+                return;
+            };
+            for group in &object.groups {
+                round.offer(
+                    SymbolName::new(group.signature),
+                    round_file.file.position,
+                    round_file.id,
+                );
+            }
+        });
+        files.par_iter_mut().for_each(|round_file| {
+            let id = round_file.id;
+            let Some(object) = &mut round_file.file.object else {
+                return;
+            };
+            let discarded: Vec<bool> = object
+                .groups
+                .iter()
+                .map(|group| round.owner(&SymbolName::new(group.signature)) != Some(id))
+                .collect();
+            if discarded.contains(&true) {
+                object.discard_groups(discarded);
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Marks dead the members of the COMDAT group copies [`ComdatHook`]
+/// discarded. Returns the number of discarded groups.
 pub fn deduplicate_comdat(files: &[ElfInput<'_>], sections: &mut Sections) -> usize {
-    let mut seen: HashMap<&[u8], usize, foldhash::fast::FixedState> =
-        HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x636f_6d64_6174));
     let mut discarded = 0usize;
     for (file_index, file) in files.iter().enumerate() {
         let Some(object) = &file.object else {
@@ -99,8 +145,8 @@ pub fn deduplicate_comdat(files: &[ElfInput<'_>], sections: &mut Sections) -> us
         {
             continue;
         }
-        for group in &object.groups {
-            if seen.insert(group.signature, file_index).is_none() {
+        for (group, &dropped) in object.groups.iter().zip(&object.discarded_groups) {
+            if !dropped {
                 continue;
             }
             discarded = discarded.saturating_add(1);
@@ -134,92 +180,12 @@ fn in_dead_section(files: &[ElfInput<'_>], sections: &Sections, def: &Definition
     }
 }
 
-/// Re-resolves symbols whose winning definition lies in a discarded COMDAT
-/// group section, choosing among the definitions in live sections. Symbols
-/// left with no definition become undefined. Returns how many symbols were
-/// redirected.
-pub fn redirect_discarded(
-    table: &SymbolTable<'_>,
-    rules: &ElfRules,
-    files: &[ElfInput<'_>],
-    resolution: &Resolution<'_>,
-    sections: &Sections,
-) -> usize {
-    let affected: Vec<SymbolId> = table
-        .ids()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .filter(|&id| {
-            let def = table.definition(id);
-            matches!(
-                def.kind,
-                DefinitionKind::Regular | DefinitionKind::Weak | DefinitionKind::Common
-            ) && in_dead_section(files, sections, &def)
-        })
-        .collect();
-    if affected.is_empty() {
-        return 0;
-    }
-    let mut flags = vec![false; table.len()];
-    for id in &affected {
-        if let Some(flag) = flags.get_mut(id.index()) {
-            *flag = true;
-        }
-    }
-    let mut candidates: Vec<(SymbolId, Definition)> = files
-        .par_iter()
-        .enumerate()
-        .filter(|(index, _)| resolution.is_live(FileId::new(*index)))
-        .flat_map_iter(|(index, file)| {
-            let ids = resolution.symbol_ids(FileId::new(index));
-            let flags = &flags;
-            ids.iter().enumerate().filter_map(move |(symbol, &id)| {
-                if !flags.get(id.index()).copied().unwrap_or(false) {
-                    return None;
-                }
-                let object = file.object.as_ref()?;
-                let SymbolUse::Definition { kind, aux } = *object.uses.get(symbol)? else {
-                    return None;
-                };
-                let def = Definition {
-                    kind,
-                    file: FileId::new(index),
-                    index: u32::try_from(symbol).ok()?,
-                    position: file.position,
-                    aux,
-                };
-                (!in_dead_section(files, sections, &def)).then_some((id, def))
-            })
-        })
-        .collect();
-    candidates.sort_unstable_by_key(|(id, def)| (*id, def.tie_key()));
-    let mut best: Vec<(SymbolId, Definition)> = Vec::with_capacity(affected.len());
-    for (id, def) in candidates {
-        match best.last_mut() {
-            Some((last, current)) if *last == id => {
-                if takes_precedence(rules, &def, current) {
-                    *current = def;
-                }
-            }
-            _ => best.push((id, def)),
-        }
-    }
-    for &id in &affected {
-        let replacement = best
-            .binary_search_by_key(&id, |(i, _)| *i)
-            .ok()
-            .and_then(|at| best.get(at))
-            .map_or_else(Definition::undefined, |(_, def)| *def);
-        table.replace_definition(id, &replacement);
-    }
-    affected.len()
-}
-
 /// Reports duplicate definitions, lld-style. Returns the number of errors.
 pub fn report_duplicates(
     files: &[ElfInput<'_>],
     resolution: &Resolution<'_>,
     sections: &Sections,
+    demangle: bool,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
     let mut errors = 0usize;
@@ -234,9 +200,11 @@ pub fn report_duplicates(
         if others.is_empty() || in_dead_section(files, sections, &duplicate.winner) {
             continue;
         }
-        let mut diagnostic =
-            Diagnostic::error(format!("duplicate symbol: {}", duplicate.name.display()))
-                .order(duplicate.winner.position.raw());
+        let mut diagnostic = Diagnostic::error(format!(
+            "duplicate symbol: {}",
+            crate::hints::display_symbol(duplicate.name.bytes(), demangle)
+        ))
+        .order(duplicate.winner.position.raw());
         for def in std::iter::once(&duplicate.winner).chain(others) {
             diagnostic = diagnostic.detail(format!("defined at {}", definition_site(files, def)));
         }
@@ -273,7 +241,9 @@ pub fn definition_site(files: &[ElfInput<'_>], def: &Definition) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::FileId;
     use crate::symbols::InputPosition;
+    use crate::symbols::takes_precedence;
 
     fn def(kind: DefinitionKind, position: u32, aux: u64) -> Definition {
         Definition {

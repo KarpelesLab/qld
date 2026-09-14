@@ -113,6 +113,20 @@ pub fn collect(
         })
         .map(SectionId::new)
         .collect();
+    // Symbols the dynamic symbol table exports, and those shared libraries
+    // refer to.
+    let exported = crate::symbols::SymbolFlags::EXPORTED;
+    roots.par_extend(
+        refs.symbols
+            .ids()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .filter(|&id| {
+                let flags = refs.symbols.flags(id);
+                flags.contains(exported) || flags.contains(super::dso::REF_DYNAMIC)
+            })
+            .filter_map(|id| refs.target_section(&refs.global_target(id, true))),
+    );
     for (name, _) in &internal.names {
         if let Some(id) = refs.symbols.lookup(&SymbolName::new(name)) {
             let target = refs.global_target(id, false);

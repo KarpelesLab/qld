@@ -1,0 +1,24 @@
+# M2: --emit-relocs (-q) keeps the input relocations in the output, as BOLT
+# and the Linux kernel's relocs tool expect: one `.rela` section per output
+# section, offsets as output addresses, section symbols for local targets.
+# The executable must still run, and GC'd code must not leave relocations.
+description = "--emit-relocs keeps input relocations in an executable"
+compile = [
+  "cc -O1 -g -ffunction-sections -fdata-sections -fPIE -c main.c",
+  "cc -O1 -g -ffunction-sections -fdata-sections -fPIE -c helper.c",
+]
+driver = "cc"
+link = "-o out main.o helper.o -Wl,--emit-relocs -Wl,--gc-sections"
+run = "./out"
+expect.stdout = "alpha 15\n"
+expect.readelf = [
+  "Relocation section '.rela.text'",
+  "Relocation section '.rela.data.rel.ro'",
+  "Relocation section '.rela.debug_info'",
+  "R_X86_64_GOTTPOFF",
+  "SECTION LOCAL  DEFAULT",
+  "R_X86_64_64 ",
+  "helper_qld + 0",
+  "!unused_qld",
+]
+determinism = true

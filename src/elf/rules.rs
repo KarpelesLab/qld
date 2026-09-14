@@ -56,24 +56,57 @@ pub struct InputRule {
 }
 
 /// What synthetic content an output section may hold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Synthetic {
     /// No synthetic content.
     None,
     /// `.note.gnu.build-id`.
     BuildId,
-    /// `.rela.iplt` (IRELATIVE relocations of a static executable).
-    RelaIplt,
-    /// `.iplt` stubs.
-    Iplt,
+    /// `.interp`: the program interpreter path.
+    Interp,
+    /// `.hash`: the System V symbol hash table.
+    Hash,
+    /// `.gnu.hash`: the GNU symbol hash table.
+    GnuHash,
+    /// `.dynsym`.
+    DynSym,
+    /// `.dynstr`.
+    DynStr,
+    /// `.gnu.version`: the version of each dynamic symbol.
+    VerSym,
+    /// `.gnu.version_d`: version definitions.
+    VerDef,
+    /// `.gnu.version_r`: version requirements.
+    VerNeed,
+    /// `.rela.dyn`.
+    RelaDyn,
+    /// `.rela.plt`: `JUMP_SLOT` relocations of a dynamic output, and the
+    /// `IRELATIVE` relocations of IFUNC PLT entries (all a static
+    /// executable has).
+    RelaPlt,
+    /// `.relr.dyn`: packed relative relocations.
+    RelrDyn,
+    /// `.plt`: the lazy PLT of a dynamic output, or the IFUNC stubs of a
+    /// static executable.
+    Plt,
+    /// `.plt.got`: PLT entries that jump through a GOT entry.
+    PltGot,
+    /// `.plt.sec`: the IBT-enabled second PLT.
+    PltSec,
     /// `.eh_frame_hdr`.
     EhFrameHdr,
     /// `.note.gnu.property`.
     GnuProperty,
+    /// Space for copy relocations of read-only data, in `.data.rel.ro`.
+    DynRelro,
+    /// `.dynamic`.
+    Dynamic,
     /// The GOT.
     Got,
-    /// `.igot.plt` (IFUNC GOT slots).
-    IgotPlt,
+    /// `.got.plt`: the dynamic linker's reserved words and the PLT slots.
+    GotPlt,
+    /// Space for copy relocations, at the start of `.bss`.
+    DynBss,
     /// Common symbols, at the end of `.bss`.
     Common,
     /// Linker identification appended to `.comment`.
@@ -117,6 +150,8 @@ pub struct OutputRule {
     pub synthetic: Synthetic,
     /// Orphans of this class go right after this output section.
     pub hold: Option<OrphanClass>,
+    /// The section is read-only after relocation (`PT_GNU_RELRO`).
+    pub relro: bool,
 }
 
 const fn plain(patterns: &'static [&'static str]) -> InputRule {
@@ -134,7 +169,17 @@ const fn rule(name: &'static str, inputs: &'static [InputRule]) -> OutputRule {
         keep: false,
         synthetic: Synthetic::None,
         hold: None,
+        relro: false,
     }
+}
+
+const fn relro(mut rule: OutputRule) -> OutputRule {
+    rule.relro = true;
+    rule
+}
+
+const fn synthetic_only(name: &'static str, synthetic: Synthetic) -> OutputRule {
+    synth(rule(name, &[]), synthetic)
 }
 
 const fn keep(mut rule: OutputRule) -> OutputRule {
@@ -161,17 +206,27 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
         ),
         OrphanClass::Note,
     ),
+    synthetic_only(".interp", Synthetic::Interp),
+    synthetic_only(".hash", Synthetic::Hash),
+    synthetic_only(".gnu.hash", Synthetic::GnuHash),
+    synthetic_only(".dynsym", Synthetic::DynSym),
+    synthetic_only(".dynstr", Synthetic::DynStr),
+    synthetic_only(".gnu.version", Synthetic::VerSym),
+    synthetic_only(".gnu.version_d", Synthetic::VerDef),
+    synthetic_only(".gnu.version_r", Synthetic::VerNeed),
+    synthetic_only(".rela.dyn", Synthetic::RelaDyn),
     synth(
         rule(
             ".rela.plt",
             &[plain(&[".rela.plt"]), plain(&[".rela.iplt"])],
         ),
-        Synthetic::RelaIplt,
+        Synthetic::RelaPlt,
     ),
+    synthetic_only(".relr.dyn", Synthetic::RelrDyn),
     keep(rule(".init", &[plain(&[".init"])])),
-    synth(rule(".plt", &[plain(&[".plt", ".iplt"])]), Synthetic::Iplt),
-    rule(".plt.got", &[plain(&[".plt.got"])]),
-    rule(".plt.sec", &[plain(&[".plt.sec"])]),
+    synth(rule(".plt", &[plain(&[".plt", ".iplt"])]), Synthetic::Plt),
+    synth(rule(".plt.got", &[plain(&[".plt.got"])]), Synthetic::PltGot),
+    synth(rule(".plt.sec", &[plain(&[".plt.sec"])]), Synthetic::PltSec),
     hold(
         rule(
             ".text",
@@ -234,14 +289,14 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
     rule(".note.dlopen", &[plain(&[".note.dlopen"])]),
     rule(".note.netbsd.ident", &[plain(&[".note.netbsd.ident"])]),
     rule(".note.openbsd.ident", &[plain(&[".note.openbsd.ident"])]),
-    hold(
+    relro(hold(
         rule(
             ".tdata",
             &[plain(&[".tdata", ".tdata.*", ".gnu.linkonce.td.*"])],
         ),
         OrphanClass::Tdata,
-    ),
-    hold(
+    )),
+    relro(hold(
         rule(
             ".tbss",
             &[
@@ -250,9 +305,9 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
             ],
         ),
         OrphanClass::Tbss,
-    ),
-    keep(rule(".preinit_array", &[plain(&[".preinit_array"])])),
-    keep(rule(
+    )),
+    relro(keep(rule(".preinit_array", &[plain(&[".preinit_array"])]))),
+    relro(keep(rule(
         ".init_array",
         &[
             InputRule {
@@ -266,8 +321,8 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
                 files: FileFilter::NotCrtBeginEnd,
             },
         ],
-    )),
-    keep(rule(
+    ))),
+    relro(keep(rule(
         ".fini_array",
         &[
             InputRule {
@@ -281,8 +336,8 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
                 files: FileFilter::NotCrtBeginEnd,
             },
         ],
-    )),
-    keep(rule(
+    ))),
+    relro(keep(rule(
         ".ctors",
         &[
             InputRule {
@@ -292,8 +347,8 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
             },
             plain(&[".ctors"]),
         ],
-    )),
-    keep(rule(
+    ))),
+    relro(keep(rule(
         ".dtors",
         &[
             InputRule {
@@ -303,23 +358,29 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
             },
             plain(&[".dtors"]),
         ],
+    ))),
+    relro(keep(rule(".jcr", &[plain(&[".jcr"])]))),
+    relro(synth(
+        rule(
+            ".data.rel.ro",
+            &[
+                plain(&[".data.rel.ro.local*", ".gnu.linkonce.d.rel.ro.local.*"]),
+                plain(&[".data.rel.ro", ".data.rel.ro.*", ".gnu.linkonce.d.rel.ro.*"]),
+            ],
+        ),
+        Synthetic::DynRelro,
     )),
-    keep(rule(".jcr", &[plain(&[".jcr"])])),
-    rule(
-        ".data.rel.ro",
-        &[
-            plain(&[".data.rel.ro.local*", ".gnu.linkonce.d.rel.ro.local.*"]),
-            plain(&[".data.rel.ro", ".data.rel.ro.*", ".gnu.linkonce.d.rel.ro.*"]),
-        ],
-    ),
-    rule(".dynamic", &[plain(&[".dynamic"])]),
-    synth(
+    relro(synth(
+        rule(".dynamic", &[plain(&[".dynamic"])]),
+        Synthetic::Dynamic,
+    )),
+    relro(synth(
         rule(".got", &[plain(&[".got"]), plain(&[".igot"])]),
         Synthetic::Got,
-    ),
+    )),
     synth(
         rule(".got.plt", &[plain(&[".got.plt"]), plain(&[".igot.plt"])]),
-        Synthetic::IgotPlt,
+        Synthetic::GotPlt,
     ),
     hold(
         rule(
@@ -338,7 +399,7 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
                     plain(&[".bss", ".bss.*", ".gnu.linkonce.b.*"]),
                 ],
             ),
-            Synthetic::Common,
+            Synthetic::DynBss,
         ),
         OrphanClass::Bss,
     ),
