@@ -737,6 +737,28 @@ fn stdout_of(dir: &Path, binary: &str) -> String {
 }
 
 #[test]
+fn gc_sections_drops_imports_only_dead_code_uses() {
+    require!("cc", "readelf");
+    let dir = scratch("gc-imports");
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\n#include <unistd.h>\n\
+         int dead_qld(void) { return chdir(\"/\"); }\n\
+         int main(void) { puts(\"live\"); return 0; }\n",
+        &["-fPIE", "-ffunction-sections"],
+    );
+    cc_link_ok(&dir, &["-o", "out", "main.o", "-Wl,--gc-sections"]);
+    assert_eq!(stdout_of(&dir, "out"), "live\n");
+    let symbols = readelf(&dir, &["--dyn-syms", "-s", "out"]);
+    assert!(symbols.contains("puts@GLIBC"), "{symbols}");
+    assert!(!symbols.contains("chdir"), "{symbols}");
+    cc_link_ok(&dir, &["-o", "all", "main.o"]);
+    let symbols = readelf(&dir, &["--dyn-syms", "all"]);
+    assert!(symbols.contains("chdir"), "{symbols}");
+}
+
+#[test]
 fn lazy_binding_without_ibt() {
     require!("cc", "readelf");
     let dir = scratch("lazy-binding");

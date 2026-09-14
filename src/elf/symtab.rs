@@ -116,6 +116,18 @@ fn referenced_locals(
     referenced
 }
 
+/// Whether an import survives `--gc-sections`: live code refers to it, or
+/// it needs a GOT, PLT or copy (from a relocation of live code).
+fn live_import(flags: SymbolFlags) -> bool {
+    flags.contains(super::scan::REF_LIVE)
+        || flags.intersects(
+            SymbolFlags::NEEDS_GOT
+                | SymbolFlags::NEEDS_PLT
+                | SymbolFlags::NEEDS_COPY_RELOC
+                | SymbolFlags::NEEDS_DYNSYM,
+        )
+}
+
 /// Plans the symbol table. Returns an empty plan for `-s`.
 #[must_use]
 pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) -> SymtabPlan {
@@ -195,12 +207,16 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                         _ => true,
                     }
                 }
-                DefinitionKind::Shared => symbols.flags(id).contains(REF_REGULAR),
+                DefinitionKind::Shared => {
+                    let flags = symbols.flags(id);
+                    flags.contains(REF_REGULAR) && (!options.gc_sections || live_import(flags))
+                }
                 DefinitionKind::Undefined | DefinitionKind::Lazy => {
                     let flags = symbols.flags(id);
-                    (flags.contains(SymbolFlags::WEAK_REFERENCED)
+                    ((flags.contains(SymbolFlags::WEAK_REFERENCED)
                         && !flags.contains(SymbolFlags::REFERENCED))
-                        || (flags.contains(REF_REGULAR) && flags.contains(PREEMPTIBLE))
+                        || (flags.contains(REF_REGULAR) && flags.contains(PREEMPTIBLE)))
+                        && (!options.gc_sections || live_import(flags))
                 }
             };
             if !emit {

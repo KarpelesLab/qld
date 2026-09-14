@@ -42,6 +42,11 @@ use super::reloc::{self, Context, Dynamic, LocalNeed, Problem};
 /// `IRELATIVE` GOT slot.
 pub const NEEDS_IPLT: SymbolFlags = SymbolFlags::backend(0);
 
+/// Backend flag: a relocation of a live allocated section refers to the
+/// symbol. After `--gc-sections`, imports without it are left out of the
+/// symbol tables, as GNU ld hides symbols only dead code refers to.
+pub const REF_LIVE: SymbolFlags = SymbolFlags::backend(2);
+
 /// One reference to an undefined symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UndefinedRef {
@@ -253,7 +258,12 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
         let mut skip = false;
         for rel in relas.iter() {
             if skip {
+                // The call a TLS relaxation removed still counts as a use
+                // (GNU ld keeps `__tls_get_addr` in the dynamic symbols).
                 skip = false;
+                if let Some(id) = refs.global_id(file_index, rel.symbol as usize) {
+                    refs.symbols.set_flags(id, REF_LIVE);
+                }
                 continue;
             }
             let Some(target) = refs.target(file_index, rel.symbol as usize) else {
@@ -270,6 +280,11 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             let flags = target
                 .global
                 .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+            if let Some(id) = target.global
+                && !flags.contains(REF_LIVE)
+            {
+                refs.symbols.set_flags(id, REF_LIVE);
+            }
             let decision =
                 match reloc::decide(context, &rel, data, &target, flags, section.header.sh_flags) {
                     Ok(decision) => decision,

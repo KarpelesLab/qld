@@ -48,6 +48,7 @@ use super::dso::{Needed, REF_REGULAR, REF_REGULAR_STRONG};
 use super::export::{Exports, Mode, PREEMPTIBLE, merged_visibility};
 use super::refs::{Def, LINKER_FILE, Refs};
 use super::rules::Synthetic;
+use super::scan::REF_LIVE;
 use super::scan::ScanResult;
 use super::synth::Synth;
 use super::values::Addresses;
@@ -339,7 +340,9 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
             }
             match kind {
                 DefinitionKind::Shared => {
-                    (flags.contains(REF_REGULAR) || flags.intersects(needs)).then_some((id, false))
+                    let referenced = flags.contains(REF_REGULAR)
+                        && (!options.gc_sections || flags.contains(REF_LIVE));
+                    (referenced || flags.intersects(needs)).then_some((id, false))
                 }
                 DefinitionKind::Undefined | DefinitionKind::Lazy => {
                     let wanted = flags.contains(PREEMPTIBLE)
