@@ -12,9 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use qld::debug::compress::deflate::{
-    DEFAULT_CHUNK_SIZE, Level, zlib_compress, zlib_compress_chunked,
-};
+use qld::debug::compress::deflate::{Level, zlib_compress, zlib_compress_chunked};
 use qld::debug::compress::{Codec, zlib_decompress_into};
 use qld::debug::section::{
     CompressedSection, OutputCompression, compress_section, decompressed_name, encode_chdr,
@@ -393,10 +391,12 @@ fn compressed_output_sections_accepted_by_binutils() {
     };
     let expected_dump = dump(&plain);
 
-    for (label, chunk, level) in [
-        ("fast", DEFAULT_CHUNK_SIZE, Level::FASTEST),
-        ("default-4k-chunks", 4096, Level::DEFAULT),
-        ("stored-1k-chunks", 1000, Level::STORE),
+    for label in [
+        "zlib-fast",
+        "zlib-default-4k-chunks",
+        "zlib-stored-1k-chunks",
+        "zstd",
+        "zstd-1k-frames",
     ] {
         let mut patched = original.clone();
         let mut compressed = 0;
@@ -406,18 +406,29 @@ fn compressed_output_sections_accepted_by_binutils() {
             }
             let start = header.sh_offset as usize;
             let data = &original[start..start + header.sh_size as usize];
-            let contents = if chunk == DEFAULT_CHUNK_SIZE {
-                compress_section::<Elf64Le>(
-                    data,
-                    OutputCompression::Zlib(level),
-                    header.sh_addralign,
-                )
-                .unwrap()
-            } else {
-                let mut contents =
-                    encode_chdr::<Elf64Le>(1, data.len() as u64, header.sh_addralign);
-                contents.extend_from_slice(&zlib_compress_chunked(data, level, chunk));
+            let align = header.sh_addralign;
+            let manual = |ch_type: u32, stream: Vec<u8>| {
+                let mut contents = encode_chdr::<Elf64Le>(ch_type, data.len() as u64, align);
+                contents.extend_from_slice(&stream);
                 contents
+            };
+            let contents = match label {
+                "zlib-fast" => compress_section::<Elf64Le>(
+                    data,
+                    OutputCompression::Zlib(Level::FASTEST),
+                    align,
+                ),
+                "zlib-default-4k-chunks" => {
+                    manual(1, zlib_compress_chunked(data, Level::DEFAULT, 4096))
+                }
+                "zlib-stored-1k-chunks" => {
+                    manual(1, zlib_compress_chunked(data, Level::STORE, 1000))
+                }
+                "zstd" => compress_section::<Elf64Le>(data, OutputCompression::Zstd, align),
+                _ => manual(
+                    2,
+                    qld::debug::compress::zstd::zstd_compress_chunked(data, 1000),
+                ),
             };
             replace_section(
                 &mut patched,
@@ -844,6 +855,50 @@ fn zstd_survives_corruption() {
     }
 }
 
+/// Both compressors round-trip randomly structured inputs (runs, repeats
+/// at random distances, noise) at every setting.
+#[test]
+fn compressors_roundtrip_random_inputs() {
+    use qld::debug::compress::zstd::zstd_compress_chunked;
+
+    let mut rng = Rng(0x1234_5678);
+    for round in 0..150 * fuzz_scale() {
+        let len = rng.below(if round % 10 == 0 { 300_000 } else { 5_000 });
+        let mut data = Vec::with_capacity(len);
+        while data.len() < len {
+            match rng.below(4) {
+                0 => {
+                    let byte = rng.next() as u8;
+                    let n = 1 + rng.below(300);
+                    data.extend(std::iter::repeat_n(byte, n));
+                }
+                1 if !data.is_empty() => {
+                    let distance = 1 + rng.below(data.len());
+                    let n = 3 + rng.below(400);
+                    for _ in 0..n {
+                        data.push(data[data.len() - distance]);
+                    }
+                }
+                _ => {
+                    let n = 1 + rng.below(50);
+                    let alphabet = 1 + rng.below(256) as u64;
+                    data.extend((0..n).map(|_| (rng.next() % alphabet) as u8));
+                }
+            }
+        }
+        data.truncate(len);
+        let mut out = vec![0u8; len];
+        let level = Level::new(rng.below(10) as u8);
+        let chunk = [1 << 20, 1000, 70_000][rng.below(3)];
+        let z = zlib_compress_chunked(&data, level, chunk);
+        zlib_decompress_into(&z, &mut out).unwrap();
+        assert!(out == data, "zlib round {round}");
+        let z = zstd_compress_chunked(&data, [1 << 21, 777, 150_000][rng.below(3)]);
+        Codec::Zstd.decompress_into(&z, &mut out).unwrap();
+        assert!(out == data, "zstd round {round}");
+    }
+}
+
 /// Corrupts the debug and relocation sections of the committed objects
 /// (the rest of the file is kept intact so that parsing reaches the DWARF
 /// readers).
@@ -1082,6 +1137,31 @@ fn zstd_matches_system_zstd() {
     println!("checked {checked} zstd streams");
 }
 
+/// qld's zstd output decompresses with the `zstd` command (libzstd), for
+/// every corpus and several frame sizes.
+#[test]
+fn zstd_output_accepted_by_system_zstd() {
+    use qld::debug::compress::zstd::zstd_compress_chunked;
+
+    let Some(zstd) = find_program("zstd") else {
+        return skip("zstd not found");
+    };
+    let dir = scratch_dir("zstd-output");
+    let mut checked = 0;
+    for (name, data) in corpora() {
+        for chunk in [4096, 200_000, 1 << 21] {
+            let z = zstd_compress_chunked(&data, chunk);
+            let path = dir.join(format!("{name}.{chunk}.zst"));
+            std::fs::write(&path, &z).unwrap();
+            let out = run(Command::new(&zstd).args(["-d", "-c", "-q"]).arg(&path))
+                .unwrap_or_else(|| panic!("zstd rejected {name} (chunk {chunk})"));
+            assert!(out == data, "{name} (chunk {chunk}): zstd output differs");
+            checked += 1;
+        }
+    }
+    println!("zstd accepted {checked} streams");
+}
+
 /// The committed zstd fixtures decode (runs without any tools).
 #[test]
 fn zstd_committed_fixtures() {
@@ -1259,6 +1339,54 @@ fn bench_zstd() {
             data.len() as f64 / 1048576.0,
             mb_per_s(data.len(), elapsed),
         );
+    }
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bench_zstd_compress() {
+    use qld::debug::compress::zstd::zstd_compress;
+
+    let data = bench_corpus(64 << 20);
+    let serial = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let mut z = Vec::new();
+    let one = best_of(2, || z = serial.install(|| zstd_compress(&data)));
+    let mut zp = Vec::new();
+    let all = best_of(3, || zp = zstd_compress(&data));
+    assert!(z == zp, "output depends on thread count");
+    let mut back = vec![0u8; data.len()];
+    Codec::Zstd.decompress_into(&z, &mut back).unwrap();
+    assert!(back == data);
+    println!(
+        "zstd compress: qld 1 thread {:.0} MB/s, {} threads {:.0} MB/s, ratio {:.3}",
+        mb_per_s(data.len(), one),
+        rayon::current_num_threads(),
+        mb_per_s(data.len(), all),
+        z.len() as f64 / data.len() as f64,
+    );
+    let Some(zstd) = find_program("zstd") else {
+        return skip("zstd not found");
+    };
+    let dir = scratch_dir("bench-zstd-compress");
+    let raw = dir.join("corpus.bin");
+    std::fs::write(&raw, &data).unwrap();
+    for level in [1, 3] {
+        // `zstd -b` reports in-memory compression speed and ratio.
+        let text = run(Command::new(&zstd)
+            .args(["-b", &format!("-{level}"), "-i2", "-T1"])
+            .arg(&raw))
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_default();
+        let line = text
+            .split(['\r', '\n'])
+            .rfind(|line| line.matches("MB/s").count() == 2)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        println!("  libzstd -{level} (1 thread): {line}");
     }
 }
 

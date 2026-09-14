@@ -14,9 +14,12 @@
 //! (literals), `sequences` (sequence decoding and execution).
 
 mod bits;
+mod encode;
 mod fse;
 mod huffman;
 mod sequences;
+
+pub use encode::{DEFAULT_CHUNK_SIZE, zstd_compress, zstd_compress_chunked};
 
 use super::DecodeError;
 use crate::output::hash::xxh64;

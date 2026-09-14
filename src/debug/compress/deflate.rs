@@ -824,7 +824,7 @@ impl DynamicHeader {
 ///
 /// At least two symbols always get a code, as zlib ensures, so that every
 /// decoder accepts the code even when only one symbol is used.
-fn huffman_lengths(freqs: &[u32], max_bits: usize, lens: &mut [u8]) {
+pub(super) fn huffman_lengths(freqs: &[u32], max_bits: usize, lens: &mut [u8]) {
     lens.fill(0);
     let mut syms: Vec<(u32, u16)> = freqs
         .iter()

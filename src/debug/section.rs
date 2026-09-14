@@ -28,6 +28,7 @@ use std::borrow::Cow;
 
 use super::compress::Codec;
 use super::compress::deflate::{Level, zlib_compress};
+use super::compress::zstd::zstd_compress;
 use crate::elf::read::consts::{ELFCLASS64, ELFCOMPRESS_ZLIB, ELFCOMPRESS_ZSTD};
 use crate::elf::read::{
     CompressionHeader, ElfFormat, Endian, ObjectFile, RawRecord, SectionHeader, Source,
@@ -276,29 +277,23 @@ impl OutputCompression {
 /// `Elf_Chdr` for format `F`, then the compressed stream. `align` is the
 /// uncompressed section's alignment.
 ///
-/// The output is deterministic and independent of the thread count.
-///
-/// # Errors
-///
-/// Returns `Error::Unimplemented` for Zstandard, which qld cannot write yet.
+/// The data is compressed in parallel chunks on the current rayon pool; the
+/// output is deterministic and independent of the thread count.
+#[must_use]
 pub fn compress_section<F: ElfFormat>(
     data: &[u8],
     compression: OutputCompression,
     align: u64,
-) -> Result<Vec<u8>> {
+) -> Vec<u8> {
     let (ch_type, stream) = match compression {
         OutputCompression::Zlib(level) => (ELFCOMPRESS_ZLIB, zlib_compress(data, level)),
-        OutputCompression::Zstd => {
-            return Err(Error::Unimplemented(
-                "--compress-debug-sections=zstd output (roadmap M5)".into(),
-            ));
-        }
+        OutputCompression::Zstd => (ELFCOMPRESS_ZSTD, zstd_compress(data)),
     };
     let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
     let mut out = encode_chdr::<F>(ch_type, size, align);
     out.reserve_exact(stream.len());
     out.extend_from_slice(&stream);
-    Ok(out)
+    out
 }
 
 /// Encodes an `Elf32_Chdr` or `Elf64_Chdr` in `F`'s byte order.
@@ -369,13 +364,18 @@ mod tests {
         let data: Vec<u8> = (0..300_000u32)
             .map(|i| (i % 251) as u8 ^ (i >> 9) as u8)
             .collect();
-        let contents =
-            compress_section::<Elf64Le>(&data, OutputCompression::Zlib(Level::FASTEST), 1).unwrap();
-        let (raw, _) = <[u8; 24]>::slice_from(&contents);
-        let chdr = Elf64Le::decode_chdr(&raw[0]);
-        let section = CompressedSection::from_chdr(&chdr, &contents[24..], 24, source()).unwrap();
-        assert_eq!(section.decompress(source()).unwrap(), data);
-        assert!(compress_section::<Elf64Le>(&data, OutputCompression::Zstd, 1).is_err());
+        for (compression, ch_type) in [
+            (OutputCompression::Zlib(Level::FASTEST), ELFCOMPRESS_ZLIB),
+            (OutputCompression::Zstd, ELFCOMPRESS_ZSTD),
+        ] {
+            let contents = compress_section::<Elf64Le>(&data, compression, 1);
+            let (raw, _) = <[u8; 24]>::slice_from(&contents);
+            let chdr = Elf64Le::decode_chdr(&raw[0]);
+            assert_eq!(chdr.ch_type, ch_type);
+            let section =
+                CompressedSection::from_chdr(&chdr, &contents[24..], 24, source()).unwrap();
+            assert_eq!(section.decompress(source()).unwrap(), data);
+        }
     }
 
     #[test]
