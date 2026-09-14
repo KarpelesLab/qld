@@ -1,0 +1,79 @@
+# Linker argv captured from: rustc -O -C linker-features=-lld -o rustc-bin-bfd main.rs
+# Tools: rustc 1.98.0 (88d9e12ae 2026-08-18), GNU ld (Gentoo 2.46.1 p1) 2.46.1
+# Host: x86_64-pc-linux-gnu (Gentoo). One argument per line; argv[0] is not included.
+# Machine-specific paths are normalized: build dir -> /build, $HOME -> /home/user,
+# temporary file names -> XXXXXX.
+#! output = rustc-bin-bfd
+#! kind = Pie
+#! gc_sections = true
+-plugin
+/usr/libexec/gcc/x86_64-pc-linux-gnu/15/liblto_plugin.so
+-plugin-opt=/usr/libexec/gcc/x86_64-pc-linux-gnu/15/lto-wrapper
+-plugin-opt=-fresolution=/tmp/ccXXXXXX.res
+--build-id
+--eh-frame-hdr
+-m
+elf_x86_64
+-dynamic-linker
+/lib64/ld-linux-x86-64.so.2
+-pie
+-z
+now
+-o
+rustc-bin-bfd
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/Scrt1.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crti.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/crtbeginS.o
+-L/build/rustcXXXXXX/raw-dylibs
+-L/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64
+-L/lib/../lib64
+-L/usr/lib/../lib64
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../x86_64-pc-linux-gnu/lib
+-L/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../..
+-L/lib
+-L/usr/lib
+/build/rustcXXXXXX/symbols.o
+rustc-bin-bfd.main.6ab68c262d61f9cf-cgu.0.rcgu.o
+rustc-bin-bfd.0icztk8ue118k8es12ycrcpyv.rcgu.o
+--as-needed
+-Bstatic
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-2e38004a9ef1deab.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libpanic_unwind-b12739ac718ad94d.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libobject-539315557aa33d2a.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libmemchr-438369955a1aeb02.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libaddr2line-9bf1503802f1fe1f.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libgimli-b05ed1427e633af3.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcfg_if-380714c6ea67686e.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/librustc_demangle-7e135abb3d08f85c.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd_detect-8ebd82e261ed1599.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libhashbrown-5616f5bf81fe0066.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/librustc_std_workspace_alloc-4eb375f3ee2d977f.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libminiz_oxide-80dd92fda65ee391.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libadler2-1855b06535e3a6dc.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libunwind-c548baaa1b36fffe.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/liblibc-f28c4264f0143d08.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/librustc_std_workspace_core-ae5f5e65a4426175.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/liballoc-ca14532e0afe7a5d.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcore-a6075fd9c05de416.rlib
+/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcompiler_builtins-b8411246c6de4c7a.rlib
+-Bdynamic
+-lgcc_s
+-lutil
+-lrt
+-lpthread
+-lm
+-ldl
+-lc
+--eh-frame-hdr
+-z
+noexecstack
+--gc-sections
+-z
+relro
+-z
+now
+-O1
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/crtendS.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15/../../../../lib64/crtn.o
