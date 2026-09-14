@@ -15,15 +15,18 @@ run = "./out; a=$?; ./out2; echo $a $?"
 expect.stdout = "42 42\n"
 expect.readelf = [
   "Entry point address:               0x500000",
-  ".text             PROGBITS        0000000000500000 001000 000029",
-  ".data             PROGBITS        0000000000600000 003000 000004",
-  ".bss              NOBITS          0000000000680000 005000 000008",
-  ".mysec            PROGBITS        0000000000640000 004000 000004",
-  "LOAD           0x004000 0x0000000000640000 0x0000000000640000 0x000004 0x000004 RW  0x1000",
+  # Addresses only: file offsets and section indices differ between binutils
+  # versions (2.42 lays these out differently from 2.46), and GNU ld has to
+  # match too.
+  ".text             PROGBITS        0000000000500000",
+  ".data             PROGBITS        0000000000600000",
+  ".bss              NOBITS          0000000000680000",
+  ".mysec            PROGBITS        0000000000640000",
+  "0x0000000000640000 0x0000000000640000 0x000004 0x000004 RW",
 ]
 expect.readelf_files."out2" = [
   "LOAD           0x000000 0x0000000000800000 0x0000000000800000",
-  ".text             PROGBITS        0000000000801000 001000 000029",
+  ".text             PROGBITS        0000000000801000",
   ".bss              NOBITS          0000000000900000",
   "   .data .mysec ",
 ]

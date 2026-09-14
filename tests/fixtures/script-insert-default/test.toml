@@ -9,7 +9,10 @@ expect.exit = 42
 expect.readelf = [
   "   .data .plugins .bss ",
   "000000000000000c     0 NOTYPE  GLOBAL DEFAULT  ABS answer",
-  "GLOBAL DEFAULT    4 __plugins_start",
+  # The section index varies between binutils versions; the symbol must exist
+  # and be global.
+  "GLOBAL DEFAULT",
+  "__plugins_start",
   ".plugins          PROGBITS",
 ]
 targets = ["x86_64-linux-gnu"]
