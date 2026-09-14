@@ -66,7 +66,8 @@ See [architecture.md](architecture.md#module-layout) for the layout and
 
 - **Input is untrusted.** Parsing code never panics on malformed input: no
   `unwrap`, no unchecked indexing, no arithmetic that can overflow on offsets
-  or sizes. Use checked arithmetic and return `Error::Malformed { file, offset, what }`.
+  or sizes. Use checked arithmetic and return `Error::Malformed { file, offset, what }`
+  (or `Error::Script` for linker scripts, which carry a line and column).
   Modules that parse untrusted bytes (`input`, `elf/read`, `script`, and
   the future COFF and Mach-O readers) put
   `#![deny(clippy::arithmetic_side_effects)]` at the top of their module, so

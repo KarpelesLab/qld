@@ -184,6 +184,30 @@ succeed. The error message names the missing search path.
 - **Threads.** Parallel by default. `--threads=N`, `--no-threads` and
   `--thread-count=N` (gold) are honored.
 
+### Linker scripts
+
+qld's script parser follows GNU ld's grammar and tokenization (including its
+surprises: `foo=1` at top level is a single name, and `INPUT(a.o, b.o)` names
+a file `a.o,`). Deliberate differences:
+
+- **More lenient** where GNU ld rejects: a stray `;` inside `SECTIONS`
+  (including after `ASSERT(...)`), an empty `INPUT()`, output section
+  attributes in any order, a keyword used as a symbol name where no keyword
+  could appear, and in version scripts `local:` before `global:` and an
+  optional `;` before `}`.
+- **Short-circuit evaluation**: `&&` and `||` do not evaluate their right
+  operand when the result is already known. GNU ld evaluates both, which only
+  matters when the right side would be an error.
+- **Stricter**: invalid characters are errors (GNU ld warns); division or
+  modulo by zero is always an error; `i64::MIN / -1` yields `i64::MIN`
+  (GNU ld crashes with `SIGFPE`).
+- **Nesting limits**: expressions 128 levels deep, `INCLUDE` 10 (as GNU ld),
+  `AS_NEEDED` and version `extern` blocks 32.
+- **Not supported**: MRI scripts (`-c`).
+- `OVERWRITE_SECTIONS` is an lld extension and follows lld's semantics.
+
+Errors are reported GNU-style as `file:line:column: message`.
+
 ## ld64 flavor notes
 
 - Single-dash long options only (`-dylib`, `-framework Foo`, `-arch arm64`).

@@ -42,7 +42,7 @@ can work at the same time without colliding.
 | --- | --- | --- | --- | --- |
 | W1 | Command-line parsing | `src/args/**` | — | merged |
 | W2 | Input files and archives | `src/input/**` | — | merged |
-| W3 | Linker scripts | `src/script/**` | — | yes |
+| W3 | Linker scripts | `src/script/**` | — | merged |
 | W4 | Symbol table and interning | `src/symbols/**` | — | merged |
 | W5 | Output writer | `src/output/**` | — | merged |
 | W6 | GC / ICF / merge passes | `src/passes/**` | — | merged |
@@ -296,6 +296,8 @@ that cross workstream boundaries. The integrator does these between merges.
 | W4 | `const fn` ID accessors and `Default` on IDs | done |
 | W1 | Emit `LinkOptions::warnings` to the diagnostic sink, honoring `--no-warnings` / `--fatal-warnings` | done (`main.rs`) |
 | W1 | Re-export `parse_gnu_with` from the crate root | done |
+| W3 | `Error` variant for script errors with line and column | done: `Error::Script` |
+| W3 | Layout-side script semantics: `DATA_SEGMENT_*` relro adjustment, `PROVIDE` only-if-referenced, `NEXT_SECTION`, section-relative symbols from `.` | open, for W8 / M3 |
 | W1 | Let `ParseOutcome` grow print-and-exit variants (`--print-sysroot`, `--print-output-format`); `main.rs` must handle them | open |
 | W1 | `target.rs`: more operating systems (FreeBSD, …) and architectures (MIPS, PowerPC32, …) for their `-m` emulations | open, when needed |
 | W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | open |

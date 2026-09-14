@@ -91,7 +91,7 @@ Everything a typical Linux distribution build needs.
 
 - [ ] Shared object inputs: `.dynsym`, `DT_NEEDED`/`DT_SONAME`, symbol versions
       (`.gnu.version`, `.gnu.version_d`, `.gnu.version_r`)
-- [ ] Linker scripts as inputs (`libc.so` style `GROUP`/`AS_NEEDED`/`INPUT`)
+- [~] Linker scripts as inputs (`libc.so` style `GROUP`/`AS_NEEDED`/`INPUT`): parsing done, driver hookup pending
 - [ ] Output kinds: PIE (`-pie`), non-PIE dynamic, shared objects (`-shared`)
 - [ ] PLT/GOT, lazy and `-z now` binding, `.plt.got`, IBT-enabled PLT
 - [ ] Copy relocations and canonical PLT entries for non-PIC executables
@@ -120,7 +120,7 @@ dynamic symbol tables and `DT_*` entries, apart from documented differences.
 
 ## M3: Linker scripts, raw binary and embedded targets
 
-- [ ] Full GNU linker script language: `SECTIONS`, `MEMORY`, `PHDRS`, `ENTRY`,
+- [~] Full GNU linker script language (parser, evaluator and pattern matching done; layout integration pending): `SECTIONS`, `MEMORY`, `PHDRS`, `ENTRY`,
       `PROVIDE`/`PROVIDE_HIDDEN`, `ASSERT`, `INCLUDE`, `INSERT AFTER/BEFORE`,
       `OVERWRITE_SECTIONS`, `/DISCARD/`, `KEEP`, `SORT_*`, `EXCLUDE_FILE`,
       `AT`/`AT>` load addresses, `>region`, `FILL`, `BYTE`/`LONG`/`QUAD`,
