@@ -75,7 +75,7 @@ The first end-to-end link: fully static x86-64 Linux executables.
 - [x] Linker-defined symbols (`_end`, `_etext`, `__bss_start`, `__ehdr_start`, …)
 - [x] `--build-id` (parallel tree hash), `-s`/`-S`, `--strip-debug`
 - [x] `--icf`, `-Map`, `--why-live`, `--print-gc-sections`
-- [~] Compressed debug sections in inputs (`-gz`): W10's API merged, ELF driver hookup pending
+- [x] Compressed debug sections in inputs (`-gz`)
 - [ ] Musl C programs verified (only the Rust musl target is tested so far)
 - [x] Parallel output writer: mapped output, disjoint slices per chunk,
       replacing an existing output atomically
@@ -92,24 +92,24 @@ the result passes the test suite.
 
 Everything a typical Linux distribution build needs.
 
-- [ ] Shared object inputs: `.dynsym`, `DT_NEEDED`/`DT_SONAME`, symbol versions
+- [x] Shared object inputs: `.dynsym`, `DT_NEEDED`/`DT_SONAME`, symbol versions
       (`.gnu.version`, `.gnu.version_d`, `.gnu.version_r`)
-- [~] Linker scripts as inputs (`libc.so` style `GROUP`/`AS_NEEDED`/`INPUT`): parsing done, driver hookup pending
-- [ ] Output kinds: PIE (`-pie`), non-PIE dynamic, shared objects (`-shared`)
-- [ ] PLT/GOT, lazy and `-z now` binding, `.plt.got`, IBT-enabled PLT
-- [ ] Copy relocations and canonical PLT entries for non-PIC executables
-- [ ] `.dynamic`, `.dynsym`, `.dynstr`, `.hash`/`.gnu.hash` (`--hash-style`)
-- [ ] `-z relro`, `-z now`, `PT_GNU_RELRO`, `PT_INTERP`, `--dynamic-linker`
-- [ ] `DT_RELR` (`-z pack-relative-relocs`), sorted `.rela.dyn`, `-z combreloc`
-- [ ] TLS in shared objects: GD/LD/IE with the dynamic TLS relocations
-- [ ] Symbol visibility, `--export-dynamic`, `--dynamic-list`, `--exclude-libs`,
+- [x] Linker scripts as inputs (`libc.so` style `GROUP`/`AS_NEEDED`/`INPUT`)
+- [x] Output kinds: PIE (`-pie`), non-PIE dynamic, shared objects (`-shared`)
+- [x] PLT/GOT, lazy and `-z now` binding, `.plt.got`, IBT-enabled PLT
+- [x] Copy relocations and canonical PLT entries for non-PIC executables
+- [x] `.dynamic`, `.dynsym`, `.dynstr`, `.hash`/`.gnu.hash` (`--hash-style`)
+- [x] `-z relro`, `-z now`, `PT_GNU_RELRO`, `PT_INTERP`, `--dynamic-linker`
+- [x] `DT_RELR` (`-z pack-relative-relocs`), sorted `.rela.dyn`, `-z combreloc`
+- [x] TLS in shared objects: GD/LD/IE with the dynamic TLS relocations
+- [x] Symbol visibility, `--export-dynamic`, `--dynamic-list`, `--exclude-libs`,
       version scripts (`--version-script`), `-Bsymbolic`, `--no-undefined`,
       `--allow-shlib-undefined`
-- [ ] `--as-needed`, `-rpath`, `-rpath-link`, `--enable-new-dtags`, `$ORIGIN`
-- [ ] `--wrap`, `--defsym`, `--trace-symbol`, `-Map`, `--cref`,
+- [x] `--as-needed`, `-rpath`, `-rpath-link`, `--enable-new-dtags`, `$ORIGIN`
+- [x] `--wrap`, `--defsym`, `--trace-symbol`, `-Map`, `--cref`,
       `--print-gc-sections`, `--why-live`
-- [ ] Relocatable output (`-r`) and `--emit-relocs`
-- [ ] Library symbol matching: suggest the missing `-l` flag, version mismatch
+- [x] Relocatable output (`-r`) and `--emit-relocs` (`-r` limits: no non-COMDAT section groups, no `SHT_REL` inputs, no `--compress-debug-sections`)
+- [x] Library symbol matching: suggest the missing `-l` flag, version mismatch
       hints, "did you mean" for near-miss names
       ([optimizations.md](docs/optimizations.md#intelligent-library-symbol-matching))
 
@@ -176,9 +176,8 @@ its linker.
 - [ ] Identical code folding: `--icf=safe` (using `.llvm_addrsig`) and `--icf=all`
 - [ ] String tail merging (`-O2`)
 - [ ] Section ordering: `--symbol-ordering-file`, `--call-graph-profile-sort`
-- [~] Compressed debug sections: read and write zlib and zstd
-      (`--compress-debug-sections`): codecs and section API done (in-crate,
-      parallel); ELF driver hookup pending
+- [x] Compressed debug sections: read and write zlib and zstd
+      (`--compress-debug-sections`), in-crate codecs, parallel
 - [ ] `--gdb-index` and `--debug-names` generation
 - [ ] Unlinking a large old output file in the background
 - [ ] Optional separate-debug output (`--separate-debug-file`) with

@@ -6,11 +6,13 @@ their command lines, so compiler drivers (`gcc`, `clang`, `rustc`) and build
 systems can use it with no other changes. It is also a Rust library, so tools
 can link programs in-process.
 
-> **Status: pre-alpha.** qld links **static x86-64 Linux executables**
-> (roadmap milestone M1): C and C++ (exceptions, threads, TLS, IFUNC) against
-> glibc, and Rust programs against glibc or musl, with `--gc-sections`,
-> `--icf`, debug info and `--build-id`. A statically linked qld built by qld
-> works as a linker. Dynamic linking
+> **Status: pre-alpha.** qld links **x86-64 Linux ELF** (roadmap milestones
+> M1 and M2): static and dynamic executables, PIE and static PIE, shared
+> libraries and relocatable (`-r`) output, with symbol versioning, RELRO,
+> `DT_RELR`, `--gc-sections`, `--icf`, compressed debug sections and
+> `--build-id`. Used as the system linker it builds and passes the test
+> suites of zlib, lua, bzip2, jansson, gzip, grep, expat and cmark, and qld's
+> own test suite. Other architectures and formats are not supported yet. Dynamic linking
 > (PIE, shared libraries) is next (M2); everything else below describes where
 > qld is going, not what it does today. See [ROADMAP.md](ROADMAP.md).
 
@@ -67,20 +69,19 @@ can link programs in-process.
 
 ## Usage
 
-Today (static x86-64 only):
+Today (x86-64 Linux ELF):
 
 ```sh
 # gcc: -B points at a directory whose `ld` is a symlink to qld
-gcc -static -B/opt/qld/bin hello.c -o hello
+gcc -B/opt/qld/bin hello.c -o hello
 
-# Rust, static glibc. Until PIE support lands (M2), ask for a non-PIE binary.
-RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static \
-  -C linker=gcc -C linker-features=-lld -C link-arg=-B/opt/qld/bin" \
-  cargo build --release --target x86_64-unknown-linux-gnu
+# clang
+clang --ld-path=/opt/qld/bin/ld hello.c -o hello
+
+# Rust (recent rustc uses its bundled rust-lld by default; turn that off)
+RUSTFLAGS="-C linker=gcc -C linker-features=-lld -C link-arg=-B/opt/qld/bin" \
+  cargo build --release
 ```
-
-Gentoo's GCC compresses debug info by default; add `-gz=none` when compiling
-with `-g` until compressed input sections are supported.
 
 ## Planned usage
 

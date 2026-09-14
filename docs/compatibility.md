@@ -205,6 +205,31 @@ succeed. The error message names the missing search path.
   implementation and chunked parallel compression); the decompressed contents
   are the same.
 
+### Dynamic linking and `-r`
+
+- **COMDAT selection** takes the earliest resolution round, then the lowest
+  input position. GNU ld keeps the first copy it loads; the two differ only
+  when an archive member extracted for a later file's reference carries the
+  group (GNU keeps the member's copy, qld the later object's). The copies are
+  interchangeable by definition.
+- **Static executables get `PT_GNU_RELRO`**, as with dynamic ones.
+- **GNU quirks kept on purpose:** a `.plt` header is emitted even when only
+  `.plt.got` entries exist, and calls to undefined weak symbols in static PIEs
+  go through `.plt.got`; copy-relocated aliases share one copy (lld style).
+- Imports appear in `.symtab` as `name@VERSION`.
+- **`-r`:** output sections appear in first-appearance order (GNU uses its
+  script order); `SHF_MERGE` sections are concatenated, not deduplicated;
+  `.eh_frame` is kept as-is (GNU removes duplicate CIEs); with
+  `--gc-sections`, unreferenced common symbols are kept; `--defsym x=sym+off`
+  makes `x` relative to `sym`'s section (GNU makes it absolute).
+- **`--emit-relocs`:** relocations to discarded COMDAT copies become
+  `R_X86_64_NONE` (GNU redirects debug relocations to the kept copy).
+- **`--cref`** leaves out symbols mentioned only by shared libraries; **`-y`**
+  prints `qld: note: main.o: reference to puts`.
+- **Compressed debug output** uses zlib level 1 below `-O2`, so a section
+  that barely compresses can end up stored uncompressed where GNU ld
+  compresses it, or the reverse.
+
 ### Linker scripts
 
 qld's script parser follows GNU ld's grammar and tokenization (including its
