@@ -55,6 +55,7 @@ can work at the same time without colliding.
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | merged |
 | W16 | M2 exit criteria: real-world builds | `src/elf/**`, `tests/projects/**` | W11 | in progress |
 | W14 | PE/COFF reading | `src/coff/**` | — | merged |
+| W17 | LTO plugin host | `src/plugin/**` | — | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -351,6 +352,18 @@ dylibs (arm64, x86_64), fat slice selection, `.tbd` text stubs (v3–v5), and
 the per-atom information dead stripping needs (`.subsections_via_symbols`).
 
 **Owns:** `src/macho/**`, `tests/macho_read.rs`, `tests/data/macho_read/`.
+
+---
+
+## W17: LTO plugin host
+
+**Goal:** the linker half of the GNU linker plugin API (`-plugin`,
+`-plugin-opt`), loading GCC's `liblto_plugin.so` and LLVM's `LLVMgold.so`,
+as a standalone API: claim IR inputs, report their symbols, take
+resolutions, and collect the native objects the plugin produces. Wiring it
+into the ELF driver's resolution rounds is a later integration step.
+
+**Owns:** `src/plugin/**`, `tests/plugin.rs`, `tests/data/plugin/`.
 
 ---
 
