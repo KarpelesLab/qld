@@ -566,6 +566,12 @@ pub struct LinkOptions {
     pub noinhibit_exec: bool,
     /// LTO plugin paths (`-plugin`) and their options (`-plugin-opt`).
     pub plugins: Vec<(PathBuf, Vec<String>)>,
+    /// `-plugin-save-temps`: keep the files an LTO plugin generates.
+    pub plugin_save_temps: bool,
+    /// Exit the process when an LTO plugin reports a fatal error, as GNU ld
+    /// does. The `qld` binary sets this; library callers get an error
+    /// instead, and accept that a plugin may not expect to be called again.
+    pub exit_on_plugin_fatal: bool,
     /// Options that were recognized but have no effect yet, kept so that
     /// `--verbose` and tests can report them.
     pub ignored: Vec<OsString>,

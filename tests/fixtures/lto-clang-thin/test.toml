@@ -34,3 +34,10 @@ timeout = 120
 # LLVM gives .eh_frame the type SHT_X86_64_UNWIND; qld keeps the input type
 # where GNU ld writes PROGBITS (not specific to LTO).
 diff.ignore = ["section: .eh_frame X86_64_UNWIND", "section: .eh_frame PROGBITS"]
+# clang can be installed without LLVMgold.so, which -flto needs.
+requires_files = [
+  "/usr/lib/llvm/*/lib*/LLVMgold.so",   # Gentoo
+  "/usr/lib/llvm-*/lib/LLVMgold.so",    # Debian, Ubuntu
+  "/usr/lib*/LLVMgold.so",              # Fedora, Arch
+  "/usr/local/lib*/LLVMgold.so",
+]

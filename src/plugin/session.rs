@@ -59,7 +59,7 @@ impl SessionOptions {
                 .iter()
                 .map(|symbol| symbol.as_bytes().to_vec())
                 .collect(),
-            save_temps: false,
+            save_temps: options.plugin_save_temps,
             fatal_hook: None,
         }
     }

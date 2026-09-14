@@ -151,7 +151,7 @@ pub fn ir_error(file: &str, kind: IrKind, mode: LtoMode) -> Error {
         IrKind::LlvmBitcode => ("LLVM bitcode", "clang", "LLVMgold.so"),
         IrKind::GccSlim | IrKind::GccFat => ("GCC LTO", "gcc", "liblto_plugin.so"),
     };
-    Error::Option(match mode {
+    Error::Plugin(match mode {
         LtoMode::NoPlugin => format!(
             "{file}: {what} input needs an LTO plugin: link it through the compiler \
              driver ({driver} -flto), which passes -plugin {plugin}"
@@ -380,7 +380,7 @@ mod plugin_link {
         fn session(&mut self) -> Result<&mut Session> {
             if self.session.is_none() {
                 let mut session = Session::new(SessionOptions {
-                    fatal_hook: Some(exit_on_fatal),
+                    fatal_hook: self.options.exit_on_plugin_fatal.then_some(exit_on_fatal),
                     ..SessionOptions::from_link_options(self.options)
                 })?;
                 for (path, plugin_options) in &self.options.plugins {

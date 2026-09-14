@@ -220,6 +220,7 @@ pub(crate) enum Action {
     DependentLibraries(bool),
     Plugin,
     PluginOpt,
+    PluginSaveTemps,
 }
 
 /// What an implemented `-z` keyword does. Private to the parser.
@@ -1326,7 +1327,13 @@ pub static GNU_OPTIONS: &[OptionDef] = &[
     uns("task-link", V, NOT_PLANNED),
     uns("print-output-format", F, PRINTS),
     uns("print-sysroot", F, PRINTS),
-    ign("plugin-save-temps", F),
+    imp(
+        "plugin-save-temps",
+        F,
+        Action::PluginSaveTemps,
+        "",
+        "Keep the files LTO plugins generate",
+    ),
     ign("flto", OV),
     ign("flto-partition", V),
     ign("fuse-ld", V),

@@ -32,7 +32,11 @@ fn run(args: &[std::ffi::OsString], diagnostics: &dyn DiagnosticSink) -> qld::Re
             println!("{}", qld::version_line());
             Ok(())
         }
-        ParseOutcome::Link(options) => {
+        ParseOutcome::Link(mut options) => {
+            // GNU ld exits inside the plugin's fatal callback; plugins can
+            // misbehave if the linker returns instead. Library callers get
+            // an error (see LinkOptions::exit_on_plugin_fatal).
+            options.exit_on_plugin_fatal = true;
             if !options.no_warnings {
                 for warning in &options.warnings {
                     diagnostics.emit(Diagnostic::warning(warning.clone()));

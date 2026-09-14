@@ -727,6 +727,7 @@ impl GnuParser {
             Action::DependencyFile => o.dependency_file = Some(path(m)?),
             Action::DependentLibraries(on) => o.dependent_libraries = on,
             Action::Plugin => o.plugins.push((path(m)?, Vec::new())),
+            Action::PluginSaveTemps => o.plugin_save_temps = true,
             Action::PluginOpt => {
                 let option = text(m)?;
                 match o.plugins.last_mut() {
