@@ -27,7 +27,8 @@ use rayon::prelude::*;
 
 use crate::args::{BuildId, LinkOptions};
 use crate::elf::read::consts::{
-    GNU_PROPERTY_1_NEEDED, GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_FEATURE_1_IBT,
+    GNU_PROPERTY_1_NEEDED, GNU_PROPERTY_AARCH64_FEATURE_1_AND, GNU_PROPERTY_AARCH64_FEATURE_1_BTI,
+    GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_FEATURE_1_IBT,
     GNU_PROPERTY_X86_FEATURE_1_SHSTK, GNU_PROPERTY_X86_FEATURE_2_NEEDED,
     GNU_PROPERTY_X86_FEATURE_2_USED, GNU_PROPERTY_X86_ISA_1_NEEDED, GNU_PROPERTY_X86_ISA_1_USED,
     NT_GNU_BUILD_ID, NT_GNU_PROPERTY_TYPE_0,
@@ -226,6 +227,7 @@ impl Synth {
     /// Plans GOT, PLT and copy relocation entries from the scan.
     pub fn plan_entries(&mut self, refs: &Refs<'_, '_>, scan: &ScanResult, mode: Mode) {
         let symbols = refs.symbols;
+        self.arch = Arch::of_files(refs.files).unwrap_or(self.arch);
         self.mode = Some(mode);
         let all: Vec<SymbolId> = symbols.ids().collect();
         let flagged = |test: &(dyn Fn(SymbolFlags) -> bool + Sync)| -> Vec<SymbolId> {
@@ -786,27 +788,36 @@ pub fn plan_build_id(options: &LinkOptions) -> Option<u64> {
     build_id_size(&options.build_id).and_then(|s| u64::try_from(s).ok())
 }
 
-/// The x86 feature bits every regular object has (0 without objects).
+/// The architecture feature bits every regular object has (0 without
+/// objects): x86 `FEATURE_1_AND` or AArch64 `FEATURE_1_AND`, whichever the
+/// link targets.
 #[must_use]
 pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
+    let aarch64 = Arch::of_files(files) == Some(Arch::AArch64);
     let mut feature_and: Option<u32> = None;
     for file in files {
         let Some(object) = &file.object else {
             continue;
         };
-        let features = object
-            .properties
-            .and_then(|p| p.x86_feature_1_and)
-            .unwrap_or(0);
+        let properties = object.properties.unwrap_or_default();
+        let features = if aarch64 {
+            properties.aarch64_feature_1_and.unwrap_or(0)
+        } else {
+            properties.x86_feature_1_and.unwrap_or(0)
+        };
         feature_and = Some(feature_and.map_or(features, |f| f & features));
     }
     feature_and.unwrap_or(0)
 }
 
-/// Whether the PLT is IBT-enabled: every regular object has IBT, or
-/// `-z ibtplt` or `-z ibt` was given.
+/// Whether PLT entries carry a landing pad: x86-64 IBT (`-z ibtplt`,
+/// `-z ibt`, or every object marked) or AArch64 BTI (every object marked,
+/// or `-z force-bti`).
 #[must_use]
 pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+    if Arch::of_files(files) == Some(Arch::AArch64) {
+        return input_features(files) & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
+    }
     options.x86.ibtplt
         || options.x86.ibt
         || input_features(files) & GNU_PROPERTY_X86_FEATURE_1_IBT != 0
@@ -825,6 +836,7 @@ pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
 /// libraries do not take part.
 #[must_use]
 pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Option<Vec<u8>> {
+    let aarch64 = Arch::of_files(files) == Some(Arch::AArch64);
     let mut needed_1 = 0u32;
     let mut isa_needed = 0u32;
     let mut feature_2_needed = 0u32;
@@ -853,7 +865,19 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     if !any {
         return None;
     }
-    let mut features = input_features(files);
+    let features = input_features(files);
+    if aarch64 {
+        // AArch64 has one feature word; the x86 properties do not apply.
+        let properties: Vec<(u32, u32)> = [
+            (GNU_PROPERTY_1_NEEDED, needed_1),
+            (GNU_PROPERTY_AARCH64_FEATURE_1_AND, features),
+        ]
+        .into_iter()
+        .filter(|&(_, value)| value != 0)
+        .collect();
+        return encode_property_note(&properties);
+    }
+    let mut features = features;
     if options.x86.ibt {
         features |= GNU_PROPERTY_X86_FEATURE_1_IBT;
     }
@@ -878,6 +902,11 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     .into_iter()
     .filter(|&(_, value)| value != 0)
     .collect();
+    encode_property_note(&properties)
+}
+
+/// Encodes `.note.gnu.property` from `(type, value)` pairs, in type order.
+fn encode_property_note(properties: &[(u32, u32)]) -> Option<Vec<u8>> {
     if properties.is_empty() {
         return None;
     }
@@ -887,7 +916,7 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     note.extend_from_slice(&descsz.to_le_bytes());
     note.extend_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
     note.extend_from_slice(b"GNU\0");
-    for (kind, value) in properties {
+    for &(kind, value) in properties {
         note.extend_from_slice(&kind.to_le_bytes());
         note.extend_from_slice(&4u32.to_le_bytes());
         note.extend_from_slice(&value.to_le_bytes());
@@ -898,12 +927,12 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
 
 /// Plans `.interp`: the `--dynamic-linker` path, or the default.
 #[must_use]
-pub fn plan_interp(options: &LinkOptions, mode: Mode) -> Option<Vec<u8>> {
+pub fn plan_interp(options: &LinkOptions, mode: Mode, arch: Arch) -> Option<Vec<u8>> {
     if !mode.interp {
         return None;
     }
     let mut path = options.dynamic_linker.as_ref().map_or_else(
-        || DEFAULT_INTERPRETER.as_bytes().to_vec(),
+        || arch.default_interpreter().as_bytes().to_vec(),
         |p| p.as_os_str().as_encoded_bytes().to_vec(),
     );
     path.push(0);

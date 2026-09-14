@@ -624,7 +624,13 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
 
     // 3. Segment plan (before addresses: the header size depends on it).
     let mode = input.mode;
-    let separate = input.options.separate_code.unwrap_or(SeparateCode::Code);
+    let separate = input.options.separate_code.unwrap_or({
+        if input.synth.arch.separate_code_by_default() {
+            SeparateCode::Code
+        } else {
+            SeparateCode::None
+        }
+    });
     let perm = |section: &OutSection<'_>| -> u32 {
         let mut flags = PF_R;
         if section.flags & SHF_EXECINSTR != 0 {

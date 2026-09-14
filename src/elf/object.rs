@@ -12,9 +12,9 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::elf::read::consts::{
-    EM_X86_64, SHF_ALLOC, SHF_EXCLUDE, SHF_EXECINSTR, SHF_MERGE, SHF_WRITE, SHT_GROUP,
-    SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NULL, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
-    SHT_SYMTAB_SHNDX, STB_LOCAL, STB_WEAK,
+    SHF_ALLOC, SHF_EXCLUDE, SHF_EXECINSTR, SHF_MERGE, SHF_WRITE, SHT_GROUP, SHT_LLVM_ADDRSIG,
+    SHT_NOBITS, SHT_NULL, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_LOCAL,
+    STB_WEAK,
 };
 use std::sync::Arc;
 
@@ -304,8 +304,8 @@ impl<'a> ObjectInput<'a> {
     /// [`Error::Unimplemented`] for objects qld cannot link yet.
     pub fn parse(data: &'a [u8], source: Source<'a>, config: &ParseConfig<'a>) -> Result<Self> {
         let elf = ObjectFile::<Elf64Le>::parse(data, source)?;
-        if elf.elf().header().e_machine != EM_X86_64 {
-            return Err(source.malformed(18, "ELF machine (incompatible with elf_x86_64)"));
+        if crate::elf::arch::Arch::from_machine(elf.elf().header().e_machine).is_none() {
+            return Err(source.malformed(18, "ELF machine (not an architecture qld links)"));
         }
 
         let count = elf.section_count();

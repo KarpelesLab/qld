@@ -599,7 +599,7 @@ pub fn collect<'a>(
         walker.add(id, entry.attrs, &entry.what, &entry.found_as)?;
     }
     let target = walker.target.unwrap_or(Target::X86_64_LINUX);
-    if target.arch != Architecture::X86_64 {
+    if !matches!(target.arch, Architecture::X86_64 | Architecture::Aarch64) {
         return Err(Error::Unimplemented(format!(
             "linking for {:?} (roadmap M4: more ELF architectures)",
             target.arch

@@ -410,6 +410,13 @@ impl Arch {
         }
     }
 
+    /// Whether `-z separate-code` is the default, as it is for GNU ld's
+    /// x86 targets but not for AArch64.
+    #[must_use]
+    pub fn separate_code_by_default(self) -> bool {
+        self == Self::X86_64
+    }
+
     /// The default program interpreter on Linux.
     #[must_use]
     pub fn default_interpreter(self) -> &'static str {
