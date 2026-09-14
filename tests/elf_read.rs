@@ -541,6 +541,9 @@ fn parse_readelf_symbols(out: &str) -> BTreeMap<String, (usize, Vec<RSym>)> {
         if num.parse::<usize>().is_err() {
             continue;
         }
+        // Without ELFOSABI_GNU, readelf prints GNU types and bindings as
+        // "<OS specific>: 10"; make that one token.
+        let rest = rest.replace("<OS specific>: ", "OS:");
         let mut rest = rest.trim_start();
         let mut fields = Vec::new();
         for _ in 0..5 {
@@ -714,8 +717,10 @@ fn compare_with_readelf(path: &Path, inv: &Inventory) {
             };
             let mut ok = r.value == s.value
                 && r.size == s.size
-                && readelf_type(s.kind).is_none_or(|t| t == r.kind)
-                && readelf_bind(s.bind).is_none_or(|b| b == r.bind)
+                && (readelf_type(s.kind).is_none_or(|t| t == r.kind)
+                    || r.kind == format!("OS:{}", s.kind))
+                && (readelf_bind(s.bind).is_none_or(|b| b == r.bind)
+                    || r.bind == format!("OS:{}", s.bind))
                 && readelf_vis(s.vis) == r.vis
                 && ndx == r.ndx;
             let full = format!("{}{}", s.name, s.version);
