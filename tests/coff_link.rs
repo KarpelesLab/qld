@@ -347,12 +347,30 @@ fn sections_match_gnu_ld() {
             .map(|name| name.split_whitespace().next().unwrap_or("").to_string())
             .collect()
     };
-    let gnu = names("gnu.exe");
-    let ours = names("qld.exe");
+    let mut gnu = names("gnu.exe");
+    let mut ours = names("qld.exe");
     if gnu.is_empty() || ours.is_empty() {
         return;
     }
-    assert_eq!(ours, gnu, "section names differ from GNU ld");
+    // Allocated sections must match in order; the order of the non-allocated
+    // debug sections relative to `.reloc` differs between binutils versions,
+    // so compare those as sets.
+    let split = |list: &mut Vec<String>| {
+        let at = list
+            .iter()
+            .position(|name| name.starts_with(".debug") || name == ".reloc")
+            .unwrap_or(list.len());
+        let mut rest: Vec<String> = list.split_off(at);
+        rest.sort();
+        rest
+    };
+    let gnu_rest = split(&mut gnu);
+    let ours_rest = split(&mut ours);
+    assert_eq!(ours, gnu, "allocated section names differ from GNU ld");
+    assert_eq!(
+        ours_rest, gnu_rest,
+        "trailing section names differ from GNU ld"
+    );
 }
 
 #[test]

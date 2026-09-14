@@ -187,6 +187,11 @@ mod linux {
     }
 
     fn cc() -> Option<PathBuf> {
+        // These tests assemble x86-64 sources, so they only run there.
+        if !cfg!(target_arch = "x86_64") {
+            skip("the stub tests assemble x86-64 assembly");
+            return None;
+        }
         let found = find_program("cc").or_else(|| find_program("gcc"));
         if found.is_none() {
             skip("no C compiler");
