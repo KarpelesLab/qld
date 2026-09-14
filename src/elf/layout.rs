@@ -483,7 +483,13 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         }
         let mut flags = output.flags;
         let mut sh_type = output.sh_type;
-        if flags == 0 {
+        // Zero flags alone don't make an output synthetic: non-allocated
+        // input sections such as `.note.stapsdt` (SHT_NOTE) have no flags and
+        // must keep their input type.
+        if placed
+            .iter()
+            .all(|p| matches!(p.member, Member::Synthetic(_)))
+        {
             // Purely synthetic: take flags from the kind.
             (flags, sh_type) = synthetic_flags(output.synthetic);
         } else if output.synthetic != Synthetic::None
