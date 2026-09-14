@@ -6,7 +6,9 @@
 //!
 //! 1. [`inputs`]: search paths, archives, input scripts; then the thread
 //!    pool is sized from the input size unless `--threads` was given;
-//! 2. [`resolve_symbols`] with [`ElfRules`], then COMDAT deduplication;
+//! 2. [`resolve_symbols_with`] with [`ElfRules`], claiming COMDAT groups as
+//!    rounds load files ([`resolve::ComdatHook`]), then dropping the
+//!    discarded copies' sections;
 //! 3. [`place`]: output section assignment;
 //! 4. linker-defined symbols ([`defined`]);
 //! 5. `.eh_frame` splitting, `--gc-sections` and `--why-live` ([`gc`]);
@@ -28,7 +30,7 @@ use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
 use crate::passes::IcfMode;
-use crate::symbols::{SymbolName, SymbolTable, resolve_symbols};
+use crate::symbols::{SymbolName, SymbolTable, resolve_symbols_with};
 
 use super::common;
 use super::defined;
@@ -191,7 +193,9 @@ fn link_inputs<'a>(
         allow_multiple_definition: options.allow_multiple_definition,
     };
     let mut symbols = SymbolTable::new();
-    let resolution = resolve_symbols(&mut symbols, &rules, &mut inputs.files)?;
+    let mut comdat = resolve::ComdatHook::default();
+    let resolution = resolve_symbols_with(&mut symbols, &rules, &mut inputs.files, &mut comdat)?;
+    drop(comdat);
     let files = &inputs.files;
     lap("resolution");
 
@@ -204,7 +208,6 @@ fn link_inputs<'a>(
         relocatable::revive_named(files, &mut sections, b".note.GNU-stack");
     }
     resolve::deduplicate_comdat(files, &mut sections);
-    resolve::redirect_discarded(&symbols, &rules, files, &resolution, &sections);
     let mut errors = resolve::report_duplicates(files, &resolution, &sections, diagnostics);
     report_gnu_warnings(files, &symbols, diagnostics);
     xref::trace_symbols(files, &resolution, options, diagnostics);

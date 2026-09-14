@@ -254,6 +254,9 @@ pub struct ObjectInput<'a> {
     pub splits: Vec<SplitSection<'a>>,
     /// Whether some global symbol is named `name@@VERSION`.
     pub has_default_versions: bool,
+    /// For each of [`groups`](Self::groups), whether another file's copy
+    /// was kept and this one is discarded.
+    pub discarded_groups: Vec<bool>,
 }
 
 /// Whether a section name is debug information that `--strip-debug` drops.
@@ -536,7 +539,37 @@ impl<'a> ObjectInput<'a> {
             warnings,
             splits,
             has_default_versions,
+            discarded_groups: Vec::new(),
         })
+    }
+
+    /// Discards the COMDAT groups flagged in `discarded` (by index in
+    /// [`groups`](Self::groups)): their global definitions stop taking part
+    /// in resolution, so references bind to the kept copy.
+    pub fn discard_groups(&mut self, discarded: Vec<bool>) {
+        let symbols = *self.elf.symbols();
+        for (local, use_) in self.uses.iter_mut().enumerate() {
+            if !matches!(use_, SymbolUse::Definition { .. }) {
+                continue;
+            }
+            let Some(index) = local.checked_add(self.first_global) else {
+                break;
+            };
+            let Some(raw) = symbols.get_raw(index) else {
+                break;
+            };
+            let Ok(SectionIndex::Section(section)) = symbols.section(index, &raw) else {
+                continue;
+            };
+            let group = self
+                .sections
+                .get(section as usize)
+                .and_then(|s| s.group.checked_sub(1));
+            if group.is_some_and(|g| discarded.get(g as usize).copied().unwrap_or(false)) {
+                *use_ = SymbolUse::Ignore;
+            }
+        }
+        self.discarded_groups = discarded;
     }
 
     /// For global symbol `local` (an index into [`names`](Self::names)) named
