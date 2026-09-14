@@ -36,6 +36,21 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gcc g++ binutils libc6-dev libstdc++-13-dev
       - run: cargo test --all-features --test fixtures -- --ignored --nocapture
 
+  arm64-linux:
+    name: AArch64 fixtures on arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc g++ binutils libc6-dev libstdc++-13-dev
+      # On this runner aarch64-linux-gnu is the host, so the aarch64-* fixtures
+      # compile, link, run and are checked natively, and tests/aarch64.rs
+      # compares against the native GNU ld.
+      - run: cargo test --all-features --no-fail-fast
+
   pe-windows:
     name: PE images run on Windows
     runs-on: windows-latest
