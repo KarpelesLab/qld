@@ -105,6 +105,54 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     let mut inputs = inputs::collect(options, &table, &internal, config)?;
     lap("inputs");
 
+    match input_sized_threads(options, &table) {
+        Some(threads) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| Error::Internal(format!("cannot create thread pool: {e}")))?;
+            pool.install(|| link_inputs(options, diagnostics, &mut inputs, &internal, &lap))
+        }
+        None => link_inputs(options, diagnostics, &mut inputs, &internal, &lap),
+    }
+}
+
+/// Input bytes per worker thread when `--threads` is not given.
+const BYTES_PER_THREAD: u64 = 16 << 20;
+/// Most threads used when `--threads` is not given.
+const MAX_DEFAULT_THREADS: usize = 32;
+
+/// The thread count for a link whose thread count was not set explicitly:
+/// one thread per [`BYTES_PER_THREAD`] of input, at most
+/// [`MAX_DEFAULT_THREADS`] and the current pool's size. `None` keeps the
+/// current pool.
+///
+/// Small links are dominated by the fixed cost of spreading tiny tasks over
+/// many threads (a static "hello world" takes 10 ms on one thread and 28 ms
+/// on 64). The output does not depend on the thread count.
+fn input_sized_threads(options: &LinkOptions, table: &FileTable) -> Option<usize> {
+    if options.threads.is_some() {
+        return None;
+    }
+    let bytes: u64 = table
+        .iter()
+        .filter(|(_, file)| file.parent().is_none())
+        .map(|(_, file)| u64::try_from(file.data().len()).unwrap_or(u64::MAX))
+        .fold(0u64, u64::saturating_add);
+    let wanted = usize::try_from(bytes.div_ceil(BYTES_PER_THREAD))
+        .unwrap_or(usize::MAX)
+        .clamp(1, MAX_DEFAULT_THREADS);
+    (wanted < rayon::current_num_threads()).then_some(wanted)
+}
+
+/// Everything after input collection, run in the link's thread pool.
+fn link_inputs<'a>(
+    options: &LinkOptions,
+    diagnostics: &dyn DiagnosticSink,
+    inputs: &mut inputs::Inputs<'a>,
+    internal: &InternalNames,
+    lap: &(dyn Fn(&str) + Sync),
+) -> Result<()> {
     let rules = ElfRules {
         allow_multiple_definition: options.allow_multiple_definition,
     };
@@ -132,7 +180,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
             resolution: &resolution,
             sections: &sections,
         };
-        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, &internal)?;
+        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
@@ -167,7 +215,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         &refs,
         &scan,
         options,
-        &internal,
+        internal,
         diagnostics,
     ));
     if errors > 0 && !options.noinhibit_exec {
