@@ -49,7 +49,7 @@ can work at the same time without colliding.
 | W7 | ELF reading | `src/elf/read/**` | — | merged |
 | W8 | ELF layout, writing and link driver | `src/elf/**` (extends `read/` as needed) | W7 | merged (M1) |
 | W9 | Test harness and fixtures | `tests/**` except other workstreams' `tests/<area>.rs` and `tests/data/<area>/` | — | merged |
-| W10 | DWARF | `src/debug/**` | W7 | in progress |
+| W10 | DWARF | `src/debug/**` | W7 | merged |
 | W11 | Dynamic ELF on x86-64 (M2) | `src/elf/**` | W8 | in progress |
 | W12 | Symbol resolution follow-ups | `src/symbols/**` | W4 | in progress |
 | W13 | Symbol hints and demangling | `src/hints/**`, `src/demangle/**` | — | in progress |
@@ -343,7 +343,9 @@ that cross workstream boundaries. The integrator does these between merges.
 | W8 | Let the ELF driver size the pool when `--threads` is absent | done (`lib.rs`) |
 | W8 | `resolve_symbols` runs parallel iterators over all files every round, including inactive archive members: 17 ms at 64 threads vs 2.5 ms on one for static hello. Iterate only the round's files, or `with_min_len` | open |
 | W8 | `ResolveFile` hook between loading and interning, so COMDAT groups can be claimed before insertion | open |
-| W8 | Switch the local debug tombstone helper in `elf/write.rs` to W10's rules, and handle compressed inputs via W10 | open, after W10 |
+| W8 | Switch the local debug tombstone helper in `elf/write.rs` to W10's rules, handle compressed inputs and `--compress-debug-sections` via `crate::debug`, and pass `LinkOptions::dead_reloc_in_nonalloc` | open, for W11 (API merged) |
+| W10 | `-z dead-reloc-in-nonalloc=` parsing in `src/args` | done |
+| W10 | Fill `Location::source` for undefined-symbol diagnostics with `debug::dwarf::LineLookup` | open, for W11 |
 | W8 | `ifunc-static` fixture prints "same address: no" when built with clang, under GNU ld too: fixture/toolchain issue | open |
 | W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | open, investigate |
 | W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |

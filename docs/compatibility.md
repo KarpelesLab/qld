@@ -196,6 +196,14 @@ succeed. The error message names the missing search path.
 - **`--print-gc-sections` and `--print-icf-sections`** write their lines as
   `qld: note: …` diagnostics.
 - **`PT_GNU_RELRO`** is not emitted in static executables yet (M2).
+- **Debug tombstones.** A relocation in `.debug_loc` whose target was
+  discarded gets `1` (lld's value), so the location list is not cut short.
+  GNU ld 2.46 writes `0` there, which ends the list early. `.debug_ranges`
+  gets `1` in both linkers; `.debug_names` gets `-1` as in lld; everything
+  else gets `0`. Override with `-z dead-reloc-in-nonalloc=<glob>=<value>`.
+- **Compressed debug output bytes** differ from GNU ld's (different zlib
+  implementation and chunked parallel compression); the decompressed contents
+  are the same.
 
 ### Linker scripts
 

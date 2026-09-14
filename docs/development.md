@@ -37,10 +37,13 @@ See [architecture.md](architecture.md#module-layout) for the layout and
   - `memmap2` (file mapping)
   - `hashbrown` + `foldhash` (hash tables)
   Expected later, when the feature that needs them lands:
-  - `flate2` with the `miniz_oxide` backend, and a pure-Rust zstd (`ruzstd`), for compressed debug sections
   - `libloading` (plugin feature only)
-  Small algorithms we need in one place — MD5 and SHA-1 for `--build-id`, CRC32
-  for PE — are implemented in-crate rather than pulled in as dependencies.
+  Algorithms qld needs are implemented in-crate rather than pulled in as
+  dependencies: MD5, SHA-1 and xxHash64 (`output::hash`), and zlib/DEFLATE and
+  Zstandard codecs (`debug::compress`). The codecs sit behind one `Codec` enum,
+  so swapping in a crate later is a local change. Measured against the system
+  libraries: inflate and deflate match or beat zlib; the zstd decoder is about
+  2.5x slower than libzstd.
 - **Object parsing is written in-house**, not taken from the `object` crate. The
   hot paths need zero-copy, monomorphized, parallel-friendly access that fits
   qld's ID-based data model. `object`, `gimli` and similar crates may still be
