@@ -22,9 +22,9 @@
 //! | [`write`] | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
 //!
-//! Not implemented yet: auto-import and runtime pseudo-relocations, `-r`,
-//! `--gc-sections`, local symbols in the output symbol table, and
-//! architectures other than x86-64.
+//! Not implemented yet: `-r`, `--gc-sections`, local symbols in the output
+//! symbol table, auto-import of PC-relative references, and architectures
+//! other than x86-64.
 
 pub mod defined;
 pub mod directives;

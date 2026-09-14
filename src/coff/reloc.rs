@@ -62,6 +62,47 @@ impl Value {
     }
 }
 
+/// One MinGW runtime pseudo-relocation.
+///
+/// The linker stores the *address of the import address table slot* in the
+/// relocated field; `_pei386_runtime_relocator` replaces it at startup with
+/// the slot's contents, keeping the addend. See `docs/compatibility.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PseudoReloc {
+    /// RVA of the `__imp_` slot.
+    pub sym: u32,
+    /// RVA of the relocated field.
+    pub target: u32,
+    /// Width of the field in bits.
+    pub flags: u32,
+}
+
+/// Version 2 header of the pseudo-relocation list: two zero words and the
+/// version.
+pub const PSEUDO_RELOC_V2_HEADER: [u32; 3] = [0, 0, 1];
+
+/// Encodes the version 2 pseudo-relocation list `_pei386_runtime_relocator`
+/// walks between `__RUNTIME_PSEUDO_RELOC_LIST__` and its `_END__`.
+#[must_use]
+pub fn encode_pseudo_relocs(relocs: &[PseudoReloc]) -> Vec<u8> {
+    if relocs.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<PseudoReloc> = relocs.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = Vec::with_capacity(sorted.len().saturating_add(1).saturating_mul(12));
+    for word in PSEUDO_RELOC_V2_HEADER {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    for reloc in &sorted {
+        out.extend_from_slice(&reloc.sym.to_le_bytes());
+        out.extend_from_slice(&reloc.target.to_le_bytes());
+        out.extend_from_slice(&reloc.flags.to_le_bytes());
+    }
+    out
+}
+
 /// A site that needs an entry in `.reloc`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BaseReloc {
@@ -90,6 +131,9 @@ pub struct Addresses<'i, 'a> {
     pub commons: HashMap<SymbolId, Value>,
     /// `--alternatename` and weak-external fallbacks.
     pub aliases: HashMap<SymbolId, SymbolId>,
+    /// Symbols MinGW auto-import binds to a DLL's import address table slot
+    /// rather than to a definition, mapped to the `__imp_` symbol.
+    pub auto_imported: HashMap<SymbolId, SymbolId>,
 }
 
 impl<'a> Addresses<'_, 'a> {
@@ -216,6 +260,8 @@ impl<'a> Addresses<'_, 'a> {
 pub struct Applied {
     /// Sites that need a base relocation.
     pub base_relocs: Vec<BaseReloc>,
+    /// Sites the MinGW runtime relocator must fix up.
+    pub pseudo_relocs: Vec<PseudoReloc>,
     /// Problems found, as diagnostics.
     pub errors: Vec<Diagnostic>,
 }
@@ -243,6 +289,40 @@ pub fn apply(
         .as_ref()
         .map_or(0, super::read::CoffObject::machine);
     let mut relocate = |offset: u32, r_type: u16, record: u32| {
+        let auto = addresses
+            .record_symbol(file, record)
+            .and_then(|id| addresses.auto_imported.get(&id).copied())
+            .and_then(|slot| addresses.value(slot))
+            .and_then(Value::rva);
+        if let Some(slot) = auto {
+            let site = rva.wrapping_add(offset);
+            let bits = match r_type {
+                IMAGE_REL_AMD64_ADDR64 => 64,
+                IMAGE_REL_AMD64_ADDR32 => 32,
+                _ => {
+                    out.errors.push(
+                        Diagnostic::error(format!(
+                            "auto-import cannot fix up a {} relocation; declare the symbol \
+                             `__declspec(dllimport)`",
+                            relocation_name(machine, r_type)
+                                .map_or_else(|| format!("{r_type:#x}"), str::to_string)
+                        ))
+                        .at(location(
+                            addresses,
+                            file,
+                            &input.name,
+                            u64::from(offset),
+                        )),
+                    );
+                    return;
+                }
+            };
+            out.pseudo_relocs.push(PseudoReloc {
+                sym: slot,
+                target: site,
+                flags: bits,
+            });
+        }
         let value = addresses.record_value(file, record);
         let Some(value) = value else {
             let name = addresses

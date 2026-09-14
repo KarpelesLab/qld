@@ -36,6 +36,7 @@ use super::implib;
 use super::inputs::{self, CoffInput, InternalNames};
 use super::layout::{self, CommonSymbol, LayoutInput};
 use super::object::GlobalKind;
+use super::options::AutoImport;
 use super::options::PeOptions;
 use super::read::consts::{
     IMAGE_SUBSYSTEM_WINDOWS_CUI, IMAGE_SUBSYSTEM_WINDOWS_GUI, IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY,
@@ -110,8 +111,40 @@ pub fn link_with(
     };
     let options = &options;
 
-    let table = FileTable::new();
-    let mut inputs = inputs::collect(options, &table, &internal)?;
+    // MinGW auto-import may need `__imp_` symbols that nothing referred to,
+    // so their import library members were never extracted. The first
+    // attempt finds them; the second links with them as roots.
+    for attempt in 0..2u32 {
+        let table = FileTable::new();
+        let extra = link_once(options, pe, diagnostics, &table, &internal)?;
+        if extra.is_empty() {
+            return Ok(());
+        }
+        if attempt == 1 {
+            return Err(Error::Internal(
+                "auto-import did not settle after two resolution passes".into(),
+            ));
+        }
+        for name in &extra {
+            internal.push(name);
+        }
+    }
+    Ok(())
+}
+
+/// One resolution and link attempt.
+///
+/// Returns the `__imp_` symbols auto-import needs as extra roots, which is
+/// empty when the image was written.
+#[allow(clippy::too_many_lines)]
+fn link_once<'a>(
+    options: &LinkOptions,
+    pe: &PeOptions,
+    diagnostics: &dyn DiagnosticSink,
+    table: &'a FileTable,
+    internal: &'a InternalNames,
+) -> Result<Vec<Vec<u8>>> {
+    let mut inputs = inputs::collect(options, table, internal)?;
     let files = &mut inputs.files;
 
     let rules = CoffRules {
@@ -131,7 +164,19 @@ pub fn link_with(
     for file in files {
         directives.add_from(file)?;
     }
-    let aliases = alias_table(&symbols, files, &resolution, &directives);
+    let mut aliases = alias_table(&symbols, files, &resolution, &directives);
+    // Auto-import must be decided before undefined symbols are reported: it
+    // is what binds a reference to a DLL's data that was compiled without
+    // `__declspec(dllimport)`.
+    let auto_imported = if pe.auto_import == AutoImport::Enabled {
+        let pending = pending_auto_imports(&symbols);
+        if !pending.is_empty() {
+            return Ok(pending);
+        }
+        auto_import_table(&symbols, &mut aliases)
+    } else {
+        HashMap::default()
+    };
     errors = errors.saturating_add(report_undefined(
         &symbols,
         &resolution,
@@ -168,8 +213,11 @@ pub fn link_with(
         implib::write_def(path, &exports)?;
     }
 
-    // Lay out, relocate, then lay out again with the real `.reloc` size.
+    // Lay out, relocate, then lay out again with the real `.reloc` and
+    // pseudo-relocation sizes. Both only grow the end of a section, so the
+    // pass converges in two rounds.
     let mut reloc_size = 0u32;
+    let mut pseudo_size = 0u32;
     let mut attempt = 0u32;
     loop {
         let mut synthetic: Vec<(Vec<u8>, u32, u32)> = Vec::new();
@@ -184,6 +232,7 @@ pub fn link_with(
             options: pe,
             commons: &commons,
             synthetic: &synthetic,
+            pseudo_reloc_size: pseudo_size,
         })?;
         let linker = defined::values(&plan, &symbols, pe.section_alignment);
         let addresses = Addresses {
@@ -195,6 +244,7 @@ pub fn link_with(
             linker,
             commons: common_values(&plan, &commons),
             aliases: aliases.clone(),
+            auto_imported: auto_imported.clone(),
         };
         let mut generated: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         if export_size > 0
@@ -211,13 +261,18 @@ pub fn link_with(
         } else {
             Vec::new()
         };
+        let pseudo = reloc::encode_pseudo_relocs(&applied.pseudo_relocs);
         let wanted = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
+        let wanted_pseudo = u32::try_from(pseudo.len()).unwrap_or(u32::MAX);
         attempt = attempt.saturating_add(1);
-        if emit_relocs && wanted != reloc_size {
+        if (emit_relocs && wanted != reloc_size) || wanted_pseudo != pseudo_size {
             if attempt > 4 {
-                return Err(Error::Internal(".reloc size did not converge".into()));
+                return Err(Error::Internal(
+                    "the generated section sizes did not converge".into(),
+                ));
             }
             reloc_size = wanted;
+            pseudo_size = wanted_pseudo;
             continue;
         }
 
@@ -227,11 +282,26 @@ pub fn link_with(
         }
         let has_relocs = !encoded.is_empty();
         generated.push((b".reloc".to_vec(), encoded));
-        let (contents, _) = if has_relocs {
+        let (mut contents, _) = if has_relocs {
             write::render(&addresses, &generated)
         } else {
             (contents, applied)
         };
+        // The pseudo-relocation list sits inside `.rdata`, between the
+        // bounds `__RUNTIME_PSEUDO_RELOC_LIST__` names.
+        if !pseudo.is_empty()
+            && let Some(&(_, section, offset)) = plan
+                .markers
+                .iter()
+                .find(|&&(marker, _, _)| marker == layout::Marker::PseudoStart)
+            && let Some(bytes) = contents.get_mut(section as usize)
+        {
+            let start = offset as usize;
+            let end = start.saturating_add(pseudo.len());
+            if let Some(slot) = bytes.get_mut(start..end) {
+                slot.copy_from_slice(&pseudo);
+            }
+        }
 
         let symbols = if options.strip >= StripMode::All {
             super::symtab::SymbolTable::default()
@@ -256,7 +326,7 @@ pub fn link_with(
             },
             &contents,
         )?;
-        return Ok(());
+        return Ok(Vec::new());
     }
 }
 
@@ -453,6 +523,78 @@ fn alias_table<'a>(
         }
     }
     aliases
+}
+
+/// The `__imp_` symbols auto-import needs but that resolution left lazy,
+/// because nothing referred to them: an import library member defines them,
+/// and only an extra root pulls it in.
+///
+/// Returning a non-empty list makes the driver resolve again with these
+/// names as roots.
+fn pending_auto_imports(symbols: &SymbolTable<'_>) -> Vec<Vec<u8>> {
+    let mut pending = Vec::new();
+    for id in symbols.ids() {
+        if symbols.definition_kind(id) != DefinitionKind::Undefined
+            || !symbols
+                .flags(id)
+                .intersects(SymbolFlags::REFERENCED | SymbolFlags::WEAK_REFERENCED)
+        {
+            continue;
+        }
+        let name = symbols.name(id).bytes();
+        if name.starts_with(super::read::IMP_PREFIX) {
+            continue;
+        }
+        let imp = [super::read::IMP_PREFIX, name].concat();
+        if symbols
+            .lookup(&SymbolName::new(&imp))
+            .is_some_and(|slot| symbols.definition_kind(slot) == DefinitionKind::Lazy)
+        {
+            pending.push(imp);
+        }
+    }
+    pending.sort_unstable();
+    pending.dedup();
+    pending
+}
+
+/// The symbols MinGW auto-import binds to an import address table slot.
+///
+/// A reference to a DLL's *data* that was compiled without
+/// `__declspec(dllimport)` leaves `<name>` undefined while `__imp_<name>` is
+/// defined by the import library. `--enable-auto-import` binds `<name>` to
+/// the slot's address and records a runtime pseudo-relocation, which
+/// `_pei386_runtime_relocator` turns into the slot's contents at startup.
+fn auto_import_table(
+    symbols: &SymbolTable<'_>,
+    aliases: &mut HashMap<SymbolId, SymbolId>,
+) -> HashMap<SymbolId, SymbolId> {
+    let mut table = HashMap::default();
+    for id in symbols.ids() {
+        if !is_unresolved(symbols, id) || aliases.contains_key(&id) {
+            continue;
+        }
+        if !symbols
+            .flags(id)
+            .intersects(SymbolFlags::REFERENCED | SymbolFlags::WEAK_REFERENCED)
+        {
+            continue;
+        }
+        let name = symbols.name(id).bytes();
+        if name.starts_with(super::read::IMP_PREFIX) {
+            continue;
+        }
+        let imp = [super::read::IMP_PREFIX, name].concat();
+        let Some(slot) = symbols.lookup(&SymbolName::new(&imp)) else {
+            continue;
+        };
+        if is_unresolved(symbols, slot) {
+            continue;
+        }
+        aliases.insert(id, slot);
+        table.insert(id, slot);
+    }
+    table
 }
 
 /// Whether a symbol ends the link without a definition in the image.

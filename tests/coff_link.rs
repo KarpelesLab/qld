@@ -1010,3 +1010,104 @@ fn symbol_table_matches_gnu_ld() {
         );
     }
 }
+
+const AUTO_IMPORT_CLIENT: &str = r#"
+#include <stdio.h>
+/* No __declspec(dllimport): the reference is direct, and MinGW auto-import
+   has to bind it through the import address table at startup. */
+extern int exported_data;
+int *data_pointer = &exported_data;
+__declspec(dllimport) void greet(void);
+int main(void) {
+    greet();
+    printf("%d\n", *data_pointer);
+    return 0;
+}
+"#;
+
+/// MinGW auto-import: a pointer to a DLL's data that was compiled without
+/// `__declspec(dllimport)` binds through the import address table, and the
+/// image carries a runtime pseudo-relocation list for it.
+///
+/// RUN ON WINDOWS: the executable should print `hello from the dll` then
+/// `41`, and exit 0.
+#[test]
+fn auto_import_and_runtime_pseudo_relocs() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    let dir = scratch("auto-import");
+    let Some(library_object) = compile(&dir, "library", LIBRARY, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(
+        &dir,
+        &[
+            "-shared",
+            library_object.as_str(),
+            "-o",
+            "sample.dll",
+            "-fno-lto",
+        ],
+    ) else {
+        return;
+    };
+    let mut options = options_from(&argv, &dir.join("sample.dll"));
+    options.kind = qld::args::OutputKind::Shared;
+    let mut pe = PeOptions::from_link_options(&options);
+    pe.out_implib = Some(dir.join("libsample.dll.a"));
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to link the DLL:\n{error}");
+    }
+
+    let Some(client_object) = compile(&dir, "client", AUTO_IMPORT_CLIENT, &[]) else {
+        return;
+    };
+    let Some(argv) = link_argv(&dir, &[client_object.as_str(), "-o", "out.exe", "-fno-lto"]) else {
+        return;
+    };
+    let mut options = options_from(&argv, &dir.join("auto.exe"));
+    options.inputs.push(InputSpec {
+        kind: InputKind::File(dir.join("libsample.dll.a")),
+        attrs: InputAttrs::default(),
+        position: options.inputs.len(),
+    });
+    let pe = PeOptions::from_link_options(&options);
+    if let Err(error) = qld_link(&options, &pe) {
+        panic!("qld failed to auto-import a DLL's data:\n{error}");
+    }
+    // The pseudo-relocation list must be non-empty and bracketed by the
+    // symbols the MinGW runtime walks.
+    let Some(symbols) = run(&format!("{PREFIX}nm"), &["auto.exe"], &dir) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&symbols.stdout).into_owned();
+    let address = |name: &str| -> Option<u64> {
+        text.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let value = parts.next()?;
+            let _kind = parts.next()?;
+            (parts.next()? == name).then(|| u64::from_str_radix(value, 16).ok())?
+        })
+    };
+    let (Some(start), Some(end)) = (
+        address("__RUNTIME_PSEUDO_RELOC_LIST__"),
+        address("__RUNTIME_PSEUDO_RELOC_LIST_END__"),
+    ) else {
+        panic!("the pseudo-relocation list bounds are missing:\n{text}");
+    };
+    assert!(
+        end > start,
+        "the pseudo-relocation list is empty ({start:#x}..{end:#x})"
+    );
+    // A version 2 header plus one 12-byte entry.
+    assert_eq!(end - start, 24, "unexpected pseudo-relocation list size");
+
+    // `--disable-auto-import` must refuse the same link rather than produce
+    // an image that crashes.
+    let mut pe = PeOptions::from_link_options(&options);
+    pe.auto_import = qld::coff::options::AutoImport::Disabled;
+    let error = qld_link(&options, &pe).unwrap_err();
+    assert!(error.contains("exported_data"), "{error}");
+}

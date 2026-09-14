@@ -467,6 +467,9 @@ pub struct LayoutInput<'i, 'a> {
     /// Extra sections the linker generates, as `(name, size, align)`; their
     /// contents are filled in later.
     pub synthetic: &'i [(Vec<u8>, u32, u32)],
+    /// Bytes to reserve for the MinGW runtime pseudo-relocation list, which
+    /// sits between the `__RUNTIME_PSEUDO_RELOC_LIST__` bounds in `.rdata`.
+    pub pseudo_reloc_size: u32,
 }
 
 /// Assigns every live input section to an output section and gives each one
@@ -599,6 +602,18 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                             piece: Piece::Fill(bytes),
                         });
                         offset = offset.saturating_add(size);
+                    }
+                    // The pseudo-relocation list the linker generates goes
+                    // where GNU ld's script puts the input sections of the
+                    // same name: inside the `__RUNTIME_PSEUDO_RELOC_LIST__`
+                    // bounds. Its bytes are patched in after layout.
+                    if *marker == Marker::PseudoStart && input.pseudo_reloc_size > 0 {
+                        chunks.push(Chunk {
+                            offset,
+                            size: input.pseudo_reloc_size,
+                            piece: Piece::Zero,
+                        });
+                        offset = offset.saturating_add(input.pseudo_reloc_size);
                     }
                 }
                 Step::Place(_) => {
