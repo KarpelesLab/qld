@@ -1,0 +1,37 @@
+--- !tapi-tbd-v3
+archs:                 [ i386, x86_64, x86_64h ]
+uuids:                 [ 'i386: 4D39C1C8-5C5A-3A3F-B3D2-5C1C0E1A0001',
+                         'x86_64: 4D39C1C8-5C5A-3A3F-B3D2-5C1C0E1A0002',
+                         'x86_64h: 4D39C1C8-5C5A-3A3F-B3D2-5C1C0E1A0003' ]
+platform:              macosx
+flags:                 [ flat_namespace ]
+install-name:          /usr/lib/libqldobjc.A.dylib
+current-version:       779.1
+compatibility-version: 1
+objc-constraint:       none
+parent-umbrella:       System
+exports:
+  - archs:             [ i386 ]
+    symbols:           [ .objc_class_name_Protocol, __objc_empty_vtable_i386 ]
+  - archs:             [ x86_64, x86_64h ]
+    allowable-clients: [ QldRuntimeClient ]
+    re-exports:        [ /usr/lib/libqldobjc-trampolines.dylib ]
+    symbols:           [ __objc_empty_cache, _objc_msgSend, _objc_retain ]
+    objc-classes:      [ NSObject, Protocol ]
+    objc-eh-types:     [ NSObject ]
+    objc-ivars:        [ NSObject.isa ]
+    weak-def-symbols:  [ _objc_weak_default ]
+    thread-local-symbols: [ _objc_tls_slot ]
+undefineds:
+  - archs:             [ i386, x86_64, x86_64h ]
+    symbols:           [ _malloc ]
+    weak-ref-symbols:  [ _os_unfair_lock_lock_with_options ]
+--- !tapi-tbd-v3
+archs:                 [ x86_64, x86_64h ]
+platform:              macosx
+install-name:          /usr/lib/libqldobjc-trampolines.dylib
+current-version:       779.1
+exports:
+  - archs:             [ x86_64, x86_64h ]
+    symbols:           [ _objc_blockTrampoline ]
+...

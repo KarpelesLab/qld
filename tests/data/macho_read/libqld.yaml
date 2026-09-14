@@ -1,0 +1,213 @@
+--- !mach-o
+# Mach-O reader fixture: a minimal arm64 dylib with an export trie
+# (LC_DYLD_INFO_ONLY), dependencies of every kind, run paths, an umbrella
+# and an allowable client. Build: yaml2obj libqld.yaml -o libqld-arm64.dylib
+FileHeader:
+  magic:           0xFEEDFACF
+  cputype:         0x100000C
+  cpusubtype:      0x0
+  filetype:        0x6
+  ncmds:           14
+  sizeofcmds:      1000
+  flags:           0x118085
+  reserved:        0x0
+LoadCommands:
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         152
+    segname:         __TEXT
+    vmaddr:          0
+    vmsize:          16384
+    fileoff:         0
+    filesize:        16384
+    maxprot:         5
+    initprot:        5
+    nsects:          1
+    flags:           0
+    Sections:
+      - sectname:        __text
+        segname:         __TEXT
+        addr:            0x3F40
+        size:            16
+        offset:          0x3F40
+        align:           2
+        reloff:          0x0
+        nreloc:          0
+        flags:           0x80000400
+        reserved1:       0x0
+        reserved2:       0x0
+        reserved3:       0x0
+        content:         200080D2C0035FD6400080D2C0035FD6
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         72
+    segname:         __LINKEDIT
+    vmaddr:          16384
+    vmsize:          16384
+    fileoff:         16384
+    filesize:        256
+    maxprot:         1
+    initprot:        1
+    nsects:          0
+    flags:           0
+  - cmd:             LC_ID_DYLIB
+    cmdsize:         48
+    dylib:
+      name:            24
+      timestamp:       1
+      current_version: 66051
+      compatibility_version: 65536
+    Content:         '@rpath/libqld.dylib'
+    ZeroPadBytes:    5
+  - cmd:             LC_DYLD_INFO_ONLY
+    cmdsize:         48
+    rebase_off:      0
+    rebase_size:     0
+    bind_off:        0
+    bind_size:       0
+    weak_bind_off:   0
+    weak_bind_size:  0
+    lazy_bind_off:   0
+    lazy_bind_size:  0
+    export_off:      16384
+    export_size:     96
+  - cmd:             LC_SYMTAB
+    cmdsize:         24
+    symoff:          16488
+    nsyms:           2
+    stroff:          16520
+    strsize:         24
+  - cmd:             LC_BUILD_VERSION
+    cmdsize:         32
+    platform:        1
+    minos:           851968
+    sdk:             852224
+    ntools:          1
+    Tools:
+      - tool:            3
+        version:         71582720
+  - cmd:             LC_LOAD_DYLIB
+    cmdsize:         56
+    dylib:
+      name:            24
+      timestamp:       2
+      current_version: 87556096
+      compatibility_version: 65536
+    Content:         '/usr/lib/libSystem.B.dylib'
+    ZeroPadBytes:    6
+  - cmd:             LC_LOAD_WEAK_DYLIB
+    cmdsize:         48
+    dylib:
+      name:            24
+      timestamp:       2
+      current_version: 65536
+      compatibility_version: 65536
+    Content:         '@rpath/libweak.dylib'
+    ZeroPadBytes:    4
+  - cmd:             LC_REEXPORT_DYLIB
+    cmdsize:         48
+    dylib:
+      name:            24
+      timestamp:       2
+      current_version: 131072
+      compatibility_version: 65536
+    Content:         '@rpath/libinner.dylib'
+    ZeroPadBytes:    3
+  - cmd:             LC_LOAD_UPWARD_DYLIB
+    cmdsize:         48
+    dylib:
+      name:            24
+      timestamp:       2
+      current_version: 65536
+      compatibility_version: 65536
+    Content:         '@rpath/libupward.dylib'
+    ZeroPadBytes:    2
+  - cmd:             LC_RPATH
+    cmdsize:         32
+    path:            12
+    Content:         '@loader_path/lib'
+    ZeroPadBytes:    4
+  - cmd:             LC_RPATH
+    cmdsize:         40
+    path:            12
+    Content:         '/opt/qld/lib'
+    ZeroPadBytes:    16
+  - cmd:             LC_SUB_FRAMEWORK
+    cmdsize:         24
+    umbrella:        12
+    Content:         'QldKit'
+    ZeroPadBytes:    6
+  - cmd:             LC_SUB_CLIENT
+    cmdsize:         24
+    client:          12
+    Content:         'QldApp'
+    ZeroPadBytes:    6
+LinkEditData:
+  ExportTrie:
+    TerminalSize:    0
+    NodeOffset:      0
+    Name:            ''
+    Flags:           0x0
+    Address:         0x0
+    Other:           0x0
+    ImportName:      ''
+    Children:
+      - TerminalSize:    0
+        NodeOffset:      9
+        Name:            _qld_
+        Flags:           0x0
+        Address:         0x0
+        Other:           0x0
+        ImportName:      ''
+        Children:
+          - TerminalSize:    3
+            NodeOffset:      40
+            Name:            one
+            Flags:           0x0
+            Address:         0x3F40
+            Other:           0x0
+            ImportName:      ''
+          - TerminalSize:    3
+            NodeOffset:      45
+            Name:            two
+            Flags:           0x4
+            Address:         0x3F48
+            Other:           0x0
+            ImportName:      ''
+          - TerminalSize:    15
+            NodeOffset:      50
+            Name:            again
+            Flags:           0x8
+            Address:         0x0
+            Other:           0x3
+            ImportName:      _inner_again
+          - TerminalSize:    4
+            NodeOffset:      67
+            Name:            tlv
+            Flags:           0x1
+            Address:         0x4000
+            Other:           0x0
+            ImportName:      ''
+          - TerminalSize:    5
+            NodeOffset:      73
+            Name:            ifunc
+            Flags:           0x10
+            Address:         0x3F48
+            Other:           0x3F4C
+            ImportName:      ''
+  NameList:
+    - n_strx:          2
+      n_type:          0xF
+      n_sect:          1
+      n_desc:          0
+      n_value:         16192
+    - n_strx:          11
+      n_type:          0xF
+      n_sect:          1
+      n_desc:          128
+      n_value:         16200
+  StringTable:
+    - ' '
+    - _qld_one
+    - _qld_two
+    - ''
+    - ''
+...
