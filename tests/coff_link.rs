@@ -139,30 +139,14 @@ fn pe_target() -> Target {
     }
 }
 
-/// Parses `argv` into [`LinkOptions`], dropping the options the GNU table
-/// still marks unsupported for PE (qld's PE options live in [`PeOptions`]).
+/// Parses `argv` — the whole MinGW link line, PE options included — into
+/// [`LinkOptions`], with the output redirected to `output` because the test
+/// process does not run in the scratch directory.
 fn options_from(argv: &[String], output: &Path) -> LinkOptions {
-    let mut kept: Vec<std::ffi::OsString> = Vec::new();
-    let mut skip_next = false;
-    for word in argv {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        match word.as_str() {
-            "-m" | "--subsystem" | "-e" => {
-                skip_next = word != "-e";
-                if word == "-e" {
-                    kept.push(word.into());
-                }
-                continue;
-            }
-            "--enable-auto-image-base" | "--shared" | "-shared" => continue,
-            _ => {}
-        }
-        kept.push(word.into());
-    }
-    let mut options = match qld::parse_gnu(&kept) {
+    let words: Vec<std::ffi::OsString> = std::iter::once("qld".into())
+        .chain(argv.iter().map(std::ffi::OsString::from))
+        .collect();
+    let mut options = match qld::parse_gnu(&words) {
         Ok(qld::ParseOutcome::Link(options)) => *options,
         other => panic!("cannot parse the MinGW link line: {other:?}"),
     };
@@ -518,6 +502,104 @@ fn dll_with_import_library() {
             "GNU ld read qld's import library differently"
         );
     }
+}
+
+/// The same DLL and client, driven entirely by qld's command line: the
+/// options come from `gcc -shared`'s own link line plus `--out-implib` and
+/// `--output-def`, and no [`PeOptions`] is built by hand.
+///
+/// RUN ON WINDOWS: the executable should print `hello from the dll` then
+/// `42`, and exit 0.
+#[test]
+fn command_line_builds_a_dll_and_an_executable() {
+    if tool(&format!("{PREFIX}gcc")).is_none() {
+        skip("x86_64-w64-mingw32-gcc not found");
+        return;
+    }
+    let dir = scratch("command-line-dll");
+    let Some(library_object) = compile(&dir, "library", LIBRARY, &[]) else {
+        return;
+    };
+    let implib = dir.join("libargv.dll.a");
+    let def = dir.join("argv.def");
+    let Some(mut argv) = link_argv(
+        &dir,
+        &[
+            "-shared",
+            library_object.as_str(),
+            "-o",
+            "argv.dll",
+            "-fno-lto",
+        ],
+    ) else {
+        return;
+    };
+    argv.push("--out-implib".to_owned());
+    argv.push(implib.to_str().unwrap().to_owned());
+    argv.push("--output-def".to_owned());
+    argv.push(def.to_str().unwrap().to_owned());
+    argv.push("--major-image-version=3".to_owned());
+    argv.push("--minor-image-version=1".to_owned());
+    argv.push("--disable-high-entropy-va".to_owned());
+
+    // `--shared` and the MinGW options all come from the command line.
+    let options = options_from(&argv, &dir.join("argv.dll"));
+    assert_eq!(options.kind, qld::args::OutputKind::Shared);
+    assert_eq!(options.pe.out_implib, Some(implib.clone()));
+    let sink = Collect::new();
+    qld::link(&options, &sink).expect("qld::link with a MinGW -shared command line");
+
+    let Some(headers) = readobj(&dir, "argv.dll", &["--file-headers"]) else {
+        return;
+    };
+    assert!(headers.contains("IMAGE_FILE_DLL"), "{headers}");
+    assert!(headers.contains("MajorImageVersion: 3"), "{headers}");
+    assert!(headers.contains("MinorImageVersion: 1"), "{headers}");
+    assert!(
+        !headers.contains("IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA"),
+        "--disable-high-entropy-va was ignored:\n{headers}"
+    );
+    let Some(exports) = readobj(&dir, "argv.dll", &["--coff-exports"]) else {
+        return;
+    };
+    assert!(exports.contains("add_one"), "{exports}");
+    assert!(
+        std::fs::read_to_string(&def).unwrap().contains("add_one @"),
+        "--output-def wrote no export list"
+    );
+
+    // The executable, linked against that import library, again from argv.
+    let Some(client_object) = compile(&dir, "client", CLIENT, &[]) else {
+        return;
+    };
+    let Some(mut argv) = link_argv(
+        &dir,
+        &[client_object.as_str(), "-o", "argv-client.exe", "-fno-lto"],
+    ) else {
+        return;
+    };
+    argv.push(implib.to_str().unwrap().to_owned());
+    argv.push("--subsystem".to_owned());
+    argv.push("console,6.1".to_owned());
+    argv.push("--stack".to_owned());
+    argv.push("0x100000,0x2000".to_owned());
+    let options = options_from(&argv, &dir.join("argv-client.exe"));
+    let sink = Collect::new();
+    qld::link(&options, &sink).expect("qld::link with a MinGW executable command line");
+
+    let Some(headers) = readobj(&dir, "argv-client.exe", &["--file-headers"]) else {
+        return;
+    };
+    assert!(headers.contains("IMAGE_SUBSYSTEM_WINDOWS_CUI"), "{headers}");
+    assert!(headers.contains("MajorSubsystemVersion: 6"), "{headers}");
+    assert!(headers.contains("MinorSubsystemVersion: 1"), "{headers}");
+    assert!(headers.contains("SizeOfStackReserve: 1048576"), "{headers}");
+    assert!(headers.contains("SizeOfStackCommit: 8192"), "{headers}");
+    let Some(imports) = readobj(&dir, "argv-client.exe", &["--coff-imports"]) else {
+        return;
+    };
+    assert!(imports.contains("argv.dll"), "{imports}");
+    assert!(imports.contains("add_one"), "{imports}");
 }
 
 const CXX: &str = r#"
