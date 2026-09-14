@@ -133,6 +133,13 @@ pub struct OutSection<'a> {
     /// Written before the name in `.shstrtab` (`.rela` for
     /// [`Trailer::Rela`]).
     pub name_prefix: &'static [u8],
+    /// Load address (LMA); equal to `addr` unless a script says otherwise.
+    pub lma: u64,
+    /// Padding written with a fill pattern: `(offset, size, pattern)`, the
+    /// pattern indexing [`Layout::fill_patterns`]. Other gaps are zero.
+    pub fills: Vec<(u64, u64, u32)>,
+    /// Bytes from script data commands: `(offset, bytes)`.
+    pub data: Vec<(u64, Vec<u8>)>,
 }
 
 impl OutSection<'_> {
@@ -158,8 +165,10 @@ pub struct Segment {
     pub flags: u32,
     /// `p_offset`.
     pub offset: u64,
-    /// `p_vaddr` and `p_paddr`.
+    /// `p_vaddr`.
     pub vaddr: u64,
+    /// `p_paddr` when it differs from `p_vaddr`.
+    pub paddr: Option<u64>,
     /// `p_filesz`.
     pub filesz: u64,
     /// `p_memsz`.
@@ -246,6 +255,20 @@ pub struct Layout<'a> {
     /// Number of section symbols at the start of `.symtab`
     /// (`--emit-relocs`).
     pub section_symbols: u32,
+    /// Fill patterns used by [`OutSection::fills`].
+    pub fill_patterns: Vec<Vec<u8>>,
+    /// Values of linker script symbols, by slot.
+    pub script_symbols: Vec<crate::elf::script_layout::ScriptSymbol>,
+    /// Warnings from layout, emitted once by the writer.
+    pub warnings: Vec<crate::diag::Diagnostic>,
+    /// File offset of the program header table.
+    pub phoff: u64,
+    /// Header space (ELF header and program headers) addresses were
+    /// computed with.
+    pub headers_reserved: u64,
+    /// `NOCROSSREFS` lists: output section names, and whether the list is
+    /// `NOCROSSREFS_TO` (only references to the first section are checked).
+    pub nocrossrefs: Vec<(bool, Vec<Vec<u8>>)>,
 }
 
 impl Layout<'_> {
@@ -270,7 +293,7 @@ pub struct LayoutInput<'l, 'a> {
     /// Options.
     pub options: &'l LinkOptions,
     /// Rules.
-    pub rules: &'l RuleSet,
+    pub rules: &'l RuleSet<'l>,
     /// Inputs.
     pub files: &'l [ElfInput<'a>],
     /// Input sections.
@@ -305,7 +328,7 @@ pub struct CompressedOutput {
     pub gnu: bool,
 }
 
-fn align_up(value: u64, align: u64) -> Result<u64> {
+pub(crate) fn align_up(value: u64, align: u64) -> Result<u64> {
     let align = align.max(1);
     if !align.is_power_of_two() {
         return Err(Error::Internal(format!(
@@ -318,7 +341,7 @@ fn align_up(value: u64, align: u64) -> Result<u64> {
         .ok_or_else(|| Error::Limit("output larger than the address space".into()))
 }
 
-fn add(a: u64, b: u64) -> Result<u64> {
+pub(crate) fn add(a: u64, b: u64) -> Result<u64> {
     a.checked_add(b)
         .ok_or_else(|| Error::Limit("output larger than the address space".into()))
 }
@@ -345,6 +368,9 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 ///
 /// Returns [`Error::Limit`] when the image does not fit the address space.
 pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
+    if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
+        return crate::elf::script_layout::layout(input, script, placed);
+    }
     let placement = input.placement;
     let sections = input.sections;
     let files = input.files;
@@ -556,6 +582,9 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             members: placed,
             name_offset: 0,
             name_prefix: b"",
+            lma: 0,
+            fills: Vec::new(),
+            data: Vec::new(),
         });
     }
 
@@ -579,94 +608,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         }
     }
 
-    // Trailers. With `--emit-relocs`, the symbol table starts with a section
-    // symbol for every output section (whose header index is its position
-    // plus one, as trailers come last), and every output section with input
-    // relocations gets a `.rela` section.
-    let mut section_symbols = 0u32;
-    if input.options.emit_relocs && input.trailers.symtab > 0 {
-        let regular = out_sections.len();
-        section_symbols =
-            u32::try_from(regular).map_err(|_| Error::Limit("too many output sections".into()))?;
-        for position in 0..regular {
-            let Some(target) = out_sections.get(position) else {
-                break;
-            };
-            let count = super::emit::count(
-                input.files,
-                input.sections,
-                input.eh_frames,
-                &target.members,
-            )?;
-            if count == 0 {
-                continue;
-            }
-            let mut rela = trailer(
-                target.name,
-                Trailer::Rela(u32::try_from(position).unwrap_or(NONE)),
-                crate::elf::read::consts::SHT_RELA,
-                count.saturating_mul(24),
-                8,
-            );
-            rela.name_prefix = b".rela";
-            rela.flags = crate::elf::read::consts::SHF_INFO_LINK;
-            rela.entsize = 24;
-            rela.info = u32::try_from(position.saturating_add(1)).unwrap_or(0);
-            out_sections.push(rela);
-        }
-    }
-    if input.trailers.symtab > 0 {
-        out_sections.push(trailer(
-            b".symtab",
-            Trailer::Symtab,
-            SHT_SYMTAB,
-            input
-                .trailers
-                .symtab
-                .saturating_add(u64::from(section_symbols).saturating_mul(24)),
-            8,
-        ));
-        out_sections.push(trailer(
-            b".strtab",
-            Trailer::Strtab,
-            SHT_STRTAB,
-            input.trailers.strtab,
-            1,
-        ));
-    }
-    out_sections.push(trailer(b".shstrtab", Trailer::Shstrtab, SHT_STRTAB, 0, 1));
-
-    // Section names.
-    let mut shstrtab = vec![0u8];
-    for section in &mut out_sections {
-        section.name_offset = u32::try_from(shstrtab.len())
-            .map_err(|_| Error::Limit("section name table larger than 4 GiB".into()))?;
-        shstrtab.extend_from_slice(section.name_prefix);
-        shstrtab.extend_from_slice(section.name);
-        shstrtab.push(0);
-    }
-    let shstrtab_len = u64::try_from(shstrtab.len()).unwrap_or(u64::MAX);
-    let header_of = |kind: Trailer| {
-        out_sections
-            .iter()
-            .position(|s| s.trailer == kind)
-            .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
-            .unwrap_or(0)
-    };
-    let strtab_index = header_of(Trailer::Strtab);
-    let symtab_index = header_of(Trailer::Symtab);
-    for section in &mut out_sections {
-        match section.trailer {
-            Trailer::Shstrtab => section.size = shstrtab_len,
-            Trailer::Symtab => {
-                section.link = strtab_index;
-                section.info = input.trailers.first_global.saturating_add(section_symbols);
-                section.entsize = 24;
-            }
-            Trailer::Rela(_) => section.link = symtab_index,
-            _ => {}
-        }
-    }
+    let (section_symbols, shstrtab) = add_trailers(input, &mut out_sections)?;
 
     // 3. Segment plan (before addresses: the header size depends on it).
     let mode = input.mode;
@@ -791,6 +733,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         flags: previous,
         offset: 0,
         vaddr: base,
+        paddr: None,
         filesz: headers,
         memsz: headers,
         align: page,
@@ -850,6 +793,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
                 flags: p,
                 offset,
                 vaddr,
+                paddr: None,
                 filesz: 0,
                 memsz: 0,
                 align: page,
@@ -928,6 +872,9 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             *slot = (0, 0, u32::try_from(i).unwrap_or(NONE));
         }
     }
+    for section in &mut out_sections {
+        section.lma = section.addr;
+    }
     let shnum = u64::try_from(out_sections.len().saturating_add(1)).unwrap_or(u64::MAX);
     let shoff = align_up(file_end, 8)?;
     let file_size = add(shoff, shnum.saturating_mul(SHDR_SIZE))?;
@@ -955,6 +902,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
                 flags,
                 offset,
                 vaddr,
+                paddr: None,
                 filesz: size,
                 memsz: size,
                 align,
@@ -968,6 +916,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             flags: PF_R,
             offset: EHDR_SIZE,
             vaddr: base.saturating_add(EHDR_SIZE),
+            paddr: None,
             filesz: size,
             memsz: size,
             align: 8,
@@ -1004,6 +953,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
                         flags: PF_R,
                         offset: section.offset,
                         vaddr: section.addr,
+                        paddr: None,
                         filesz: section.size,
                         memsz: section.size,
                         align: section.align,
@@ -1034,6 +984,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             flags: PF_R,
             offset: first.map_or(0, |s| s.offset),
             vaddr: t.start,
+            paddr: None,
             filesz,
             memsz: t.memsz,
             align: t.align,
@@ -1066,6 +1017,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             flags: PF_R | PF_W | if exec { PF_X } else { 0 },
             offset: 0,
             vaddr: 0,
+            paddr: None,
             filesz: 0,
             memsz: input.options.stack_size.unwrap_or(0),
             align: 16,
@@ -1084,6 +1036,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             flags: PF_R,
             offset,
             vaddr: start,
+            paddr: None,
             filesz: stop.saturating_sub(start),
             memsz: stop.saturating_sub(start),
             align: 1,
@@ -1168,7 +1121,112 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         bss_start,
         end,
         section_symbols,
+        fill_patterns: Vec::new(),
+        script_symbols: Vec::new(),
+        warnings: Vec::new(),
+        phoff: EHDR_SIZE,
+        headers_reserved: 0,
+        nocrossrefs: Vec::new(),
     })
+}
+
+/// Appends the trailing sections (`--emit-relocs` `.rela` sections,
+/// `.symtab`, `.strtab`, `.shstrtab`) to `out_sections`, names every
+/// section, and links the trailers. Returns the number of section symbols
+/// and the `.shstrtab` contents.
+pub(crate) fn add_trailers(
+    input: &LayoutInput<'_, '_>,
+    out_sections: &mut Vec<OutSection<'_>>,
+) -> Result<(u32, Vec<u8>)> {
+    // Trailers. With `--emit-relocs`, the symbol table starts with a section
+    // symbol for every output section (whose header index is its position
+    // plus one, as trailers come last), and every output section with input
+    // relocations gets a `.rela` section.
+    let mut section_symbols = 0u32;
+    if input.options.emit_relocs && input.trailers.symtab > 0 {
+        let regular = out_sections.len();
+        section_symbols =
+            u32::try_from(regular).map_err(|_| Error::Limit("too many output sections".into()))?;
+        for position in 0..regular {
+            let Some(target) = out_sections.get(position) else {
+                break;
+            };
+            let count = super::emit::count(
+                input.files,
+                input.sections,
+                input.eh_frames,
+                &target.members,
+            )?;
+            if count == 0 {
+                continue;
+            }
+            let mut rela = trailer(
+                target.name,
+                Trailer::Rela(u32::try_from(position).unwrap_or(NONE)),
+                crate::elf::read::consts::SHT_RELA,
+                count.saturating_mul(24),
+                8,
+            );
+            rela.name_prefix = b".rela";
+            rela.flags = crate::elf::read::consts::SHF_INFO_LINK;
+            rela.entsize = 24;
+            rela.info = u32::try_from(position.saturating_add(1)).unwrap_or(0);
+            out_sections.push(rela);
+        }
+    }
+    if input.trailers.symtab > 0 {
+        out_sections.push(trailer(
+            b".symtab",
+            Trailer::Symtab,
+            SHT_SYMTAB,
+            input
+                .trailers
+                .symtab
+                .saturating_add(u64::from(section_symbols).saturating_mul(24)),
+            8,
+        ));
+        out_sections.push(trailer(
+            b".strtab",
+            Trailer::Strtab,
+            SHT_STRTAB,
+            input.trailers.strtab,
+            1,
+        ));
+    }
+    out_sections.push(trailer(b".shstrtab", Trailer::Shstrtab, SHT_STRTAB, 0, 1));
+
+    // Section names.
+    let mut shstrtab = vec![0u8];
+    for section in out_sections.iter_mut() {
+        section.name_offset = u32::try_from(shstrtab.len())
+            .map_err(|_| Error::Limit("section name table larger than 4 GiB".into()))?;
+        shstrtab.extend_from_slice(section.name_prefix);
+        shstrtab.extend_from_slice(section.name);
+        shstrtab.push(0);
+    }
+    let shstrtab_len = u64::try_from(shstrtab.len()).unwrap_or(u64::MAX);
+    let header_of = |kind: Trailer| {
+        out_sections
+            .iter()
+            .position(|s| s.trailer == kind)
+            .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
+            .unwrap_or(0)
+    };
+    let strtab_index = header_of(Trailer::Strtab);
+    let symtab_index = header_of(Trailer::Symtab);
+    for section in out_sections.iter_mut() {
+        match section.trailer {
+            Trailer::Shstrtab => section.size = shstrtab_len,
+            Trailer::Symtab => {
+                section.link = strtab_index;
+                section.info = input.trailers.first_global.saturating_add(section_symbols);
+                section.entsize = 24;
+            }
+            Trailer::Rela(_) => section.link = symtab_index,
+            _ => {}
+        }
+    }
+    Ok((section_symbols, shstrtab))
 }
 
 /// Where a writable segment that can start at `start` begins, and where its
@@ -1184,7 +1242,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
 /// ([`Tls::tp`]) only agree with that when the segment starts aligned. A
 /// 4-byte `.tdata` followed by an 8-aligned `.tbss` otherwise put every
 /// `@tpoff` 4 bytes off (LLVM's `TimeTraceProfilerInstance`).
-fn align_tls_start(sections: &mut [OutSection<'_>], alloc: &[usize]) {
+pub(crate) fn align_tls_start(sections: &mut [OutSection<'_>], alloc: &[usize]) {
     fn is_tls(section: &OutSection<'_>) -> bool {
         section.flags & SHF_TLS != 0
     }
@@ -1247,7 +1305,7 @@ fn relro_start<F: Fn(&OutSection<'_>) -> bool>(
 
 /// Sets `sh_link`, `sh_info` and `sh_entsize` of the dynamic linking
 /// sections, which refer to each other by section header index.
-fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
+pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
     let index_of = |sections: &[OutSection<'_>], kind: Synthetic| -> u32 {
         sections
             .iter()
@@ -1317,7 +1375,13 @@ fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
     }
 }
 
-fn trailer(name: &[u8], kind: Trailer, sh_type: u32, size: u64, align: u64) -> OutSection<'_> {
+pub(crate) fn trailer(
+    name: &[u8],
+    kind: Trailer,
+    sh_type: u32,
+    size: u64,
+    align: u64,
+) -> OutSection<'_> {
     OutSection {
         name,
         output: NONE,
@@ -1334,10 +1398,13 @@ fn trailer(name: &[u8], kind: Trailer, sh_type: u32, size: u64, align: u64) -> O
         members: Vec::new(),
         name_offset: 0,
         name_prefix: b"",
+        lma: 0,
+        fills: Vec::new(),
+        data: Vec::new(),
     }
 }
 
-fn synthetic_flags(kind: Synthetic) -> (u64, u32) {
+pub(crate) fn synthetic_flags(kind: Synthetic) -> (u64, u32) {
     use crate::elf::read::consts::{
         SHF_INFO_LINK, SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_HASH, SHT_GNU_VERDEF, SHT_GNU_VERNEED,
         SHT_GNU_VERSYM, SHT_HASH, SHT_RELA, SHT_RELR,
@@ -1372,7 +1439,7 @@ fn synthetic_flags(kind: Synthetic) -> (u64, u32) {
     }
 }
 
-fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result<(u64, u64)> {
+pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result<(u64, u64)> {
     Ok(match member {
         Member::Input(id) => {
             let (file, index) = input
@@ -1410,7 +1477,7 @@ fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result<(u64, u64)
     })
 }
 
-fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[Placed]) -> u64 {
+pub(crate) fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[Placed]) -> u64 {
     let mut entsize: Option<u64> = None;
     for p in placed {
         let size = match p.member {

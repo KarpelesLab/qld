@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use crate::elf::read::consts::{
     SHF_ALLOC, SHF_EXECINSTR, SHF_GNU_RETAIN, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE,
-    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS,
+    SHF_X86_64_LARGE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS,
 };
 use crate::ids::SectionId;
 
@@ -40,6 +40,9 @@ pub struct OutputSection<'a> {
     pub synthetic: Synthetic,
     /// Sections here are GC roots.
     pub keep: bool,
+    /// Under a linker script, the output section statement (index in the
+    /// plan's outputs, then orphans); [`NONE`] with the default rules.
+    pub stmt: u32,
 }
 
 impl OutputSection<'_> {
@@ -62,11 +65,17 @@ pub struct Placement<'a> {
     /// Whether each input section is a GC root because of its placement
     /// (`KEEP`) or its flags (`SHF_GNU_RETAIN`, notes).
     pub keep: Vec<bool>,
+    /// Sections a script's `/DISCARD/` (or `--orphan-handling=discard`)
+    /// removes, sorted; the driver clears their live bits.
+    pub discarded: Vec<SectionId>,
+    /// Statement order, orphans and linker-generated sections under a
+    /// linker script.
+    pub script: Option<Box<crate::elf::script_layout::ScriptPlacement>>,
 }
 
-/// Flags that are not carried from input to output sections.
+/// Flags that are carried from input to output sections.
 const OUTPUT_FLAG_MASK: u64 =
-    SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_MERGE | SHF_STRINGS | SHF_TLS;
+    SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_MERGE | SHF_STRINGS | SHF_TLS | SHF_X86_64_LARGE;
 
 enum Assigned<'a> {
     Rule(u16, u16),
@@ -75,7 +84,15 @@ enum Assigned<'a> {
 
 /// Assigns output sections to every live input section.
 #[must_use]
-pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -> Placement<'a> {
+pub fn place<'a>(
+    rules: &RuleSet<'a>,
+    files: &[ElfInput<'a>],
+    sections: &Sections,
+    options: &crate::args::LinkOptions,
+) -> Placement<'a> {
+    if let Some(script) = rules.script {
+        return crate::elf::script_layout::place(script, files, sections, options);
+    }
     let total = sections.len();
     let mut out = vec![NONE; total];
     let mut sub = vec![0u16; total];
@@ -174,6 +191,7 @@ pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -
                 flags: 0,
                 synthetic: rule.synthetic,
                 keep: rule.keep,
+                stmt: NONE,
             }
         })
         .collect();
@@ -195,6 +213,7 @@ pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -
                     flags: 0,
                     synthetic: Synthetic::None,
                     keep: false,
+                    stmt: NONE,
                 });
                 next
             });
@@ -212,6 +231,8 @@ pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -
         out,
         sub,
         keep,
+        discarded: Vec::new(),
+        script: None,
     };
     placement.compute_flags(files, sections);
     placement

@@ -465,14 +465,31 @@ pub static DEFAULT_RULES: &[OutputRule] = &[
 ];
 
 /// A compiled rule set: patterns ready for matching.
-#[derive(Debug)]
-pub struct RuleSet {
+///
+/// With a linker script, [`RuleSet::script`] holds the layout plan and the
+/// script engine ([`crate::elf::script_layout`]) replaces the default
+/// rules in placement and layout.
+pub struct RuleSet<'r> {
     /// The output rules.
     pub outputs: &'static [OutputRule],
     /// `(output, input description, pattern)` in match order.
     patterns: Vec<(u16, u16, Pattern)>,
     /// For each orphan class, the output rule it follows.
     holds: Vec<(OrphanClass, u16)>,
+    /// The linker script plan, when scripts drive layout.
+    pub script: Option<&'r crate::elf::script_layout::LayoutScript>,
+    /// Where layout reports script problems (region overflows, failed
+    /// assertions, orphans).
+    pub diagnostics: Option<&'r dyn crate::diag::DiagnosticSink>,
+}
+
+impl std::fmt::Debug for RuleSet<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleSet")
+            .field("outputs", &self.outputs.len())
+            .field("script", &self.script.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Where the rules put one input section.
@@ -484,11 +501,24 @@ pub struct Placement {
     pub input: u16,
 }
 
-impl RuleSet {
+impl<'r> RuleSet<'r> {
     /// Compiles the default rules.
     #[must_use]
     pub fn default_rules() -> Self {
         Self::new(DEFAULT_RULES)
+    }
+
+    /// The rules of a link: the script engine's plan when there is one,
+    /// else the default rules.
+    #[must_use]
+    pub fn for_link(
+        script: Option<&'r crate::elf::script_layout::LayoutScript>,
+        diagnostics: &'r dyn crate::diag::DiagnosticSink,
+    ) -> Self {
+        let mut rules = Self::new(DEFAULT_RULES);
+        rules.script = script;
+        rules.diagnostics = Some(diagnostics);
+        rules
     }
 
     /// Compiles a rule list.
@@ -516,6 +546,8 @@ impl RuleSet {
             outputs,
             patterns,
             holds,
+            script: None,
+            diagnostics: None,
         }
     }
 

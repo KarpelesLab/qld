@@ -94,6 +94,20 @@ impl<'x, 'a> Addresses<'x, 'a> {
                     defsyms.push((id, index));
                     continue;
                 }
+                Value::Script { slot, .. } => {
+                    // Absolute script symbols are SHN_ABS in the symbol
+                    // table and are not relocated in PIC output.
+                    if layout
+                        .script_symbols
+                        .get(slot as usize)
+                        .is_some_and(|s| s.absolute)
+                    {
+                        refs.symbols.set_flags(id, super::defined::ABSOLUTE);
+                    } else {
+                        refs.symbols.clear_flags(id, super::defined::ABSOLUTE);
+                    }
+                    this.linker_value(value, placement)
+                }
                 other => this.linker_value(other, placement),
             };
             if let Some(slot) = this.globals.get_mut(id.index()) {
@@ -191,6 +205,10 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 .synthetic(Synthetic::Dynamic)
                 .map_or(0, |(addr, ..)| addr),
             Value::Defsym(_) => 0,
+            Value::Script { slot, .. } => layout
+                .script_symbols
+                .get(slot as usize)
+                .map_or(0, |s| s.value),
         }
     }
 

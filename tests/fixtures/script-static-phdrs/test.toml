@@ -1,0 +1,28 @@
+# M3: a runnable Linux executable laid out entirely by a linker script:
+# PHDRS with FILEHDR/PHDRS and FLAGS, SIZEOF_HEADERS, SUBALIGN, SORT and
+# SORT_BY_NAME, KEEP, fill patterns, symbol arithmetic outside sections,
+# DEFINED, QUAD, PROVIDE, ASSERT and /DISCARD/. Addresses are GNU ld's.
+description = "runnable executable with PHDRS and a custom SECTIONS layout"
+compile = ["as -o start.o start.s"]
+link = "-T layout.ld -z max-page-size=0x1000 -o out start.o"
+run = "./out"
+expect.stdout = "linked by a script\n"
+expect.exit = 37
+expect.readelf = [
+  ".rodata           PROGBITS        0000000010000158 000158 000013",
+  ".text             PROGBITS        0000000010001000 001000 00005e",
+  ".data             PROGBITS        000000001000205e 00105e 000020",
+  "PHDR           0x000040 0x0000000010000040 0x0000000010000040 0x00012b 0x00012b R   0x1",
+  "LOAD           0x000000 0x0000000010000000 0x0000000010000000 0x00016b 0x00016b R   0x1000",
+  "LOAD           0x001000 0x0000000010001000 0x0000000010001000 0x00005e 0x00005e R E 0x1000",
+  "LOAD           0x00105e 0x000000001000205e 0x000000001000205e 0x000020 0x000020 RW  0x1000",
+  "GNU_STACK",
+  "0000000010001048     0 NOTYPE  LOCAL  DEFAULT    2 four",
+  "0000000000000013     0 NOTYPE  GLOBAL DEFAULT  ABS msg_size",
+  "0000000010002076     0 NOTYPE  GLOBAL DEFAULT    3 counter",
+  "!never_called",
+  "!unused_provide",
+  "!.comment",
+]
+targets = ["x86_64-linux-gnu"]
+determinism = true

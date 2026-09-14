@@ -1,0 +1,18 @@
+# M3: a `-T` script with INSERT AFTER augments the default layout rather than
+# replacing it, and a linker script named like an input file (an implicit
+# script) adds a symbol assignment.
+description = "INSERT AFTER into the default layout, and an implicit script"
+compile = ["as -o start.o start.s"]
+link = "-static -T plugins.ld -o out start.o answer.ld"
+run = "./out"
+expect.exit = 42
+expect.readelf = [
+  "   .data .plugins .bss ",
+  "000000000000000c     0 NOTYPE  GLOBAL DEFAULT  ABS answer",
+  "GLOBAL DEFAULT    4 __plugins_start",
+  ".plugins          PROGBITS",
+]
+targets = ["x86_64-linux-gnu"]
+determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]

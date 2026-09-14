@@ -25,7 +25,7 @@ use crate::elf::read::consts::x86_64::{
     R_X86_64_COPY, R_X86_64_DTPMOD64, R_X86_64_IRELATIVE, R_X86_64_JUMP_SLOT, R_X86_64_PLT32,
     R_X86_64_PLT32_BND, R_X86_64_RELATIVE,
 };
-use crate::elf::read::consts::{EM_X86_64, ET_DYN, ET_EXEC, SHF_ALLOC, reloc_name};
+use crate::elf::read::consts::{EM_X86_64, ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR, reloc_name};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::output::{ChunkRange, OutputFile};
@@ -59,6 +59,74 @@ enum Chunk {
     EmitRelocs(u32),
     Prerendered(usize),
     SectionHeaders,
+    /// Script padding: section position, index in its fills.
+    Fill(u32, u32),
+    /// Script data: section position, index in its data.
+    Data(u32, u32),
+    /// Padding between the contents of a code section: no-op instructions.
+    Nop,
+}
+
+/// Adds no-op padding for the gaps of an executable section that nothing
+/// else fills, as BFD's x86 default fill does.
+fn push_code_padding(
+    section: &super::layout::OutSection<'_>,
+    _position: u32,
+    chunks: &mut Vec<(ChunkRange, Chunk)>,
+) {
+    let mut covered: Vec<(u64, u64)> = section
+        .members
+        .iter()
+        .filter(|p| p.size > 0)
+        .map(|p| (p.offset, p.size))
+        .chain(section.fills.iter().map(|&(o, size, _)| (o, size)))
+        .chain(
+            section
+                .data
+                .iter()
+                .map(|(o, b)| (*o, u64::try_from(b.len()).unwrap_or(0))),
+        )
+        .collect();
+    covered.sort_unstable();
+    let mut cursor = 0u64;
+    for (offset, size) in covered.into_iter().chain([(section.size, 0)]) {
+        if offset > cursor && cursor < section.size {
+            let end = offset.min(section.size);
+            chunks.push((
+                ChunkRange::new(
+                    section.offset.saturating_add(cursor),
+                    end.saturating_sub(cursor),
+                ),
+                Chunk::Nop,
+            ));
+        }
+        cursor = cursor.max(offset.saturating_add(size));
+    }
+}
+
+/// Fills `out` with the longest x86 no-op instructions, as BFD's
+/// `bfd_arch_i386_fill` does.
+fn write_nops(out: &mut [u8]) {
+    const NOPS: [&[u8]; 10] = [
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    let mut rest = out;
+    while !rest.is_empty() {
+        let n = rest.len().min(10);
+        let nop = NOPS.get(n.saturating_sub(1)).copied().unwrap_or(&[0x90]);
+        let (head, tail) = rest.split_at_mut(n.min(nop.len()));
+        head.copy_from_slice(nop.get(..head.len()).unwrap_or_default());
+        rest = tail;
+    }
 }
 
 /// Inputs to the writer.
@@ -110,8 +178,18 @@ pub struct Prerendered {
 /// [`Error::Internal`] for layout bugs.
 pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     let layout = input.addresses.layout;
+    if !input.options.no_warnings {
+        for warning in &layout.warnings {
+            input.diagnostics.emit(warning.clone());
+        }
+    }
+    let raw = input
+        .options
+        .output_format
+        .as_deref()
+        .and_then(super::rawout::Format::from_name);
     let mut chunks: Vec<(ChunkRange, Chunk)> = Vec::new();
-    let headers = EHDR_SIZE.saturating_add(
+    let headers = layout.phoff.max(EHDR_SIZE).saturating_add(
         PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(0)),
     );
     chunks.push((ChunkRange::new(0, headers), Chunk::Headers));
@@ -150,6 +228,24 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                 ));
             }
             Trailer::None => {
+                let position32 = u32::try_from(position).unwrap_or(u32::MAX);
+                for (index, &(offset, size, _)) in section.fills.iter().enumerate() {
+                    if size > 0 {
+                        chunks.push((
+                            ChunkRange::new(section.offset.saturating_add(offset), size),
+                            Chunk::Fill(position32, u32::try_from(index).unwrap_or(u32::MAX)),
+                        ));
+                    }
+                }
+                for (index, (offset, bytes)) in section.data.iter().enumerate() {
+                    let size = u64::try_from(bytes.len()).unwrap_or(0);
+                    if size > 0 {
+                        chunks.push((
+                            ChunkRange::new(section.offset.saturating_add(*offset), size),
+                            Chunk::Data(position32, u32::try_from(index).unwrap_or(u32::MAX)),
+                        ));
+                    }
+                }
                 for placed in &section.members {
                     if placed.size == 0 {
                         continue;
@@ -164,6 +260,9 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                         ChunkRange::new(section.offset.saturating_add(placed.offset), placed.size);
                     chunks.push((range, chunk));
                 }
+                if section.flags & SHF_EXECINSTR != 0 {
+                    push_code_padding(section, position32, &mut chunks);
+                }
             }
         }
     }
@@ -176,11 +275,15 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     let ranges: Vec<ChunkRange> = chunks.iter().map(|(range, _)| *range).collect();
 
     let path = input.options.output_path();
-    let mut file = OutputFile::create(
-        &path,
-        layout.file_size,
-        &crate::output::OutputOptions::default(),
-    )?;
+    let mut file = if raw.is_some() {
+        OutputFile::in_memory(layout.file_size)?
+    } else {
+        OutputFile::create(
+            &path,
+            layout.file_size,
+            &crate::output::OutputOptions::default(),
+        )?
+    };
     // Chunks report into a collector; problems are emitted afterwards in
     // input order, so the diagnostics do not depend on scheduling.
     let collected = Collect::new();
@@ -207,6 +310,21 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     emit_collected(collected, input)?;
     if let Some((_, offset, _)) = layout.synthetic(Synthetic::BuildId) {
         file.apply_build_id(&input.options.build_id, offset.saturating_add(16))?;
+    }
+    if let Some(format) = raw {
+        let name = path.as_os_str().as_encoded_bytes().to_vec();
+        let bytes = super::rawout::render(format, layout, file.as_slice(), input.entry, &name)?;
+        drop(file);
+        let mut options = crate::output::OutputOptions::default();
+        if format != super::rawout::Format::Binary {
+            options.mode = crate::output::FileMode::Regular;
+        }
+        let size = u64::try_from(bytes.len())
+            .map_err(|_| Error::Limit("raw output larger than the address space".into()))?;
+        let mut out = OutputFile::create(&path, size, &options)?;
+        out.as_mut_slice().copy_from_slice(&bytes);
+        out.finish()?;
+        return Ok(());
     }
     file.finish()?;
     Ok(())
@@ -353,6 +471,35 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             Ok(())
         }
         Chunk::Input(id) => write_input(input, id, out),
+        Chunk::Fill(position, index) => {
+            let pattern = layout
+                .sections
+                .get(position as usize)
+                .and_then(|s| s.fills.get(index as usize))
+                .and_then(|&(_, _, pattern)| layout.fill_patterns.get(pattern as usize));
+            if let Some(pattern) = pattern
+                && !pattern.is_empty()
+            {
+                for (slot, byte) in out.iter_mut().zip(pattern.iter().cycle()) {
+                    *slot = *byte;
+                }
+            }
+            Ok(())
+        }
+        Chunk::Nop => {
+            write_nops(out);
+            Ok(())
+        }
+        Chunk::Data(position, index) => {
+            if let Some((_, bytes)) = layout
+                .sections
+                .get(position as usize)
+                .and_then(|s| s.data.get(index as usize))
+            {
+                copy_into(out, bytes);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -376,10 +523,16 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     header[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[24..32].copy_from_slice(&input.entry.to_le_bytes());
-    header[32..40].copy_from_slice(&EHDR_SIZE.to_le_bytes());
+    let phoff = if layout.segments.is_empty() {
+        0
+    } else {
+        layout.phoff
+    };
+    header[32..40].copy_from_slice(&phoff.to_le_bytes());
     header[40..48].copy_from_slice(&layout.shoff.to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());
-    header[54..56].copy_from_slice(&56u16.to_le_bytes());
+    let phentsize: u16 = if layout.segments.is_empty() { 0 } else { 56 };
+    header[54..56].copy_from_slice(&phentsize.to_le_bytes());
     let phnum = u16::try_from(layout.segments.len())
         .map_err(|_| Error::Limit("too many program headers".into()))?;
     header[56..58].copy_from_slice(&phnum.to_le_bytes());
@@ -392,7 +545,8 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     header[60..62].copy_from_slice(&shnum_field.to_le_bytes());
     header[62..64].copy_from_slice(&shstrndx.to_le_bytes());
 
-    let phdrs = out.get_mut(64..).ok_or_else(too_small)?;
+    let table_start = usize::try_from(phoff.max(64).saturating_sub(0)).unwrap_or(64);
+    let phdrs = out.get_mut(table_start..).ok_or_else(too_small)?;
     for (segment, entry) in layout
         .segments
         .iter()
@@ -402,7 +556,7 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         entry[4..8].copy_from_slice(&segment.flags.to_le_bytes());
         entry[8..16].copy_from_slice(&segment.offset.to_le_bytes());
         entry[16..24].copy_from_slice(&segment.vaddr.to_le_bytes());
-        entry[24..32].copy_from_slice(&segment.vaddr.to_le_bytes());
+        entry[24..32].copy_from_slice(&segment.paddr.unwrap_or(segment.vaddr).to_le_bytes());
         entry[32..40].copy_from_slice(&segment.filesz.to_le_bytes());
         entry[40..48].copy_from_slice(&segment.memsz.to_le_bytes());
         entry[48..56].copy_from_slice(&segment.align.to_le_bytes());
@@ -1216,6 +1370,12 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         let Some(target) = refs.target(file_index, rel.symbol as usize) else {
             continue;
         };
+        if let Some((from, to)) = prohibited_cross_reference(input, id, &target) {
+            let name = cross_reference_name(refs, file_index, rel.symbol, &target);
+            report(format!(
+                "prohibited cross reference from {from} to `{name}' in {to}"
+            ));
+        }
         let flags = target
             .global
             .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
@@ -1376,6 +1536,81 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         }
     }
     Ok(())
+}
+
+/// The output section names of a reference from input section `from` to
+/// `target` when a `NOCROSSREFS` list prohibits it, as GNU ld checks: both
+/// output sections are in one list and differ, and for `NOCROSSREFS_TO`
+/// the target is in the list's first section.
+fn prohibited_cross_reference(
+    input: &WriteInput<'_, '_, '_>,
+    from: SectionId,
+    target: &super::refs::Target,
+) -> Option<(String, String)> {
+    let addresses = input.addresses;
+    let layout = addresses.layout;
+    if layout.nocrossrefs.is_empty() {
+        return None;
+    }
+    let name_of = |shndx: u32| -> Option<&[u8]> {
+        let position = usize::try_from(shndx.checked_sub(1)?).ok()?;
+        layout.sections.get(position).map(|s| s.name)
+    };
+    let shndx_of = |id: SectionId| layout.section_shndx.get(id.index()).copied();
+    let from_name = name_of(shndx_of(from)?)?;
+    let to_shndx = match target.def {
+        super::refs::Def::Section { file, section, .. } => {
+            shndx_of(addresses.refs.sections.id(file, section)?)?
+        }
+        super::refs::Def::Linker(id) => {
+            u32::from(super::defined::linker_shndx(addresses, input.linker, id)?)
+        }
+        _ => return None,
+    };
+    let to_name = name_of(to_shndx)?;
+    if from_name == to_name {
+        return None;
+    }
+    let listed = |names: &[Vec<u8>], name: &[u8]| names.iter().any(|n| n.as_slice() == name);
+    layout
+        .nocrossrefs
+        .iter()
+        .any(|(first_only, names)| {
+            let target_listed = if *first_only {
+                names.first().is_some_and(|n| n.as_slice() == to_name)
+            } else {
+                listed(names, to_name)
+            };
+            target_listed && listed(names, from_name)
+        })
+        .then(|| {
+            (
+                String::from_utf8_lossy(from_name).into_owned(),
+                String::from_utf8_lossy(to_name).into_owned(),
+            )
+        })
+}
+
+/// The name a cross-reference error uses for a symbol: GNU ld names a
+/// section symbol after its input section, which has no symbol name.
+fn cross_reference_name(
+    refs: &Refs<'_, '_>,
+    file: usize,
+    symbol: u32,
+    target: &super::refs::Target,
+) -> String {
+    if target.is_section_symbol()
+        && let super::refs::Def::Section { section, .. } = target.def
+        && let Some(name) = refs
+            .files
+            .get(file)
+            .and_then(|f| f.object.as_ref())
+            .and_then(|o| o.section(section))
+            .map(|s| String::from_utf8_lossy(s.name).into_owned())
+    {
+        return name;
+    }
+    symbol_name(refs, file, symbol)
 }
 
 fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {

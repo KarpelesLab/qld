@@ -1,0 +1,32 @@
+# M3: `--oformat ihex` and `--oformat srec` write text records with CRLF line
+# ends: Intel HEX extended linear address (04) records when the load address
+# crosses a 64 KiB boundary, a start linear address (05) record for the
+# entry point; S-records with an S0 header naming the output, S3 data records
+# and an S7 entry record. The text is GNU ld's.
+description = "Intel HEX and S-record output"
+compile = ["as -o image.o image.s"]
+link = [
+  "-T flash.ld --oformat ihex -o out.hex image.o",
+  "-T flash.ld --oformat srec -o out.srec image.o",
+]
+run = 'sed "s/\r$/ CRLF/" out.hex out.srec'
+expect.stdout = """
+:020000040800F2 CRLF
+:0CFFF400B878563412B9F0DEBC9A31C85F CRLF
+:020000040801F1 CRLF
+:0F00000083C00F83E901C3626F756E646172790B CRLF
+:020000040802F0 CRLF
+:0C000000F4FF0008000000000DF0FECA34 CRLF
+:040000050800FFF4FC CRLF
+:00000001FF CRLF
+S00B00006F75742E73726563C1 CRLF
+S3150800FFF4B878563412B9F0DEBC9A31C883C00F8378 CRLF
+S31008010004E901C3626F756E64617279D1 CRLF
+S31108020000F4FF0008000000000DF0FECA24 CRLF
+S7050800FFF4FF CRLF
+"""
+targets = ["x86_64-linux-gnu"]
+determinism = true
+# The differential runner reads outputs with readelf; raw outputs are not ELF.
+# `run` compares their bytes with GNU ld's instead.
+diff.skip = "raw (non-ELF) outputs"
