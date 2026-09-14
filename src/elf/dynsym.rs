@@ -355,7 +355,9 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
     let mut imports: Vec<SymbolId> = Vec::new();
     let mut exports: Vec<Entry> = Vec::new();
     for &(id, defined) in &chosen {
-        if defined {
+        // A canonical PLT entry gives an undefined symbol an address the
+        // dynamic linker must find by hash, as GNU ld does.
+        if defined || symbols.flags(id).contains(SymbolFlags::NEEDS_CANONICAL_PLT) {
             exports.push(Entry::Symbol(id));
         } else {
             imports.push(id);
@@ -962,8 +964,7 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
     rest.par_iter_mut()
         .zip(plan.entries.par_iter())
         .zip(plan.names.par_iter())
-        .enumerate()
-        .for_each(|(position, ((slot, &entry), &name))| {
+        .for_each(|((slot, &entry), &name)| {
             let id = match entry {
                 Entry::Version(_) => {
                     put_sym(
@@ -988,8 +989,12 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
             let target = refs.global_target(id, true);
             let raw = target.raw.unwrap_or_default();
             let copy = addresses.synth.copy_of(id).is_some();
-            if position < plan.first_hashed {
-                // An import.
+            let import = match target.def {
+                Def::Shared(_) => !copy,
+                Def::Undefined { .. } => true,
+                _ => false,
+            };
+            if import {
                 let binding = if flags.contains(REF_REGULAR_STRONG) {
                     STB_GLOBAL
                 } else {
