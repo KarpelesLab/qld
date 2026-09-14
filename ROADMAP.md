@@ -130,18 +130,35 @@ dynamic symbol tables and `DT_*` entries, apart from documented differences.
 
 ## M3: Linker scripts, raw binary and embedded targets
 
-- [~] Full GNU linker script language (parser, evaluator and pattern matching done; layout integration pending): `SECTIONS`, `MEMORY`, `PHDRS`, `ENTRY`,
+- [x] Full GNU linker script language: `SECTIONS`, `MEMORY`, `PHDRS`, `ENTRY`,
       `PROVIDE`/`PROVIDE_HIDDEN`, `ASSERT`, `INCLUDE`, `INSERT AFTER/BEFORE`,
       `OVERWRITE_SECTIONS`, `/DISCARD/`, `KEEP`, `SORT_*`, `EXCLUDE_FILE`,
       `AT`/`AT>` load addresses, `>region`, `FILL`, `BYTE`/`LONG`/`QUAD`,
       location counter arithmetic and all built-in functions
-- [ ] `-T`, `--default-script`, `--verbose` (dump the effective default script)
-- [ ] `-Ttext`/`-Tdata`/`-Tbss`/`--section-start`, `--image-base`
-- [ ] Raw binary output: `--oformat binary`, `OUTPUT_FORMAT(binary)`, gap fill
-- [ ] Binary input: `-b binary` / `--format=binary` with
+- [x] `-T`, `--default-script`/`-dT` (`--verbose` does not dump the effective
+      default script yet)
+- [x] `-Ttext`/`-Tdata`/`-Tbss`/`--section-start`, `--image-base`
+- [x] Raw binary output: `--oformat binary`, `OUTPUT_FORMAT(binary)`, gap fill
+- [x] Binary input: `-b binary` / `--format=binary` with
       `_binary_<name>_start/_end/_size` symbols
-- [ ] Intel HEX and S-record output (`--oformat ihex`/`srec`)
-- [ ] `--no-relax`, `--nmagic`/`--omagic`, `-N`/`-n`
+- [x] Intel HEX and S-record output (`--oformat ihex`/`srec`)
+- [x] `--no-relax`, `--nmagic`/`--omagic`, `-N`/`-n`
+- [ ] `-r` together with `-T`, and `--defsym` expressions beyond `symbol+offset`
+
+**Status: exit criteria met** (W19, verified by the integrator with
+`tests/projects/kernel.sh` and `baremetal.sh`).
+
+- **Kernel:** linux 7.2.5 `defconfig` builds with qld doing all six x86-64
+  links (`vmlinux` through the kernel's own `SECTIONS` script with
+  `--orphan-handling=error` and `--emit-relocs`, the vdso, and the compressed
+  image); 43 allocated sections and all 238,897 symbol addresses match GNU
+  ld's, and the bzImage boots in QEMU. 32-bit links (`-m elf_i386`) and `-r`
+  still go to GNU ld: ELF32 is M4, and `-r` output of `vmlinux.o` makes
+  objtool fail.
+- **Bare metal:** a flash image (`MEMORY`, `AT>`, `KEEP`, `SORT`, fill, data
+  commands, `NOLOAD`, `LOADADDR`, `ASSERT`, `/DISCARD/`) and a `PHDRS`
+  executable match GNU ld's sections, segments and every symbol address, and
+  the `binary`, `ihex` and `srec` outputs are byte-identical.
 
 **Exit criteria:** The Linux kernel (x86-64, `vmlinux` and bzImage) builds and
 boots in QEMU. A bare-metal x86-64 image built from a linker script matches
