@@ -1,0 +1,19 @@
+-m elf_x86_64
+-z noexecstack
+--no-warn-rwx-segments
+--emit-relocs
+--discard-none
+-z max-page-size=0x200000
+--build-id=sha1
+--orphan-handling=warn
+-X
+--script=./arch/x86/kernel/vmlinux.lds
+--strip-debug
+-o vmlinux
+--whole-archive
+vmlinux.a
+init/version-timestamp.o
+--no-whole-archive
+--start-group
+--end-group
+.tmp_vmlinux.kallsyms2.o

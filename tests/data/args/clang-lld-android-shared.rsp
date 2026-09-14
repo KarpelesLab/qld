@@ -1,0 +1,43 @@
+--sysroot=/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+-EL
+--fix-cortex-a53-843419
+-z now
+-z relro
+-z max-page-size=16384
+--hash-style=gnu
+--eh-frame-hdr
+-m aarch64linux
+-shared
+-o libnative.so
+/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/24/crtbegin_so.o
+-L=/usr/lib/aarch64-linux-android/24
+-L$SYSROOT/usr/lib
+--build-id=sha1
+--no-rosegment
+--no-undefined-version
+--fatal-warnings
+--no-undefined
+-soname libnative.so
+--gc-sections
+--icf=safe
+-z noexecstack
+-plugin-opt=mcpu=cortex-a53
+--thinlto-cache-dir=/tmp/thinlto
+native.o
+"dir with spaces/helper.o"
+--exclude-libs=libunwind.a,libgcc.a
+-Bstatic
+-lc++_static
+-Bdynamic
+-l:libc++abi.a
+--push-state
+--as-needed
+-lm
+--pop-state
+-lc
+--start-lib
+lazy1.o
+lazy2.o
+--end-lib
+-ldl
+/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/24/crtend_so.o
