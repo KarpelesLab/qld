@@ -33,16 +33,16 @@ case "$LTO" in
 esac
 jobs=${JOBS:-$(nproc)}
 
-# Counts the objects under the given directories that hold IR (LLVM bitcode,
-# or GCC objects with the slim-LTO marker): every one of them reached the
-# link through the plugin, since qld refuses IR it cannot hand to one.
+# Counts the objects under the given directories that hold IR: LLVM bitcode,
+# or ELF objects with GCC .gnu.lto_ sections (slim or fat). qld refuses IR
+# it cannot hand to a plugin, and claims fat objects when a plugin is loaded.
 count_ir_objects() {
   ir=0
   total=0
   for f in $(find "$@" -type f -name '*.o' 2>/dev/null); do
     total=$((total + 1))
     if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' ')" = 4243c0de ] ||
-      grep -q __gnu_lto_slim "$f" 2>/dev/null; then
+      grep -q "\.gnu\.lto_" "$f" 2>/dev/null; then
       ir=$((ir + 1))
     fi
   done
