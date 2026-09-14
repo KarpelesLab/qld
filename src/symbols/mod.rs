@@ -18,6 +18,11 @@
 //!   definition wins. ELF's rules are here only as a reference and test
 //!   implementation, [`elf_reference::ElfReferenceRules`]; the ELF backend owns
 //!   the real ones.
+//! - [`resolve_symbols`]: the format-neutral driver that inserts definitions
+//!   and extracts archive members, round by round, to a fixpoint, over any
+//!   file type implementing [`ResolveFile`].
+//! - Undefined and duplicate symbols as sorted data ([`UndefinedSymbol`],
+//!   [`DuplicateSymbol`]) for diagnostics to render.
 //!
 //! Resolution must not depend on which thread runs first: ties are broken by
 //! [`InputPosition`]. See `docs/architecture.md` ("Symbol resolution").
@@ -28,9 +33,13 @@ mod definition;
 pub mod elf_reference;
 mod flags;
 mod name;
+mod report;
+pub mod resolve;
 pub mod table;
 
 pub use definition::{Definition, DefinitionKind, Resolver, takes_precedence};
 pub use flags::SymbolFlags;
 pub use name::{InputPosition, SymbolName};
+pub use report::{DuplicateSymbol, SymbolReference, UndefinedSymbol};
+pub use resolve::{Resolution, ResolveFile, SymbolUse, resolve_symbols};
 pub use table::{InternJob, SymbolTable};
