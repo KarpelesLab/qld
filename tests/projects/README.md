@@ -23,6 +23,8 @@ tests/projects/coreutils.sh ~/.cache/qld-projects/qld ~/.cache/qld-projects
 | `llvm.sh` | LLVM, clang, lld; static and `BUILD_SHARED_LIBS` | [llvm.md](llvm.md) |
 | `rust.sh` | rustc stage 1 bootstrap, `tests/ui`, `library/std` | [rust.md](rust.md) |
 | `musl.sh` | musl `ld.so` loading qld's shared objects | [musl.md](musl.md) |
+| `lto.sh` | M6: zlib, lua, curl, OpenSSL, coreutils or Python with `gcc -flto`, `clang -flto` or `-flto=thin` | [lto.md](lto.md) |
+| `rust-lto.sh` | M6: `-C linker-plugin-lto` (Rust and C, and qld's unit tests) through LLVMgold | [lto.md](lto.md) |
 
 `coreutils.sh`, `curl.sh`, `openssl.sh` and `python.sh` take a third
 argument, `gnu`, to build the same tree with the system GNU ld for
@@ -77,6 +79,7 @@ See each project's notes. Summary of the last full run (qld at the head of
 | LLVM | 23.1.1 | `check-llvm`, `check-clang`, `check-lld`: all pass (static); 1 path-name failure (shared) |
 | Rust | 1.98.1 | stage 1 builds; `tests/ui` 21288 passed, `library/std` passed |
 | musl | 1.2.5 | shared libraries, PIE, non-PIE and zlib's tests run under musl's `ld.so` |
+| LTO (M6, W18) | as above | zlib, lua, curl, OpenSSL: tests pass with gcc, clang and ThinLTO; coreutils and Python: same results as GNU ld; see [lto.md](lto.md) |
 
 ## Performance
 

@@ -1,0 +1,33 @@
+# M6: gcc -flto shared library and executable. The version script leaves
+# lib_internal_helper_lto_qld local, so qld reports it IR-only and LTO
+# internalizes it: it is in neither symbol table of the library. The library
+# references exe_callback_lto_qld, which the executable defines in IR: it
+# must stay exported. exe_unused_lto_qld is referenced by nothing and
+# disappears.
+description = "gcc -flto shared library and executable: internalization and exports"
+compile = ["cc -O2 -flto -fPIC -c lib.c", "cc -O2 -flto -fPIE -c main.c"]
+driver = "cc"
+link = [
+  "-O2 -flto -shared -Wl,-soname,liblto.so -Wl,--version-script=lib.map -o liblto.so lib.o",
+  "-O2 -flto -o out main.o -L. -llto -Wl,-rpath,$ORIGIN -Wl,--no-as-needed",
+]
+run = "./out"
+expect.stdout = """
+callback 1
+api=16
+calls=1
+"""
+expect.readelf = [
+  "Shared library: [liblto.so]",
+  "exe_callback_lto_qld",
+  "lib_api_lto_qld@LIBLTO_1",
+  "!exe_unused_lto_qld",
+]
+expect.readelf_files."liblto.so" = [
+  "Library soname: [liblto.so]",
+  "lib_api_lto_qld@@LIBLTO_1",
+  "lib_calls_lto_qld@@LIBLTO_1",
+  "!lib_internal_helper_lto_qld",
+]
+determinism = true
+timeout = 120

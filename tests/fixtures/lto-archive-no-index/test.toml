@@ -1,0 +1,21 @@
+# M6: an archive of GCC LTO IR members without a symbol index (ar S). qld
+# claims the members before resolution (known_used false) to learn what
+# they define, then claims the extracted ones again, since GCC's plugin
+# compiles only files claimed as used. GNU ld refuses archives without an
+# index ("run ranlib"); see docs/compatibility.md.
+description = "gcc -flto with an IR archive that has no symbol index"
+compile = [
+  "cc -O2 -flto -c main.c",
+  "cc -O2 -flto -c used.c",
+  "cc -O2 -flto -c helper.c",
+  "cc -O2 -flto -c unused.c",
+  "ar rcS libir.a used.o helper.o unused.o",
+]
+driver = "cc"
+link = "-O2 -flto -o out main.o -L. -lir"
+gnu_ld = "fail"
+run = "./out"
+expect.stdout = "used=41\n"
+expect.readelf = ["!archive_unused_member_lto_qld", "!__gnu_lto_slim"]
+determinism = true
+timeout = 120

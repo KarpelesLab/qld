@@ -1,0 +1,19 @@
+# M6: an archive of GCC LTO IR members, indexed by gcc-ar (which asks the
+# plugin for the symbols). used.o is extracted by main.o, helper.o by
+# used.o's IR (a second extraction round); unused.o is claimed by nobody
+# and stays out of the link.
+description = "gcc -flto with an archive of IR members (gcc-ar)"
+compile = [
+  "cc -O2 -flto -c main.c",
+  "cc -O2 -flto -c used.c",
+  "cc -O2 -flto -c helper.c",
+  "cc -O2 -flto -c unused.c",
+  "gcc-ar rcs libir.a used.o helper.o unused.o",
+]
+driver = "cc"
+link = "-O2 -flto -o out main.o -L. -lir"
+run = "./out"
+expect.stdout = "used=41\n"
+expect.readelf = ["!archive_unused_member_lto_qld", "!__gnu_lto_slim"]
+determinism = true
+timeout = 120

@@ -1,0 +1,27 @@
+# M6: gcc -flto, static executable. main.o and square.o are GCC LTO IR
+# (slim objects), native.o is ordinary code. The plugin claims the IR, qld
+# reports resolutions (ir_callee_lto_qld is referenced from native.o, so it
+# must stay; dead_function_lto_qld is referenced by nothing, so LTO drops
+# it), and the objects the plugin generates replace the IR.
+description = "gcc -flto static executable mixing IR and native objects"
+compile = [
+  "cc -O2 -flto -c main.c",
+  "cc -O2 -flto -c square.c",
+  "cc -O2 -c native.c",
+]
+driver = "cc"
+link = "-O2 -flto -static -o out main.o square.o native.o"
+run = "./out"
+expect.stdout = """
+square=49
+native=42
+native->ir=2010
+"""
+expect.readelf = [
+  "ir_callee_lto_qld",
+  "native_add_lto_qld",
+  "!dead_function_lto_qld",
+  "!__gnu_lto_slim",
+]
+determinism = true
+timeout = 120

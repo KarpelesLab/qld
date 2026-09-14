@@ -36,7 +36,8 @@ use crate::symbols::{DefinitionKind, InputPosition, ResolveFile, SymbolName, Sym
 use crate::target::{Architecture, Target};
 
 use super::dso::SharedInput;
-use super::object::{ObjectInput, ParseConfig};
+use super::lto::{self, IrKind, IrSymbols};
+use super::object::{GccLto, ObjectInput, ParseConfig, WrapTable};
 
 /// What kind of link input an [`ElfInput`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +68,38 @@ impl<'a> InternalSymbols<'a> {
     }
 }
 
+/// How a link treats inputs that carry compiler IR (LTO).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LtoMode {
+    /// No `-plugin` was given: IR inputs are errors.
+    NoPlugin,
+    /// `-plugin` was given, but qld was built without the `plugin` feature.
+    Unsupported,
+    /// IR inputs are claimed through the plugins as resolution loads them
+    /// (the [`super::lto`] module).
+    Claim,
+    /// The resolution after LTO code generation: IR inputs that were not
+    /// part of LTO are errors.
+    AfterLto,
+    /// An object an LTO plugin generated. GCC IR in it (GCC's incremental
+    /// `-r` output is IR again) is linked as a regular object.
+    Generated,
+}
+
+impl LtoMode {
+    /// The mode for a link with `options`.
+    #[must_use]
+    pub fn for_options(options: &LinkOptions) -> Self {
+        if options.plugins.is_empty() {
+            Self::NoPlugin
+        } else if cfg!(feature = "plugin") {
+            Self::Claim
+        } else {
+            Self::Unsupported
+        }
+    }
+}
+
 /// A member of a thin archive, loaded from disk when it is extracted.
 #[derive(Debug)]
 struct ThinMember<'a> {
@@ -93,9 +126,15 @@ pub struct ElfInput<'a> {
     pub internal: InternalSymbols<'a>,
     /// For shared objects, the parsed library.
     pub shared: Option<SharedInput<'a>>,
+    /// For IR inputs an LTO plugin claimed, the symbols it reported.
+    pub ir: Option<Box<IrSymbols<'a>>>,
     thin: Option<ThinMember<'a>>,
     table: &'a FileTable,
     config: ParseConfig<'a>,
+    lto: LtoMode,
+    /// A lazy IR member whose defined names the archive index does not
+    /// list: the plugin must claim it before resolution to learn them.
+    needs_claim: bool,
 }
 
 impl<'a> ElfInput<'a> {
@@ -123,6 +162,118 @@ impl<'a> ElfInput<'a> {
     #[must_use]
     pub fn member(&self) -> Option<String> {
         self.file.and_then(|f| f.member()).map(str::to_owned)
+    }
+
+    /// The file table the link's inputs live in.
+    #[must_use]
+    pub fn table(&self) -> &'a FileTable {
+        self.table
+    }
+
+    /// The `--wrap` table.
+    #[must_use]
+    pub fn wrap(&self) -> &'a WrapTable {
+        self.config.wrap
+    }
+
+    /// How this input treats IR.
+    #[must_use]
+    pub fn lto_mode(&self) -> LtoMode {
+        self.lto
+    }
+
+    /// Whether this is a lazy IR member the plugins must claim before
+    /// resolution, because the archive index does not name its symbols.
+    #[must_use]
+    pub fn needs_claim(&self) -> bool {
+        self.needs_claim && !self.live_at_start
+    }
+
+    /// The kind of IR a loaded input carries and no plugin has claimed yet:
+    /// LLVM bitcode, or a GCC object with `.gnu.lto_*` sections (slim or
+    /// fat). `None` for claimed inputs and ordinary ones.
+    #[must_use]
+    pub fn pending_ir(&self) -> Option<IrKind> {
+        if self.ir.is_some() {
+            return None;
+        }
+        if let Some(object) = &self.object {
+            return match object.gcc_lto {
+                GccLto::None => None,
+                GccLto::Slim => Some(IrKind::GccSlim),
+                GccLto::Fat => Some(IrKind::GccFat),
+            };
+        }
+        if self.shared.is_some() {
+            return None;
+        }
+        match self.file?.format() {
+            FileFormat::LlvmBitcode(_) => Some(IrKind::LlvmBitcode),
+            FileFormat::GccLtoIr(_) => Some(IrKind::GccSlim),
+            _ => None,
+        }
+    }
+
+    /// Records that no plugin claimed this input: a fat GCC object is
+    /// linked from its native code; any other IR is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the file for IR without native code.
+    pub fn claim_declined(&self) -> Result<()> {
+        match self.pending_ir() {
+            None | Some(IrKind::GccFat) => Ok(()),
+            Some(kind) => Err(lto::ir_error(&self.display(), kind, self.lto)),
+        }
+    }
+
+    /// Learns the defined names of a lazy member that no plugin claimed
+    /// from its native symbol table (a fat GCC object).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Malformed`] if the member cannot be parsed.
+    pub fn use_native_lazy_names(&mut self) -> Result<()> {
+        if let Some(file) = self.file
+            && matches!(file.format(), FileFormat::Elf(ident) if ident.is_relocatable())
+        {
+            self.lazy_names = defined_names(file)?.0;
+        }
+        Ok(())
+    }
+
+    /// Prepares an input of the first resolution for the resolution after
+    /// LTO: inputs that were live stay live (archive extractions are kept),
+    /// discarded COMDAT groups stay discarded (as in GNU ld, the first
+    /// copy loaded wins even when it was IR), and IR can no longer be
+    /// claimed.
+    pub fn prepare_after_lto(&mut self, live: bool) {
+        self.live_at_start |= live;
+        self.ir = None;
+        self.lto = LtoMode::AfterLto;
+        self.needs_claim = false;
+    }
+
+    /// A live input for `file`, an object an LTO plugin produced, placed at
+    /// `position`.
+    #[must_use]
+    pub fn lto_object(&self, file: &'a InputFile, position: InputPosition) -> Self {
+        ElfInput {
+            position,
+            role: InputRole::Object,
+            file: Some(file),
+            live_at_start: true,
+            lazy_names: Vec::new(),
+            object: None,
+            internal: InternalSymbols::default(),
+            shared: None,
+            ir: None,
+            thin: None,
+            table: self.table,
+            config: self.config,
+            lto: LtoMode::Generated,
+            needs_claim: false,
+        }
     }
 }
 
@@ -166,21 +317,31 @@ impl<'a> ResolveFile<'a> for ElfInput<'a> {
                 )));
             }
             format if format.is_ir() => {
-                return Err(Error::Unimplemented(format!(
-                    "LTO input {} (roadmap M6: link-time optimization)",
-                    self.display()
-                )));
+                // Claimed once the round's files are loaded, in input order
+                // (the round hook in `lto`).
+                return match self.lto {
+                    LtoMode::Claim => Ok(()),
+                    mode => Err(lto::ir_error(&self.display(), IrKind::LlvmBitcode, mode)),
+                };
             }
             _ => {
                 return Err(source.malformed(0, "archive member (not an ELF relocatable object)"));
             }
         }
         let object = ObjectInput::parse(file.data(), source, &self.config)?;
+        if object.gcc_lto == GccLto::Slim
+            && !matches!(self.lto, LtoMode::Claim | LtoMode::Generated)
+        {
+            return Err(lto::ir_error(&self.display(), IrKind::GccSlim, self.lto));
+        }
         self.object = Some(object);
         Ok(())
     }
 
     fn symbol_names(&self) -> &[SymbolName<'a>] {
+        if let Some(ir) = &self.ir {
+            return &ir.names;
+        }
         match (&self.object, &self.shared) {
             (Some(object), _) => &object.names,
             (None, Some(shared)) => &shared.names,
@@ -189,10 +350,11 @@ impl<'a> ResolveFile<'a> for ElfInput<'a> {
     }
 
     fn symbol_use(&self, index: usize) -> SymbolUse {
-        let uses = match (&self.object, &self.shared) {
-            (Some(object), _) => &object.uses,
-            (None, Some(shared)) => &shared.uses,
-            (None, None) => &self.internal.uses,
+        let uses = match (&self.ir, &self.object, &self.shared) {
+            (Some(ir), _, _) => &ir.uses,
+            (None, Some(object), _) => &object.uses,
+            (None, None, Some(shared)) => &shared.uses,
+            (None, None, None) => &self.internal.uses,
         };
         uses.get(index).copied().unwrap_or(SymbolUse::Ignore)
     }
@@ -409,9 +571,12 @@ pub fn collect<'a>(
         object: None,
         internal: internal_symbols,
         shared: None,
+        ir: None,
         thin: None,
         table,
         config,
+        lto: LtoMode::for_options(options),
+        needs_claim: false,
     });
 
     let mut walker = Walker {
@@ -427,6 +592,7 @@ pub fn collect<'a>(
             options.kind,
             crate::args::OutputKind::StaticExecutable | crate::args::OutputKind::StaticPie
         ),
+        lto: LtoMode::for_options(options),
     };
     for (entry, id) in pending.iter().zip(loaded) {
         let id = id?;
@@ -457,6 +623,8 @@ struct Walker<'a, 's> {
     sonames: Vec<Vec<u8>>,
     /// The output is a static executable or static PIE.
     static_output: bool,
+    /// How new inputs treat IR.
+    lto: LtoMode,
 }
 
 impl<'a> Walker<'a, '_> {
@@ -478,9 +646,12 @@ impl<'a> Walker<'a, '_> {
             object: None,
             internal: InternalSymbols::default(),
             shared: None,
+            ir: None,
             thin: None,
             table: self.table,
             config: self.config,
+            lto: self.lto,
+            needs_claim: false,
         }
     }
 
@@ -510,7 +681,13 @@ impl<'a> Walker<'a, '_> {
                 let mut input = self.input(InputPosition::new(input_number, 0), InputRole::Object);
                 input.file = Some(file);
                 if attrs.lazy {
-                    input.lazy_names = defined_names(file)?;
+                    let (names, gcc_lto) = defined_names(file)?;
+                    if gcc_lto && self.lto == LtoMode::Claim {
+                        // IR names come from the plugin: link it eagerly.
+                        input.live_at_start = true;
+                    } else {
+                        input.lazy_names = names;
+                    }
                 } else {
                     input.live_at_start = true;
                 }
@@ -528,10 +705,23 @@ impl<'a> Walker<'a, '_> {
             FileFormat::Archive | FileFormat::ThinArchive => self.add_archive(id, file, attrs),
             FileFormat::Text(_) => self.add_script(file, attrs, what),
             FileFormat::Empty => Ok(()),
-            format if format.is_ir() => Err(Error::Unimplemented(format!(
-                "LTO input {} (roadmap M6: link-time optimization)",
-                file.path().display()
-            ))),
+            format if format.is_ir() => {
+                if self.lto != LtoMode::Claim {
+                    return Err(lto::ir_error(
+                        &file.path().display().to_string(),
+                        IrKind::LlvmBitcode,
+                        self.lto,
+                    ));
+                }
+                // Claimed when resolution loads it. `--start-lib` IR is
+                // linked eagerly: only the plugin knows what it defines.
+                let input_number = self.next_position()?;
+                let mut input = self.input(InputPosition::new(input_number, 0), InputRole::Object);
+                input.file = Some(file);
+                input.live_at_start = true;
+                self.files.push(input);
+                Ok(())
+            }
             _ => Err(Error::malformed(
                 file.path(),
                 0,
@@ -633,16 +823,57 @@ impl<'a> Walker<'a, '_> {
             }
             None => {
                 // No index: learn what each member defines by reading it.
+                // IR members are claimed before resolution instead.
+                let claim = self.lto == LtoMode::Claim;
                 let members = self.files.get_mut(first..).unwrap_or_default();
                 members.par_iter_mut().try_for_each(|input| -> Result<()> {
-                    if let Some(member_file) = input.file
-                        && matches!(member_file.format(), FileFormat::Elf(i) if i.is_relocatable())
-                    {
-                        input.lazy_names = defined_names(member_file)?;
+                    let Some(member_file) = input.file else {
+                        return Ok(());
+                    };
+                    match member_file.format() {
+                        FileFormat::Elf(i) if i.is_relocatable() => {
+                            let (names, gcc_lto) = defined_names(member_file)?;
+                            if gcc_lto && claim {
+                                input.needs_claim = true;
+                            } else {
+                                input.lazy_names = names;
+                            }
+                        }
+                        format if format.is_ir() => input.needs_claim = claim,
+                        _ => {}
                     }
                     Ok(())
                 })?;
+                return Ok(());
             }
+        }
+        if self.lto == LtoMode::Claim {
+            // IR members the index does not describe (an archive built
+            // without the plugin lists at most GCC's marker symbol) are
+            // claimed before resolution to learn their symbols.
+            let members = self.files.get_mut(first..).unwrap_or_default();
+            members.par_iter_mut().for_each(|input| {
+                let Some(member_file) = input.file else {
+                    return;
+                };
+                let undescribed = input.lazy_names.iter().all(|name| {
+                    name.bytes() == super::object::GCC_LTO_SLIM_MARKER
+                        || name.bytes() == b"__gnu_lto_v1"
+                });
+                if !undescribed {
+                    return;
+                }
+                let ir = match member_file.format() {
+                    FileFormat::Elf(i) if i.is_relocatable() => {
+                        defined_names(member_file).is_ok_and(|(_, gcc_lto)| gcc_lto)
+                    }
+                    format => format.is_ir(),
+                };
+                if ir {
+                    input.needs_claim = true;
+                    input.lazy_names = Vec::new();
+                }
+            });
         }
         Ok(())
     }
@@ -742,8 +973,9 @@ impl<'a> Walker<'a, '_> {
 }
 
 /// The global symbols an object defines, for lazy objects and archives
-/// without an index.
-fn defined_names(file: &InputFile) -> Result<Vec<SymbolName<'_>>> {
+/// without an index, and whether the object carries GCC LTO IR (only
+/// checked when it defines GCC's slim-object marker or nothing).
+fn defined_names(file: &InputFile) -> Result<(Vec<SymbolName<'_>>, bool)> {
     let source = match file.member() {
         Some(member) => ElfSource::member(file.path(), member),
         None => ElfSource::new(file.path()),
@@ -758,7 +990,109 @@ fn defined_names(file: &InputFile) -> Result<Vec<SymbolName<'_>>> {
         }
         names.push(SymbolName::new(symbol.name));
     }
-    Ok(names)
+    // Fat LTO objects define their real symbols and are linkable natively,
+    // but the IR is what a plugin wants: look for it in every object.
+    let gcc_lto = object.has_gcc_lto_ir().unwrap_or(false);
+    Ok((names, gcc_lto))
+}
+
+/// Adds the inputs an LTO plugin asked for after code generation: `objects`
+/// (already in the file table) that are not relocatable objects, which the
+/// caller places itself, and the `-l` `libraries`, searched in
+/// `library_paths` and then the `-L` paths.
+/// Libraries already in the link, and libraries not found, are skipped, and
+/// relocatable output takes no libraries. The new inputs come after every
+/// existing one, with the `-Bstatic`/`--as-needed` state of the last
+/// command-line input.
+///
+/// # Errors
+///
+/// Errors loading the new inputs.
+pub fn add_after_lto<'a>(
+    files: &mut Vec<ElfInput<'a>>,
+    options: &LinkOptions,
+    objects: &[FileId],
+    libraries: &[std::ffi::OsString],
+    library_paths: &[PathBuf],
+) -> Result<()> {
+    let Some(template) = files.first() else {
+        return Err(Error::Internal("no internal input file".into()));
+    };
+    let (table, config) = (template.table, template.config);
+    let search_paths: Vec<PathBuf> = library_paths
+        .iter()
+        .chain(&options.search_paths)
+        .cloned()
+        .collect();
+    let fs = RealFileSystem;
+    let static_output = matches!(
+        options.kind,
+        crate::args::OutputKind::StaticExecutable | crate::args::OutputKind::StaticPie
+    );
+    let mut attrs = options
+        .inputs
+        .last()
+        .map(|spec| spec.attrs)
+        .unwrap_or_default();
+    attrs.whole_archive = false;
+    attrs.lazy = false;
+    attrs.static_only |= static_output;
+    let ordinal = files
+        .iter()
+        .map(|file| file.position.input())
+        .max()
+        .unwrap_or(0);
+    let mut walker = Walker {
+        table,
+        search: SearchContext {
+            search_paths: &search_paths,
+            sysroot: options.sysroot.as_deref(),
+            naming: LibraryNaming::Elf,
+            fs: &fs,
+        },
+        config,
+        sonames: files
+            .iter()
+            .filter_map(|file| Some(file.shared.as_ref()?.needed_name.clone()))
+            .collect(),
+        files: std::mem::take(files),
+        ordinal,
+        target: Some(Target::X86_64_LINUX),
+        depth: 0,
+        static_output,
+        lto: LtoMode::AfterLto,
+    };
+    let result = (|| -> Result<()> {
+        for &id in objects {
+            let found_as = table.get(id).map(|f| base_name_of(f.path()));
+            walker.add(id, attrs, "", &found_as.unwrap_or_default())?;
+        }
+        if options.kind == crate::args::OutputKind::Relocatable {
+            // Undefined symbols stay undefined in relocatable output.
+            return Ok(());
+        }
+        for library in libraries {
+            let name = library.to_string_lossy();
+            // GCC's plugin hands back every library the driver named
+            // (`-pass-through=-lgcc_s` even for -static); one that is not
+            // found cannot have been needed by the original link either.
+            let Some(path) = walker.search.find_library(&name, attrs.static_only) else {
+                continue;
+            };
+            let present = walker.files.iter().any(|file| {
+                file.file
+                    .is_some_and(|f| f.parent().is_none() && f.path() == path)
+            });
+            if present {
+                continue;
+            }
+            let id = table.load_path(&path)?;
+            walker.add(id, attrs, "", &base_name_of(&path))?;
+        }
+        Ok(())
+    })();
+    *files = walker.files;
+    result
 }
 
 #[cfg(test)]

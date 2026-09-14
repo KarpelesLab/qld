@@ -1,0 +1,24 @@
+# M6: -ffunction-sections -fdata-sections with LTO and --gc-sections. The
+# LTO-generated objects and the native one go through garbage collection
+# together: the native dead function and data are removed, and the
+# generated code keeps working.
+description = "gcc -flto with -ffunction-sections and --gc-sections"
+compile = [
+  "cc -O2 -flto -ffunction-sections -fdata-sections -c main.c",
+  "cc -O2 -ffunction-sections -fdata-sections -c native.c",
+]
+driver = "cc"
+link = "-O2 -flto -ffunction-sections -fdata-sections -o out main.o native.o -Wl,--gc-sections"
+run = "./out"
+expect.stdout = """
+42
+100
+"""
+expect.readelf = [
+  "native_function_lto_qld",
+  "!native_dead_function_lto_qld",
+  "!native_dead_data_lto_qld",
+  "!__gnu_lto_slim",
+]
+determinism = true
+timeout = 120
