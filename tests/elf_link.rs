@@ -687,7 +687,10 @@ fn shim(dir: &Path) -> String {
     fs::create_dir_all(&shim).unwrap();
     let ld = shim.join("ld");
     if !ld.exists() {
+        #[cfg(unix)]
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_qld"), &ld).unwrap();
+        #[cfg(not(unix))]
+        fs::copy(env!("CARGO_BIN_EXE_qld"), &ld).unwrap();
     }
     format!("-B{}/", shim.display())
 }
