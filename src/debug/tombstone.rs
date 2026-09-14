@@ -41,7 +41,8 @@
 //! # Applying
 //!
 //! The linker calls [`Tombstones::for_section`] once per non-allocated input
-//! section, then, for each relocation whose target section is dead, writes
+//! section (with its decompressed name: `.debug_info`, not `.zdebug_info`),
+//! then, for each relocation whose target section is dead, writes
 //! the value truncated to the field's width ([`truncate`]) instead of
 //! relocating. Only absolute relocations (and TLS offsets such as
 //! `R_X86_64_DTPOFF32`) should be replaced; lld relocates others normally.
@@ -158,10 +159,10 @@ impl Tombstones {
                     _ => 0,
                 });
                 let discarded = user.or(builtin);
-                let folded = if is_debug && name != b".debug_line" {
-                    discarded
-                } else {
+                let folded = if name == b".debug_line" {
                     None
+                } else {
+                    discarded
                 };
                 SectionTombstone { discarded, folded }
             }
@@ -426,8 +427,11 @@ mod tests {
         assert_eq!(t.value(b".debug_loc", d), Some(42));
         assert_eq!(t.value(b".debug_ranges", d), Some(7));
         assert_eq!(t.value(b".my_notes", d), Some(9));
-        // Non-debug sections never get an ICF tombstone.
-        assert_eq!(t.value(b".my_notes", DeadTarget::Folded), None);
+        // Wherever a tombstone applies, ICF-folded targets get it too, except
+        // in .debug_line.
+        assert_eq!(t.value(b".my_notes", DeadTarget::Folded), Some(9));
+        assert_eq!(t.value(b".debug_line", DeadTarget::Folded), None);
+        assert_eq!(t.value(b".comment", DeadTarget::Folded), None);
         assert!(
             Tombstones::default()
                 .with_rules([(b"[abc".as_slice(), 1)])
