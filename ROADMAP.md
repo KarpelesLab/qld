@@ -209,7 +209,7 @@ in the library.
 
 ## M7: PE/COFF (MinGW flavor)
 
-- [ ] COFF object and archive parsing, `.drectve` linker directives
+- [x] COFF object and archive parsing, `.drectve` linker directives (reading; resolution is part of the linker work below)
 - [ ] Short import libraries (MSVC/LLVM style) and long import libraries
       (GNU dlltool `.idata$N` objects); linking directly against `.dll` files
 - [ ] PE32+ (x86-64) then PE32 (i386), then ARM64

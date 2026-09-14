@@ -22,3 +22,6 @@ expect.readelf = [
   "!unused_qld",
 ]
 determinism = true
+# GNU ld 2.46 keeps `.note.GNU-stack` as an output section with
+# --emit-relocs, as qld does; GNU ld 2.42 (Ubuntu 24.04) drops it.
+diff.ignore = [".note.GNU-stack"]

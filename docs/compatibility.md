@@ -271,6 +271,23 @@ Diagnostics, map files and `--print-*` output demangle names unless
 - Not yet demangled (left as-is): C++20 `requires` clauses and a few other
   recent Itanium extensions that `llvm-cxxfilt` handles.
 
+### PE/COFF inputs (MinGW flavor)
+
+The readers exist; linking PE output is M7. Behaviour already fixed by them:
+
+- **`.drectve` quoting**: values are split outside quotes first, so
+  `-export:"a,b"` is one name (GNU ld's reading; lld splits it).
+- **`.def` files** accept the union of GNU dlltool/ld and lld syntax:
+  `NONAME`, `DATA`, `PRIVATE`, `CONSTANT` in any case, commas between flags,
+  `DESCRIPTION`, `SECTIONS`, `IMPORTS`, `CODE`/`DATA`, and `NONAME` without an
+  ordinal (lld rejects these). Numbers may be `0x` hex; a leading `0` is
+  decimal, not octal as in GNU. `EXPORTAS` is a keyword (GNU dlltool 2.4x
+  reads it as two more exports).
+- **Section alignment** with no `IMAGE_SCN_ALIGN_*` flag is left for the
+  linker to choose (lld uses 1, MSVC and GNU ld use 16).
+- **Data exports of a DLL linked directly** are recognized from the section's
+  code/execute flags; GNU ld looks at the section name.
+
 ## ld64 flavor notes
 
 - Single-dash long options only (`-dylib`, `-framework Foo`, `-arch arm64`).

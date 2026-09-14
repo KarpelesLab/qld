@@ -43,6 +43,7 @@ use crate::ids::{FileId, SymbolId};
 use crate::script::{Pattern, VersionNode};
 use crate::symbols::{DefinitionKind, Resolution, SymbolFlags, SymbolTable, SymbolUse};
 
+use super::defined::{LinkerSymbols, is_hidden};
 use super::dso::{Needed, REF_DYNAMIC};
 use super::inputs::{ElfInput, InputRole};
 use super::refs::LINKER_FILE;
@@ -310,6 +311,7 @@ pub fn plan(
     mode: Mode,
     script: Option<VersionScript>,
     dynamic_patterns: &[Pattern],
+    linker: &LinkerSymbols,
 ) -> Result<Exports> {
     // Merged visibility, and definitions also made by needed libraries.
     files
@@ -416,6 +418,16 @@ pub fn plan(
                     });
                     if file.is_some_and(excluded) && !linker_defined {
                         set |= FORCED_LOCAL;
+                        visibility = STV_HIDDEN;
+                    }
+                    // `_GLOBAL_OFFSET_TABLE_`, `_DYNAMIC`, `__ehdr_start` and the
+                    // other PROVIDE_HIDDEN symbols are per-module: never exported,
+                    // not even with --export-dynamic (as in GNU ld and lld).
+                    if def.file == LINKER_FILE
+                        && linker
+                            .get(def.index)
+                            .is_some_and(|(_, value)| is_hidden(value))
+                    {
                         visibility = STV_HIDDEN;
                     }
                     // Explicit versions from `name@VERSION` and

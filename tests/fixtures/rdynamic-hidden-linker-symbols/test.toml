@@ -1,0 +1,16 @@
+# Regression: with -rdynamic, qld exported _GLOBAL_OFFSET_TABLE_ from an
+# executable whose objects referenced it (Ubuntu's startup files do). GNU ld
+# and lld define it hidden, so it never reaches .dynsym; likewise __ehdr_start.
+description = "--export-dynamic does not export hidden linker-defined symbols"
+compile = ["cc -O2 -fPIE -c main.c"]
+driver = "cc"
+link = "-o out main.o -rdynamic"
+run = "./out"
+expect.stdout = "got=1 ehdr=1 exported=42\n"
+expect.readelf_args = "--dyn-syms"
+expect.readelf = [
+  "exported_function",
+  "!_GLOBAL_OFFSET_TABLE_",
+  "!__ehdr_start",
+]
+determinism = true

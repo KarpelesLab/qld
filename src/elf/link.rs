@@ -257,6 +257,7 @@ fn link_inputs<'a>(
         mode,
         version_script,
         &dynamic_patterns,
+        &linker,
     )?;
     lap("placement");
 
