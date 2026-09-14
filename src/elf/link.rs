@@ -198,6 +198,7 @@ fn link_inputs<'a>(
     let resolution = resolve_symbols_with(&mut symbols, &rules, &mut inputs.files, &mut comdat)?;
     drop(comdat);
     let files = &inputs.files;
+    dso::bind_unextracted(files, &symbols, &resolution);
     lap("resolution");
 
     let mut sections = Sections::new(files, &resolution)?;

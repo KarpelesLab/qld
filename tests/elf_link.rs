@@ -1726,3 +1726,88 @@ fn gnu_property_notes_merge_used_and_needed_bits() {
     let notes = readelf(&dir, &["-n", "combined.o"]);
     assert!(notes.contains("x86 ISA used"), "{notes}");
 }
+
+// ---------------------------------------------------------------------------
+// Real-project regressions (workstream W16).
+// ---------------------------------------------------------------------------
+
+/// An archive member beats a shared library that comes after its archive,
+/// as in GNU ld (gcc's `-lgcc --as-needed -lgcc_s` relies on it for
+/// `__popcountdi2`); weak references still bind to the shared library.
+#[test]
+fn archive_before_shared_library_is_extracted() {
+    require!("cc", "ar", "readelf");
+    let dir = scratch("archive-before-shared");
+    compile_with(
+        &dir,
+        "shared",
+        "int dup_qld(void) { return 1; }\nint weakonly_qld(void) { return 5; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "helper",
+        "int dup_qld(void) { return 1; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "member_a",
+        "int dup_qld(void) { return 2; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "member_b",
+        "int weakonly_qld(void) { return 6; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\nint dup_qld(void);\nint weakonly_qld(void) __attribute__((weak));\n\
+         int main(void) { printf(\"%d %d\\n\", dup_qld(), weakonly_qld ? weakonly_qld() : 0); return 0; }\n",
+        &["-fPIE"],
+    );
+    compile_with(
+        &dir,
+        "main2",
+        "#include <stdio.h>\nint dup_qld(void);\nint main(void) { printf(\"%d\\n\", dup_qld()); return 0; }\n",
+        &["-fPIE"],
+    );
+    run_ok(&dir, "ar", &["rcs", "libdup.a", "member_a.o", "member_b.o"]);
+    cc_link_ok(&dir, &["-shared", "-o", "libdup.so", "shared.o"]);
+    cc_link_ok(&dir, &["-shared", "-o", "libhelper.so", "helper.o"]);
+
+    // Archive first: the member defining dup_qld is extracted; the weak
+    // reference does not extract the other one and binds to the library.
+    cc_link_ok(&dir, &["-o", "first", "main.o", "libdup.a", "-L.", "-ldup"]);
+    assert_eq!(stdout_of(&dir, "first"), "2 5\n");
+    let dynsym = readelf(&dir, &["--dyn-syms", "first"]);
+    assert!(!dynsym.contains("UND dup_qld"), "{dynsym}");
+    assert!(dynsym.contains("UND weakonly_qld"), "{dynsym}");
+
+    // Library first: it wins.
+    cc_link_ok(
+        &dir,
+        &["-o", "second", "main.o", "-L.", "-ldup", "libdup.a"],
+    );
+    assert_eq!(stdout_of(&dir, "second"), "1 5\n");
+
+    // An --as-needed library that only duplicates the archive is not needed.
+    cc_link_ok(
+        &dir,
+        &[
+            "-o",
+            "third",
+            "main2.o",
+            "libdup.a",
+            "-L.",
+            "-Wl,--as-needed",
+            "-lhelper",
+        ],
+    );
+    assert_eq!(stdout_of(&dir, "third"), "2\n");
+    let dynamic = readelf(&dir, &["-d", "third"]);
+    assert!(!dynamic.contains("libhelper.so"), "{dynamic}");
+}

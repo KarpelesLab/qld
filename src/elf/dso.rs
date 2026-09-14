@@ -342,6 +342,57 @@ pub fn plan_needed(
     Needed { needed }
 }
 
+/// Binds symbols whose best definition after resolution is an unextracted
+/// archive member to their earliest shared library definition, if any.
+///
+/// [`ElfRules`] lets a member of an archive that comes before a shared
+/// library win, so that a non-weak reference extracts it as in GNU ld. A
+/// symbol with only weak references (or none) keeps the lazy definition,
+/// which would leave it undefined; GNU ld binds it to the shared library,
+/// and so does this. Returns the number of rebound symbols.
+pub fn bind_unextracted(
+    files: &[ElfInput<'_>],
+    symbols: &SymbolTable<'_>,
+    resolution: &Resolution<'_>,
+) -> usize {
+    let mut candidates: Vec<(SymbolId, Definition)> = files
+        .par_iter()
+        .enumerate()
+        .filter(|(index, file)| file.shared.is_some() && resolution.is_live(FileId::new(*index)))
+        .flat_map_iter(|(index, file)| {
+            let ids = resolution.symbol_ids(FileId::new(index));
+            let uses = file.shared.as_ref().map_or(&[][..], |s| s.uses.as_slice());
+            ids.iter()
+                .zip(uses)
+                .enumerate()
+                .filter_map(move |(local, (&id, use_))| {
+                    let SymbolUse::Definition { kind, aux } = *use_ else {
+                        return None;
+                    };
+                    if symbols.definition_kind(id) != DefinitionKind::Lazy {
+                        return None;
+                    }
+                    Some((
+                        id,
+                        Definition {
+                            kind,
+                            file: FileId::new(index),
+                            index: u32::try_from(local).ok()?,
+                            position: file.position,
+                            aux,
+                        },
+                    ))
+                })
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|(id, def)| (*id, def.tie_key()));
+    candidates.dedup_by_key(|(id, _)| *id);
+    for (id, def) in &candidates {
+        symbols.replace_definition(*id, def);
+    }
+    candidates.len()
+}
+
 /// Binds symbols whose definition is in an unneeded shared object to the
 /// best definition in a needed one, or leaves them undefined.
 fn rebind_unneeded(
