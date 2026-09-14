@@ -531,17 +531,22 @@ exit_with_42_qld:
 }
 
 #[test]
-fn outputs_of_later_milestones_are_unimplemented() {
-    require!("as");
-    let dir = scratch("unimplemented");
+fn position_independent_outputs_link() {
+    require!("as", "readelf");
+    let dir = scratch("pic-outputs");
     assemble(&dir, "start", EXIT_42);
-    for flag in ["-shared", "-pie", "-r"] {
-        let output = qld(&dir, &[flag, "-o", "out", "start.o"]);
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("not implemented yet"), "{flag}: {stderr}");
-        assert!(stderr.contains("M2"), "{flag}: {stderr}");
-    }
+    qld_ok(&dir, &["-pie", "--no-dynamic-linker", "-o", "pie", "start.o"]);
+    assert_eq!(exit_code(&dir, "pie"), 42);
+    let headers = readelf(&dir, &["-h", "-l", "-d", "pie"]);
+    assert!(headers.contains("DYN (Position-Independent"), "{headers}");
+    assert!(headers.contains("(FLAGS_1)"), "{headers}");
+    assert!(!headers.contains("INTERP"), "{headers}");
+
+    qld_ok(&dir, &["-shared", "-soname", "libstart.so", "-o", "lib.so", "start.o"]);
+    let dynamic = readelf(&dir, &["-h", "-d", "--dyn-syms", "lib.so"]);
+    assert!(dynamic.contains("DYN (Shared object file)"), "{dynamic}");
+    assert!(dynamic.contains("Library soname: [libstart.so]"), "{dynamic}");
+    assert!(dynamic.contains(" _start"), "{dynamic}");
 }
 
 #[test]

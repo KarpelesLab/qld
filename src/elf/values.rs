@@ -21,7 +21,7 @@ use super::object::SectionKind;
 use super::place::Placement;
 use super::refs::{Def, Refs, Target};
 use super::rules::Synthetic;
-use super::synth::{Owner, Synth};
+use super::synth::{GotKind, Owner, Synth};
 
 /// Everything needed to compute addresses.
 pub struct Addresses<'x, 'a> {
@@ -79,6 +79,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
                         .unwrap_or(0),
                     Def::Absolute(value) => value,
                     Def::Common(id) => this.common_address(id),
+                    Def::Shared(id) => this.shared_address(id),
                     Def::Linker(_) | Def::Undefined { .. } => 0,
                 }
             })
@@ -116,6 +117,31 @@ impl<'x, 'a> Addresses<'x, 'a> {
         this
     }
 
+    /// The address a symbol defined by a shared library has in this
+    /// output: its copy relocation, or its canonical PLT entry, or 0.
+    fn shared_address(&self, id: SymbolId) -> u64 {
+        if let Some(copy) = self.synth.copy_of(id) {
+            let kind = if copy.relro {
+                Synthetic::DynRelro
+            } else {
+                Synthetic::DynBss
+            };
+            return self
+                .layout
+                .synthetic(kind)
+                .map_or(0, |(addr, ..)| addr.wrapping_add(copy.offset));
+        }
+        if self
+            .refs
+            .symbols
+            .flags(id)
+            .contains(crate::symbols::SymbolFlags::NEEDS_CANONICAL_PLT)
+        {
+            return self.plt_address(Owner::Global(id)).unwrap_or(0);
+        }
+        0
+    }
+
     fn common_address(&self, id: SymbolId) -> u64 {
         let base = self
             .layout
@@ -150,17 +176,20 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 layout.output_places.get(output as usize).map_or(0, |p| p.1)
             }
             Value::GotBase => layout
-                .synthetic(Synthetic::IgotPlt)
+                .synthetic(Synthetic::GotPlt)
                 .or_else(|| layout.synthetic(Synthetic::Got))
                 .map_or(named(".got.plt").0, |(addr, ..)| addr),
             Value::RelaIpltStart => layout
-                .synthetic(Synthetic::RelaIplt)
+                .synthetic(Synthetic::RelaPlt)
                 .map_or(named(".rela.plt").0, |(addr, ..)| addr),
             Value::RelaIpltEnd => layout
-                .synthetic(Synthetic::RelaIplt)
+                .synthetic(Synthetic::RelaPlt)
                 .map_or(named(".rela.plt").0, |(addr, _, size)| {
                     addr.wrapping_add(size)
                 }),
+            Value::Dynamic => layout
+                .synthetic(Synthetic::Dynamic)
+                .map_or(0, |(addr, ..)| addr),
             Value::Defsym(_) => 0,
         }
     }
@@ -272,31 +301,79 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 Some((self.section_offset_address(file, section, value)?, addend))
             }
             Def::Absolute(value) => Some((value, addend)),
-            Def::Common(id) | Def::Linker(id) => Some((*self.globals.get(id.index())?, addend)),
+            Def::Common(id) | Def::Linker(id) | Def::Shared(id) => {
+                Some((*self.globals.get(id.index())?, addend))
+            }
             Def::Undefined { .. } => Some((0, addend)),
         }
     }
 
-    /// The canonical address of an IFUNC: its PLT stub.
+    /// The canonical address of an IFUNC: its PLT stub (in a dynamic
+    /// output, its PLT entry).
     #[must_use]
     pub fn iplt_address(&self, owner: Owner) -> Option<u64> {
+        self.synth.iplt.index(owner)?;
+        if self.synth.dynamic() {
+            return self.plt_address(owner);
+        }
         let index = u64::try_from(self.synth.iplt.index(owner)?).ok()?;
-        let (base, ..) = self.layout.synthetic(Synthetic::Iplt)?;
+        let (base, ..) = self.layout.synthetic(Synthetic::Plt)?;
         base.checked_add(index.checked_mul(super::arch::x86_64::IPLT_ENTRY_SIZE)?)
     }
 
-    /// The address of the GOT entry for `owner`.
+    /// The address code jumps to for `owner`'s PLT entry: `.plt.sec` with
+    /// IBT, `.plt` without, or `.plt.got`.
     #[must_use]
-    pub fn got_address(&self, owner: Owner) -> Option<u64> {
-        let index = u64::try_from(self.synth.got.index(owner)?).ok()?;
-        let (base, ..) = self.layout.synthetic(Synthetic::Got)?;
-        base.checked_add(index.checked_mul(8)?)
+    pub fn plt_address(&self, owner: Owner) -> Option<u64> {
+        use super::arch::x86_64::{PLT_ENTRY_SIZE, PLT_GOT_ENTRY_SIZE};
+        if let Some(index) = self.synth.plt_got.index(owner) {
+            let entry = if self.synth.ibt {
+                PLT_ENTRY_SIZE
+            } else {
+                PLT_GOT_ENTRY_SIZE
+            };
+            let (base, ..) = self.layout.synthetic(Synthetic::PltGot)?;
+            return base.checked_add(u64::try_from(index).ok()?.checked_mul(entry)?);
+        }
+        if !self.synth.dynamic() {
+            return self.iplt_address(owner);
+        }
+        let index = self.synth.plt_index(owner)?;
+        if self.synth.ibt {
+            let (base, ..) = self.layout.synthetic(Synthetic::PltSec)?;
+            base.checked_add(index.checked_mul(PLT_ENTRY_SIZE)?)
+        } else {
+            self.lazy_plt_address(index)
+        }
     }
 
-    /// The address of the `.got.plt` slot of IFUNC entry `index`.
+    /// The address of lazy `.plt` entry `index` (after the header).
+    #[must_use]
+    pub fn lazy_plt_address(&self, index: u64) -> Option<u64> {
+        use super::arch::x86_64::PLT_ENTRY_SIZE;
+        let (base, ..) = self.layout.synthetic(Synthetic::Plt)?;
+        base.checked_add(index.checked_add(1)?.checked_mul(PLT_ENTRY_SIZE)?)
+    }
+
+    /// The address of the address GOT entry for `owner`.
+    #[must_use]
+    pub fn got_address(&self, owner: Owner) -> Option<u64> {
+        self.got_entry_address(owner, GotKind::Address)
+    }
+
+    /// The address of `owner`'s GOT entry of `kind`.
+    #[must_use]
+    pub fn got_entry_address(&self, owner: Owner, kind: GotKind) -> Option<u64> {
+        let word = self.synth.got_word(owner, kind)?;
+        let (base, ..) = self.layout.synthetic(Synthetic::Got)?;
+        base.checked_add(word.checked_mul(8)?)
+    }
+
+    /// The address of the `.got.plt` slot of PLT entry `index` (for a
+    /// static executable, IFUNC entry `index`).
     #[must_use]
     pub fn igot_address(&self, index: usize) -> Option<u64> {
-        let (base, ..) = self.layout.synthetic(Synthetic::IgotPlt)?;
+        let (base, ..) = self.layout.synthetic(Synthetic::GotPlt)?;
         let slot = u64::try_from(index)
             .ok()?
             .checked_add(self.synth.got_plt_reserved)?;
@@ -307,7 +384,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
     #[must_use]
     pub fn got_base(&self) -> u64 {
         self.layout
-            .synthetic(Synthetic::IgotPlt)
+            .synthetic(Synthetic::GotPlt)
             .or_else(|| self.layout.synthetic(Synthetic::Got))
             .map_or(0, |(addr, ..)| addr)
     }

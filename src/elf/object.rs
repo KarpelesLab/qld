@@ -171,6 +171,8 @@ pub struct ObjectInput<'a> {
     /// The pieces of every [`SectionKind::Merge`] section, split at parse
     /// time.
     pub splits: Vec<SplitSection<'a>>,
+    /// Whether some global symbol is named `name@@VERSION`.
+    pub has_default_versions: bool,
 }
 
 /// Whether a section name is debug information that `--strip-debug` drops.
@@ -381,6 +383,7 @@ impl<'a> ObjectInput<'a> {
         let global_count = symbols.len().saturating_sub(first_global);
         let mut names = Vec::with_capacity(global_count);
         let mut uses = Vec::with_capacity(global_count);
+        let mut has_default_versions = false;
         for index in first_global..symbols.len() {
             let Some(raw) = symbols.get_raw(index) else {
                 break;
@@ -418,7 +421,9 @@ impl<'a> ObjectInput<'a> {
             };
             // `redirect` may return a name owned by the wrap table, which
             // lives as long as the link.
-            names.push(SymbolName::new(strip_default_version(name)));
+            let (base, version) = split_version(name);
+            has_default_versions |= version.is_none() && base.len() < name.len();
+            names.push(SymbolName::with_version(base, version));
             uses.push(use_);
         }
 
@@ -435,7 +440,23 @@ impl<'a> ObjectInput<'a> {
             addrsig,
             warnings,
             splits,
+            has_default_versions,
         })
+    }
+
+    /// For global symbol `local` (an index into [`names`](Self::names)) named
+    /// `name@@VERSION`, the version.
+    #[must_use]
+    pub fn default_version(&self, local: usize) -> Option<&'a [u8]> {
+        if !self.has_default_versions {
+            return None;
+        }
+        let symbols = self.elf.symbols();
+        let index = local.checked_add(self.first_global)?;
+        let raw = symbols.get_raw(index)?;
+        let name = symbols.name(index, &raw).ok()?;
+        let at = name.windows(2).position(|w| w == b"@@")?;
+        name.get(at.checked_add(2)?..)
     }
 
     /// The object's source, for diagnostics.
@@ -481,10 +502,22 @@ fn definition(weak: bool, comdat: bool) -> SymbolUse {
     }
 }
 
-/// `foo@@VERSION` defines `foo` in a static link.
-fn strip_default_version(name: &[u8]) -> &[u8] {
-    match name.windows(2).position(|w| w == b"@@") {
-        Some(at) => name.get(..at).unwrap_or(name),
-        None => name,
+/// Splits a symbol table name into the name and its explicit version:
+/// `foo@@VERSION` is the default version of `foo` (the plain name, returned
+/// without a version), `foo@VERSION` a distinct, versioned symbol.
+#[must_use]
+pub fn split_version(name: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let Some(at) = name.iter().position(|&b| b == b'@') else {
+        return (name, None);
+    };
+    let base = name.get(..at).unwrap_or(name);
+    if base.is_empty() {
+        return (name, None);
+    }
+    let rest = name.get(at.saturating_add(1)..).unwrap_or_default();
+    match rest.strip_prefix(b"@") {
+        Some(_) => (base, None),
+        None if rest.is_empty() => (name, None),
+        None => (base, Some(rest)),
     }
 }

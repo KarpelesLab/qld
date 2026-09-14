@@ -1,18 +1,22 @@
-//! x86-64 relocations for static executables: classification, relaxation
-//! and application.
+//! x86-64 relocations: classification, relaxation, application, and the
+//! PLT entry encodings.
 //!
 //! [`classify`] turns a relocation type (plus the instruction bytes in front
 //! of it, for relaxations) into a [`Kind`]: what value to compute and which
 //! instruction rewrite, if any, applies. The relocation scan uses it to find
-//! GOT and IFUNC needs; the writer uses the same answer to patch the output,
-//! so both always agree. Relaxations follow the psABI and lld:
+//! GOT, PLT and TLS needs; the writer uses the same answer to patch the
+//! output, so both always agree. Relaxations follow the psABI and lld:
 //!
 //! - `GOTPCRELX`/`REX_GOTPCRELX` with addend −4: `mov` → `lea`,
-//!   `call *` → `addr32 call`, `jmp *` → `jmp; nop`, and (REX only) `test`
-//!   and binary operators → immediate forms;
-//! - TLS general-dynamic, local-dynamic, initial-exec and TLS descriptors →
-//!   local-exec, since a static executable has exactly one TLS block at a
-//!   known offset from the thread pointer.
+//!   `call *` → `addr32 call`, `jmp *` → `jmp; nop`, and (REX only, in
+//!   position-dependent output) `test` and binary operators → immediate
+//!   forms;
+//! - TLS in executables ([`TlsMode`]): general-dynamic, local-dynamic,
+//!   initial-exec and TLS descriptors → local-exec when the variable is in
+//!   the executable, which has exactly one TLS block at a known offset from
+//!   the thread pointer; general-dynamic and descriptors → initial-exec when
+//!   the variable is in a shared library. Shared objects keep the dynamic
+//!   models.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -56,6 +60,18 @@ pub enum Kind {
     DescToLe,
     /// TLS descriptor call → `nop`.
     DescCallToLe,
+    /// General-dynamic → initial-exec; the next relocation is consumed.
+    GdToIe,
+    /// TLS descriptor → initial-exec (`lea` → `mov` from the GOT).
+    DescToIe,
+    /// Initial-exec kept: `TP offset GOT entry + A - P`.
+    GotTpOff,
+    /// General-dynamic kept: `module/offset GOT pair + A - P`.
+    TlsGd,
+    /// Local-dynamic kept: `module GOT pair + A - P`.
+    TlsLd,
+    /// TLS descriptor kept: `descriptor GOT pair + A - P`.
+    TlsDesc,
 }
 
 impl Kind {
@@ -76,7 +92,14 @@ impl Kind {
     /// call to `__tls_get_addr`).
     #[must_use]
     pub fn skips_next(self) -> bool {
-        matches!(self, Self::GdToLe | Self::LdToLe)
+        matches!(self, Self::GdToLe | Self::LdToLe | Self::GdToIe)
+    }
+
+    /// Whether the relocation is an initial-exec access through a GOT
+    /// entry holding the thread pointer offset.
+    #[must_use]
+    pub fn needs_gottpoff(self) -> bool {
+        matches!(self, Self::GdToIe | Self::DescToIe | Self::GotTpOff)
     }
 
     /// Whether the relocation is a TLS access.
@@ -91,7 +114,53 @@ impl Kind {
                 | Self::IeToLe
                 | Self::DescToLe
                 | Self::DescCallToLe
+                | Self::GdToIe
+                | Self::DescToIe
+                | Self::GotTpOff
+                | Self::TlsGd
+                | Self::TlsLd
+                | Self::TlsDesc
         )
+    }
+}
+
+/// How TLS accesses to one variable are linked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsMode {
+    /// The variable is in the executable being linked: relax to local-exec.
+    LocalExec,
+    /// An executable accessing a shared library's variable: relax
+    /// general-dynamic and descriptors to initial-exec.
+    InitialExec,
+    /// A shared object: keep the dynamic models.
+    Dynamic,
+}
+
+/// What [`classify`] needs to know besides the relocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassifyContext {
+    /// GOT-indirect accesses may be rewritten into direct ones.
+    pub relax_got: bool,
+    /// The output is position-independent, so an address cannot become an
+    /// immediate operand.
+    pub pic: bool,
+    /// How TLS accesses to the relocation's symbol are linked.
+    pub tls: TlsMode,
+    /// How local-dynamic accesses are linked: by the kind of output, not
+    /// the variable.
+    pub tls_ld: TlsMode,
+}
+
+impl ClassifyContext {
+    /// The context of a static executable: everything relaxes.
+    #[must_use]
+    pub const fn static_exec(relax_got: bool) -> Self {
+        Self {
+            relax_got,
+            pic: false,
+            tls: TlsMode::LocalExec,
+            tls_ld: TlsMode::LocalExec,
+        }
     }
 }
 
@@ -151,10 +220,9 @@ fn byte_after(data: &[u8], offset: u64, forward: u64) -> Option<u8> {
 
 /// Classifies relocation `r_type` at `offset` in section `data`.
 ///
-/// `relax_got` says whether GOT-indirect accesses to the symbol may be
-/// rewritten into direct ones (the symbol is not an IFUNC and `--no-relax`
-/// was not given). TLS accesses are always relaxed: a static executable
-/// cannot do anything else.
+/// `context.relax_got` says whether GOT-indirect accesses to the symbol may
+/// be rewritten into direct ones (the symbol is defined in the output, not
+/// preemptible, not an IFUNC, and `--no-relax` was not given).
 ///
 /// # Errors
 ///
@@ -164,10 +232,11 @@ pub fn classify(
     addend: i64,
     data: &[u8],
     offset: u64,
-    relax_got: bool,
+    context: ClassifyContext,
 ) -> Result<Class, ClassifyError> {
     use Kind as K;
     use Width as W;
+    let relax_got = context.relax_got;
     Ok(match r_type {
         R_X86_64_NONE | R_X86_64_GNU_VTINHERIT | R_X86_64_GNU_VTENTRY => class(K::None, W::None),
         R_X86_64_64 => class(K::Abs, W::W64),
@@ -190,6 +259,7 @@ pub fn classify(
                 (Some(0xff), Some(0x15 | 0x25)) if relaxable => class(K::RelaxGotPc, W::I32),
                 (Some(0x85 | 0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 | 0x3b), _)
                     if relaxable
+                        && !context.pic
                         && r_type == R_X86_64_REX_GOTPCRELX
                         && byte_before(data, offset, 3).is_some() =>
                 {
@@ -214,23 +284,43 @@ pub fn classify(
             // or 66 48 ff 15 <__tls_get_addr@gotpcrel>.
             let call = (byte_after(data, offset, 6), byte_after(data, offset, 7));
             let lea = byte_before(data, offset, 4);
-            match (lea, call) {
-                (Some(0x66), (Some(0x48), Some(0xe8)) | (Some(0xff), Some(0x15))) => {
-                    class(K::GdToLe, W::None)
-                }
-                _ => return Err(ClassifyError::BadTlsInstruction),
+            match context.tls {
+                TlsMode::Dynamic => class(K::TlsGd, W::I32),
+                mode => match (lea, call) {
+                    (Some(0x66), (Some(0x48), Some(0xe8)) | (Some(0xff), Some(0x15))) => {
+                        if mode == TlsMode::LocalExec {
+                            class(K::GdToLe, W::None)
+                        } else {
+                            class(K::GdToIe, W::None)
+                        }
+                    }
+                    _ => return Err(ClassifyError::BadTlsInstruction),
+                },
             }
         }
         R_X86_64_TLSLD => {
+            if context.tls_ld != TlsMode::LocalExec {
+                return Ok(class(K::TlsLd, W::I32));
+            }
             let after = (byte_after(data, offset, 4), byte_after(data, offset, 5));
             match after {
                 (Some(0xe8), _) | (Some(0xff), Some(0x15)) => class(K::LdToLe, W::None),
                 _ => return Err(ClassifyError::BadTlsInstruction),
             }
         }
-        R_X86_64_GOTTPOFF => class(K::IeToLe, W::None),
-        R_X86_64_GOTPC32_TLSDESC => class(K::DescToLe, W::None),
-        R_X86_64_TLSDESC_CALL => class(K::DescCallToLe, W::None),
+        R_X86_64_GOTTPOFF => match context.tls {
+            TlsMode::LocalExec => class(K::IeToLe, W::None),
+            _ => class(K::GotTpOff, W::I32),
+        },
+        R_X86_64_GOTPC32_TLSDESC => match context.tls {
+            TlsMode::LocalExec => class(K::DescToLe, W::None),
+            TlsMode::InitialExec => class(K::DescToIe, W::None),
+            TlsMode::Dynamic => class(K::TlsDesc, W::I32),
+        },
+        R_X86_64_TLSDESC_CALL => match context.tls {
+            TlsMode::Dynamic => class(K::None, W::None),
+            _ => class(K::DescCallToLe, W::None),
+        },
         _ => return Err(ClassifyError::Unsupported),
     })
 }
@@ -466,6 +556,147 @@ pub fn relax_tls(out: &mut [u8], offset: u64, kind: Kind, tpoff: i64) -> Result<
     }
 }
 
+/// `mov %fs:0, %rax` followed by `add x@gottpoff(%rip), %rax`.
+const GD_TO_IE: [u8; 16] = [
+    0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x03, 0x05, 0, 0, 0, 0,
+];
+
+/// Relaxes a general-dynamic or descriptor access to initial-exec.
+/// `got_pc` is `GOT entry + A - P`, with `A` the relocation's addend.
+///
+/// # Errors
+///
+/// [`ApplyError`] for unrecognized instruction sequences.
+pub fn relax_tls_ie(
+    out: &mut [u8],
+    offset: u64,
+    kind: Kind,
+    got_pc: i64,
+) -> Result<(), ApplyError> {
+    match kind {
+        Kind::GdToIe => {
+            let start = offset.checked_sub(4).ok_or(ApplyError::BadInstruction)?;
+            let at = usize::try_from(start).map_err(|_| ApplyError::OutOfBounds)?;
+            let end = at
+                .checked_add(GD_TO_IE.len())
+                .ok_or(ApplyError::OutOfBounds)?;
+            out.get_mut(at..end)
+                .ok_or(ApplyError::BadInstruction)?
+                .copy_from_slice(&GD_TO_IE);
+            // The displacement is at P + 8 and relative to P + 12; the
+            // addend of the original relocation accounts for 4 of it.
+            write_i32(
+                out,
+                offset.checked_add(8).ok_or(ApplyError::OutOfBounds)?,
+                got_pc.checked_sub(8).ok_or(ApplyError::Overflow)?,
+            )
+        }
+        Kind::DescToIe => {
+            // lea x@tlsdesc(%rip), %reg -> mov x@gottpoff(%rip), %reg
+            if get(out, offset, 2)? != 0x8d {
+                return Err(ApplyError::BadInstruction);
+            }
+            put(out, offset, -2, 0x8b)?;
+            write_i32(out, offset, got_pc)
+        }
+        _ => Err(ApplyError::BadInstruction),
+    }
+}
+
+/// Size of a PLT entry (all entry kinds with IBT, and `.plt` entries
+/// without it).
+pub const PLT_ENTRY_SIZE: u64 = 16;
+/// Size of a `.plt.got` entry without IBT.
+pub const PLT_GOT_ENTRY_SIZE: u64 = 8;
+
+fn rel32(target: u64, next_instruction: u64) -> Result<[u8; 4], ApplyError> {
+    let value = (target as i64).wrapping_sub(next_instruction as i64);
+    Ok(i32::try_from(value)
+        .map_err(|_| ApplyError::Overflow)?
+        .to_le_bytes())
+}
+
+fn put_bytes(out: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), ApplyError> {
+    let end = at.checked_add(bytes.len()).ok_or(ApplyError::OutOfBounds)?;
+    out.get_mut(at..end)
+        .ok_or(ApplyError::OutOfBounds)?
+        .copy_from_slice(bytes);
+    Ok(())
+}
+
+/// Writes the lazy PLT header at address `plt`: push the link map word and
+/// jump to the resolver through `.got.plt` (at `got_plt`).
+///
+/// # Errors
+///
+/// [`ApplyError`] when out of range.
+pub fn write_plt_header(out: &mut [u8], plt: u64, got_plt: u64) -> Result<(), ApplyError> {
+    put_bytes(out, 0, &[0xff, 0x35])?;
+    put_bytes(
+        out,
+        2,
+        &rel32(got_plt.wrapping_add(8), plt.wrapping_add(6))?,
+    )?;
+    put_bytes(out, 6, &[0xff, 0x25])?;
+    put_bytes(
+        out,
+        8,
+        &rel32(got_plt.wrapping_add(16), plt.wrapping_add(12))?,
+    )?;
+    put_bytes(out, 12, &[0x0f, 0x1f, 0x40, 0x00])
+}
+
+/// Writes lazy `.plt` entry `index` at `entry`. Without IBT it jumps
+/// through its `.got.plt` slot at `slot` (which initially points back at
+/// the `push`); with IBT it is only the lazy-binding half, and the jump is
+/// in `.plt.sec`.
+///
+/// # Errors
+///
+/// [`ApplyError`] when out of range.
+pub fn write_plt_entry(
+    out: &mut [u8],
+    entry: u64,
+    slot: u64,
+    index: u32,
+    plt: u64,
+    ibt: bool,
+) -> Result<(), ApplyError> {
+    if ibt {
+        put_bytes(out, 0, &[0xf3, 0x0f, 0x1e, 0xfa, 0x68])?;
+        put_bytes(out, 5, &index.to_le_bytes())?;
+        put_bytes(out, 9, &[0xe9])?;
+        put_bytes(out, 10, &rel32(plt, entry.wrapping_add(14))?)?;
+        put_bytes(out, 14, &[0x66, 0x90])
+    } else {
+        put_bytes(out, 0, &[0xff, 0x25])?;
+        put_bytes(out, 2, &rel32(slot, entry.wrapping_add(6))?)?;
+        put_bytes(out, 6, &[0x68])?;
+        put_bytes(out, 7, &index.to_le_bytes())?;
+        put_bytes(out, 11, &[0xe9])?;
+        put_bytes(out, 12, &rel32(plt, entry.wrapping_add(16))?)
+    }
+}
+
+/// Writes a `.plt.sec` entry (IBT) or `.plt.got` entry at `entry` that
+/// jumps through the GOT word at `slot`. `ibt` selects the 16-byte form
+/// with `endbr64`; otherwise the 8-byte `.plt.got` form is written.
+///
+/// # Errors
+///
+/// [`ApplyError`] when out of range.
+pub fn write_plt_jump(out: &mut [u8], entry: u64, slot: u64, ibt: bool) -> Result<(), ApplyError> {
+    if ibt {
+        put_bytes(out, 0, &[0xf3, 0x0f, 0x1e, 0xfa, 0xff, 0x25])?;
+        put_bytes(out, 6, &rel32(slot, entry.wrapping_add(10))?)?;
+        put_bytes(out, 10, &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00])
+    } else {
+        put_bytes(out, 0, &[0xff, 0x25])?;
+        put_bytes(out, 2, &rel32(slot, entry.wrapping_add(6))?)?;
+        put_bytes(out, 6, &[0x66, 0x90])
+    }
+}
+
 /// Size of an IFUNC PLT stub.
 pub const IPLT_ENTRY_SIZE: u64 = 16;
 
@@ -495,18 +726,39 @@ mod tests {
     fn relaxes_mov_to_lea() {
         // mov foo@GOTPCREL(%rip), %rax
         let mut code = vec![0x48, 0x8b, 0x05, 0, 0, 0, 0];
-        let class = classify(R_X86_64_REX_GOTPCRELX, -4, &code, 3, true).unwrap();
+        let class = classify(
+            R_X86_64_REX_GOTPCRELX,
+            -4,
+            &code,
+            3,
+            ClassifyContext::static_exec(true),
+        )
+        .unwrap();
         assert_eq!(class.kind, Kind::RelaxGotPc);
         relax_got(&mut code, 3, class.kind, 0x100).unwrap();
         assert_eq!(code, [0x48, 0x8d, 0x05, 0, 1, 0, 0]);
-        let class = classify(R_X86_64_REX_GOTPCRELX, -4, &code, 3, false).unwrap();
+        let class = classify(
+            R_X86_64_REX_GOTPCRELX,
+            -4,
+            &code,
+            3,
+            ClassifyContext::static_exec(false),
+        )
+        .unwrap();
         assert_eq!(class.kind, Kind::GotPc);
     }
 
     #[test]
     fn relaxes_call_and_jmp() {
         let mut call = vec![0xff, 0x15, 0, 0, 0, 0];
-        let class = classify(R_X86_64_GOTPCRELX, -4, &call, 2, true).unwrap();
+        let class = classify(
+            R_X86_64_GOTPCRELX,
+            -4,
+            &call,
+            2,
+            ClassifyContext::static_exec(true),
+        )
+        .unwrap();
         relax_got(&mut call, 2, class.kind, -8).unwrap();
         assert_eq!(call, [0x67, 0xe8, 0xf8, 0xff, 0xff, 0xff]);
         let mut jmp = vec![0xff, 0x25, 0, 0, 0, 0];
@@ -532,7 +784,14 @@ mod tests {
         let mut code = vec![
             0x66, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x66, 0x66, 0x48, 0xe8, 0, 0, 0, 0,
         ];
-        let class = classify(R_X86_64_TLSGD, -4, &code, 4, true).unwrap();
+        let class = classify(
+            R_X86_64_TLSGD,
+            -4,
+            &code,
+            4,
+            ClassifyContext::static_exec(true),
+        )
+        .unwrap();
         let plt = classify(
             R_X86_64_TLSGD,
             -4,
@@ -540,13 +799,54 @@ mod tests {
                 0x66, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x66, 0x48, 0xff, 0x15, 0, 0, 0, 0,
             ],
             4,
-            true,
+            ClassifyContext::static_exec(true),
         );
         assert_eq!(plt.map(|c| c.kind), Ok(Kind::GdToLe));
+        let shared = ClassifyContext {
+            relax_got: false,
+            pic: true,
+            tls: TlsMode::Dynamic,
+            tls_ld: TlsMode::Dynamic,
+        };
+        let kept = classify(R_X86_64_TLSGD, -4, &code, 4, shared).unwrap();
+        assert_eq!(kept.kind, Kind::TlsGd);
+        let ie = ClassifyContext {
+            tls: TlsMode::InitialExec,
+            tls_ld: TlsMode::LocalExec,
+            ..shared
+        };
+        let mut gd = code.clone();
+        let ie_class = classify(R_X86_64_TLSGD, -4, &gd, 4, ie).unwrap();
+        assert_eq!(ie_class.kind, Kind::GdToIe);
+        relax_tls_ie(&mut gd, 4, Kind::GdToIe, 0x100 - 4).unwrap();
+        assert_eq!(&gd[..12], &GD_TO_IE[..12]);
+        assert_eq!(&gd[12..], &(0x100i32 - 12).to_le_bytes());
         assert_eq!(class.kind, Kind::GdToLe);
         relax_tls(&mut code, 4, Kind::GdToLe, -8 - 4).unwrap();
         assert_eq!(&code[..12], &GD_TO_LE[..12]);
         assert_eq!(&code[12..], &(-8i32).to_le_bytes());
+    }
+
+    #[test]
+    fn plt_entries_jump_through_their_slots() {
+        let mut header = [0u8; 16];
+        write_plt_header(&mut header, 0x1020, 0x3000).unwrap();
+        assert_eq!(&header[..2], &[0xff, 0x35]);
+        assert_eq!(&header[2..6], &(0x3008i32 - 0x1026).to_le_bytes());
+        let mut entry = [0u8; 16];
+        write_plt_entry(&mut entry, 0x1030, 0x3018, 3, 0x1020, false).unwrap();
+        assert_eq!(&entry[2..6], &(0x3018i32 - 0x1036).to_le_bytes());
+        assert_eq!(&entry[7..11], &3u32.to_le_bytes());
+        assert_eq!(&entry[12..16], &(0x1020i32 - 0x1040).to_le_bytes());
+        write_plt_entry(&mut entry, 0x1030, 0x3018, 3, 0x1020, true).unwrap();
+        assert_eq!(&entry[..4], &[0xf3, 0x0f, 0x1e, 0xfa]);
+        assert_eq!(&entry[10..14], &(0x1020i32 - 0x103e).to_le_bytes());
+        let mut sec = [0u8; 16];
+        write_plt_jump(&mut sec, 0x1050, 0x3018, true).unwrap();
+        assert_eq!(&sec[6..10], &(0x3018i32 - 0x105a).to_le_bytes());
+        let mut got = [0u8; 8];
+        write_plt_jump(&mut got, 0x1050, 0x3018, false).unwrap();
+        assert_eq!(got[..2], [0xff, 0x25]);
     }
 
     #[test]
@@ -572,11 +872,17 @@ mod tests {
     #[test]
     fn unsupported_types_are_reported() {
         assert_eq!(
-            classify(R_X86_64_COPY, 0, &[], 0, true),
+            classify(R_X86_64_COPY, 0, &[], 0, ClassifyContext::static_exec(true)),
             Err(ClassifyError::Unsupported)
         );
         assert_eq!(
-            classify(R_X86_64_TLSGD, -4, &[0; 8], 4, true),
+            classify(
+                R_X86_64_TLSGD,
+                -4,
+                &[0; 8],
+                4,
+                ClassifyContext::static_exec(true)
+            ),
             Err(ClassifyError::BadTlsInstruction)
         );
     }

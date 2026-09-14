@@ -368,7 +368,7 @@ fn icf_target(
             )
         }
         Def::Absolute(value) => (IcfTarget::Value(value), addend),
-        Def::Common(id) | Def::Linker(id) => (IcfTarget::Symbol(id), addend),
+        Def::Common(id) | Def::Linker(id) | Def::Shared(id) => (IcfTarget::Symbol(id), addend),
         Def::Undefined { .. } => match target.global {
             Some(id) => (IcfTarget::Symbol(id), addend),
             None => (IcfTarget::Value(0), addend),

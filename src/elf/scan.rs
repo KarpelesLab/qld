@@ -1,21 +1,27 @@
 //! The relocation scan (pipeline stage 6).
 //!
 //! Scans the relocations of every live allocated section, in parallel per
-//! file, and records what layout has to provide:
+//! file, and records what layout has to provide, using the per-relocation
+//! decisions of [`reloc::decide`]:
 //!
-//! - per-symbol [`SymbolFlags`]: `NEEDS_GOT` for GOT-indirect accesses that
-//!   cannot be relaxed, [`NEEDS_IPLT`] for references to IFUNC symbols, and
-//!   `ADDRESS_TAKEN` for non-call references (for `--icf=safe`). Flags are
-//!   atomic, so threads set them without locks. Local symbols have no flag
-//!   word; their needs are returned per file instead.
-//! - whether anything uses the GOT base (`_GLOBAL_OFFSET_TABLE_`);
+//! - per-symbol [`SymbolFlags`]: GOT, PLT, copy relocation, canonical PLT,
+//!   TLS GOT needs, [`NEEDS_IPLT`] for IFUNC symbols, and `ADDRESS_TAKEN`
+//!   for non-call references (for `--icf=safe`). Flags are atomic, so
+//!   threads set them without locks. Local symbols have no flag word; their
+//!   needs are returned per file instead.
+//! - the number of dynamic relocations each section needs, so `.rela.dyn`
+//!   is sized before layout, and whether any lands in a read-only section
+//!   (`DT_TEXTREL`);
+//! - whether anything uses the GOT base (`_GLOBAL_OFFSET_TABLE_`) or needs
+//!   a module-local TLS GOT pair;
 //! - undefined symbols, with the location of every reference, for lld-style
 //!   diagnostics;
-//! - unsupported relocations, as errors.
+//! - unsupported relocations and relocations the output cannot express, as
+//!   errors.
 //!
 //! Relocations that TLS relaxation consumes (the `__tls_get_addr` call after
 //! a general- or local-dynamic access) are skipped, so they neither need a
-//! GOT entry nor report `__tls_get_addr` as undefined.
+//! GOT or PLT entry nor report `__tls_get_addr` as undefined.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -27,9 +33,10 @@ use crate::elf::read::consts::{EM_X86_64, SHF_ALLOC, reloc_name};
 use crate::ids::SymbolId;
 use crate::symbols::SymbolFlags;
 
-use super::arch::x86_64::{self, ClassifyError, Kind};
+use super::arch::x86_64::{ClassifyError, Kind};
 use super::object::SectionKind;
 use super::refs::{Def, Refs};
+use super::reloc::{self, Context, Dynamic, LocalNeed, Problem};
 
 /// Backend flag: the symbol is an IFUNC that needs a PLT stub and an
 /// `IRELATIVE` GOT slot.
@@ -48,6 +55,17 @@ pub struct UndefinedRef {
     pub offset: u64,
 }
 
+/// A section with dynamic relocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DynSection {
+    /// The section index in its file.
+    pub section: u32,
+    /// How many `R_X86_64_RELATIVE` relocations it needs.
+    pub relative: u32,
+    /// How many symbolic dynamic relocations it needs.
+    pub symbolic: u32,
+}
+
 /// What the scan of one file found.
 #[derive(Debug, Default)]
 pub struct FileScan {
@@ -55,6 +73,21 @@ pub struct FileScan {
     pub got_locals: Vec<u32>,
     /// Local IFUNC symbols needing a PLT stub, sorted and deduplicated.
     pub iplt_locals: Vec<u32>,
+    /// Local TLS symbols needing a module/offset GOT pair.
+    pub tlsgd_locals: Vec<u32>,
+    /// Local TLS symbols needing a thread pointer offset GOT entry.
+    pub gottpoff_locals: Vec<u32>,
+    /// Local TLS symbols needing a descriptor GOT pair.
+    pub tlsdesc_locals: Vec<u32>,
+    /// A module-local TLS GOT pair is needed.
+    pub tls_ld: bool,
+    /// Sections with dynamic relocations, by section index.
+    pub dyn_sections: Vec<DynSection>,
+    /// A dynamic relocation applies to a read-only section.
+    pub text_relocs: bool,
+    /// An initial-exec TLS access remains (`DF_STATIC_TLS` in shared
+    /// objects).
+    pub static_tls: bool,
     /// References to undefined symbols.
     pub undefined: Vec<UndefinedRef>,
     /// Problems found.
@@ -76,16 +109,48 @@ impl ScanResult {
     pub fn uses_got_base(&self) -> bool {
         self.files.iter().any(|f| f.uses_got_base)
     }
+
+    /// Whether any file needs a module-local TLS GOT pair.
+    #[must_use]
+    pub fn tls_ld(&self) -> bool {
+        self.files.iter().any(|f| f.tls_ld)
+    }
+
+    /// Whether any dynamic relocation applies to a read-only section.
+    #[must_use]
+    pub fn text_relocs(&self) -> bool {
+        self.files.iter().any(|f| f.text_relocs)
+    }
+
+    /// Whether an initial-exec TLS access remains.
+    #[must_use]
+    pub fn static_tls(&self) -> bool {
+        self.files.iter().any(|f| f.static_tls)
+    }
+
+    /// Total `(relative, symbolic)` dynamic relocations of input sections.
+    #[must_use]
+    pub fn section_dyn_relocs(&self) -> (u64, u64) {
+        self.files
+            .iter()
+            .flat_map(|f| &f.dyn_sections)
+            .fold((0u64, 0u64), |(r, s), d| {
+                (
+                    r.saturating_add(u64::from(d.relative)),
+                    s.saturating_add(u64::from(d.symbolic)),
+                )
+            })
+    }
 }
 
 /// Scans every live allocated section.
 #[must_use]
-pub fn scan(refs: &Refs<'_, '_>, relax: bool) -> ScanResult {
+pub fn scan(refs: &Refs<'_, '_>, context: &Context) -> ScanResult {
     let files = refs
         .files
         .par_iter()
         .enumerate()
-        .map(|(file_index, _)| scan_file(refs, file_index, relax))
+        .map(|(file_index, _)| scan_file(refs, file_index, context))
         .collect();
     ScanResult { files }
 }
@@ -107,7 +172,11 @@ pub fn location(refs: &Refs<'_, '_>, file: usize, section: u32, offset: u64) -> 
     }
 }
 
-fn scan_file(refs: &Refs<'_, '_>, file_index: usize, relax: bool) -> FileScan {
+fn type_name(r_type: u32) -> String {
+    reloc_name(EM_X86_64, r_type).map_or_else(|| r_type.to_string(), str::to_owned)
+}
+
+fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileScan {
     let mut result = FileScan::default();
     let Some(file) = refs.files.get(file_index) else {
         return result;
@@ -162,6 +231,11 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, relax: bool) -> FileScan {
             continue;
         };
         let eh_frame = section.kind == SectionKind::EhFrame;
+        let mut dyn_section = DynSection {
+            section: section_index,
+            relative: 0,
+            symbolic: 0,
+        };
         let mut skip = false;
         for rel in relas.iter() {
             if skip {
@@ -179,66 +253,89 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, relax: bool) -> FileScan {
                 );
                 continue;
             };
-            let is_ifunc = target.is_ifunc();
-            let class = match x86_64::classify(
-                rel.r_type,
-                rel.addend,
-                data,
-                rel.offset,
-                relax && !is_ifunc,
-            ) {
-                Ok(class) => class,
-                Err(error) => {
-                    let what = match error {
-                        ClassifyError::Unsupported => format!(
-                            "unsupported relocation type {}",
-                            reloc_name(EM_X86_64, rel.r_type)
-                                .map_or_else(|| rel.r_type.to_string(), str::to_owned)
-                        ),
-                        ClassifyError::BadTlsInstruction => format!(
-                            "{} must be followed by a call to __tls_get_addr",
-                            reloc_name(EM_X86_64, rel.r_type).unwrap_or("TLS relocation")
-                        ),
-                    };
-                    result.errors.push(
-                        Diagnostic::error(what)
-                            .at(location(refs, file_index, section_index, rel.offset))
-                            .order(order),
-                    );
-                    continue;
-                }
-            };
-            skip = class.kind.skips_next();
-            if class.kind == Kind::None {
+            let flags = target
+                .global
+                .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+            let decision =
+                match reloc::decide(context, &rel, data, &target, flags, section.header.sh_flags) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        let what = match error {
+                            ClassifyError::Unsupported => {
+                                format!("unsupported relocation type {}", type_name(rel.r_type))
+                            }
+                            ClassifyError::BadTlsInstruction => format!(
+                                "{} must be followed by a call to __tls_get_addr",
+                                reloc_name(EM_X86_64, rel.r_type).unwrap_or("TLS relocation")
+                            ),
+                        };
+                        result.errors.push(
+                            Diagnostic::error(what)
+                                .at(location(refs, file_index, section_index, rel.offset))
+                                .order(order),
+                        );
+                        continue;
+                    }
+                };
+            let kind = decision.class.kind;
+            skip = kind.skips_next();
+            if kind == Kind::None {
                 continue;
             }
-            result.uses_got_base |= class.kind.uses_got_base();
-            match target.def {
-                Def::Undefined { weak: false } => {
-                    if let Some(symbol) = target.global
-                        && !eh_frame
-                    {
-                        result.undefined.push(UndefinedRef {
-                            symbol,
-                            file: file_index,
-                            section: section_index,
-                            offset: rel.offset,
-                        });
-                    }
-                }
-                Def::Section { .. } | Def::Absolute(_) | Def::Common(_) | Def::Linker(_) => {}
-                Def::Undefined { weak: true } => {}
+            result.uses_got_base |= kind.uses_got_base();
+            result.tls_ld |= decision.tls_ld;
+            result.static_tls |= kind.needs_gottpoff();
+            if let Def::Undefined { weak: false } = target.def
+                && let Some(symbol) = target.global
+                && !eh_frame
+            {
+                result.undefined.push(UndefinedRef {
+                    symbol,
+                    file: file_index,
+                    section: section_index,
+                    offset: rel.offset,
+                });
             }
-            let got = class.kind.needs_got();
+            if let Some(problem) = decision.problem {
+                let name = refs
+                    .symbol_name(file_index, rel.symbol)
+                    .unwrap_or_else(|| "local symbol".to_string());
+                let what = match problem {
+                    Problem::NeedsPic => format!(
+                        "relocation {} cannot be used against symbol '{name}'; recompile with -fPIC",
+                        type_name(rel.r_type)
+                    ),
+                    Problem::LocalExecTls => format!(
+                        "relocation {} against '{name}' cannot be used with this output; \
+                         recompile with -fPIC",
+                        type_name(rel.r_type)
+                    ),
+                    Problem::NoCopyReloc => format!(
+                        "unresolvable relocation {} against symbol '{name}'; recompile with -fPIC \
+                         or remove '-z nocopyreloc'",
+                        type_name(rel.r_type)
+                    ),
+                };
+                result.errors.push(
+                    Diagnostic::error(what)
+                        .at(location(refs, file_index, section_index, rel.offset))
+                        .order(order),
+                );
+                continue;
+            }
+            match decision.dynamic {
+                Dynamic::None => {}
+                Dynamic::Relative => {
+                    dyn_section.relative = dyn_section.relative.saturating_add(1);
+                }
+                Dynamic::Symbolic(_) => {
+                    dyn_section.symbolic = dyn_section.symbolic.saturating_add(1);
+                }
+            }
+            result.text_relocs |= decision.text;
             match target.global {
                 Some(id) => {
-                    let mut flags = SymbolFlags::EMPTY;
-                    if got {
-                        flags |= SymbolFlags::NEEDS_GOT;
-                    }
-                    if is_ifunc {
-                        flags |= NEEDS_IPLT;
-                    }
+                    let mut flags = decision.flags;
                     if !matches!(rel.r_type, crate::elf::read::consts::x86_64::R_X86_64_PLT32) {
                         flags |= SymbolFlags::ADDRESS_TAKEN;
                     }
@@ -247,19 +344,35 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, relax: bool) -> FileScan {
                     }
                 }
                 None => {
-                    if got {
-                        result.got_locals.push(rel.symbol);
+                    let list = match decision.local {
+                        LocalNeed::None => None,
+                        LocalNeed::Got => Some(&mut result.got_locals),
+                        LocalNeed::TlsGd => Some(&mut result.tlsgd_locals),
+                        LocalNeed::GotTpOff => Some(&mut result.gottpoff_locals),
+                        LocalNeed::TlsDesc => Some(&mut result.tlsdesc_locals),
+                    };
+                    if let Some(list) = list {
+                        list.push(rel.symbol);
                     }
-                    if is_ifunc {
+                    if target.is_ifunc() {
                         result.iplt_locals.push(rel.symbol);
                     }
                 }
             }
         }
+        if dyn_section.relative != 0 || dyn_section.symbolic != 0 {
+            result.dyn_sections.push(dyn_section);
+        }
     }
-    result.got_locals.sort_unstable();
-    result.got_locals.dedup();
-    result.iplt_locals.sort_unstable();
-    result.iplt_locals.dedup();
+    for list in [
+        &mut result.got_locals,
+        &mut result.iplt_locals,
+        &mut result.tlsgd_locals,
+        &mut result.gottpoff_locals,
+        &mut result.tlsdesc_locals,
+    ] {
+        list.sort_unstable();
+        list.dedup();
+    }
     result
 }

@@ -1,14 +1,25 @@
-//! Synthetic sections (pipeline stage 9): GOT, IFUNC PLT and its
-//! `IRELATIVE` relocations, `.note.gnu.build-id`, `.note.gnu.property`, the
-//! linker's `.comment` string and `.eh_frame_hdr`.
+//! Synthetic sections (pipeline stage 9): GOT and TLS GOT entries, PLTs,
+//! `.got.plt`, copy relocation space, the dynamic relocations they need,
+//! `.interp`, `.note.gnu.build-id`, `.note.gnu.property`, the linker's
+//! `.comment` string and `.eh_frame_hdr`. The dynamic symbol table and its
+//! companions are planned by [`super::dynsym`].
 //!
 //! Planning happens before layout and fixes every size. Contents are written
 //! after layout, from final addresses.
 //!
-//! GOT and IFUNC entries are generic over what needs them: global symbols
-//! (by [`SymbolId`], from the scan's flags) and local symbols (by file and
-//! symbol index). A static executable has no dynamic relocations except
-//! `IRELATIVE`, so every other GOT entry holds a link-time constant.
+//! Entries are generic over what needs them: global symbols (by
+//! [`SymbolId`], from the scan's flags) and local symbols (by file and
+//! symbol index). The `.got` holds, in order: address entries, TLS
+//! module/offset pairs, thread pointer offsets, TLS descriptor pairs, and the
+//! module-local TLS pair.
+//!
+//! **PLT.** A static executable has only IFUNC stubs in `.plt` (with their
+//! `.got.plt` slots and `IRELATIVE` relocations in `.rela.plt`). A dynamic
+//! output follows GNU ld: `.plt` starts with the lazy-binding header, then
+//! one entry per called preemptible function and per IFUNC; with IBT, the
+//! entries that code jumps to are in `.plt.sec`. A preemptible function
+//! that also has a GOT entry is called through `.plt.got`, which jumps
+//! through that GOT entry and needs no `JUMP_SLOT` relocation.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -22,14 +33,16 @@ use crate::elf::read::consts::{
 };
 use crate::ids::SymbolId;
 use crate::output::build_id::build_id_size;
-use crate::symbols::{SymbolFlags, SymbolTable};
+use crate::symbols::SymbolFlags;
 
-use super::arch::x86_64::IPLT_ENTRY_SIZE;
+use super::arch::x86_64::{IPLT_ENTRY_SIZE, PLT_ENTRY_SIZE, PLT_GOT_ENTRY_SIZE};
+use super::export::{Mode, PREEMPTIBLE};
 use super::inputs::ElfInput;
+use super::refs::{Def, Refs};
 use super::rules::Synthetic;
 use super::scan::{NEEDS_IPLT, ScanResult};
 
-/// A GOT or IFUNC entry owner.
+/// A GOT or PLT entry owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Owner {
     /// A global symbol.
@@ -87,16 +100,71 @@ impl EntryList {
     }
 }
 
+/// What a GOT entry holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GotKind {
+    /// The symbol's address (one word).
+    Address,
+    /// TLS module ID and offset (two words).
+    TlsGd,
+    /// The thread pointer offset (one word).
+    TpOff,
+    /// A TLS descriptor (two words).
+    TlsDesc,
+    /// The module-local TLS module ID and a zero offset (two words).
+    TlsLd,
+}
+
+/// A space reserved in the executable for a copy relocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyReloc {
+    /// The symbol.
+    pub symbol: SymbolId,
+    /// Offset in its block (`.bss` or `.data.rel.ro`).
+    pub offset: u64,
+    /// Size.
+    pub size: u64,
+    /// In the read-only block.
+    pub relro: bool,
+}
+
 /// The planned synthetic sections.
 #[derive(Debug, Default)]
 pub struct Synth {
-    /// GOT entries.
+    /// The output mode.
+    pub mode: Option<Mode>,
+    /// Address GOT entries.
     pub got: EntryList,
+    /// TLS module/offset pairs.
+    pub tlsgd: EntryList,
+    /// Thread pointer offset entries.
+    pub gottpoff: EntryList,
+    /// TLS descriptor pairs.
+    pub tlsdesc: EntryList,
+    /// Whether the module-local TLS pair exists.
+    pub tlsld: bool,
     /// IFUNC symbols, each with a PLT stub, a `.got.plt` slot and an
     /// `IRELATIVE` relocation.
     pub iplt: EntryList,
-    /// Reserved words at the start of `.got.plt` (when the GOT base is used).
+    /// Preemptible functions called through `.plt` (dynamic outputs).
+    pub plt: EntryList,
+    /// Preemptible functions called through `.plt.got`.
+    pub plt_got: EntryList,
+    /// Copy relocations, sorted by symbol.
+    pub copies: Vec<CopyReloc>,
+    /// Size and alignment of the copy relocation block in `.bss`.
+    pub dynbss: (u64, u64),
+    /// Size and alignment of the copy relocation block in `.data.rel.ro`.
+    pub dynrelro: (u64, u64),
+    /// IBT-enabled PLT.
+    pub ibt: bool,
+    /// Reserved words at the start of `.got.plt`.
     pub got_plt_reserved: u64,
+    /// Dynamic relocations in `.rela.dyn` that come from GOT entries and
+    /// copy relocations, `(relative, other)`.
+    pub got_dyn_relocs: (u64, u64),
+    /// Dynamic relocations of input sections, `(relative, symbolic)`.
+    pub section_dyn_relocs: (u64, u64),
     /// Size of the build-id, if one is written.
     pub build_id: Option<u64>,
     /// The `.note.gnu.property` contents, if any.
@@ -109,6 +177,15 @@ pub struct Synth {
     pub eh_frame_end: bool,
     /// Common block size and alignment.
     pub common: (u64, u64),
+    /// The program interpreter, NUL-terminated, if `.interp` is written.
+    pub interp: Option<Vec<u8>>,
+    /// Sizes and alignments of the dynamic linking sections planned by
+    /// [`super::dynsym`].
+    pub dynamic_sizes: Vec<(Synthetic, u64, u64)>,
+    /// Number of `.gnu.version_r` file entries (`sh_info`).
+    pub verneed_count: u64,
+    /// Number of `.gnu.version_d` entries (`sh_info`).
+    pub verdef_count: u64,
 }
 
 /// The string the linker adds to `.comment`.
@@ -119,15 +196,29 @@ pub fn comment() -> Vec<u8> {
     text
 }
 
+/// The default program interpreter on x86-64 Linux.
+pub const DEFAULT_INTERPRETER: &str = "/lib64/ld-linux-x86-64.so.2";
+
+fn u64_len(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
 impl Synth {
-    /// Plans GOT and IFUNC entries from the scan.
-    pub fn plan_entries(&mut self, symbols: &SymbolTable<'_>, scan: &ScanResult) {
-        let flagged = |flag: SymbolFlags| -> Vec<SymbolId> {
-            symbols
-                .ids()
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .filter(|&id| symbols.flags(id).contains(flag))
+    /// Whether the output is dynamic.
+    #[must_use]
+    pub fn dynamic(&self) -> bool {
+        self.mode.is_some_and(|m| m.dynamic)
+    }
+
+    /// Plans GOT, PLT and copy relocation entries from the scan.
+    pub fn plan_entries(&mut self, refs: &Refs<'_, '_>, scan: &ScanResult, mode: Mode) {
+        let symbols = refs.symbols;
+        self.mode = Some(mode);
+        let all: Vec<SymbolId> = symbols.ids().collect();
+        let flagged = |test: &(dyn Fn(SymbolFlags) -> bool + Sync)| -> Vec<SymbolId> {
+            all.par_iter()
+                .copied()
+                .filter(|&id| test(symbols.flags(id)))
                 .collect()
         };
         let locals = |pick: fn(&super::scan::FileScan) -> &Vec<u32>| -> Vec<(u32, u32)> {
@@ -140,31 +231,274 @@ impl Synth {
                 })
                 .collect()
         };
+        let dynamic = mode.dynamic;
+        // A preemptible function with both a GOT entry and calls goes
+        // through `.plt.got`, unless its PLT entry is its canonical address.
+        let plt_got = move |f: SymbolFlags| {
+            dynamic
+                && f.contains(SymbolFlags::NEEDS_PLT | SymbolFlags::NEEDS_GOT)
+                && !f.contains(SymbolFlags::NEEDS_CANONICAL_PLT)
+        };
         self.got = EntryList {
-            globals: flagged(SymbolFlags::NEEDS_GOT),
+            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_GOT)),
             locals: locals(|f| &f.got_locals),
         };
+        self.tlsgd = EntryList {
+            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_TLSGD)),
+            locals: locals(|f| &f.tlsgd_locals),
+        };
+        self.gottpoff = EntryList {
+            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_GOTTPOFF)),
+            locals: locals(|f| &f.gottpoff_locals),
+        };
+        self.tlsdesc = EntryList {
+            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_TLSDESC)),
+            locals: locals(|f| &f.tlsdesc_locals),
+        };
+        self.tlsld = scan.tls_ld();
         self.iplt = EntryList {
-            globals: flagged(NEEDS_IPLT),
+            globals: flagged(&|f| f.contains(NEEDS_IPLT)),
             locals: locals(|f| &f.iplt_locals),
         };
+        self.plt = EntryList {
+            globals: flagged(&|f| {
+                dynamic
+                    && f.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
+                    && !f.contains(NEEDS_IPLT)
+                    && !plt_got(f)
+            }),
+            locals: Vec::new(),
+        };
+        self.plt_got = EntryList {
+            globals: flagged(&|f| plt_got(f) && !f.contains(NEEDS_IPLT)),
+            locals: Vec::new(),
+        };
+        self.plan_copies(
+            refs,
+            flagged(&|f| f.contains(SymbolFlags::NEEDS_COPY_RELOC)),
+        );
+        let has_got_plt = !self.got.is_empty()
+            || !self.plt.is_empty()
+            || !self.iplt.is_empty()
+            || !self.plt_got.is_empty()
+            || !self.tlsgd.is_empty()
+            || !self.gottpoff.is_empty()
+            || !self.tlsdesc.is_empty()
+            || self.tlsld
+            || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
         // `.got.plt` words.
-        self.got_plt_reserved = 0;
+        self.got_plt_reserved = if dynamic && has_got_plt { 3 } else { 0 };
+        self.section_dyn_relocs = scan.section_dyn_relocs();
+        self.got_dyn_relocs = self.count_got_relocs(refs);
+    }
+
+    /// Allocates space for copy relocations, in symbol order.
+    fn plan_copies(&mut self, refs: &Refs<'_, '_>, symbols: Vec<SymbolId>) {
+        let mut bss = (0u64, 1u64);
+        let mut relro = (0u64, 1u64);
+        let mut copies = Vec::with_capacity(symbols.len());
+        for id in symbols {
+            let (size, align, read_only) = copy_shape(refs, id);
+            let block = if read_only { &mut relro } else { &mut bss };
+            let mask = align.wrapping_sub(1);
+            let offset = block.0.checked_add(mask).map_or(block.0, |v| v & !mask);
+            block.0 = offset.saturating_add(size);
+            block.1 = block.1.max(align);
+            copies.push(CopyReloc {
+                symbol: id,
+                offset,
+                size,
+                relro: read_only,
+            });
+        }
+        self.copies = copies;
+        self.dynbss = bss;
+        self.dynrelro = relro;
+    }
+
+    /// The copy relocation of `id`, if it has one.
+    #[must_use]
+    pub fn copy_of(&self, id: SymbolId) -> Option<&CopyReloc> {
+        let at = self.copies.binary_search_by_key(&id, |c| c.symbol).ok()?;
+        self.copies.get(at)
+    }
+
+    /// Counts the `.rela.dyn` relocations of GOT entries and copies:
+    /// `(relative, other)`.
+    fn count_got_relocs(&self, refs: &Refs<'_, '_>) -> (u64, u64) {
+        let Some(mode) = self.mode.filter(|m| m.dynamic) else {
+            return (0, 0);
+        };
+        let mut relative = 0u64;
+        let mut other = 0u64;
+        let mut add = |reloc: SlotReloc| match reloc {
+            SlotReloc::None => {}
+            SlotReloc::Relative => relative = relative.saturating_add(1),
+            SlotReloc::Symbolic(_) | SlotReloc::Module(_) => other = other.saturating_add(1),
+        };
+        for (list, kind) in [
+            (&self.got, GotKind::Address),
+            (&self.tlsgd, GotKind::TlsGd),
+            (&self.gottpoff, GotKind::TpOff),
+            (&self.tlsdesc, GotKind::TlsDesc),
+        ] {
+            for owner in list.iter() {
+                let [first, second] = got_slot_relocs(refs, mode, owner, kind);
+                add(first);
+                add(second);
+            }
+        }
+        if self.tlsld {
+            add(SlotReloc::Module(0));
+        }
+        other = other.saturating_add(u64_len(self.copies.len()));
+        (relative, other)
+    }
+
+    /// Number of `.rela.dyn` entries.
+    #[must_use]
+    pub fn rela_dyn_count(&self) -> u64 {
+        self.got_dyn_relocs
+            .0
+            .saturating_add(self.got_dyn_relocs.1)
+            .saturating_add(self.section_dyn_relocs.0)
+            .saturating_add(self.section_dyn_relocs.1)
+    }
+
+    /// Number of `R_X86_64_RELATIVE` relocations in `.rela.dyn`.
+    #[must_use]
+    pub fn relative_count(&self) -> u64 {
+        self.got_dyn_relocs
+            .0
+            .saturating_add(self.section_dyn_relocs.0)
+    }
+
+    /// Number of words the GOT occupies.
+    #[must_use]
+    pub fn got_words(&self) -> u64 {
+        u64_len(self.got.len())
+            .saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2))
+            .saturating_add(u64_len(self.gottpoff.len()))
+            .saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2))
+            .saturating_add(if self.tlsld { 2 } else { 0 })
+    }
+
+    /// The first GOT word of each kind of entry.
+    #[must_use]
+    pub fn got_base_word(&self, kind: GotKind) -> u64 {
+        let address = u64_len(self.got.len());
+        let tlsgd = address.saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2));
+        let tpoff = tlsgd.saturating_add(u64_len(self.gottpoff.len()));
+        let desc = tpoff.saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2));
+        match kind {
+            GotKind::Address => 0,
+            GotKind::TlsGd => address,
+            GotKind::TpOff => tlsgd,
+            GotKind::TlsDesc => tpoff,
+            GotKind::TlsLd => desc,
+        }
+    }
+
+    /// The GOT word of `owner`'s entry of `kind`.
+    #[must_use]
+    pub fn got_word(&self, owner: Owner, kind: GotKind) -> Option<u64> {
+        let (list, width) = match kind {
+            GotKind::Address => (&self.got, 1u64),
+            GotKind::TlsGd => (&self.tlsgd, 2),
+            GotKind::TpOff => (&self.gottpoff, 1),
+            GotKind::TlsDesc => (&self.tlsdesc, 2),
+            GotKind::TlsLd => return self.tlsld.then(|| self.got_base_word(GotKind::TlsLd)),
+        };
+        let index = u64::try_from(list.index(owner)?).ok()?;
+        self.got_base_word(kind)
+            .checked_add(index.checked_mul(width)?)
+    }
+
+    /// Number of PLT entries in `.plt` (and `.plt.sec`) of a dynamic output:
+    /// preemptible functions, then IFUNCs.
+    #[must_use]
+    pub fn plt_entries(&self) -> u64 {
+        u64_len(self.plt.len()).saturating_add(u64_len(self.iplt.len()))
+    }
+
+    /// The PLT index (in `.plt` entries and `.got.plt` slots) of `owner`.
+    #[must_use]
+    pub fn plt_index(&self, owner: Owner) -> Option<u64> {
+        if let Some(index) = self.plt.index(owner) {
+            return u64::try_from(index).ok();
+        }
+        let index = u64::try_from(self.iplt.index(owner)?).ok()?;
+        if self.dynamic() {
+            index.checked_add(u64_len(self.plt.len()))
+        } else {
+            Some(index)
+        }
     }
 
     /// Size and alignment of a synthetic part.
     #[must_use]
     pub fn size_align(&self, kind: Synthetic) -> (u64, u64) {
-        let count = |list: &EntryList| u64::try_from(list.len()).unwrap_or(u64::MAX);
+        let count = |list: &EntryList| u64_len(list.len());
+        let dynamic = self.dynamic();
         match kind {
             Synthetic::None => (0, 1),
             Synthetic::BuildId => match self.build_id {
                 Some(size) => (16u64.saturating_add(align4(size)), 4),
                 None => (0, 1),
             },
-            Synthetic::RelaIplt => (count(&self.iplt).saturating_mul(24), 8),
-            Synthetic::Iplt => (count(&self.iplt).saturating_mul(IPLT_ENTRY_SIZE), 16),
+            Synthetic::Interp => (self.interp.as_ref().map_or(0, |i| u64_len(i.len())), 1),
+            Synthetic::Hash
+            | Synthetic::GnuHash
+            | Synthetic::DynSym
+            | Synthetic::DynStr
+            | Synthetic::VerSym
+            | Synthetic::VerDef
+            | Synthetic::VerNeed
+            | Synthetic::RelrDyn
+            | Synthetic::Dynamic => self
+                .dynamic_sizes
+                .iter()
+                .find(|(k, ..)| *k == kind)
+                .map_or((0, 1), |&(_, size, align)| (size, align)),
+            Synthetic::RelaDyn => (self.rela_dyn_count().saturating_mul(24), 8),
+            Synthetic::RelaPlt => {
+                let entries = if dynamic {
+                    self.plt_entries()
+                } else {
+                    count(&self.iplt)
+                };
+                (entries.saturating_mul(24), 8)
+            }
+            Synthetic::Plt => {
+                if dynamic {
+                    // GNU ld keeps the lazy PLT header when only `.plt.got`
+                    // entries exist.
+                    let entries = self.plt_entries();
+                    if entries == 0 && self.plt_got.is_empty() {
+                        (0, 16)
+                    } else {
+                        (PLT_ENTRY_SIZE.saturating_mul(entries.saturating_add(1)), 16)
+                    }
+                } else {
+                    (count(&self.iplt).saturating_mul(IPLT_ENTRY_SIZE), 16)
+                }
+            }
+            Synthetic::PltSec => {
+                if dynamic && self.ibt {
+                    (self.plt_entries().saturating_mul(PLT_ENTRY_SIZE), 16)
+                } else {
+                    (0, 16)
+                }
+            }
+            Synthetic::PltGot => {
+                let (entry, align) = if self.ibt {
+                    (PLT_ENTRY_SIZE, 16)
+                } else {
+                    (PLT_GOT_ENTRY_SIZE, 8)
+                };
+                (count(&self.plt_got).saturating_mul(entry), align)
+            }
             Synthetic::EhFrameHdr => {
                 if self.eh_frame_hdr {
                     (12u64.saturating_add(self.fde_count.saturating_mul(8)), 4)
@@ -179,14 +513,150 @@ impl Synth {
                     .map_or(0, |n| u64::try_from(n.len()).unwrap_or(0)),
                 8,
             ),
-            Synthetic::Got => (count(&self.got).saturating_mul(8), 8),
-            Synthetic::IgotPlt => {
-                let slots = count(&self.iplt).saturating_add(self.got_plt_reserved);
-                (slots.saturating_mul(8), 8)
+            Synthetic::Got => (self.got_words().saturating_mul(8), 8),
+            Synthetic::GotPlt => {
+                let slots = if dynamic {
+                    self.plt_entries()
+                } else {
+                    count(&self.iplt)
+                };
+                (
+                    slots
+                        .saturating_add(self.got_plt_reserved)
+                        .saturating_mul(8),
+                    8,
+                )
             }
+            Synthetic::DynBss => self.dynbss,
+            Synthetic::DynRelro => self.dynrelro,
             Synthetic::Common => self.common,
             Synthetic::Comment => (u64::try_from(comment().len()).unwrap_or(0), 1),
         }
+    }
+}
+
+/// Size, alignment and read-only-ness of the space a copy relocation of
+/// `id` needs, from the shared library's definition.
+fn copy_shape(refs: &Refs<'_, '_>, id: SymbolId) -> (u64, u64, bool) {
+    use crate::elf::read::consts::SHF_WRITE;
+    let def = refs.symbols.definition(id);
+    let Some(shared) = refs
+        .files
+        .get(def.file.index())
+        .and_then(|f| f.shared.as_ref())
+    else {
+        return (0, 1, false);
+    };
+    let Some(raw) = shared
+        .symbols
+        .get(def.index as usize)
+        .and_then(|&index| shared.elf.symbols().get_raw(index as usize))
+    else {
+        return (0, 1, false);
+    };
+    let section = shared
+        .elf
+        .elf()
+        .section_header(u32::from(raw.st_shndx))
+        .ok();
+    let section_align = section.map_or(1, |s| s.sh_addralign.max(1));
+    let value_align = if raw.st_value == 0 {
+        u64::MAX
+    } else {
+        1u64.checked_shl(raw.st_value.trailing_zeros())
+            .unwrap_or(u64::MAX)
+    };
+    let align = section_align.min(value_align).clamp(1, 1 << 20);
+    let align = if align.is_power_of_two() { align } else { 1 };
+    // A copy of data in a read-only (RELRO) part of the library belongs in
+    // the executable's RELRO region too.
+    let read_only = section.is_some_and(|s| s.sh_flags & SHF_WRITE == 0);
+    (raw.st_size, align, read_only)
+}
+
+/// The dynamic relocation one GOT word needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotReloc {
+    /// None: the word is final at link time.
+    None,
+    /// `R_X86_64_RELATIVE`.
+    Relative,
+    /// A relocation of this type against the owner's dynamic symbol.
+    Symbolic(u32),
+    /// A relocation of this type against symbol 0 (the output itself).
+    Module(u32),
+}
+
+/// The dynamic relocations of the (one or two) GOT words of `owner`'s
+/// entry of `kind`.
+#[must_use]
+pub fn got_slot_relocs(
+    refs: &Refs<'_, '_>,
+    mode: Mode,
+    owner: Owner,
+    kind: GotKind,
+) -> [SlotReloc; 2] {
+    use crate::elf::read::consts::x86_64::{
+        R_X86_64_DTPMOD64, R_X86_64_DTPOFF64, R_X86_64_GLOB_DAT, R_X86_64_TLSDESC, R_X86_64_TPOFF64,
+    };
+    if !mode.dynamic {
+        return [SlotReloc::None; 2];
+    }
+    if kind == GotKind::TlsLd {
+        return [SlotReloc::Module(R_X86_64_DTPMOD64), SlotReloc::None];
+    }
+    let target = match owner {
+        Owner::Global(id) => Some(refs.global_target(id, true)),
+        Owner::Local { file, symbol } => refs.target(file as usize, symbol as usize),
+    };
+    let Some(target) = target else {
+        return [SlotReloc::None; 2];
+    };
+    let flags = target
+        .global
+        .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+    let preemptible = target.global.is_some() && flags.contains(PREEMPTIBLE);
+    let defined = !matches!(target.def, Def::Undefined { .. } | Def::Shared(_));
+    let absolute = matches!(target.def, Def::Absolute(_));
+    match kind {
+        GotKind::Address => {
+            if preemptible {
+                [SlotReloc::Symbolic(R_X86_64_GLOB_DAT), SlotReloc::None]
+            } else if mode.pic && defined && !absolute {
+                [SlotReloc::Relative, SlotReloc::None]
+            } else {
+                [SlotReloc::None; 2]
+            }
+        }
+        GotKind::TpOff => {
+            if preemptible {
+                [SlotReloc::Symbolic(R_X86_64_TPOFF64), SlotReloc::None]
+            } else if mode.shared {
+                [SlotReloc::Module(R_X86_64_TPOFF64), SlotReloc::None]
+            } else {
+                [SlotReloc::None; 2]
+            }
+        }
+        GotKind::TlsGd => {
+            if preemptible {
+                [
+                    SlotReloc::Symbolic(R_X86_64_DTPMOD64),
+                    SlotReloc::Symbolic(R_X86_64_DTPOFF64),
+                ]
+            } else if mode.shared {
+                [SlotReloc::Module(R_X86_64_DTPMOD64), SlotReloc::None]
+            } else {
+                [SlotReloc::None; 2]
+            }
+        }
+        GotKind::TlsDesc => {
+            if preemptible {
+                [SlotReloc::Symbolic(R_X86_64_TLSDESC), SlotReloc::None]
+            } else {
+                [SlotReloc::Module(R_X86_64_TLSDESC), SlotReloc::None]
+            }
+        }
+        GotKind::TlsLd => [SlotReloc::Module(R_X86_64_DTPMOD64), SlotReloc::None],
     }
 }
 
@@ -203,12 +673,37 @@ pub fn plan_build_id(options: &LinkOptions) -> Option<u64> {
     build_id_size(&options.build_id).and_then(|s| u64::try_from(s).ok())
 }
 
+/// The x86 feature bits every regular object has (0 without objects).
+#[must_use]
+pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
+    let mut feature_and: Option<u32> = None;
+    for file in files {
+        let Some(object) = &file.object else {
+            continue;
+        };
+        let features = object
+            .properties
+            .and_then(|p| p.x86_feature_1_and)
+            .unwrap_or(0);
+        feature_and = Some(feature_and.map_or(features, |f| f & features));
+    }
+    feature_and.unwrap_or(0)
+}
+
+/// Whether the PLT is IBT-enabled: every regular object has IBT, or
+/// `-z ibtplt` or `-z ibt` was given.
+#[must_use]
+pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+    options.x86.ibtplt
+        || options.x86.ibt
+        || input_features(files) & GNU_PROPERTY_X86_FEATURE_1_IBT != 0
+}
+
 /// Merges the inputs' GNU properties into the output note: x86 feature bits
 /// are ANDed across inputs (an input without the note has none), ISA levels
-/// needed are ORed.
+/// needed are ORed. Shared libraries do not take part.
 #[must_use]
 pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Option<Vec<u8>> {
-    let mut feature_and: Option<u32> = None;
     let mut isa_needed = 0u32;
     let mut any = false;
     for file in files {
@@ -216,11 +711,6 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
             continue;
         };
         any = true;
-        let features = object
-            .properties
-            .and_then(|p| p.x86_feature_1_and)
-            .unwrap_or(0);
-        feature_and = Some(feature_and.map_or(features, |f| f & features));
         isa_needed |= object
             .properties
             .and_then(|p| p.x86_isa_1_needed)
@@ -229,7 +719,7 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     if !any {
         return None;
     }
-    let mut features = feature_and.unwrap_or(0);
+    let mut features = input_features(files);
     if options.x86.ibt {
         features |= GNU_PROPERTY_X86_FEATURE_1_IBT;
     }
@@ -262,6 +752,20 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
         note.extend_from_slice(&[0; 4]);
     }
     Some(note)
+}
+
+/// Plans `.interp`: the `--dynamic-linker` path, or the default.
+#[must_use]
+pub fn plan_interp(options: &LinkOptions, mode: Mode) -> Option<Vec<u8>> {
+    if !mode.interp {
+        return None;
+    }
+    let mut path = options.dynamic_linker.as_ref().map_or_else(
+        || DEFAULT_INTERPRETER.as_bytes().to_vec(),
+        |p| p.as_os_str().as_encoded_bytes().to_vec(),
+    );
+    path.push(0);
+    Some(path)
 }
 
 /// Writes the header of a build-id note of `size` bytes into `out`; the

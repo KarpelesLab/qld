@@ -38,6 +38,8 @@ pub enum Def {
     Common(SymbolId),
     /// A linker-defined symbol (global).
     Linker(SymbolId),
+    /// Defined by a shared object (global): resolved at run time.
+    Shared(SymbolId),
     /// Undefined; `weak` tells whether the reference is weak.
     Undefined {
         /// The reference (in the referring file) is weak.
@@ -131,7 +133,22 @@ impl<'a> Refs<'_, 'a> {
             raw: None,
         };
         match def.kind {
-            DefinitionKind::Undefined | DefinitionKind::Lazy | DefinitionKind::Shared => undefined,
+            DefinitionKind::Undefined | DefinitionKind::Lazy => undefined,
+            DefinitionKind::Shared => {
+                let raw = self
+                    .files
+                    .get(def.file.index())
+                    .and_then(|f| f.shared.as_ref())
+                    .and_then(|s| {
+                        let index = *s.symbols.get(def.index as usize)?;
+                        s.elf.symbols().get_raw(index as usize)
+                    });
+                Target {
+                    global: Some(id),
+                    def: Def::Shared(id),
+                    raw,
+                }
+            }
             DefinitionKind::Common => Target {
                 global: Some(id),
                 def: Def::Common(id),
@@ -171,6 +188,14 @@ impl<'a> Refs<'_, 'a> {
                 }
             }
         }
+    }
+
+    /// The name of symbol `symbol` of `file`, for diagnostics.
+    #[must_use]
+    pub fn symbol_name(&self, file: usize, symbol: u32) -> Option<String> {
+        let object = self.files.get(file)?.object.as_ref()?;
+        let symbol = object.elf.symbols().get(symbol as usize).ok()?;
+        Some(String::from_utf8_lossy(symbol.name).into_owned())
     }
 
     /// The section a target is defined in.

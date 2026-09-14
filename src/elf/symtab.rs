@@ -17,13 +17,16 @@ use rayon::prelude::*;
 use crate::args::{DiscardMode, LinkOptions, StripMode};
 use crate::elf::read::consts::{
     SHN_ABS, SHN_UNDEF, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_NOTYPE, STT_OBJECT,
-    STT_SECTION, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL,
+    STT_SECTION, STT_TLS, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL,
 };
 use crate::elf::read::{RawSymbol, SectionIndex};
 use crate::ids::SymbolId;
 use crate::symbols::{DefinitionKind, SymbolFlags};
 
 use super::defined::{LinkerSymbols, is_hidden};
+use super::dso::{REF_REGULAR, REF_REGULAR_STRONG};
+use super::dynsym::shndx_of_address;
+use super::export::PREEMPTIBLE;
 use super::refs::{Def, Refs};
 use super::values::Addresses;
 
@@ -148,9 +151,12 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                         _ => true,
                     }
                 }
-                DefinitionKind::Undefined | DefinitionKind::Lazy | DefinitionKind::Shared => {
-                    symbols.flags(id).contains(SymbolFlags::WEAK_REFERENCED)
-                        && !symbols.flags(id).contains(SymbolFlags::REFERENCED)
+                DefinitionKind::Shared => symbols.flags(id).contains(REF_REGULAR),
+                DefinitionKind::Undefined | DefinitionKind::Lazy => {
+                    let flags = symbols.flags(id);
+                    (flags.contains(SymbolFlags::WEAK_REFERENCED)
+                        && !flags.contains(SymbolFlags::REFERENCED))
+                        || (flags.contains(REF_REGULAR) && flags.contains(PREEMPTIBLE))
                 }
             };
             if !emit {
@@ -163,7 +169,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
             if hidden && discard == DiscardMode::All {
                 return None;
             }
-            let len = symbols.name(id).bytes().len().saturating_add(1);
+            let len = name_len(symbols.name(id)).saturating_add(1);
             Some((id, hidden, len))
         })
         .collect();
@@ -216,6 +222,28 @@ impl SymtabPlan {
     }
 }
 
+/// The length of a symbol's name in `.strtab`: `name@version` for
+/// versioned symbols.
+fn name_len(name: crate::symbols::SymbolName<'_>) -> usize {
+    match name.version() {
+        Some(version) => name
+            .bytes()
+            .len()
+            .saturating_add(1)
+            .saturating_add(version.len()),
+        None => name.bytes().len(),
+    }
+}
+
+/// In executables and shared objects, a TLS symbol's value is its offset in
+/// the TLS template.
+fn tls_relative(addresses: &Addresses<'_, '_>, kind: u8, value: u64, shndx: u16) -> u64 {
+    if kind != STT_TLS || shndx == SHN_ABS || shndx == SHN_UNDEF {
+        return value;
+    }
+    value.wrapping_sub(addresses.layout.tls.map_or(0, |t| t.start))
+}
+
 fn put_sym(out: &mut [u8], name: usize, info: u8, other: u8, shndx: u16, value: u64, size: u64) {
     let Some(entry) = out.first_chunk_mut::<SYM_SIZE>() else {
         return;
@@ -248,16 +276,6 @@ fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32) -> u16 {
         return SHN_ABS;
     }
     u16::try_from(index).unwrap_or(crate::elf::read::consts::SHN_XINDEX)
-}
-
-fn shndx_of_address(addresses: &Addresses<'_, '_>, value: u64) -> u16 {
-    addresses
-        .layout
-        .sections
-        .iter()
-        .position(|s| s.is_alloc() && s.addr <= value && value <= s.addr.saturating_add(s.size))
-        .and_then(|p| u16::try_from(p.saturating_add(1)).ok())
-        .unwrap_or(SHN_ABS)
 }
 
 /// Writes `.symtab` into `out`.
@@ -308,6 +326,7 @@ pub fn write_symtab(
                     ),
                     _ => (SHN_ABS, raw.st_value),
                 };
+                let value = tls_relative(addresses, raw.kind(), value, shndx);
                 put_sym(
                     entry,
                     name_offset,
@@ -371,9 +390,36 @@ pub fn write_symtab(
                         0,
                     )
                 }
-                Def::Undefined { .. } => (STB_WEAK, STT_NOTYPE, STV_DEFAULT, SHN_UNDEF, 0),
+                Def::Shared(_) => {
+                    let raw = target.raw.unwrap_or_default();
+                    if addresses.synth.copy_of(id).is_some() {
+                        (
+                            STB_GLOBAL,
+                            raw.kind(),
+                            STV_DEFAULT,
+                            shndx_of_address(addresses, value),
+                            raw.st_size,
+                        )
+                    } else {
+                        (
+                            import_binding(refs, id),
+                            raw.kind(),
+                            STV_DEFAULT,
+                            SHN_UNDEF,
+                            0,
+                        )
+                    }
+                }
+                Def::Undefined { .. } => (
+                    import_binding(refs, id),
+                    STT_NOTYPE,
+                    STV_DEFAULT,
+                    SHN_UNDEF,
+                    0,
+                ),
             };
             let binding = if local { STB_LOCAL } else { binding };
+            let value = tls_relative(addresses, kind, value, shndx);
             put_sym(
                 entry,
                 name_offset,
@@ -390,7 +436,7 @@ pub fn write_symtab(
     for &id in &plan.hidden {
         offsets.push(offset);
         offset = offset
-            .saturating_add(refs.symbols.name(id).bytes().len())
+            .saturating_add(name_len(refs.symbols.name(id)))
             .saturating_add(1);
     }
     hidden
@@ -404,7 +450,7 @@ pub fn write_symtab(
     for &id in &plan.globals {
         offsets.push(offset);
         offset = offset
-            .saturating_add(refs.symbols.name(id).bytes().len())
+            .saturating_add(name_len(refs.symbols.name(id)))
             .saturating_add(1);
     }
     globals
@@ -431,7 +477,30 @@ pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
         }
     }
     for &id in plan.hidden.iter().chain(&plan.globals) {
-        cursor = put_name(out, cursor, refs.symbols.name(id).bytes());
+        let name = refs.symbols.name(id);
+        match name.version() {
+            Some(version) => {
+                let end = cursor.saturating_add(name.bytes().len());
+                if let Some(dest) = out.get_mut(cursor..end) {
+                    dest.copy_from_slice(name.bytes());
+                }
+                if let Some(at) = out.get_mut(end) {
+                    *at = b'@';
+                }
+                cursor = put_name(out, end.saturating_add(1), version);
+            }
+            None => cursor = put_name(out, cursor, name.bytes()),
+        }
+    }
+}
+
+/// The binding of an undefined or imported symbol: weak when every
+/// reference from a regular object is weak.
+fn import_binding(refs: &Refs<'_, '_>, id: SymbolId) -> u8 {
+    if refs.symbols.flags(id).contains(REF_REGULAR_STRONG) {
+        STB_GLOBAL
+    } else {
+        STB_WEAK
     }
 }
 

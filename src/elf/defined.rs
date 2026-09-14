@@ -52,6 +52,8 @@ pub enum Value {
     RelaIpltStart,
     /// `__rela_iplt_end`.
     RelaIpltEnd,
+    /// `_DYNAMIC`: the `.dynamic` section.
+    Dynamic,
     /// `--defsym`, by index in the options.
     Defsym(usize),
 }
@@ -67,6 +69,7 @@ pub fn is_hidden(value: Value) -> bool {
             | Value::RelaIpltStart
             | Value::RelaIpltEnd
             | Value::GotBase
+            | Value::Dynamic
     )
 }
 
@@ -94,7 +97,12 @@ const FIXED: &[(&str, Value)] = &[
     ("_GLOBAL_OFFSET_TABLE_", Value::GotBase),
     ("__rela_iplt_start", Value::RelaIpltStart),
     ("__rela_iplt_end", Value::RelaIpltEnd),
+    ("_DYNAMIC", Value::Dynamic),
 ];
+
+/// Symbols an executable always defines, as GNU ld's default script
+/// assigns them unconditionally; they are exported with `--export-dynamic`.
+pub const ALWAYS_DEFINED: &[&str] = &["_edata", "__bss_start", "_end"];
 
 /// The linker-defined symbols of a link.
 #[derive(Debug, Default)]
@@ -123,18 +131,26 @@ impl LinkerSymbols {
 fn wanted(symbols: &SymbolTable<'_>, id: SymbolId) -> bool {
     matches!(
         symbols.definition_kind(id),
-        DefinitionKind::Undefined | DefinitionKind::Lazy
-    ) && symbols
-        .flags(id)
-        .intersects(SymbolFlags::REFERENCED | SymbolFlags::WEAK_REFERENCED)
+        DefinitionKind::Undefined | DefinitionKind::Lazy | DefinitionKind::Shared
+    ) && symbols.flags(id).intersects(
+        super::dso::REF_REGULAR | SymbolFlags::REFERENCED | SymbolFlags::WEAK_REFERENCED,
+    ) && (symbols.definition_kind(id) != DefinitionKind::Shared
+        || symbols.flags(id).contains(super::dso::REF_REGULAR))
 }
 
 /// Defines the linker symbols that are referenced and not otherwise defined.
 #[must_use]
+///
+/// `dynamic` says the output is dynamic: `__rela_iplt_start` and
+/// `__rela_iplt_end` then stay undefined, as in GNU ld's dynamic scripts,
+/// since the dynamic relocation code applies `IRELATIVE` relocations.
+/// Names in `always` are defined even when nothing refers to them.
 pub fn register(
     symbols: &SymbolTable<'_>,
     placement: &Placement<'_>,
     options: &LinkOptions,
+    dynamic: bool,
+    always: &[&str],
 ) -> LinkerSymbols {
     let mut result = LinkerSymbols::default();
     let define = |id: SymbolId, value: Value, result: &mut LinkerSymbols| {
@@ -152,8 +168,19 @@ pub fn register(
         result.entries.push((id, value));
     };
     for &(name, value) in FIXED {
+        if dynamic && matches!(value, Value::RelaIpltStart | Value::RelaIpltEnd) {
+            continue;
+        }
+        if !dynamic && value == Value::Dynamic {
+            continue;
+        }
         if let Some(id) = symbols.lookup(&SymbolName::new(name.as_bytes()))
-            && wanted(symbols, id)
+            && (wanted(symbols, id)
+                || (always.contains(&name)
+                    && matches!(
+                        symbols.definition_kind(id),
+                        DefinitionKind::Undefined | DefinitionKind::Lazy | DefinitionKind::Shared
+                    )))
         {
             define(id, value, &mut result);
         }

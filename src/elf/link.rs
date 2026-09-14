@@ -28,7 +28,10 @@ use crate::symbols::{SymbolName, SymbolTable, resolve_symbols};
 
 use super::common;
 use super::defined;
+use super::dso;
+use super::dynsym;
 use super::ehframe;
+use super::export::{self, Mode};
 use super::gc;
 use super::icf;
 use super::inputs::{self, InternalNames, parse_number};
@@ -38,6 +41,7 @@ use super::merge;
 use super::object::{ParseConfig, WrapTable};
 use super::place;
 use super::refs::{Def, Refs};
+use super::reloc;
 use super::resolve::{self, ElfRules};
 use super::rules::RuleSet;
 use super::scan::{self, UndefinedRef};
@@ -60,23 +64,10 @@ const MAX_REFERENCES: usize = 3;
 /// [`Error::Reported`] when errors were reported to `diagnostics`, and any
 /// I/O or parse error.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
-    match options.kind {
-        OutputKind::StaticExecutable | OutputKind::Executable => {}
-        OutputKind::Pie | OutputKind::StaticPie => {
-            return Err(Error::Unimplemented(
-                "position-independent executables (roadmap M2: dynamic ELF)".into(),
-            ));
-        }
-        OutputKind::Shared => {
-            return Err(Error::Unimplemented(
-                "shared objects (roadmap M2: dynamic ELF)".into(),
-            ));
-        }
-        OutputKind::Relocatable => {
-            return Err(Error::Unimplemented(
-                "relocatable output (roadmap M2: dynamic ELF)".into(),
-            ));
-        }
+    if options.kind == OutputKind::Relocatable {
+        return Err(Error::Unimplemented(
+            "relocatable output (roadmap M2: dynamic ELF)".into(),
+        ));
     }
     // `-plugin` needs no check here: compiler drivers always pass it, and
     // an IR input is reported as Unimplemented (M6) when it is loaded.
@@ -189,6 +180,7 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable) -> Option<usize
 }
 
 /// Everything after input collection, run in the link's thread pool.
+#[allow(clippy::too_many_lines)]
 fn link_inputs<'a>(
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
@@ -210,9 +202,31 @@ fn link_inputs<'a>(
     let mut errors = resolve::report_duplicates(files, &resolution, &sections, diagnostics);
     report_gnu_warnings(files, &symbols, diagnostics);
 
+    let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
+    let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
+    let always: &[&str] = if mode.dynamic && mode.executable() && options.export_dynamic {
+        for name in defined::ALWAYS_DEFINED {
+            symbols.intern(SymbolName::new(name.as_bytes()));
+        }
+        defined::ALWAYS_DEFINED
+    } else {
+        &[]
+    };
+
     let rule_set = RuleSet::default_rules();
-    let placement = place::place(&rule_set, files, &sections);
-    let linker = defined::register(&symbols, &placement, options);
+    let mut placement = place::place(&rule_set, files, &sections);
+    let linker = defined::register(&symbols, &placement, options, mode.dynamic, always);
+    let (version_script, dynamic_patterns) = export::read_scripts(options)?;
+    let exports = export::plan(
+        files,
+        &symbols,
+        &resolution,
+        &needed,
+        options,
+        mode,
+        version_script,
+        &dynamic_patterns,
+    )?;
     lap("placement");
 
     let mut eh_frames = ehframe::split(files, &sections)?;
@@ -238,6 +252,7 @@ fn link_inputs<'a>(
         eh_frames
             .sections
             .retain(|s| sections.live.get(s.id.index()).copied().unwrap_or(false));
+        placement.compute_flags(files, &sections);
         lap("gc");
     }
 
@@ -247,14 +262,40 @@ fn link_inputs<'a>(
         resolution: &resolution,
         sections: &sections,
     };
-    let scan = scan::scan(&refs, options.relax);
+    let context = reloc::Context {
+        mode,
+        relax: options.relax,
+        copy_relocs: options.copy_relocs,
+    };
+    let scan = scan::scan(&refs, &context);
     for file in &scan.files {
         for error in &file.errors {
             diagnostics.emit(error.clone());
             errors = errors.saturating_add(1);
         }
     }
-    errors = errors.saturating_add(report_undefined(&refs, &scan, options, diagnostics));
+    errors = errors.saturating_add(report_undefined(&refs, &scan, options, mode, diagnostics));
+    errors = errors.saturating_add(dso::check_shlib_undefined(
+        files,
+        &symbols,
+        &resolution,
+        &needed,
+        options,
+        diagnostics,
+    ));
+    if scan.text_relocs() && mode.dynamic {
+        let message = if mode.shared {
+            "creating DT_TEXTREL in a shared object"
+        } else {
+            "creating DT_TEXTREL in a PIE"
+        };
+        if options.error_textrel {
+            diagnostics.emit(Diagnostic::error(message.to_string()));
+            errors = errors.saturating_add(1);
+        } else if options.warn_textrel || mode.pic {
+            diagnostics.emit(Diagnostic::warning(message.to_string()));
+        }
+    }
     if errors > 0 && !options.noinhibit_exec {
         return Err(Error::Reported { errors });
     }
@@ -268,12 +309,12 @@ fn link_inputs<'a>(
         Some("safe") => Some(IcfMode::Safe),
         _ => None,
     };
-    if let Some(mode) = icf_mode {
+    if let Some(icf_mode) = icf_mode {
         let fold_into = icf::fold(
             &refs,
             &placement,
             &merged,
-            mode,
+            icf_mode,
             options.print_icf_sections,
             diagnostics,
         )?;
@@ -289,13 +330,49 @@ fn link_inputs<'a>(
     eh_frames.finalize(&refs);
 
     let mut synth = Synth::default();
-    synth.plan_entries(&symbols, &scan);
+    synth.plan_entries(&refs, &scan, mode);
+    synth.ibt = synth::plan_ibt(files, options);
     synth.build_id = synth::plan_build_id(options);
     synth.property_note = synth::plan_property_note(files, options);
+    synth.interp = synth::plan_interp(options, mode);
     synth.fde_count = u64::try_from(eh_frames.live_fdes()).unwrap_or(0);
     synth.eh_frame_hdr = options.eh_frame_hdr && synth.fde_count > 0;
     synth.eh_frame_end = eh_frames.sections.iter().any(|s| s.size > 0);
     synth.common = (commons.size, commons.align);
+
+    let nonempty_outputs = nonempty_outputs(files, &sections, &placement);
+    let has_output = |name: &[u8]| {
+        placement
+            .outputs
+            .iter()
+            .zip(&nonempty_outputs)
+            .any(|(output, &nonempty)| nonempty && output.name == name)
+    };
+    let soname = options
+        .soname
+        .as_ref()
+        .map(|s| s.as_bytes().to_vec())
+        .or_else(|| {
+            options
+                .output_path()
+                .file_name()
+                .map(|n| n.as_encoded_bytes().to_vec())
+        });
+    let dynamic = dynsym::plan(&dynsym::PlanInput {
+        refs: &refs,
+        needed: &needed,
+        mode,
+        options,
+        synth: &synth,
+        exports: &exports,
+        scan: &scan,
+        has_output: &has_output,
+        soname,
+    })?;
+    synth.dynamic_sizes = dynamic.sizes();
+    synth.verneed_count = dynamic.verneed_count;
+    synth.verdef_count = dynamic.verdef_count;
+    lap("dynamic");
 
     let plan = symtab::plan(&refs, &linker, options);
     let trailers = TrailerSizes {
@@ -322,18 +399,22 @@ fn link_inputs<'a>(
         synth: &synth,
         trailers,
         exec_stack,
+        mode,
     })?;
     lap("layout");
 
     let addresses = Addresses::new(
         refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
     );
-    let entry = entry_address(&addresses, options, diagnostics);
+    let entry = entry_address(&addresses, options, mode, diagnostics);
     write::write(&WriteInput {
         options,
         addresses: &addresses,
         symtab: &plan,
         linker: &linker,
+        dynamic: &dynamic,
+        scan: &scan,
+        context,
         entry,
         diagnostics,
     })?;
@@ -342,13 +423,47 @@ fn link_inputs<'a>(
     Ok(())
 }
 
+/// Whether each placement output receives a non-empty live input section.
+fn nonempty_outputs(
+    files: &[super::inputs::ElfInput<'_>],
+    sections: &Sections,
+    placement: &place::Placement<'_>,
+) -> Vec<bool> {
+    let mut nonempty = vec![false; placement.outputs.len()];
+    for (file_index, file) in files.iter().enumerate() {
+        let Some(object) = &file.object else {
+            continue;
+        };
+        for (index, section) in object.sections.iter().enumerate() {
+            let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(u32::MAX)) else {
+                continue;
+            };
+            if section.header.sh_size == 0 || !sections.is_live(id) {
+                continue;
+            }
+            if let Some(output) = placement.output_of(id)
+                && let Some(slot) = nonempty.get_mut(output as usize)
+            {
+                *slot = true;
+            }
+        }
+    }
+    nonempty
+}
+
 /// Reports undefined symbols, lld-style. Returns the number of errors.
 fn report_undefined(
     refs: &Refs<'_, '_>,
     scan: &scan::ScanResult,
     options: &LinkOptions,
+    mode: Mode,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
+    // A shared object may leave symbols for the dynamic linker to find,
+    // unless `--no-undefined` or `-z defs`.
+    if mode.shared && options.no_undefined != Some(true) {
+        return 0;
+    }
     let mut all: Vec<UndefinedRef> = scan
         .files
         .iter()
@@ -459,8 +574,12 @@ fn report_gnu_warnings(
 fn entry_address(
     addresses: &Addresses<'_, '_>,
     options: &LinkOptions,
+    mode: Mode,
     diagnostics: &dyn DiagnosticSink,
 ) -> u64 {
+    if mode.shared && options.entry.is_none() {
+        return 0;
+    }
     let name = options.entry.as_deref().unwrap_or("_start");
     if let Some(value) = parse_number(name) {
         return value;
