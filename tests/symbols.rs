@@ -996,6 +996,151 @@ fn stress_intern_millions_of_symbols() {
     }
 }
 
+/// A link shaped like a static glibc "hello world": four objects, three
+/// archives with 1,700 members in total, of which 100 are extracted over
+/// five rounds, and about 20,000 symbol entries.
+fn small_static_link() -> (NamePool, Scenario) {
+    const MEMBERS: usize = 1700;
+    const LEVELS: usize = 5;
+    const PER_LEVEL: usize = 20;
+    const DEFS: usize = 8;
+    const OBJECT_DEFS: usize = 40;
+    // Member `m` defines names `m * DEFS .. (m + 1) * DEFS`; objects define
+    // the names after all members'.
+    let object_base = MEMBERS * DEFS;
+    let names = NamePool::new(object_base + 4 * OBJECT_DEFS + 64);
+    let mut rng = Rng(0x611bc);
+    let archive_of = |m: usize| match m {
+        0..1500 => 0,
+        1500..1650 => 1,
+        _ => 2,
+    };
+    // Chain members: level `k` member `j` is member `(k * 331 + j * 17) %
+    // MEMBERS`, spread across the archives.
+    let chain = |level: usize, j: usize| (level * 331 + j * 17 + 5) % MEMBERS;
+
+    let mut files = Vec::new();
+    for object in 0..4 {
+        let mut symbols: Vec<(usize, Use)> = (0..OBJECT_DEFS)
+            .map(|d| {
+                (
+                    object_base + object * OBJECT_DEFS + d,
+                    Use::Def(DefinitionKind::Regular, 0),
+                )
+            })
+            .collect();
+        // Each object references five first-level chain members.
+        for j in 0..PER_LEVEL / 4 {
+            symbols.push((chain(0, object * 5 + j) * DEFS, Use::Ref(false)));
+        }
+        files.push(FileSpec {
+            group: object,
+            member: 0,
+            live_at_start: true,
+            symbols,
+        });
+    }
+    let mut in_chain = vec![None; MEMBERS];
+    for level in 0..LEVELS {
+        for j in 0..PER_LEVEL {
+            in_chain[chain(level, j)] = Some((level, j));
+        }
+    }
+    let mut member_index = [0u32; 3];
+    for (m, chain_slot) in in_chain.iter().enumerate() {
+        let mut symbols: Vec<(usize, Use)> = (0..DEFS)
+            .map(|d| (m * DEFS + d, Use::Def(DefinitionKind::Regular, 0)))
+            .collect();
+        match *chain_slot {
+            Some((level, j)) if level + 1 < LEVELS => {
+                symbols.push((chain(level + 1, j) * DEFS + 1, Use::Ref(false)));
+            }
+            _ => {}
+        }
+        // References to object symbols and, from members that stay lazy, to
+        // other lazy members' symbols.
+        while symbols.len() < DEFS + 4 {
+            let name = if chain_slot.is_some() || rng.chance(50) {
+                object_base + rng.below(4 * OBJECT_DEFS)
+            } else {
+                let other = rng.below(MEMBERS);
+                if in_chain[other].is_some() || other == m {
+                    continue;
+                }
+                other * DEFS + rng.below(DEFS)
+            };
+            if symbols.iter().all(|&(n, _)| n != name) {
+                symbols.push((name, Use::Ref(rng.chance(5))));
+            }
+        }
+        let archive = archive_of(m);
+        files.push(FileSpec {
+            group: 4 + archive,
+            member: member_index[archive],
+            live_at_start: false,
+            symbols,
+        });
+        member_index[archive] += 1;
+    }
+    (names, Scenario { groups: 7, files })
+}
+
+#[test]
+#[ignore = "timing test; run with --release --ignored --nocapture"]
+fn timing_resolve_small_static_link() {
+    let (names, scenario) = small_static_link();
+    let layout = Layout::identity(&scenario);
+    let order: Vec<usize> = (0..scenario.files.len()).collect();
+    let entries: usize = scenario.files.iter().map(|f| f.symbols.len()).sum();
+    let iterations = 200;
+    if let Ok(load) = std::fs::read_to_string("/proc/loadavg") {
+        println!("load average: {}", load.trim());
+    }
+    let max_threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let mut reference = None;
+    for threads in [1, 8, max_threads.max(64)] {
+        let pool = pool(threads);
+        let mut times = Vec::with_capacity(iterations);
+        let mut summary = None;
+        for _ in 0..iterations {
+            let mut files = build_files(&names, &scenario, &layout, &order);
+            pool.install(|| {
+                let started = Instant::now();
+                let mut table = SymbolTable::new();
+                let resolution = resolve_symbols(&mut table, &ElfReferenceRules, &mut files)
+                    .expect("resolve");
+                times.push(started.elapsed());
+                if summary.is_none() {
+                    assert_eq!(resolution.extracted().len(), 5, "rounds");
+                    let extracted: usize = resolution.extracted().iter().map(Vec::len).sum();
+                    assert_eq!(extracted, 100, "extracted members");
+                    println!(
+                        "{} files, {entries} symbol entries, {} symbols, {extracted} extracted in {} rounds",
+                        files.len(),
+                        table.len(),
+                        resolution.extracted().len(),
+                    );
+                    summary = Some(summarize(&table, &files, &resolution));
+                }
+            });
+        }
+        times.sort();
+        println!(
+            "{threads:>3} threads: min {:>9.2?}  median {:>9.2?}  p90 {:>9.2?}",
+            times[0],
+            times[iterations / 2],
+            times[iterations * 9 / 10],
+        );
+        match &reference {
+            None => reference = summary,
+            Some(reference) => assert!(
+                Some(reference) == summary.as_ref(),
+                "results differ at {threads} threads"
+            ),
+        }
+    }
+}
+
 #[test]
 #[ignore = "stress test; run with --release --ignored --nocapture"]
 fn stress_resolve_large_link() {
