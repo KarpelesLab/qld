@@ -523,7 +523,8 @@ pub fn write_symtab(
                         if absolute {
                             SHN_ABS
                         } else {
-                            shndx_of_address(addresses, value)
+                            super::defined::linker_shndx(addresses, linker, id)
+                                .unwrap_or_else(|| shndx_of_address(addresses, value))
                         },
                         0,
                     )

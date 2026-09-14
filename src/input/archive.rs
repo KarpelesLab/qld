@@ -616,7 +616,7 @@ impl<'a> Archive<'a> {
             if rest.starts_with(b"<") && rest.ends_with(b">/") {
                 return Ok(RawName::OtherSpecial);
             }
-            let offset = parse_decimal(rest)
+            let offset = parse_decimal(rest.strip_suffix(b"/").unwrap_or(rest))
                 .and_then(read::to_usize)
                 .ok_or_else(|| self.malformed(header.offset, "archive member name"))?;
             return Ok(RawName::LongName(offset));
@@ -1265,6 +1265,30 @@ mod tests {
         data.extend(header(b"__.SYMDEF", 8));
         data.extend_from_slice(&[0x10, 0, 0, 0x10, 0, 0, 0, 0]);
         assert!(parse_error(&data).contains("BSD archive symbol table"));
+    }
+
+    #[test]
+    fn long_name_reference_may_end_with_a_slash() {
+        // Most producers write `/54`, but some pad the reference and close it
+        // with a slash (`/54            /`). Both name the same string-table
+        // offset.
+        let mut data = MAGIC.to_vec();
+        data.extend(header(b"//", 16));
+        data.extend_from_slice(b"long_name.o/\n   ");
+        for name in [&b"/0"[..], &b"/0             /"[..]] {
+            let mut archive_data = data.clone();
+            archive_data.extend(header(name, 4));
+            archive_data.extend_from_slice(b"obj\n");
+            let archive = Archive::parse(Path::new("x.a"), &archive_data).unwrap();
+            let members = all_members(&archive);
+            assert_eq!(members.len(), 1, "{:?}", String::from_utf8_lossy(name));
+            assert_eq!(
+                members[0].name,
+                b"long_name.o",
+                "{:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 
     #[test]
