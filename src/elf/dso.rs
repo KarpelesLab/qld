@@ -224,10 +224,28 @@ pub fn plan_needed(
     rules: &ElfRules,
     resolution: &Resolution<'_>,
 ) -> Needed {
+    plan_needed_with(files, symbols, rules, resolution, &[])
+}
+
+/// [`plan_needed`], with the libraries flagged in `also_needed` (by file
+/// index) needed from the start. The LTO driver uses it for libraries that
+/// IR references keep, before code generation.
+#[must_use]
+pub fn plan_needed_with(
+    files: &[ElfInput<'_>],
+    symbols: &SymbolTable<'_>,
+    rules: &ElfRules,
+    resolution: &Resolution<'_>,
+    also_needed: &[bool],
+) -> Needed {
     let count = files.len();
     let mut needed: Vec<bool> = files
         .iter()
-        .map(|f| f.shared.as_ref().is_some_and(|s| !s.as_needed))
+        .enumerate()
+        .map(|(index, f)| {
+            f.shared.as_ref().is_some_and(|s| !s.as_needed)
+                || also_needed.get(index).copied().unwrap_or(false)
+        })
         .collect();
 
     // Regular objects: references and definitions.

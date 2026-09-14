@@ -597,12 +597,42 @@ mod linux {
         let plugin = stub_plugin(&cc, &work);
         std::fs::write(
             work.join("dso.c"),
-            "extern int dso_needs_qld(void);\nint dso_func_qld(void) { return dso_needs_qld(); }\n",
+            "extern int dso_needs_qld(void);\nint dso_func_qld(void) { return dso_needs_qld(); }\n\
+             int also_in_dso_qld(void) { return 3; }\n",
         )
         .unwrap();
         run_ok(
             Command::new(&cc)
                 .args(["-shared", "-fPIC", "-nostdlib", "-o", "libdso.so", "dso.c"])
+                .current_dir(&work),
+        );
+        // Two --as-needed libraries only IR refers to: one unversioned, one
+        // with a version script.
+        std::fs::write(
+            work.join("asn.c"),
+            "int asn_plain_qld(void) { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("asv.c"),
+            "int asv_versioned_qld(void) { return 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(work.join("asv.map"), "ASV_1 { global: *; };\n").unwrap();
+        run_ok(
+            Command::new(&cc)
+                .args(["-shared", "-fPIC", "-nostdlib", "-o", "libasn.so", "asn.c"])
+                .current_dir(&work),
+        );
+        run_ok(
+            Command::new(&cc)
+                .args([
+                    "-shared",
+                    "-fPIC",
+                    "-nostdlib",
+                    "-Wl,--version-script=asv.map",
+                ])
+                .args(["-o", "libasv.so", "asv.c"])
                 .current_dir(&work),
         );
         std::fs::create_dir_all(work.join("extra")).unwrap();
@@ -621,6 +651,9 @@ mod linux {
                 "2 0 dso_func_qld",
                 "0 0 plain_qld",
                 "0 3 hidden_needed_qld",
+                "0 0 also_in_dso_qld",
+                "2 0 asn_plain_qld",
+                "2 0 asv_versioned_qld",
             ],
         );
         let plugin = format!("-plugin={}", plugin.display());
@@ -639,6 +672,11 @@ mod linux {
             "out",
             "e.bc",
             "-L.",
+            "--as-needed",
+            "-lasn",
+            "-lasv",
+            // Libraries the plugin adds take the state of the last input.
+            "--no-as-needed",
             "-ldso",
         ];
         let result = link(&work, &base);
@@ -653,6 +691,12 @@ mod linux {
         assert_eq!(e("dso_func_qld"), RESOLVED_DYN);
         assert_eq!(e("plain_qld"), PREVAILING_DEF_IRONLY);
         assert_eq!(e("hidden_needed_qld"), PREVAILING_DEF_IRONLY);
+        // Exported so that the library binds to the executable's copy.
+        assert_eq!(e("also_in_dso_qld"), PREVAILING_DEF_IRONLY_EXP);
+        // As in GNU ld, an IR reference keeps an --as-needed library for an
+        // unversioned symbol, but not for a versioned one.
+        assert_eq!(e("asn_plain_qld"), RESOLVED_DYN);
+        assert_eq!(e("asv_versioned_qld"), UNDEF);
         // The library the plugin added, found in its directory, is linked;
         // libdso.so is not added twice; a library not found is skipped.
         let output = std::fs::read(work.join("out")).unwrap();

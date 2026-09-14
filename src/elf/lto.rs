@@ -16,9 +16,9 @@
 //!    is met, so a link without IR never loads a plugin and its output does
 //!    not change. IR inputs are claimed on the resolving thread in the round
 //!    hook ([`RoundHook::after_load`](crate::symbols::RoundHook::after_load)),
-//!    round by round, in input-position order
-//!    (which is what makes the plugins' view, and so the generated code,
-//!    independent of the thread count). A claimed file's symbols become its
+//!    round by round, in input-position order (which is what makes the
+//!    plugins' view, and so the generated code, independent of the thread
+//!    count). A claimed file's symbols become its
 //!    [`IrSymbols`]: the names are copied into one buffer per file, added to
 //!    the link's [`FileTable`](crate::input::FileTable) so they live as long
 //!    as every other input, and undefined names go through `--wrap` like a
@@ -43,9 +43,10 @@
 //!    for `-r`;
 //!    [`PrevailingDefIronlyExp`](SymbolResolution::PrevailingDefIronlyExp)
 //!    when it may be referenced from outside the output (shared output,
-//!    `--export-dynamic`, a reference from a shared library in the link,
-//!    `--dynamic-list`), unless its visibility or a version script makes it
-//!    local; and [`PrevailingDefIronly`](SymbolResolution::PrevailingDefIronly)
+//!    `--export-dynamic`, `--dynamic-list`, or a shared library in the link
+//!    that refers to it or defines it too), unless its visibility or a
+//!    version script makes it local; and
+//!    [`PrevailingDefIronly`](SymbolResolution::PrevailingDefIronly)
 //!    otherwise, which lets the plugin internalize it. Files claimed but
 //!    never extracted are [`FileResolution::NotIncluded`].
 //!
@@ -246,6 +247,7 @@ mod plugin_link {
         resolve_symbols_with,
     };
     use crate::diag::{Diagnostic, DiagnosticSink};
+    use crate::elf::dso;
     use crate::elf::export::{self, Mode, VersionScript};
     use crate::elf::inputs::{self, ElfInput, InputRole};
     use crate::elf::object::split_version;
@@ -262,7 +264,8 @@ mod plugin_link {
 
     /// Pass-one flag: a live regular object or the linker names the symbol.
     const LTO_REGULAR: SymbolFlags = SymbolFlags::backend(8);
-    /// Pass-one flag: a shared library in the link references the symbol.
+    /// Pass-one flag: a shared library in the link references or defines
+    /// the symbol.
     const LTO_DYNAMIC: SymbolFlags = SymbolFlags::backend(9);
     /// Pass-one flag: a regular object gives the symbol hidden or internal
     /// visibility.
@@ -297,7 +300,9 @@ mod plugin_link {
         /// references bind to the kept one), so the generated code must
         /// define it.
         pub regular_ref: bool,
-        /// A shared library in the link references the symbol.
+        /// A shared library in the link references the symbol, or defines
+        /// it too (the output's definition is then exported so that the
+        /// library binds to it).
         pub dynamic_ref: bool,
         /// Every default-visibility definition is exported: a shared
         /// object, or `--export-dynamic` in a dynamic executable.
@@ -635,6 +640,49 @@ mod plugin_link {
         }
     }
 
+    /// The `--as-needed` libraries that a strong reference from IR keeps
+    /// before code generation, by file index: those that give the symbol an
+    /// unversioned definition. GNU ld's as-needed check accepts a reference
+    /// from a plugin's symbols only on the symbol's own name, which a
+    /// versioned default definition (`name@@VERSION`) does not have, so IR
+    /// references alone never keep a library for a versioned symbol (the
+    /// library comes back for the generated code).
+    fn needed_by_ir(
+        files: &[ElfInput<'_>],
+        symbols: &SymbolTable<'_>,
+        resolution: &Resolution<'_>,
+    ) -> Vec<bool> {
+        let mut needed = vec![false; files.len()];
+        for (index, file) in files.iter().enumerate() {
+            let Some(ir) = &file.ir else {
+                continue;
+            };
+            let ids = resolution.symbol_ids(FileId::new(index));
+            for (use_, &id) in ir.uses.iter().zip(ids) {
+                if *use_ != (SymbolUse::Reference { weak: false }) {
+                    continue;
+                }
+                let def = symbols.definition(id);
+                if def.kind != DefinitionKind::Shared {
+                    continue;
+                }
+                let owner = def.file.index();
+                let Some(shared) = files.get(owner).and_then(|f| f.shared.as_ref()) else {
+                    continue;
+                };
+                let unversioned = shared
+                    .symbols
+                    .get(def.index as usize)
+                    .and_then(|&dynsym| shared.elf.symbol_version(dynsym as usize).ok())
+                    .is_some_and(|version| version.info.is_none());
+                if unversioned && let Some(slot) = needed.get_mut(owner) {
+                    *slot = true;
+                }
+            }
+        }
+        needed
+    }
+
     /// Records, in the first resolution's table, which symbols regular
     /// objects, shared libraries and the linker name.
     fn mark_usage(files: &[ElfInput<'_>], symbols: &SymbolTable<'_>, resolution: &Resolution<'_>) {
@@ -665,8 +713,11 @@ mod plugin_link {
                     }
                 }
             } else if let Some(shared) = &file.shared {
+                // A reference, or a definition too: the output exports a
+                // symbol a library also defines, so the library binds to
+                // the output's copy (GNU ld's `non_ir_ref_dynamic`).
                 for (local, &symbol) in ids.iter().enumerate() {
-                    if matches!(shared.uses.get(local), Some(SymbolUse::Reference { .. })) {
+                    if !matches!(shared.uses.get(local), Some(SymbolUse::Ignore) | None) {
                         symbols.set_flags(symbol, LTO_DYNAMIC);
                     }
                 }
@@ -824,6 +875,15 @@ mod plugin_link {
             ));
         }
 
+        if options.kind != crate::args::OutputKind::Relocatable {
+            // What the driver does after resolution: weak references bind to
+            // a shared definition over an unextracted member, and symbols
+            // only an unneeded --as-needed library defines are unbound, so
+            // references to them are reported undefined.
+            dso::bind_unextracted(&inputs.files, &symbols, &resolution);
+            let kept = needed_by_ir(&inputs.files, &symbols, &resolution);
+            let _ = dso::plan_needed_with(&inputs.files, &symbols, rules, &resolution, &kept);
+        }
         mark_usage(&inputs.files, &symbols, &resolution);
         let context = Context::new(options, &inputs.files)?;
         let files = &inputs.files;
