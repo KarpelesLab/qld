@@ -230,6 +230,18 @@ succeed. The error message names the missing search path.
   that barely compresses can end up stored uncompressed where GNU ld
   compresses it, or the reverse.
 
+### LTO plugins
+
+- qld reports GNU ld version 2.44 to plugins and sends no gold version (GCC's
+  plugin changes behaviour when it believes it runs under gold). It
+  negotiates plugin API level 1, which GNU ld 2.46 does not offer.
+- Plugins are not `dlclose`d, and a plugin library serves one link per
+  process.
+- The plugin `message` callback formats integer and string arguments;
+  floating-point arguments are shown unformatted.
+- A fatal plugin message ends the link with an error. Used as a library, qld
+  returns the error instead of exiting, and the plugin is not called again.
+
 ### Linker scripts
 
 qld's script parser follows GNU ld's grammar and tokenization (including its

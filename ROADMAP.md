@@ -192,10 +192,12 @@ every benchmark.
 
 ## M6: Link-time optimization
 
-- [ ] GNU linker plugin API host (`-plugin`, `-plugin-opt`, `--plugin-opt=`),
-      dynamically loading `liblto_plugin.so` (GCC) and `LLVMgold.so` (LLVM)
-- [ ] Claim-file handling, symbol resolution reporting (`LDPR_*`), adding
-      compiled objects back into the link, archives containing IR members
+- [x] GNU linker plugin API host (`-plugin`, `-plugin-opt`, `--plugin-opt=`),
+      dynamically loading `liblto_plugin.so` (GCC 13–15) and `LLVMgold.so`
+      (LLVM 18–22): standalone `plugin::Session` API
+- [~] Claim-file handling, symbol resolution reporting (`LDPR_*`), adding
+      compiled objects back into the link, archives containing IR members:
+      done in the host API; ELF driver integration pending
 - [ ] ThinLTO options passthrough: jobs, cache directory and pruning policy,
       `thinlto-index-only`
 - [ ] Clean fallback and a clear diagnostic when an IR input has no plugin

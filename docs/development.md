@@ -36,8 +36,6 @@ See [architecture.md](architecture.md#module-layout) for the layout and
   - `rayon` (parallelism)
   - `memmap2` (file mapping)
   - `hashbrown` + `foldhash` (hash tables)
-  Expected later, when the feature that needs them lands:
-  - `libloading` (plugin feature only)
   Algorithms qld needs are implemented in-crate rather than pulled in as
   dependencies: MD5, SHA-1 and xxHash64 (`output::hash`), and zlib/DEFLATE and
   Zstandard codecs (`debug::compress`). The codecs sit behind one `Codec` enum,
@@ -55,8 +53,10 @@ See [architecture.md](architecture.md#module-layout) for the layout and
 ## `unsafe` policy
 
 - The crate sets `#![deny(unsafe_code)]`. Only `src/input/` (mapping),
-  `src/output/` (mapping) and `src/plugin/` (FFI) may lift it, module by
-  module, with a comment saying why.
+  `src/output/` (mapping) and `src/plugin/` (FFI: the private `dl` and `host`
+  modules) may lift it, module by module, with a comment saying why. The
+  plugin host declares `dlopen`/`dlsym`/`dlerror` itself rather than
+  depending on `libloading` or `libc`.
 - Every `unsafe` block has a `// SAFETY:` comment stating the invariant.
 - Typed views over input bytes use `from_le_bytes`/`from_be_bytes` on slices,
   or `#[repr(C)]` structs with alignment-1 integer wrappers. Never cast a

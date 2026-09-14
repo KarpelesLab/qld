@@ -116,6 +116,18 @@ code that the compiler toolchain provides, and it is loaded with `dlopen` at
 run time, only when `-plugin` is given. This lives in `src/plugin/` behind the
 `plugin` cargo feature. That feature is the only place qld uses FFI.
 
+**Environment and options.** GCC's plugin reads `COLLECT_GCC` and
+`COLLECT_GCC_OPTIONS`, which `collect2` sets when `gcc` runs the linker;
+like GNU ld, qld inherits them and never sets them. Running
+`qld -plugin liblto_plugin.so` by hand needs them, plus the `lto-wrapper`
+path and `-fresolution=` options collect2 passes. Some LLVMgold options end
+the process from inside the plugin (`thinlto-index-only`, `emit-llvm`,
+`emit-asm`, `disable-output`), exactly as under GNU ld.
+
+**Lifetime.** Plugins are never unloaded (LLVMgold registers destructors
+and GCC's plugin keeps process state), and each plugin library can be used
+by one session per process.
+
 The ld64 flavor uses `libLTO` (`-lto_library`) through a thin adapter in the
 same crate.
 
