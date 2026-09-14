@@ -94,19 +94,40 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         wrap: &wrap,
         table: &table,
     };
-    let mut inputs = inputs::collect(options, &table, &internal, config)?;
+    // Without `--threads` and outside a caller's pool, the link runs in
+    // pools of its own and never starts rayon's global pool (one thread per
+    // core): mapping the inputs gains nothing from more than a few threads,
+    // and 849 objects took 50 ms on 64 threads against 10 ms on 16.
+    let own_pools = options.threads.is_none() && rayon::current_thread_index().is_none();
+    let mut inputs = if own_pools {
+        let threads = available_threads().min(INPUT_THREADS);
+        thread_pool(threads)?.install(|| inputs::collect(options, &table, &internal, config))?
+    } else {
+        inputs::collect(options, &table, &internal, config)?
+    };
     lap("inputs");
 
-    match input_sized_threads(options, &table) {
-        Some(threads) => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| Error::Internal(format!("cannot create thread pool: {e}")))?;
-            pool.install(|| link_inputs(options, diagnostics, &mut inputs, &internal, &lap))
-        }
+    match input_sized_threads(options, &table, own_pools) {
+        Some(threads) => thread_pool(threads)?
+            .install(|| link_inputs(options, diagnostics, &mut inputs, &internal, &lap)),
         None => link_inputs(options, diagnostics, &mut inputs, &internal, &lap),
     }
+}
+
+/// Threads used to map and index the inputs when `--threads` is not given.
+const INPUT_THREADS: usize = 16;
+
+/// The number of threads this process may run: the available parallelism.
+fn available_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// A rayon pool of `threads` threads.
+fn thread_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|e| Error::Internal(format!("cannot create thread pool: {e}")))
 }
 
 /// Rejects options whose effect is not implemented yet, rather than
@@ -154,19 +175,19 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
 }
 
 /// Input bytes per worker thread when `--threads` is not given.
-const BYTES_PER_THREAD: u64 = 16 << 20;
+const BYTES_PER_THREAD: u64 = 4 << 20;
 /// Most threads used when `--threads` is not given.
-const MAX_DEFAULT_THREADS: usize = 32;
+const MAX_DEFAULT_THREADS: usize = 16;
 
 /// The thread count for a link whose thread count was not set explicitly:
 /// one thread per [`BYTES_PER_THREAD`] of input, at most
-/// [`MAX_DEFAULT_THREADS`] and the current pool's size. `None` keeps the
-/// current pool.
+/// [`MAX_DEFAULT_THREADS`] and the current pool's size (with `own_pools`,
+/// the available parallelism). `None` keeps the current pool.
 ///
 /// Small links are dominated by the fixed cost of spreading tiny tasks over
 /// many threads (a static "hello world" takes 10 ms on one thread and 28 ms
 /// on 64). The output does not depend on the thread count.
-fn input_sized_threads(options: &LinkOptions, table: &FileTable) -> Option<usize> {
+fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool) -> Option<usize> {
     if options.threads.is_some() {
         return None;
     }
@@ -178,6 +199,9 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable) -> Option<usize
     let wanted = usize::try_from(bytes.div_ceil(BYTES_PER_THREAD))
         .unwrap_or(usize::MAX)
         .clamp(1, MAX_DEFAULT_THREADS);
+    if own_pools {
+        return Some(wanted.min(available_threads()));
+    }
     (wanted < rayon::current_num_threads()).then_some(wanted)
 }
 
@@ -198,6 +222,7 @@ fn link_inputs<'a>(
     let resolution = resolve_symbols_with(&mut symbols, &rules, &mut inputs.files, &mut comdat)?;
     drop(comdat);
     let files = &inputs.files;
+    dso::bind_unextracted(files, &symbols, &resolution);
     lap("resolution");
 
     let mut sections = Sections::new(files, &resolution)?;
@@ -235,6 +260,9 @@ fn link_inputs<'a>(
 
     let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
     let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
+    if mode.dynamic && !mode.shared {
+        dso::mark_dependency_symbols(files, &symbols, &needed, options);
+    }
     let always: &[&str] = if mode.dynamic && mode.executable() && options.export_dynamic {
         for name in defined::ALWAYS_DEFINED {
             symbols.intern(SymbolName::new(name.as_bytes()));

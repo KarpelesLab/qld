@@ -887,6 +887,31 @@ fn gc_sections_drops_imports_only_dead_code_uses() {
     cc_link_ok(&dir, &["-o", "all", "main.o"]);
     let symbols = readelf(&dir, &["--dyn-syms", "all"]);
     assert!(symbols.contains("chdir"), "{symbols}");
+
+    // In a shared object, an undefined symbol only dead code refers to is
+    // left out too (LLVM's plugins and DisableABIBreakingChecks).
+    compile_with(
+        &dir,
+        "plugin",
+        "extern int missing_live_qld, missing_dead_qld;\n\
+         int live_qld(void) { return missing_live_qld; }\n\
+         static int dead_qld(void) { return missing_dead_qld; }\n\
+         int (*unused_qld)(void) __attribute__((weak, visibility(\"hidden\"))) = dead_qld;\n",
+        &["-fPIC", "-ffunction-sections", "-fdata-sections"],
+    );
+    cc_link_ok(
+        &dir,
+        &[
+            "-shared",
+            "-o",
+            "libplugin.so",
+            "plugin.o",
+            "-Wl,--gc-sections",
+        ],
+    );
+    let symbols = readelf(&dir, &["--dyn-syms", "libplugin.so"]);
+    assert!(symbols.contains("missing_live_qld"), "{symbols}");
+    assert!(!symbols.contains("missing_dead_qld"), "{symbols}");
 }
 
 #[test]
@@ -1725,4 +1750,258 @@ fn gnu_property_notes_merge_used_and_needed_bits() {
     qld_ok(&dir, &["-r", "-o", "combined.o", "start.o", "used.o"]);
     let notes = readelf(&dir, &["-n", "combined.o"]);
     assert!(notes.contains("x86 ISA used"), "{notes}");
+}
+
+// ---------------------------------------------------------------------------
+// Real-project regressions (workstream W16).
+// ---------------------------------------------------------------------------
+
+/// An archive member beats a shared library that comes after its archive,
+/// as in GNU ld (gcc's `-lgcc --as-needed -lgcc_s` relies on it for
+/// `__popcountdi2`); weak references still bind to the shared library.
+#[test]
+fn archive_before_shared_library_is_extracted() {
+    require!("cc", "ar", "readelf");
+    let dir = scratch("archive-before-shared");
+    compile_with(
+        &dir,
+        "shared",
+        "int dup_qld(void) { return 1; }\nint weakonly_qld(void) { return 5; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "helper",
+        "int dup_qld(void) { return 1; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "member_a",
+        "int dup_qld(void) { return 2; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "member_b",
+        "int weakonly_qld(void) { return 6; }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\nint dup_qld(void);\nint weakonly_qld(void) __attribute__((weak));\n\
+         int main(void) { printf(\"%d %d\\n\", dup_qld(), weakonly_qld ? weakonly_qld() : 0); return 0; }\n",
+        &["-fPIE"],
+    );
+    compile_with(
+        &dir,
+        "main2",
+        "#include <stdio.h>\nint dup_qld(void);\nint main(void) { printf(\"%d\\n\", dup_qld()); return 0; }\n",
+        &["-fPIE"],
+    );
+    run_ok(&dir, "ar", &["rcs", "libdup.a", "member_a.o", "member_b.o"]);
+    cc_link_ok(&dir, &["-shared", "-o", "libdup.so", "shared.o"]);
+    cc_link_ok(&dir, &["-shared", "-o", "libhelper.so", "helper.o"]);
+
+    // Archive first: the member defining dup_qld is extracted; the weak
+    // reference does not extract the other one and binds to the library.
+    cc_link_ok(&dir, &["-o", "first", "main.o", "libdup.a", "-L.", "-ldup"]);
+    assert_eq!(stdout_of(&dir, "first"), "2 5\n");
+    let dynsym = readelf(&dir, &["--dyn-syms", "first"]);
+    assert!(!dynsym.contains("UND dup_qld"), "{dynsym}");
+    assert!(dynsym.contains("UND weakonly_qld"), "{dynsym}");
+
+    // Library first: it wins.
+    cc_link_ok(
+        &dir,
+        &["-o", "second", "main.o", "-L.", "-ldup", "libdup.a"],
+    );
+    assert_eq!(stdout_of(&dir, "second"), "1 5\n");
+
+    // An --as-needed library that only duplicates the archive is not needed.
+    cc_link_ok(
+        &dir,
+        &[
+            "-o",
+            "third",
+            "main2.o",
+            "libdup.a",
+            "-L.",
+            "-Wl,--as-needed",
+            "-lhelper",
+        ],
+    );
+    assert_eq!(stdout_of(&dir, "third"), "2\n");
+    let dynamic = readelf(&dir, &["-d", "third"]);
+    assert!(!dynamic.contains("libhelper.so"), "{dynamic}");
+}
+
+/// `PT_TLS` starts on its alignment even when `.tdata` is less aligned than
+/// `.tbss`: glibc places the block by `p_vaddr % p_align`, so local-exec
+/// offsets were 4 bytes off (LLVM's unit tests crashed in
+/// `timeTraceProfilerBegin`).
+#[test]
+fn tls_segment_starts_aligned() {
+    require!("cc", "readelf");
+    let dir = scratch("tls-segment-aligned");
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\n__thread int small_qld = 7;\n__thread void *ptr_qld;\n\
+         __attribute__((noinline)) static int *addr(void) { return &small_qld; }\n\
+         __attribute__((noinline)) static void **paddr(void) { return &ptr_qld; }\n\
+         int main(void) { *paddr() = addr(); printf(\"%d %d\\n\", *addr(), *(int *)*paddr()); return 0; }\n",
+        &["-fPIE"],
+    );
+    cc_link_ok(&dir, &["-pie", "-o", "out", "main.o"]);
+    assert_eq!(stdout_of(&dir, "out"), "7 7\n");
+    let segments = readelf(&dir, &["-l", "out"]);
+    let tls = segments
+        .lines()
+        .find(|l| l.trim_start().starts_with("TLS"))
+        .unwrap_or_else(|| panic!("no PT_TLS: {segments}"));
+    let fields: Vec<&str> = tls.split_whitespace().collect();
+    let vaddr = u64::from_str_radix(fields[2].trim_start_matches("0x"), 16).unwrap();
+    let align = u64::from_str_radix(fields[7].trim_start_matches("0x"), 16).unwrap();
+    assert_eq!(vaddr % align, 0, "{tls}");
+}
+
+/// Importing a weak data symbol also imports the strong symbol its library
+/// defines at the same address, as GNU ld does (glibc's `environ` brings
+/// `__environ`, `timezone` brings `__timezone`).
+#[test]
+fn weak_data_imports_bring_their_strong_alias() {
+    require!("cc", "readelf");
+    let dir = scratch("weak-data-alias");
+    compile_with(
+        &dir,
+        "lib",
+        "int strong_qld = 3;\nextern int weak_qld __attribute__((weak, alias(\"strong_qld\")));\n\
+         int func_qld(void) { return 1; }\n\
+         extern int weakfunc_qld(void) __attribute__((weak, alias(\"func_qld\")));\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\nextern int weak_qld;\nint weakfunc_qld(void);\n\
+         int main(void) { printf(\"%d %d\\n\", weak_qld, weakfunc_qld()); return 0; }\n",
+        &["-fPIC"],
+    );
+    cc_link_ok(&dir, &["-shared", "-o", "libalias.so", "lib.o"]);
+    for (output, kind) in [("out", "-pie"), ("libuser.so", "-shared")] {
+        cc_link_ok(&dir, &[kind, "-o", output, "main.o", "-L.", "-lalias"]);
+        let dynsym = readelf(&dir, &["--dyn-syms", output]);
+        assert!(
+            dynsym.contains("GLOBAL DEFAULT  UND strong_qld"),
+            "{dynsym}"
+        );
+        // Functions have no such aliases.
+        assert!(
+            !dynsym.lines().any(|l| l.ends_with(" func_qld")),
+            "{dynsym}"
+        );
+    }
+    assert_eq!(stdout_of(&dir, "out"), "3 1\n");
+}
+
+/// An exported symbol in a non-allocated section keeps that section's index
+/// in `.dynsym` (rustc's `rust_metadata_*` symbols in `.rustc`), as with GNU
+/// ld, instead of becoming absolute.
+#[test]
+fn dynamic_symbols_in_non_allocated_sections_keep_their_section() {
+    require!("as", "readelf");
+    let dir = scratch("dynsym-nonalloc");
+    assemble(
+        &dir,
+        "meta",
+        "
+    .section .meta_qld,\"\",@progbits
+    .globl metadata_qld
+    .type metadata_qld, @object
+    .size metadata_qld, 4
+metadata_qld:
+    .long 1
+    .text
+    .globl code_qld
+code_qld:
+    ret
+",
+    );
+    qld_ok(&dir, &["-shared", "-o", "libmeta.so", "meta.o"]);
+    let sections = readelf(&dir, &["-S", "libmeta.so"]);
+    let index = sections
+        .lines()
+        .find(|l| l.contains(" .meta_qld "))
+        .and_then(|l| l.split('[').nth(1))
+        .and_then(|l| l.split(']').next())
+        .map(|n| n.trim().to_string())
+        .unwrap_or_else(|| panic!("no .meta_qld: {sections}"));
+    let dynsym = readelf(&dir, &["--dyn-syms", "libmeta.so"]);
+    let line = dynsym
+        .lines()
+        .find(|l| l.ends_with(" metadata_qld"))
+        .unwrap_or_else(|| panic!("metadata_qld not exported: {dynsym}"));
+    let ndx = line.split_whitespace().nth(6).unwrap_or_default();
+    assert_eq!(ndx, index, "{line}\n{sections}");
+}
+
+/// An executable exports the definitions that a dependency of its libraries
+/// (not itself on the command line) defines or references, as GNU ld does:
+/// LLVM's BUILD_SHARED_LIBS tools left template instances unexported, and a
+/// callback looked up by an indirect dependency was not found at run time.
+#[test]
+fn transitive_dependencies_see_executable_definitions() {
+    require!("cc", "readelf");
+    let dir = scratch("transitive-exports");
+    compile_with(
+        &dir,
+        "base",
+        "int callback_qld(void);\nint tmpl_qld(void) __attribute__((weak));\n\
+         int tmpl_qld(void) { return 1; }\n\
+         int base_call(void) { return callback_qld() + tmpl_qld(); }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "mid",
+        "int base_call(void);\nint mid_call(void) { return base_call(); }\n",
+        &["-fPIC"],
+    );
+    compile_with(
+        &dir,
+        "main",
+        "#include <stdio.h>\nint mid_call(void);\nint callback_qld(void) { return 40; }\n\
+         int tmpl_qld(void) __attribute__((weak));\nint tmpl_qld(void) { return 2; }\n\
+         int main(void) { printf(\"%d\\n\", mid_call() + tmpl_qld() - 2); return 0; }\n",
+        &["-fPIE"],
+    );
+    cc_link_ok(&dir, &["-shared", "-o", "libbase.so", "base.o"]);
+    cc_link_ok(
+        &dir,
+        &["-shared", "-o", "libmid.so", "mid.o", "-L.", "-lbase"],
+    );
+    cc_link_ok(
+        &dir,
+        &[
+            "-pie",
+            "-o",
+            "out",
+            "main.o",
+            "-L.",
+            "-lmid",
+            "-Wl,-rpath-link,.",
+        ],
+    );
+    let dynsym = readelf(&dir, &["--dyn-syms", "out"]);
+    let exported = |name: &str| {
+        dynsym
+            .lines()
+            .any(|l| l.ends_with(&format!(" {name}")) && !l.contains(" UND "))
+    };
+    assert!(exported("callback_qld"), "{dynsym}");
+    assert!(exported("tmpl_qld"), "{dynsym}");
+    // libbase's own references bind to the executable's definitions.
+    assert_eq!(stdout_of(&dir, "out"), "42\n");
 }

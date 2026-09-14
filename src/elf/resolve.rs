@@ -3,11 +3,21 @@
 //! # Precedence
 //!
 //! [`ElfRules`] ranks definitions as GNU ld, gold, lld and mold do:
-//! strong > common (the larger wins) > weak > shared > lazy, with ties going
-//! to the earlier input. Two strong definitions are a duplicate-symbol error,
-//! unless both come from COMDAT group sections (C++ inline functions, static
-//! locals and template instances are emitted once per object; only one group
-//! survives).
+//! strong > common (the larger wins) > weak > shared and lazy, with ties
+//! going to the earlier input. Two strong definitions are a duplicate-symbol
+//! error, unless both come from COMDAT group sections (C++ inline functions,
+//! static locals and template instances are emitted once per object; only
+//! one group survives).
+//!
+//! Between a shared library and an unextracted archive member, the earlier
+//! one on the command line wins, as in GNU ld: a member of an archive that
+//! comes first is extracted by a non-weak reference, and the shared library
+//! is used otherwise. This is what keeps gcc's `-lgcc --as-needed -lgcc_s`
+//! from binding `__popcountdi2` to `libgcc_s.so.1` (and adding a
+//! `DT_NEEDED` on it) where GNU ld links the helper from `libgcc.a`. A
+//! symbol that ends resolution with an unextracted lazy definition (only
+//! weak references, or none) is bound to its shared definition afterwards
+//! by [`dso::bind_unextracted`](super::dso::bind_unextracted).
 //!
 //! # COMDAT groups
 //!
@@ -71,6 +81,14 @@ impl ElfRules {
 
 impl Resolver for ElfRules {
     fn compare(&self, a: &Definition, b: &Definition) -> Ordering {
+        // A lazy member and a shared library: the earlier input wins.
+        if matches!(
+            (a.kind, b.kind),
+            (DefinitionKind::Lazy, DefinitionKind::Shared)
+                | (DefinitionKind::Shared, DefinitionKind::Lazy)
+        ) {
+            return b.position.cmp(&a.position);
+        }
         let by_rank = Self::rank(a.kind).cmp(&Self::rank(b.kind));
         if by_rank == Ordering::Equal && a.kind == DefinitionKind::Common {
             return (a.aux & !AUX_COMDAT).cmp(&(b.aux & !AUX_COMDAT));
@@ -266,6 +284,16 @@ mod tests {
         assert!(takes_precedence(&rules, &common_small, &weak));
         assert!(takes_precedence(&rules, &common_large, &common_small));
         assert!(takes_precedence(&rules, &strong, &common_large));
+
+        // Shared versus lazy: the earlier input, either way round.
+        let lazy_early = def(DefinitionKind::Lazy, 1, 0);
+        let shared = def(DefinitionKind::Shared, 2, 0);
+        let lazy_late = def(DefinitionKind::Lazy, 3, 0);
+        assert!(takes_precedence(&rules, &lazy_early, &shared));
+        assert!(!takes_precedence(&rules, &shared, &lazy_early));
+        assert!(takes_precedence(&rules, &shared, &lazy_late));
+        assert!(!takes_precedence(&rules, &lazy_late, &shared));
+        assert!(takes_precedence(&rules, &weak, &lazy_early));
 
         let comdat_a = def(DefinitionKind::Regular, 1, AUX_COMDAT);
         let comdat_b = def(DefinitionKind::Regular, 2, AUX_COMDAT);
