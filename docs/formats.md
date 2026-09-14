@@ -15,10 +15,10 @@ scope of each, and the order in which they arrive. Milestone numbers refer to
 | Raw binary (`-b binary`) | option | M3 |
 | LLVM bitcode (`.o` / archive members) | `BC\xC0\xDE`, bitcode wrapper | M6 |
 | GCC LTO IR (ELF with `.gnu.lto_*`) | ELF + section names | M6 |
-| COFF objects (x86-64, i386, ARM64) | machine field + heuristics | M7 |
-| COFF short import libraries | `IMPORT_OBJECT_HEADER` sig `0000 FFFF` | M7 |
-| PE DLLs (link directly against `.dll`) | `MZ` … `PE\0\0` | M7 |
-| Module-definition files (`.def`) | extension / text | M7 |
+| COFF objects, regular and bigobj (x86-64, i386, ARM64, ARM64EC/ARM64X, ARMNT) | machine field + heuristics | M7 (reader done) |
+| COFF short import libraries | `IMPORT_OBJECT_HEADER` sig `0000 FFFF` | M7 (reader done) |
+| PE DLLs (link directly against `.dll`) | `MZ` … `PE\0\0` | M7 (export reader done) |
+| Module-definition files (`.def`) | extension / text | M7 (parser done) |
 | Mach-O objects and dylibs | `MH_MAGIC_64` etc. | M8 |
 | Apple text-based stubs (`.tbd` v3–v5) | text (YAML / JSON) | M8 |
 | Universal (fat) inputs: select a slice | `FAT_MAGIC`, `FAT_MAGIC_64` | M8 |
@@ -117,7 +117,7 @@ every output format:
 | MinGW specifics | auto-import with runtime pseudo relocations, `__CTOR_LIST__`/`__DTOR_LIST__` |
 | Headers | subsystem, OS/image versions, `--dynamicbase`, `--nxcompat`, `--high-entropy-va`, `--no-seh`, `--image-base` |
 | Determinism | fixed timestamp unless `--insert-timestamp` is given |
-| Resources | `.rsrc` from windres-produced COFF objects |
+| Resources | `.rsrc` from GNU windres objects, `.rsrc$01`/`.rsrc$02` from `cvtres`/`llvm-windres` |
 
 ## Mach-O output (M8, ld64 flavor)
 

@@ -40,6 +40,8 @@ the summary; without it, output is shown only when the suite fails.
 | `QLD_FIXTURE_LINKER` | Linker for `fixtures`: `qld` (default), `ld`/`bfd`, `lld`, `mold`, `gold`, or a path |
 | `QLD_DIFF_CANDIDATE` | Linker compared against GNU ld by `differential` (default `qld`) |
 | `QLD_REQUIRE_TOOLS` | When set to a non-empty value other than `0`, a missing tool fails instead of skipping (for CI jobs that install the toolchain) |
+| `QLD_REQUIRE_COFF_TOOLS` | Same, for the PE/COFF reader tests (MinGW, `llvm-dlltool`, `llvm-readobj`); separate because CI jobs with a C toolchain may lack MinGW |
+| `QLD_COFF_SWEEP_DIRS`, `QLD_COFF_READOBJ_ARCHIVES`, `QLD_COFF_FUZZ_ROUNDS` | Extra directories for the ignored COFF sweep, archives to compare against `llvm-readobj`, and corruption rounds; COFF fixtures are regenerated with `tests/data/coff_read/generate.sh` |
 | `QLD_TEST_JOBS` | Parallel fixture jobs (default: available parallelism) |
 | `QLD_TEST_CC`, `QLD_TEST_CXX`, `QLD_TEST_AR` | Compiler driver and archiver (default `cc`/`gcc`/`clang`, `c++`/`g++`/`clang++`, `ar`/`llvm-ar`) |
 | `QLD_TEST_READELF` | `readelf` to use (default `readelf`, then `llvm-readelf`) |
