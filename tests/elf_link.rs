@@ -1806,7 +1806,20 @@ fn archive_before_shared_library_is_extracted() {
 
     // Archive first: the member defining dup_qld is extracted; the weak
     // reference does not extract the other one and binds to the library.
-    cc_link_ok(&dir, &["-o", "first", "main.o", "libdup.a", "-L.", "-ldup"]);
+    // --no-as-needed: some compilers (Ubuntu's gcc) default to --as-needed,
+    // which drops a library referenced only weakly, in GNU ld too.
+    cc_link_ok(
+        &dir,
+        &[
+            "-o",
+            "first",
+            "main.o",
+            "libdup.a",
+            "-L.",
+            "-Wl,--no-as-needed",
+            "-ldup",
+        ],
+    );
     assert_eq!(stdout_of(&dir, "first"), "2 5\n");
     let dynsym = readelf(&dir, &["--dyn-syms", "first"]);
     assert!(!dynsym.contains("UND dup_qld"), "{dynsym}");
@@ -1815,7 +1828,15 @@ fn archive_before_shared_library_is_extracted() {
     // Library first: it wins.
     cc_link_ok(
         &dir,
-        &["-o", "second", "main.o", "-L.", "-ldup", "libdup.a"],
+        &[
+            "-o",
+            "second",
+            "main.o",
+            "-L.",
+            "-Wl,--no-as-needed",
+            "-ldup",
+            "libdup.a",
+        ],
     );
     assert_eq!(stdout_of(&dir, "second"), "1 5\n");
 
