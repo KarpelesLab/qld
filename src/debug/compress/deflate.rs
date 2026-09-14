@@ -1,0 +1,1 @@
+//! DEFLATE compression (stub).
