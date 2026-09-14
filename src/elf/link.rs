@@ -30,7 +30,9 @@ use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
 use crate::passes::IcfMode;
-use crate::symbols::{SymbolName, SymbolTable, resolve_symbols_with};
+#[cfg(doc)]
+use crate::symbols::resolve_symbols_with;
+use crate::symbols::{SymbolName, SymbolTable};
 
 use super::common;
 use super::defined;
@@ -213,10 +215,8 @@ fn link_inputs<'a>(
     let rules = ElfRules {
         allow_multiple_definition: options.allow_multiple_definition,
     };
-    let mut symbols = SymbolTable::new();
-    let mut comdat = resolve::ComdatHook::default();
-    let resolution = resolve_symbols_with(&mut symbols, &rules, &mut inputs.files, &mut comdat)?;
-    drop(comdat);
+    // Resolution, and LTO when a plugin claims IR inputs (`lto` module).
+    let (mut symbols, resolution, lto) = super::lto::resolve(options, diagnostics, &rules, inputs)?;
     let files = &inputs.files;
     dso::bind_unextracted(files, &symbols, &resolution);
     lap("resolution");
@@ -260,7 +260,8 @@ fn link_inputs<'a>(
             internal,
             lap,
         )?;
-        return map::write_cref(options, cref.as_deref());
+        map::write_cref(options, cref.as_deref())?;
+        return lto.finish(diagnostics);
     }
 
     let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
@@ -637,7 +638,7 @@ fn link_inputs<'a>(
     })?;
     map::write(options, &addresses, &plan, cref.as_deref())?;
     lap("write");
-    Ok(())
+    lto.finish(diagnostics)
 }
 
 /// The rest of a relocatable (`-r`) link: `--gc-sections` when asked (GNU

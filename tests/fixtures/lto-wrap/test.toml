@@ -1,0 +1,24 @@
+# M6: --wrap with LTO. main.o and wrap.o are IR, compute.o is native. The
+# IR references to compute and malloc resolve to the IR wrappers, and the
+# wrappers' __real_ references to the real functions; qld reports the
+# wrapped and wrapper symbols as used from regular objects so LTO keeps them,
+# since the generated code is wrapped again after LTO. (A wrapped function
+# defined in IR would be called directly inside the LTO unit, as with GNU ld.)
+description = "--wrap with gcc -flto for a native function and for malloc"
+compile = [
+  "cc -O2 -flto -fno-builtin -c main.c",
+  "cc -O2 -flto -c wrap.c",
+  "cc -O2 -c compute.c",
+]
+driver = "cc"
+link = "-O2 -flto -o out main.o wrap.o compute.o -Wl,--wrap=compute -Wl,--wrap=malloc"
+run = "./out"
+expect.stdout = """
+wrapped compute(4)
+compute(4) = 41
+direct from defining object = 40
+wrapped malloc calls: 2
+"""
+expect.readelf = ["!__gnu_lto_slim"]
+determinism = true
+timeout = 120

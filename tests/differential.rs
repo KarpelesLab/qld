@@ -106,6 +106,7 @@ fn diff_inner(
     if let Some(reason) = &fixture.diff_skip {
         return Err(Status::skip(format!("diff.skip: {reason}")));
     }
+    fixture::check_required_files(fixture)?;
     if fixture.gnu_ld == fixture::GnuLdExpectation::Fail
         && (*reference == Linker::GnuLd || *candidate == Linker::GnuLd)
     {

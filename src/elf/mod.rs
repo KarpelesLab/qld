@@ -16,6 +16,7 @@
 //! | [`object`] | 4: per-object symbols for resolution, section classes, merge splitting, COMDAT groups, notes |
 //! | [`dso`] | 4–5: shared object symbols, `DT_NEEDED` and `--as-needed`, undefined symbols of shared libraries |
 //! | [`resolve`] | 5: ELF precedence rules, COMDAT group claims during resolution rounds, duplicate symbol diagnostics |
+//! | [`lto`] | 5: LTO: IR inputs claimed through plugins, resolutions reported, resolution rerun with the generated objects |
 //! | [`xref`] | 5: `-y`/`--trace-symbol`, `--warn-common` and the `--cref` table |
 //! | [`export`] | 5: output mode, merged visibility, exports, preemptibility, version scripts |
 //! | [`sections`] | Dense input section numbering, liveness and the ICF fold map |
@@ -78,6 +79,7 @@ pub mod icf;
 pub mod inputs;
 pub mod layout;
 pub mod link;
+pub mod lto;
 pub mod map;
 pub mod merge;
 pub mod object;

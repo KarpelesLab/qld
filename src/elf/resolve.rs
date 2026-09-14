@@ -29,6 +29,11 @@
 //! and its references bind to the kept copy. [`deduplicate_comdat`] then
 //! marks the members of the discarded copies dead.
 //!
+//! Symbols of IR files claimed by an LTO plugin carry COMDAT keys, which
+//! name the same groups as section group signatures do; they are claimed
+//! alongside regular objects' groups, so the copy kept can be native or IR
+//! whichever file comes first ([`lto`](super::lto)).
+//!
 //! GNU ld keeps the first copy it loads. It loads archive members as it
 //! meets them on the command line (rescanning `--start-group` groups), so a
 //! member extracted by a reference from a later file is loaded after that
@@ -119,19 +124,45 @@ impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
     ) -> Result<()> {
         let round = self.claims.begin_round();
         files.par_iter().for_each(|round_file| {
-            let Some(object) = &round_file.file.object else {
+            let file = &round_file.file;
+            // An IR file's COMDAT keys compete with the group signatures of
+            // regular objects: they name the same groups.
+            if let Some(ir) = &file.ir {
+                for &key in &ir.comdats {
+                    round.offer(SymbolName::new(key), file.position, round_file.id);
+                }
+                return;
+            }
+            let Some(object) = &file.object else {
                 return;
             };
-            for group in &object.groups {
+            for (index, group) in object.groups.iter().enumerate() {
+                // A copy discarded by an earlier resolution (the one before
+                // LTO) stays discarded: the kept copy may now be in code
+                // LTO generated without a group.
+                if object.discarded_groups.get(index).copied().unwrap_or(false) {
+                    continue;
+                }
                 round.offer(
                     SymbolName::new(group.signature),
-                    round_file.file.position,
+                    file.position,
                     round_file.id,
                 );
             }
         });
         files.par_iter_mut().for_each(|round_file| {
             let id = round_file.id;
+            if let Some(ir) = &mut round_file.file.ir {
+                let discarded: Vec<bool> = ir
+                    .comdats
+                    .iter()
+                    .map(|&key| round.owner(&SymbolName::new(key)) != Some(id))
+                    .collect();
+                if discarded.contains(&true) {
+                    ir.discard_comdats(discarded);
+                }
+                return;
+            }
             let Some(object) = &mut round_file.file.object else {
                 return;
             };

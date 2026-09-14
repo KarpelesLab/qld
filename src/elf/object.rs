@@ -257,7 +257,33 @@ pub struct ObjectInput<'a> {
     /// For each of [`groups`](Self::groups), whether another file's copy
     /// was kept and this one is discarded.
     pub discarded_groups: Vec<bool>,
+    /// The global symbols [`discard_groups`](Self::discard_groups) turned
+    /// into [`SymbolUse::Ignore`], with their original uses. LTO reports
+    /// them as used by a regular object: their references bind to the kept
+    /// copy.
+    pub group_ignored: Vec<(u32, SymbolUse)>,
+    /// Whether the object carries GCC LTO IR (`.gnu.lto_*` sections).
+    pub gcc_lto: GccLto,
 }
+
+/// Whether an ELF object carries GCC LTO IR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GccLto {
+    /// No `.gnu.lto_*` sections: an ordinary object.
+    #[default]
+    None,
+    /// IR only (`-flto` without `-ffat-lto-objects`): the object defines
+    /// the `__gnu_lto_slim` marker and has no code of its own.
+    Slim,
+    /// IR next to native code (`-ffat-lto-objects`): linkable without the
+    /// plugin.
+    Fat,
+}
+
+/// The common symbol GCC puts in slim LTO objects.
+pub const GCC_LTO_SLIM_MARKER: &[u8] = b"__gnu_lto_slim";
+/// The section name prefix of GCC LTO IR.
+pub const GCC_LTO_PREFIX: &[u8] = b".gnu.lto_";
 
 /// Whether a section name is debug information that `--strip-debug` drops.
 #[must_use]
@@ -289,8 +315,10 @@ impl<'a> ObjectInput<'a> {
         let mut has_property_note = false;
         let mut addrsig = 0u32;
         let mut warnings = Vec::new();
+        let mut has_lto_ir = false;
         for (index, header) in elf.elf().enumerate_sections() {
             let mut name = elf.section_name(&header)?;
+            has_lto_ir |= name.starts_with(GCC_LTO_PREFIX);
             let mut header = header;
             let mut contents = None;
             let stripped =
@@ -482,11 +510,13 @@ impl<'a> ObjectInput<'a> {
         let mut names = Vec::with_capacity(global_count);
         let mut uses = Vec::with_capacity(global_count);
         let mut has_default_versions = false;
+        let mut slim = false;
         for index in first_global..symbols.len() {
             let Some(raw) = symbols.get_raw(index) else {
                 break;
             };
             let name = symbols.name(index, &raw)?;
+            slim |= has_lto_ir && name == GCC_LTO_SLIM_MARKER;
             let section = symbols.section(index, &raw)?;
             let binding = raw.binding();
             let weak = binding == STB_WEAK;
@@ -540,6 +570,12 @@ impl<'a> ObjectInput<'a> {
             splits,
             has_default_versions,
             discarded_groups: Vec::new(),
+            group_ignored: Vec::new(),
+            gcc_lto: match (has_lto_ir, slim) {
+                (false, _) => GccLto::None,
+                (true, true) => GccLto::Slim,
+                (true, false) => GccLto::Fat,
+            },
         })
     }
 
@@ -566,6 +602,9 @@ impl<'a> ObjectInput<'a> {
                 .get(section as usize)
                 .and_then(|s| s.group.checked_sub(1));
             if group.is_some_and(|g| discarded.get(g as usize).copied().unwrap_or(false)) {
+                if let Ok(local) = u32::try_from(local) {
+                    self.group_ignored.push((local, *use_));
+                }
                 *use_ = SymbolUse::Ignore;
             }
         }

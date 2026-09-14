@@ -6,6 +6,8 @@
 #   shared: -DBUILD_SHARED_LIBS=ON (one .so per component library)
 # Without targets, builds `all` and runs check-llvm check-clang check-lld.
 # Compiles with the system clang; set LLVM_CC/LLVM_CXX to change that.
+# LLVM_LTO=Thin or Full builds with LTO (-DLLVM_ENABLE_LTO) through the
+# compiler's LLVMgold.so, archives made by llvm-ar, in a directory of its own.
 QLD=$1
 SCRATCH=$2
 KIND=${3:-static}
@@ -18,7 +20,7 @@ srcdir="$SCRATCH/src/llvm-project-$VERSION.src"
 if [ ! -d "$srcdir" ]; then
   tar -xf "$tarball" -C "$SCRATCH/src"
 fi
-dir="$SCRATCH/build/llvm-$VERSION-$KIND"
+dir="$SCRATCH/build/llvm-$VERSION-$KIND${LLVM_LTO:+-lto-$LLVM_LTO}"
 mkdir -p "$dir"
 cd "$dir"
 export QLD_LINK_LOG="$dir/links.log"
@@ -50,6 +52,7 @@ cmake -G Ninja "$srcdir/llvm" \
   -DBUILD_SHARED_LIBS="$shared" \
   -DLLVM_ENABLE_ASSERTIONS=OFF \
   -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  ${LLVM_LTO:+-DLLVM_ENABLE_LTO="$LLVM_LTO" -DCMAKE_AR="$(command -v llvm-ar)" -DCMAKE_RANLIB="$(command -v llvm-ranlib)"} \
   > configure.log 2>&1
 t1=$(now)
 ninja -j"$jobs" > make.log 2>&1

@@ -1,0 +1,43 @@
+# M6: clang -flto=thin (ThinLTO through LLVMgold.so): a shared library whose
+# version script leaves an internal helper local, and an executable whose
+# IR callback is referenced by the library. See lto-gcc-shared. Skipped
+# where clang is missing.
+description = "clang -flto=thin shared library and executable"
+compile = [
+  "clang -O2 -flto=thin -fPIC -c lib.c",
+  "clang -O2 -flto=thin -fPIE -c main.c",
+]
+driver = "clang"
+link = [
+  "-O2 -flto=thin -shared -Wl,-soname,liblto.so -Wl,--version-script=lib.map -o liblto.so lib.o",
+  "-O2 -flto=thin -o out main.o -L. -llto -Wl,-rpath,$ORIGIN -Wl,--no-as-needed",
+]
+run = "./out"
+expect.stdout = """
+callback 1
+api=16
+calls=1
+"""
+expect.readelf = [
+  "Shared library: [liblto.so]",
+  "lib_api_lto_qld@LIBLTO_1",
+  "!exe_unused_lto_qld",
+]
+expect.readelf_files."liblto.so" = [
+  "Library soname: [liblto.so]",
+  "lib_api_lto_qld@@LIBLTO_1",
+  "lib_calls_lto_qld@@LIBLTO_1",
+  "!lib_internal_helper_lto_qld",
+]
+determinism = true
+timeout = 120
+# LLVM gives .eh_frame the type SHT_X86_64_UNWIND; qld keeps the input type
+# where GNU ld writes PROGBITS (not specific to LTO).
+diff.ignore = ["section: .eh_frame X86_64_UNWIND", "section: .eh_frame PROGBITS"]
+# clang can be installed without LLVMgold.so, which -flto needs.
+requires_files = [
+  "/usr/lib/llvm/*/lib*/LLVMgold.so",   # Gentoo
+  "/usr/lib/llvm-*/lib/LLVMgold.so",    # Debian, Ubuntu
+  "/usr/lib*/LLVMgold.so",              # Fedora, Arch
+  "/usr/local/lib*/LLVMgold.so",
+]

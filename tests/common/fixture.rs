@@ -84,6 +84,10 @@ pub struct Fixture {
     pub diff_skip: Option<String>,
     /// Skip this fixture everywhere, with a reason.
     pub skip: Option<String>,
+    /// Skip unless at least one of these paths exists. `*` matches within one
+    /// path component, so `/usr/lib/llvm*/lib*/LLVMgold.so` covers the
+    /// different places distributions put a plugin.
+    pub requires_files: Vec<String>,
     /// Timeout for each command.
     pub timeout: Duration,
 }
@@ -120,6 +124,7 @@ impl Fixture {
             diff_ignore: Vec::new(),
             diff_skip: None,
             skip: None,
+            requires_files: Vec::new(),
             timeout: Duration::from_secs(60),
         };
 
@@ -166,6 +171,7 @@ impl Fixture {
                 ["run"] => fixture.run = Some(string()?),
                 ["targets"] => fixture.targets = strings()?,
                 ["skip"] => fixture.skip = Some(string()?),
+                ["requires_files"] => fixture.requires_files = strings()?,
                 ["determinism"] => match entry.value {
                     Value::Bool(b) => fixture.determinism = b,
                     ref other => {
@@ -284,6 +290,86 @@ impl Fixture {
 
 /// Keeps the fixtures selected by `QLD_FIXTURE` (comma-separated substrings
 /// of fixture names). Everything is selected when it is unset.
+/// Skips the fixture unless one of its `requires_files` patterns matches an
+/// existing path. `*` matches within a single path component, which is enough
+/// for the version directories distributions use (`/usr/lib/llvm*/lib*/…`).
+pub fn check_required_files(fixture: &Fixture) -> Result<(), Status> {
+    if fixture.requires_files.is_empty() {
+        return Ok(());
+    }
+    for pattern in &fixture.requires_files {
+        if glob_exists(Path::new(pattern)) {
+            return Ok(());
+        }
+    }
+    Err(Status::skip(format!(
+        "none of these exist: {}",
+        fixture.requires_files.join(", ")
+    )))
+}
+
+/// Whether any existing path matches `pattern` (components may contain `*`).
+fn glob_exists(pattern: &Path) -> bool {
+    let mut candidates = vec![PathBuf::new()];
+    for component in pattern.components() {
+        let part = component.as_os_str().to_string_lossy().into_owned();
+        if !part.contains('*') {
+            for candidate in &mut candidates {
+                candidate.push(&part);
+            }
+            continue;
+        }
+        let mut next = Vec::new();
+        for candidate in &candidates {
+            let dir = if candidate.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                candidate.as_path()
+            };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if glob_matches(&part, &name) {
+                    next.push(candidate.join(name));
+                }
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        candidates = next;
+    }
+    candidates.iter().any(|path| path.exists())
+}
+
+/// `*` matches any run of characters inside one path component.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return true;
+    };
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let mut last: Option<&str> = None;
+    for part in parts {
+        if let Some(previous) = last.replace(part)
+            && !previous.is_empty()
+        {
+            match rest.find(previous) {
+                Some(at) => rest = &rest[at + previous.len()..],
+                None => return false,
+            }
+        }
+    }
+    match last {
+        None => rest.is_empty(),
+        Some(tail) => rest.len() >= tail.len() && rest.ends_with(tail),
+    }
+}
+
 pub fn filter_from_env(fixtures: Vec<Fixture>) -> Vec<Fixture> {
     let Ok(filter) = std::env::var("QLD_FIXTURE") else {
         return fixtures;
@@ -952,6 +1038,7 @@ fn run_job_inner(
     if let Some(reason) = &fixture.skip {
         return Err(Status::skip(format!("fixture disabled: {reason}")));
     }
+    check_required_files(fixture)?;
     let env = TargetEnv::resolve(job.target.as_deref())?;
     let work = dir.join("work");
     prepare(fixture, &env, &work, log)?;

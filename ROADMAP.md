@@ -202,17 +202,26 @@ every benchmark.
 - [x] GNU linker plugin API host (`-plugin`, `-plugin-opt`, `--plugin-opt=`),
       dynamically loading `liblto_plugin.so` (GCC 13–15) and `LLVMgold.so`
       (LLVM 18–22): standalone `plugin::Session` API
-- [~] Claim-file handling, symbol resolution reporting (`LDPR_*`), adding
-      compiled objects back into the link, archives containing IR members:
-      done in the host API; ELF driver integration pending
-- [ ] ThinLTO options passthrough: jobs, cache directory and pruning policy,
-      `thinlto-index-only`
-- [ ] Clean fallback and a clear diagnostic when an IR input has no plugin
+- [x] Claim-file handling, symbol resolution reporting (`LDPR_*`), adding
+      compiled objects back into the link, archives containing IR members
+      (including archives with no symbol index)
+- [x] ThinLTO options passthrough: jobs, cache directory and pruning policy,
+      `thinlto-index-only` (distributed ThinLTO verified end to end)
+- [x] Clean fallback and a clear diagnostic when an IR input has no plugin
+
+**Status:** exit criteria met for zlib, lua, curl (1629/1629), OpenSSL (4555
+tests), coreutils and Python (same failures as their GNU ld builds), LLVM +
+clang + lld built entirely with ThinLTO (`check-lld` 2063/2063), and a Rust
+crate with `-C linker-plugin-lto`. Not tried with LTO: the rustc bootstrap and
+musl. Replaying every `gcc -flto` link of those projects and diffing the
+plugin's `-fresolution=` files against GNU ld's matched on 2.6M+ resolutions,
+apart from the documented archive-order difference.
 
 **Exit criteria:** `gcc -flto` and `clang -flto` / `-flto=thin` builds of the M2
 project set link and pass their test suites. The linker plugin is behind the
-`plugin` cargo feature, which is on by default in the binary and off by default
-in the library.
+`plugin` cargo feature, on by default (cargo features are per package, not per
+target, so the library carries it too; building with `--no-default-features`
+drops the FFI entirely).
 
 ---
 

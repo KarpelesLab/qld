@@ -44,6 +44,9 @@ pub enum Error {
     NotFound(String),
     /// A hard limit was exceeded (more than 2^32 input files, symbols, …).
     Limit(String),
+    /// An LTO plugin could not be used, or an IR input has no plugin to
+    /// compile it.
+    Plugin(String),
     /// An internal invariant was violated: a bug in qld, such as a backend
     /// handing a pass an inconsistent layout. Never caused by input files.
     Internal(String),
@@ -102,6 +105,7 @@ impl fmt::Display for Error {
             Self::Script(error) => write!(f, "{error}"),
             Self::Option(message) | Self::NotFound(message) => write!(f, "{message}"),
             Self::Limit(message) => write!(f, "limit exceeded: {message}"),
+            Self::Plugin(message) => write!(f, "{message}"),
             Self::Internal(message) => write!(f, "internal error: {message}"),
             Self::Reported { errors } if *errors == 1 => write!(f, "1 error"),
             Self::Reported { errors } => write!(f, "{errors} errors"),

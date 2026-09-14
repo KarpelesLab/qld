@@ -143,7 +143,8 @@ behavior is kept where it matters. See
 
 When LTO inputs exist, their symbol tables (supplied by the plugin) take part
 in resolution. Once resolution settles, the plugin compiles the IR, the
-resulting native objects replace the IR inputs, and resolution runs again. See
+resulting native objects replace the IR inputs, and resolution runs a second
+time from a fresh symbol table (exactly twice, not a loop). See
 [optimizations.md](optimizations.md#lto).
 
 ### 6. Relocation scan

@@ -1,0 +1,31 @@
+# M6: clang -flto (full LTO through LLVMgold.so), PIE mixing LLVM bitcode
+# (main.o, square.o) and a native object. Skipped where clang is missing.
+description = "clang -flto PIE mixing bitcode and native objects"
+compile = [
+  "clang -O2 -flto -fPIE -c main.c",
+  "clang -O2 -flto -fPIE -c square.c",
+  "clang -O2 -fPIE -c native.c",
+]
+driver = "clang"
+link = "-O2 -flto -pie -o out main.o square.o native.o"
+run = "./out"
+expect.stdout = """
+square=49
+native=42
+native->ir=2010
+"""
+expect.readelf = [
+  "DYN (Position-Independent Executable file)",
+  "ir_callee_lto_qld",
+  "native_add_lto_qld",
+  "!dead_function_lto_qld",
+]
+determinism = true
+timeout = 120
+# clang can be installed without LLVMgold.so, which -flto needs.
+requires_files = [
+  "/usr/lib/llvm/*/lib*/LLVMgold.so",   # Gentoo
+  "/usr/lib/llvm-*/lib/LLVMgold.so",    # Debian, Ubuntu
+  "/usr/lib*/LLVMgold.so",              # Fedora, Arch
+  "/usr/local/lib*/LLVMgold.so",
+]

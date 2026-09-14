@@ -104,12 +104,23 @@ interface GCC and Clang expect when they run the linker with
 - **GCC:** `liblto_plugin.so`, which runs `lto-wrapper`
 - **LLVM:** `LLVMgold.so` (full LTO and ThinLTO)
 
-**Flow:** the plugin claims IR inputs (`claim_file_handler`) and qld adds
-their symbols to resolution. When resolution settles, qld reports each
-symbol's status (`LDPR_PREVAILING_DEF_IRONLY`, …) through `get_symbols`. The
-plugin compiles the IR (`all_symbols_read_handler`) and adds native objects
-(`add_input_file`). qld then re-runs resolution with those objects in place
-of the IR.
+**Flow:** plugins are loaded when the first IR input appears, so a link with
+no IR loads nothing and is byte-identical with or without `-plugin`. IR is
+recognized while objects are parsed (LLVM bitcode magic, or `.gnu.lto_*`
+sections in a GCC object). Inputs are claimed inside the resolution rounds,
+in input-position order, so claims are deterministic; the claimed symbols
+take part in resolution exactly like an object's, and comdat keys deduplicate
+IR against native copies. When resolution settles, qld reports each symbol's
+status (`LDPR_PREVAILING_DEF_IRONLY`, …) through `get_symbols`. The plugin
+compiles the IR (`all_symbols_read_handler`) and adds native objects
+(`add_input_file`). Resolution then runs a **second** time with those objects
+in place of the claimed files, keeping earlier archive extractions live;
+libraries the plugin asks for are appended. Plugin cleanup runs after the
+output is written, since it deletes those objects.
+
+A GCC "fat" object (`-ffat-lto-objects`) links as native code when no plugin
+claims it. Other IR without a plugin is an error naming the file and the
+driver that would supply the plugin.
 
 **Pure Rust note:** building qld needs no C code. The plugin itself is native
 code that the compiler toolchain provides, and it is loaded with `dlopen` at
