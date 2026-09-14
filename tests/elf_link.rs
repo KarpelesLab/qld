@@ -1880,3 +1880,44 @@ fn weak_data_imports_bring_their_strong_alias() {
     }
     assert_eq!(stdout_of(&dir, "out"), "3 1\n");
 }
+
+/// An exported symbol in a non-allocated section keeps that section's index
+/// in `.dynsym` (rustc's `rust_metadata_*` symbols in `.rustc`), as with GNU
+/// ld, instead of becoming absolute.
+#[test]
+fn dynamic_symbols_in_non_allocated_sections_keep_their_section() {
+    require!("as", "readelf");
+    let dir = scratch("dynsym-nonalloc");
+    assemble(
+        &dir,
+        "meta",
+        "
+    .section .meta_qld,\"\",@progbits
+    .globl metadata_qld
+    .type metadata_qld, @object
+    .size metadata_qld, 4
+metadata_qld:
+    .long 1
+    .text
+    .globl code_qld
+code_qld:
+    ret
+",
+    );
+    qld_ok(&dir, &["-shared", "-o", "libmeta.so", "meta.o"]);
+    let sections = readelf(&dir, &["-S", "libmeta.so"]);
+    let index = sections
+        .lines()
+        .find(|l| l.contains(" .meta_qld "))
+        .and_then(|l| l.split('[').nth(1))
+        .and_then(|l| l.split(']').next())
+        .map(|n| n.trim().to_string())
+        .unwrap_or_else(|| panic!("no .meta_qld: {sections}"));
+    let dynsym = readelf(&dir, &["--dyn-syms", "libmeta.so"]);
+    let line = dynsym
+        .lines()
+        .find(|l| l.ends_with(" metadata_qld"))
+        .unwrap_or_else(|| panic!("metadata_qld not exported: {dynsym}"));
+    let ndx = line.split_whitespace().nth(6).unwrap_or_default();
+    assert_eq!(ndx, index, "{line}\n{sections}");
+}

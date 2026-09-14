@@ -370,7 +370,10 @@ fn put_sym(out: &mut [u8], name: usize, info: u8, other: u8, shndx: u16, value: 
     entry[16..24].copy_from_slice(&size.to_le_bytes());
 }
 
-fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32) -> u16 {
+/// The output section header index of input section `section` of `file`
+/// (after ICF folding): `SHN_ABS` when its output section was dropped as
+/// empty, `SHN_UNDEF` when it is not in the output.
+pub(crate) fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32) -> u16 {
     let Some(id) = addresses
         .refs
         .sections
