@@ -20,9 +20,10 @@
 //!
 //! # Writing
 //!
-//! [`compress_section`] produces the contents of an `SHF_COMPRESSED`
-//! output section for `--compress-debug-sections`: the compression header
-//! followed by the compressed data, compressed in parallel chunks.
+//! [`compress_section`] produces the contents of a compressed output
+//! section for `--compress-debug-sections=zlib|zstd|zlib-gnu`: the
+//! compression header (or the legacy `ZLIB` header) followed by the data,
+//! compressed in parallel chunks.
 
 use std::borrow::Cow;
 
@@ -184,8 +185,9 @@ impl<'a> CompressedSection<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Malformed` if `out` has the wrong size or the data
-    /// is corrupt, truncated, fails its checksum or has a different size.
+    /// Returns `Error::Malformed` if the data is corrupt, truncated, fails
+    /// its checksum or has a different size, and `Error::Internal` if `out`
+    /// has the wrong length.
     pub fn decompress_into(&self, out: &mut [u8], source: Source<'_>) -> Result<()> {
         if u64::try_from(out.len()).ok() != Some(self.size) {
             return Err(Error::Internal(format!(
