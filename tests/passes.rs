@@ -11,11 +11,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use qld::passes::{
-    Csr, CsrBuilder, GraphBuilder, IcfInput, IcfMode, IcfReloc, IcfSection, IcfTarget, MergeError,
-    MergeGroup, MergeKind, MergeSection, ReferenceTree, SectionGraph, collect_garbage,
-    fold_identical, merge_sections, why_live,
+    BitSet, Csr, CsrBuilder, GraphBuilder, IcfInput, IcfMode, IcfReloc, IcfSection, IcfTarget,
+    MergeError, MergeGroup, MergeInput, MergeKind, MergeSection, MergedSections, PieceRef,
+    ReferenceTree, SectionGraph, SplitSection, collect_garbage, fold_identical, merge_sections,
+    merge_split_sections, split_section, why_live,
 };
 use qld::{SectionId, SymbolId};
+use rayon::prelude::*;
 
 /// splitmix64: small, seedable, good enough for test data.
 struct Rng(u64);
@@ -634,48 +636,159 @@ fn string_section(rng: &mut Rng, vocabulary: &[Vec<u8>], char_size: usize) -> Ve
     data
 }
 
-/// Output of [`naive_merge`]: merged size, `(input offset, output offset)` of
-/// each piece of each section, and the distinct pieces.
-type NaiveMerge = (u64, Vec<Vec<(u64, u64)>>, BTreeMap<Vec<u8>, u64>);
+/// Naive reference for splitting: the `(start, end)` of every piece.
+fn naive_split(kind: MergeKind, data: &[u8]) -> Vec<(u64, u64)> {
+    let mut pieces = Vec::new();
+    match kind {
+        MergeKind::Strings { char_size } => {
+            let unit = usize::from(char_size);
+            let mut start = 0usize;
+            for position in (0..data.len()).step_by(unit) {
+                if data[position..position + unit].iter().all(|&b| b == 0) {
+                    pieces.push((start as u64, (position + unit) as u64));
+                    start = position + unit;
+                }
+            }
+        }
+        MergeKind::Fixed { entry_size } => {
+            for position in (0..data.len() as u64).step_by(entry_size as usize) {
+                pieces.push((position, position + entry_size));
+            }
+        }
+    }
+    pieces
+}
 
-/// Naive reference for merging without tail merging: pieces, first
-/// occurrence order, aligned offsets.
-fn naive_merge(group: &MergeGroup, datas: &[&[u8]]) -> NaiveMerge {
+/// Output of [`naive_merge`]: merged size, `(input offset, output offset)` of
+/// each piece of each section (`None` if dead), and the distinct live pieces.
+type NaiveMerge = (u64, Vec<Vec<(u64, Option<u64>)>>, BTreeMap<Vec<u8>, u64>);
+
+/// Naive reference for merging without tail merging: pieces, first live
+/// occurrence order, aligned offsets. `live(section, piece)` says whether a
+/// piece of `datas[section]` is live.
+fn naive_merge(
+    group: &MergeGroup,
+    datas: &[&[u8]],
+    live: &dyn Fn(usize, usize) -> bool,
+) -> NaiveMerge {
     let mut offsets: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
     let mut size = 0u64;
     let mut per_section = Vec::new();
-    for data in datas {
+    for (section, data) in datas.iter().enumerate() {
         let mut pieces = Vec::new();
-        let mut start = 0usize;
-        let mut push = |start: usize, end: usize, pieces: &mut Vec<(u64, u64)>| {
-            let bytes = data[start..end].to_vec();
+        for (piece, (start, end)) in naive_split(group.kind, data).into_iter().enumerate() {
+            if !live(section, piece) {
+                pieces.push((start, None));
+                continue;
+            }
+            let bytes = data[start as usize..end as usize].to_vec();
             let offset = *offsets.entry(bytes).or_insert_with(|| {
                 let aligned = size.div_ceil(group.alignment) * group.alignment;
-                size = aligned + (end - start) as u64;
+                size = aligned + (end - start);
                 aligned
             });
-            pieces.push((start as u64, offset));
-        };
-        match group.kind {
-            MergeKind::Strings { char_size } => {
-                let unit = usize::from(char_size);
-                for position in (0..data.len()).step_by(unit) {
-                    if data[position..position + unit].iter().all(|&b| b == 0) {
-                        push(start, position + unit, &mut pieces);
-                        start = position + unit;
-                    }
-                }
-            }
-            MergeKind::Fixed { entry_size } => {
-                let unit = entry_size as usize;
-                for position in (0..data.len()).step_by(unit) {
-                    push(position, position + unit, &mut pieces);
-                }
-            }
+            pieces.push((start, Some(offset)));
         }
         per_section.push(pieces);
     }
     (size, per_section, offsets)
+}
+
+/// The merged contents of every group.
+fn merged_images(merged: &MergedSections<'_, '_>, groups: usize) -> Vec<Vec<u8>> {
+    (0..groups)
+        .map(|g| {
+            let mut out = vec![0xee; merged.group(g).unwrap().size() as usize];
+            merged.write_group(g, &mut out).unwrap();
+            out
+        })
+        .collect()
+}
+
+/// Asserts that two merge results agree on layout and on every offset.
+fn assert_same_merge(
+    a: &MergedSections<'_, '_>,
+    b: &MergedSections<'_, '_>,
+    sections: &[MergeSection<'_>],
+    groups: usize,
+) {
+    assert_eq!(a.groups(), b.groups());
+    assert_eq!(merged_images(a, groups), merged_images(b, groups));
+    assert_eq!(a.num_pieces(), b.num_pieces());
+    for (s, section) in sections.iter().enumerate() {
+        for offset in 0..=section.data.len() as u64 {
+            assert_eq!(a.output_offset(s, offset), b.output_offset(s, offset));
+            assert_eq!(a.piece_at(s, offset), b.piece_at(s, offset));
+        }
+    }
+}
+
+/// Checks a merge result against [`naive_merge`] for every group.
+/// `live(section, piece)` uses indices into `sections`.
+fn check_against_reference(
+    merged: &MergedSections<'_, '_>,
+    groups: &[MergeGroup],
+    sections: &[MergeSection<'_>],
+    live: &dyn Fn(usize, usize) -> bool,
+) {
+    let images = merged_images(merged, groups.len());
+    for (g, group) in groups.iter().enumerate() {
+        let members: Vec<usize> = (0..sections.len())
+            .filter(|&s| sections[s].group as usize == g)
+            .collect();
+        let datas: Vec<&[u8]> = members.iter().map(|&s| sections[s].data).collect();
+        let member_live = |position: usize, piece: usize| live(members[position], piece);
+        let (naive_size, naive_pieces, uniques) = naive_merge(group, &datas, &member_live);
+        let image = &images[g];
+        let size = merged.group(g).unwrap().size();
+        let tail = group.tail_merge && matches!(group.kind, MergeKind::Strings { .. });
+        if !tail {
+            assert_eq!(size, naive_size);
+        } else {
+            assert!(size <= naive_size);
+            if group.alignment == 1 {
+                // Storage is exactly the strings that are not a suffix of
+                // another distinct string.
+                let owned: u64 = uniques
+                    .keys()
+                    .filter(|s| !uniques.keys().any(|o| o.len() > s.len() && o.ends_with(s)))
+                    .map(|s| s.len() as u64)
+                    .sum();
+                assert_eq!(size, owned);
+            }
+        }
+        for (member, pieces) in members.iter().zip(&naive_pieces) {
+            let data = sections[*member].data;
+            for (index, &(start, naive_out)) in pieces.iter().enumerate() {
+                let end = pieces.get(index + 1).map_or(data.len() as u64, |p| p.0);
+                let Some(naive_out) = naive_out else {
+                    for inner in start..end {
+                        assert_eq!(merged.output_offset(*member, inner), None);
+                    }
+                    assert_eq!(merged.piece_output_offset(*member, index as u32), None);
+                    continue;
+                };
+                let out = merged.output_offset(*member, start).expect("mapped");
+                if !tail {
+                    assert_eq!(out, naive_out);
+                }
+                assert_eq!(out % group.alignment, 0);
+                let bytes = &data[start as usize..end as usize];
+                assert_eq!(&image[out as usize..out as usize + bytes.len()], bytes);
+                assert_eq!(merged.piece_output_offset(*member, index as u32), Some(out));
+                // Offsets inside the piece keep their position.
+                for inner in start..end {
+                    assert_eq!(
+                        merged.output_offset(*member, inner),
+                        Some(out + inner - start)
+                    );
+                    let found = merged.piece_at(*member, inner).unwrap();
+                    assert_eq!(found.addend, inner - start);
+                    assert_eq!(found.piece as usize, index);
+                }
+            }
+        }
+    }
 }
 
 fn random_merge_case(rng: &mut Rng) -> (Vec<MergeGroup>, Vec<(u32, Vec<u8>)>) {
@@ -716,93 +829,153 @@ fn random_merge_case(rng: &mut Rng) -> (Vec<MergeGroup>, Vec<(u32, Vec<u8>)>) {
     (groups, sections)
 }
 
+fn to_sections(raw: &[(u32, Vec<u8>)]) -> Vec<MergeSection<'_>> {
+    raw.iter()
+        .map(|(group, data)| MergeSection {
+            group: *group,
+            data,
+        })
+        .collect()
+}
+
+/// Splits every section with its group's kind and alignment, independently,
+/// on `threads` OS threads that take sections round-robin (each in reverse
+/// order), as a backend does while parsing files in parallel.
+fn split_on_threads<'a>(
+    groups: &[MergeGroup],
+    sections: &[MergeSection<'a>],
+    threads: usize,
+) -> Vec<SplitSection<'a>> {
+    let mut indexed: Vec<(usize, SplitSection<'a>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|thread| {
+                scope.spawn(move || {
+                    (0..sections.len())
+                        .rev()
+                        .filter(|index| index % threads == thread)
+                        .map(|index| {
+                            let section = &sections[index];
+                            let group = groups[section.group as usize];
+                            let split = split_section(section.data, group.kind, group.alignment)
+                                .expect("well-formed");
+                            (index, split)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("split thread"))
+            .collect()
+    });
+    indexed.sort_by_key(|&(index, _)| index);
+    indexed.into_iter().map(|(_, split)| split).collect()
+}
+
 #[test]
 fn merge_matches_reference_on_random_sections() {
     let mut rng = Rng(6);
     for _ in 0..150 {
         let (groups, raw) = random_merge_case(&mut rng);
-        let sections: Vec<MergeSection<'_>> = raw
-            .iter()
-            .map(|(group, data)| MergeSection {
-                group: *group,
-                data,
-            })
-            .collect();
+        let sections = to_sections(&raw);
         let results: Vec<_> = POOLS
             .iter()
             .map(|&threads| {
                 in_pool(threads, || {
-                    let merged = merge_sections(&groups, &sections).expect("well-formed");
-                    let images: Vec<Vec<u8>> = (0..groups.len())
-                        .map(|g| {
-                            let mut out = vec![0xee; merged.group(g).unwrap().size() as usize];
-                            merged.write_group(g, &mut out).unwrap();
-                            out
-                        })
-                        .collect();
-                    (merged, images)
+                    merge_sections(&groups, &sections).expect("well-formed")
                 })
             })
             .collect();
-        let (merged, images) = &results[0];
-        for (other, other_images) in &results[1..] {
-            assert_eq!(images, other_images, "merged bytes depend on thread count");
-            assert_eq!(merged.groups(), other.groups());
-            for (s, section) in sections.iter().enumerate() {
-                for offset in 0..section.data.len() as u64 {
-                    assert_eq!(
-                        merged.output_offset(s, offset),
-                        other.output_offset(s, offset)
-                    );
+        for other in &results[1..] {
+            assert_same_merge(&results[0], other, &sections, groups.len());
+        }
+        check_against_reference(&results[0], &groups, &sections, &|_, _| true);
+    }
+}
+
+#[test]
+fn merge_two_phases_match_wrapper_and_reference() {
+    let mut rng = Rng(11);
+    for case in 0..150 {
+        let (groups, raw) = random_merge_case(&mut rng);
+        let sections = to_sections(&raw);
+        let splits = split_on_threads(&groups, &sections, 1 + case % 4);
+
+        // Phase 1 alone maps offsets to pieces, at piece boundaries and in
+        // the middle of pieces.
+        for (split, section) in splits.iter().zip(&sections) {
+            let naive = naive_split(groups[section.group as usize].kind, section.data);
+            assert_eq!(split.num_pieces(), naive.len());
+            assert_eq!(split.hashes().len(), naive.len());
+            for (piece, &(start, end)) in naive.iter().enumerate() {
+                let expect = |offset: u64| {
+                    Some(PieceRef {
+                        piece: piece as u32,
+                        addend: offset - start,
+                    })
+                };
+                assert_eq!(split.piece_start(piece), Some(start));
+                assert_eq!(
+                    split.piece_bytes(piece),
+                    Some(&section.data[start as usize..end as usize])
+                );
+                let mid = start + (end - start) / 2;
+                for offset in [start, mid, end - 1] {
+                    assert_eq!(split.piece_at(offset), expect(offset));
                 }
             }
+            assert_eq!(split.piece_at(section.data.len() as u64), None);
+            assert_eq!(split.piece_start(naive.len()), None);
+            assert_eq!(split.piece_bytes(naive.len()), None);
         }
 
-        for (g, group) in groups.iter().enumerate() {
-            let members: Vec<usize> = (0..sections.len())
-                .filter(|&s| sections[s].group as usize == g)
-                .collect();
-            let datas: Vec<&[u8]> = members.iter().map(|&s| sections[s].data).collect();
-            let (naive_size, naive_pieces, uniques) = naive_merge(group, &datas);
-            let image = &images[g];
-            let tail = group.tail_merge && matches!(group.kind, MergeKind::Strings { .. });
-            if !tail {
-                assert_eq!(merged.group(g).unwrap().size(), naive_size);
-            } else {
-                assert!(merged.group(g).unwrap().size() <= naive_size);
-                if group.alignment == 1 {
-                    // Storage is exactly the strings that are not a suffix of
-                    // another distinct string.
-                    let owned: u64 = uniques
-                        .keys()
-                        .filter(|s| !uniques.keys().any(|o| o.len() > s.len() && o.ends_with(s)))
-                        .map(|s| s.len() as u64)
-                        .sum();
-                    assert_eq!(merged.group(g).unwrap().size(), owned);
-                }
+        let inputs: Vec<MergeInput<'_, '_>> = splits
+            .iter()
+            .zip(&sections)
+            .map(|(split, section)| MergeInput {
+                group: section.group,
+                split,
+            })
+            .collect();
+        let bases: Vec<usize> = splits
+            .iter()
+            .scan(0, |next, split| {
+                let base = *next;
+                *next += split.num_pieces();
+                Some(base)
+            })
+            .collect();
+        let total: usize = splits.iter().map(SplitSection::num_pieces).sum();
+        let mut live = BitSet::new(total);
+        for bit in 0..total {
+            if rng.chance(70) {
+                live.insert(bit);
             }
-            for (member, pieces) in members.iter().zip(&naive_pieces) {
-                let data = sections[*member].data;
-                for (index, &(start, naive_out)) in pieces.iter().enumerate() {
-                    let end = pieces.get(index + 1).map_or(data.len() as u64, |p| p.0);
-                    let out = merged.output_offset(*member, start).expect("mapped");
-                    if !tail {
-                        assert_eq!(out, naive_out);
-                    }
-                    assert_eq!(out % group.alignment, 0);
-                    let bytes = &data[start as usize..end as usize];
-                    assert_eq!(&image[out as usize..out as usize + bytes.len()], bytes);
-                    // Offsets inside the piece keep their position.
-                    for inner in start..end {
-                        assert_eq!(
-                            merged.output_offset(*member, inner),
-                            Some(out + inner - start)
-                        );
-                        let found = merged.piece_at(*member, inner).unwrap();
-                        assert_eq!(found.addend, inner - start);
-                    }
-                }
+        }
+        let is_live = |section: usize, piece: usize| live.get(bases[section] + piece);
+
+        let wrapped = merge_sections(&groups, &sections).expect("well-formed");
+        let results: Vec<_> = POOLS
+            .iter()
+            .map(|&threads| {
+                in_pool(threads, || {
+                    let all = merge_split_sections(&groups, &inputs, None).expect("consistent");
+                    let partial =
+                        merge_split_sections(&groups, &inputs, Some(&live)).expect("consistent");
+                    (all, partial)
+                })
+            })
+            .collect();
+        for (all, partial) in &results {
+            assert_same_merge(all, &wrapped, &sections, groups.len());
+            assert_same_merge(partial, &results[0].1, &sections, groups.len());
+            check_against_reference(all, &groups, &sections, &|_, _| true);
+            check_against_reference(partial, &groups, &sections, &is_live);
+            for (s, base) in bases.iter().enumerate() {
+                assert_eq!(partial.first_piece(s), Some(*base));
             }
+            assert_eq!(partial.first_piece(sections.len()), Some(total));
         }
     }
 }
@@ -834,13 +1007,7 @@ fn merge_never_panics_on_garbage() {
                 (rng.below(groups.len() + 1) as u32, data)
             })
             .collect();
-        let sections: Vec<MergeSection<'_>> = raw
-            .iter()
-            .map(|(group, data)| MergeSection {
-                group: *group,
-                data,
-            })
-            .collect();
+        let sections = to_sections(&raw);
         match merge_sections(&groups, &sections) {
             Ok(merged) => {
                 for g in 0..groups.len() {
@@ -854,14 +1021,61 @@ fn merge_never_panics_on_garbage() {
                     }
                 }
             }
-            Err(MergeError::Malformed(malformed)) => {
-                assert!(malformed.section < sections.len());
-                assert!(malformed.offset <= sections[malformed.section].data.len() as u64);
+            Err(MergeError::Malformed { section, malformed }) => {
+                assert!(section < sections.len());
+                assert!(malformed.offset <= sections[section].data.len() as u64);
                 // The same error is reported under any thread count.
                 let again = in_pool(8, || merge_sections(&groups, &sections).err());
-                assert_eq!(again, Some(MergeError::Malformed(malformed)));
+                assert_eq!(again, Some(MergeError::Malformed { section, malformed }));
             }
             Err(MergeError::Input(_)) => {}
+        }
+
+        // Phase 1 with arbitrary kinds and alignments, then phase 2 with
+        // arbitrary (possibly mismatched) groups and liveness bitmaps.
+        let splits: Vec<SplitSection<'_>> = sections
+            .iter()
+            .filter_map(|section| {
+                let group = groups[rng.below(groups.len())];
+                let alignment = rng.below(9) as u64;
+                let result = split_section(section.data, group.kind, alignment);
+                if let Ok(split) = &result {
+                    for offset in 0..=section.data.len() as u64 {
+                        if let Some(found) = split.piece_at(offset) {
+                            let start = split.piece_start(found.piece as usize).unwrap();
+                            assert_eq!(start + found.addend, offset);
+                        }
+                    }
+                }
+                result.ok()
+            })
+            .collect();
+        let inputs: Vec<MergeInput<'_, '_>> = splits
+            .iter()
+            .map(|split| MergeInput {
+                group: rng.below(groups.len() + 1) as u32,
+                split,
+            })
+            .collect();
+        let total: usize = splits.iter().map(SplitSection::num_pieces).sum();
+        let mut live = BitSet::new(total + usize::from(rng.chance(20)));
+        for bit in 0..live.len() {
+            if rng.chance(50) {
+                live.insert(bit);
+            }
+        }
+        let bitmap = rng.chance(50).then_some(&live);
+        if let Ok(merged) = merge_split_sections(&groups, &inputs, bitmap) {
+            for g in 0..groups.len() {
+                let mut out = vec![0; merged.group(g).unwrap().size() as usize];
+                merged.write_group(g, &mut out).unwrap();
+            }
+            for (s, split) in splits.iter().enumerate() {
+                for offset in 0..=split.data().len() as u64 + 1 {
+                    let _ = merged.output_offset(s, offset);
+                }
+                let _ = merged.piece_output_offset(s, split.num_pieces() as u32);
+            }
         }
     }
 }
@@ -1006,7 +1220,7 @@ fn bench_merge_million_sections() {
         for threads in [1, 8, rayon::current_num_threads()] {
             let merged = in_pool(threads, || {
                 time(
-                    &format!("merge: tail_merge={tail_merge}, {threads} threads"),
+                    &format!("merge: one-shot, tail_merge={tail_merge}, {threads} threads"),
                     || merge_sections(&groups, &sections).expect("merge"),
                 )
             });
@@ -1015,6 +1229,31 @@ fn bench_merge_million_sections() {
                 merged.num_pieces(),
                 merged.group(0).unwrap().size()
             );
+            drop(merged);
+            in_pool(threads, || {
+                // Phase 1 as the backend runs it: one call per section from
+                // parallel per-file parsing.
+                let splits: Vec<SplitSection<'_>> = time(
+                    &format!("merge:   phase 1 split, {threads} threads"),
+                    || {
+                        sections
+                            .par_iter()
+                            .map(|section| {
+                                split_section(section.data, groups[0].kind, 1).expect("split")
+                            })
+                            .collect()
+                    },
+                );
+                let inputs: Vec<MergeInput<'_, '_>> = splits
+                    .iter()
+                    .map(|split| MergeInput { group: 0, split })
+                    .collect();
+                let merged = time(
+                    &format!("merge:   phase 2 dedup+layout, {threads} threads"),
+                    || merge_split_sections(&groups, &inputs, None).expect("merge"),
+                );
+                assert_eq!(merged.num_pieces(), n * 5);
+            });
         }
     }
 }

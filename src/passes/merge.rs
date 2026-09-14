@@ -1,43 +1,63 @@
 //! Mergeable sections (`SHF_MERGE`, `SHF_STRINGS`; Mach-O `cstring_literals`
 //! and literal pools).
 //!
-//! # Input
+//! Merging runs in two phases, at two points of the pipeline
+//! (`docs/architecture.md`):
 //!
-//! The backend sorts mergeable input sections into [`MergeGroup`]s, one per
-//! output merged section: same piece kind, same alignment, same name and
-//! flags as its format requires. Each input section is a [`MergeSection`]:
-//! its bytes plus its group number. Sections are numbered by their position
-//! in the slice passed to [`merge_sections`], which must be input order.
+//! # Phase 1: split (stage 4, object parsing)
 //!
-//! # Algorithm
+//! [`split_section`] splits one input section into pieces and hashes each
+//! piece, independently of every other section, so the backend calls it from
+//! its parallel per-file parsing. Pieces are NUL-terminated strings (the
+//! terminator is part of the piece; characters of 1, 2 or 4 bytes) or
+//! fixed-size entries. The resulting [`SplitSection`] maps any input offset to
+//! a [`PieceRef`] (piece, addend within the piece) before deduplication, which
+//! is how the relocation scan (stage 6) records references into merge
+//! sections. Malformed sections give a [`MalformedMerge`].
 //!
-//! 1. **Split** every section into pieces in parallel: NUL-terminated strings
-//!    (the terminator is part of the piece; characters of 1, 2 or 4 bytes)
-//!    or fixed-size entries. Malformed sections (an unterminated last string,
-//!    a size that is not a multiple of the character or entry size) give a
-//!    [`MergeError`]; the one in the lowest-numbered section is reported.
-//! 2. **Deduplicate** in parallel through a sharded hash table (hashbrown
-//!    behind per-shard locks, shard picked from a fixed-seed foldhash of the
-//!    piece). Each distinct content keeps the lowest piece number, so the
-//!    *leader* of every piece is its first occurrence in input order no
-//!    matter which thread inserted first.
-//! 3. **Tail merge** (optional, strings only, `-O2`): per group, sort the
+//! # Phase 2: deduplicate and lay out (stage 8, after GC, before ICF)
+//!
+//! The backend sorts the live split sections into [`MergeGroup`]s, one per
+//! output merged section (same piece kind, and the same name, flags and
+//! alignment as its format requires), and passes them to
+//! [`merge_split_sections`] as [`MergeInput`]s in input order, optionally
+//! with a per-piece liveness bitmap.
+//!
+//! 1. **Deduplicate** in parallel through a sharded hash table (hashbrown
+//!    behind per-shard locks), keyed by the precomputed piece hash mixed with
+//!    the group number, and confirmed by comparing bytes. Each distinct
+//!    content keeps the lowest piece number, so the *leader* of every piece
+//!    is its first live occurrence in input order no matter which thread
+//!    inserted first.
+//! 2. **Tail merge** (optional, strings only, `-O2`): per group, sort the
 //!    leaders by reversed content, in parallel. A string that is a suffix of
 //!    the string before it in descending order shares that string's storage,
 //!    if the offset of the suffix is a multiple of the alignment. Cost:
 //!    `O(U log U)` comparisons for `U` distinct strings, each comparison
 //!    `O(common suffix length)`.
-//! 4. **Assign offsets** per group, sequentially in first-occurrence order:
+//! 3. **Assign offsets** per group, sequentially in first-occurrence order:
 //!    every piece that owns storage starts at the next multiple of the
 //!    group's alignment. Tail-merged strings point into their owner. Every
-//!    other piece takes its leader's offset (in parallel).
+//!    other live piece takes its leader's offset (in parallel).
 //!
-//! The result maps any `(section, input offset)`, including offsets in the
-//! middle of a piece, to an output offset or to a piece plus an addend within
-//! it, and lists each group's pieces for writing.
+//! The resulting [`MergedSections`] maps (section, piece) and
+//! (section, input offset) to an output offset, and writes each group's
+//! contents in parallel.
+//!
+//! [`merge_sections`] runs both phases at once, for callers that have all
+//! sections at hand.
+//!
+//! # Errors
+//!
+//! Phase 1 reports a malformed section as a [`MalformedMerge`], which needs
+//! the file name to become a [`crate::Error`] ([`MalformedMerge::into_error`]).
+//! Phase 2 only fails on inconsistent arguments, an [`InputError`], which
+//! converts into [`crate::Error::Internal`] with `?`. [`MergeError`], from the
+//! one-shot wrapper, combines both and so has no `From` conversion either.
+
+mod split;
 
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,15 +65,22 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use rayon::prelude::*;
 
+use super::bitset::BitSet;
 use super::csr::{CsrBuilder, InputError, for_each_row_mut};
-use super::hash::hasher;
-use std::hash::Hasher;
+use split::MIN_PIECES_PER_TASK;
+pub use split::{MalformedMerge, MergeProblem, PieceRef, SplitSection, split_section};
 
 /// Number of dedup table shards. Does not affect results.
 const SHARDS: usize = 256;
 
-/// Minimum number of pieces per parallel task within one section.
-const MIN_PIECES_PER_TASK: usize = 1024;
+/// Output offset of a piece that is not live.
+const DEAD_OFFSET: u64 = u64::MAX;
+
+/// Dedup slot of a piece that is not live.
+const DEAD_SLOT: u64 = u64::MAX;
+
+/// Leader of a piece that is not live.
+const DEAD_LEADER: u32 = u32::MAX;
 
 /// How a mergeable section splits into pieces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,77 +104,24 @@ pub enum MergeKind {
 pub struct MergeGroup {
     /// How the group's sections split into pieces.
     pub kind: MergeKind,
-    /// Alignment of every piece in the output; a power of two.
+    /// Alignment of every piece in the output; a power of two, at least the
+    /// alignment of every section in the group.
     pub alignment: u64,
     /// Whether strings may share storage with strings they are a suffix of
     /// (`-O2`). Ignored for fixed-size entries.
     pub tail_merge: bool,
 }
 
-/// One mergeable input section.
-#[derive(Clone, Copy, Debug)]
-pub struct MergeSection<'a> {
-    /// Index of the section's group in the slice of [`MergeGroup`]s.
-    pub group: u32,
-    /// The section's bytes, zero-copy from the input mapping.
-    pub data: &'a [u8],
-}
-
-/// What is wrong with a malformed mergeable section.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MergeProblem {
-    /// The last string has no terminator.
-    UnterminatedString,
-    /// The section size is not a multiple of the character or entry size.
-    SizeNotMultiple {
-        /// The character or entry size.
-        unit: u64,
-    },
-}
-
-/// A malformed mergeable input section.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MalformedMerge {
-    /// Index of the section in the input slice.
-    pub section: usize,
-    /// Offset within the section where the problem starts.
-    pub offset: u64,
-    /// What is wrong.
-    pub problem: MergeProblem,
-}
-
-impl MalformedMerge {
-    /// Converts into a fatal [`crate::Error::Malformed`] for `file`, given
-    /// the file offset at which the section's data starts.
-    #[must_use]
-    pub fn into_error(self, file: impl Into<PathBuf>, section_file_offset: u64) -> crate::Error {
-        crate::Error::malformed(
-            file,
-            section_file_offset.saturating_add(self.offset),
-            self.to_string(),
-        )
-    }
-}
-
-impl fmt::Display for MalformedMerge {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.problem {
-            MergeProblem::UnterminatedString => {
-                f.write_str("mergeable string section: string is not null terminated")
-            }
-            MergeProblem::SizeNotMultiple { unit } => write!(
-                f,
-                "mergeable section: size is not a multiple of the entry size {unit}"
-            ),
-        }
-    }
-}
-
 /// An error from [`merge_sections`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeError {
     /// An input section's contents are malformed.
-    Malformed(MalformedMerge),
+    Malformed {
+        /// Index of the section in the input slice.
+        section: usize,
+        /// What is wrong with it.
+        malformed: MalformedMerge,
+    },
     /// The groups or sections passed in are inconsistent.
     Input(InputError),
 }
@@ -155,7 +129,9 @@ pub enum MergeError {
 impl fmt::Display for MergeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Malformed(malformed) => malformed.fmt(f),
+            Self::Malformed { section, malformed } => {
+                write!(f, "merge section {section}: {malformed}")
+            }
             Self::Input(input) => input.fmt(f),
         }
     }
@@ -167,28 +143,6 @@ impl From<InputError> for MergeError {
     fn from(error: InputError) -> Self {
         Self::Input(error)
     }
-}
-
-/// Identifies one piece of one input section, across all groups. Pieces are
-/// numbered in input order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PieceId(u32);
-
-impl PieceId {
-    /// The zero-based piece number.
-    #[must_use]
-    pub fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-/// A location inside a merged piece.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PieceRef {
-    /// The piece containing the location.
-    pub piece: PieceId,
-    /// Offset of the location within the piece.
-    pub addend: u64,
 }
 
 /// A piece that owns storage in a group's output, for writing.
@@ -233,18 +187,33 @@ impl MergedGroup {
     }
 }
 
-/// The result of [`merge_sections`].
+/// One live split section given to [`merge_split_sections`].
+#[derive(Clone, Copy, Debug)]
+pub struct MergeInput<'s, 'a> {
+    /// Index of the section's group in the slice of [`MergeGroup`]s.
+    pub group: u32,
+    /// The section, split at parse time.
+    pub split: &'s SplitSection<'a>,
+}
+
+/// The result of [`merge_split_sections`] or [`merge_sections`].
+///
+/// Sections are named by their index in the input slice; pieces by their
+/// index within their section, as in [`SplitSection`].
 #[derive(Clone, Debug)]
-pub struct MergedSections<'a> {
-    sections: Vec<MergeSection<'a>>,
+pub struct MergedSections<'s, 'a> {
+    splits: Splits<'s, 'a>,
+    section_groups: Vec<u32>,
     groups: Vec<MergedGroup>,
-    /// CSR offsets: pieces of section `s` are `piece_start[s]..piece_start[s + 1]`.
-    piece_start: Vec<usize>,
-    input_offset: Vec<u64>,
+    /// Global piece numbers: pieces of section `s` are
+    /// `piece_base[s]..piece_base[s + 1]`.
+    piece_base: Vec<usize>,
+    /// Output offset of every piece, by global number; [`DEAD_OFFSET`] for
+    /// pieces that are not live.
     output_offset: Vec<u64>,
 }
 
-impl<'a> MergedSections<'a> {
+impl<'a> MergedSections<'_, 'a> {
     /// The merged layout of group `group`.
     #[must_use]
     pub fn group(&self, group: usize) -> Option<&MergedGroup> {
@@ -257,46 +226,67 @@ impl<'a> MergedSections<'a> {
         &self.groups
     }
 
-    /// Total number of pieces across all sections.
+    /// Number of input sections.
+    #[must_use]
+    pub fn num_sections(&self) -> usize {
+        self.splits.len()
+    }
+
+    /// Total number of pieces across all sections, live or not.
     #[must_use]
     pub fn num_pieces(&self) -> usize {
-        self.input_offset.len()
+        self.output_offset.len()
+    }
+
+    /// The split section `section`.
+    #[must_use]
+    pub fn split(&self, section: usize) -> Option<&SplitSection<'a>> {
+        self.splits.get(section)
+    }
+
+    /// The group number of section `section`.
+    #[must_use]
+    pub fn section_group(&self, section: usize) -> Option<u32> {
+        self.section_groups.get(section).copied()
+    }
+
+    /// Global number of the first piece of `section`: its pieces are
+    /// numbered from here on, as in the liveness bitmap given to
+    /// [`merge_split_sections`]. `Some(num_pieces())` for one past the last
+    /// section.
+    #[must_use]
+    pub fn first_piece(&self, section: usize) -> Option<usize> {
+        self.piece_base.get(section).copied()
     }
 
     /// Finds the piece containing `offset` in section `section`, and the
     /// offset within that piece. `None` if the section does not exist or the
-    /// offset is at or past its end.
+    /// offset is at or past its end. Pieces that are not live are found too.
     #[must_use]
     pub fn piece_at(&self, section: usize, offset: u64) -> Option<PieceRef> {
-        let data = self.sections.get(section)?.data;
-        if offset >= data.len() as u64 {
-            return None;
-        }
-        let start = *self.piece_start.get(section)?;
-        let end = *self.piece_start.get(section.checked_add(1)?)?;
-        let row = self.input_offset.get(start..end)?;
-        let local = row
-            .partition_point(|&piece| piece <= offset)
-            .checked_sub(1)?;
-        let piece_start = *row.get(local)?;
-        Some(PieceRef {
-            piece: PieceId(u32::try_from(start + local).ok()?),
-            addend: offset - piece_start,
-        })
+        self.split(section)?.piece_at(offset)
     }
 
-    /// Output offset of the start of `piece` in its group's merged section.
+    /// Output offset of the start of `piece` of `section`, in its group's
+    /// merged section. `None` if there is no such piece or it is not live.
     #[must_use]
-    pub fn piece_output_offset(&self, piece: PieceId) -> Option<u64> {
-        self.output_offset.get(piece.index()).copied()
+    pub fn piece_output_offset(&self, section: usize, piece: u32) -> Option<u64> {
+        let base = *self.piece_base.get(section)?;
+        let end = *self.piece_base.get(section.checked_add(1)?)?;
+        let index = base.checked_add(piece as usize).filter(|&i| i < end)?;
+        self.output_offset
+            .get(index)
+            .copied()
+            .filter(|&offset| offset != DEAD_OFFSET)
     }
 
     /// Maps `offset` in input section `section` to an offset in the merged
     /// output section of its group, keeping the position within the piece.
+    /// `None` if the offset is out of range or its piece is not live.
     #[must_use]
     pub fn output_offset(&self, section: usize, offset: u64) -> Option<u64> {
         let found = self.piece_at(section, offset)?;
-        self.piece_output_offset(found.piece)?
+        self.piece_output_offset(section, found.piece)?
             .checked_add(found.addend)
     }
 
@@ -321,14 +311,14 @@ impl<'a> MergedSections<'a> {
                 len: out.len(),
             });
         }
-        write_pieces(&self.sections, &merged.pieces, 0, out);
+        write_pieces(&self.splits, &merged.pieces, 0, out);
         Ok(())
     }
 }
 
 /// Writes `pieces` (sorted by output offset, non-overlapping, all starting at
 /// or after `base`) into `out`, which starts at output offset `base`.
-fn write_pieces(sections: &[MergeSection<'_>], pieces: &[OutputPiece], base: u64, out: &mut [u8]) {
+fn write_pieces(splits: &Splits<'_, '_>, pieces: &[OutputPiece], base: u64, out: &mut [u8]) {
     if pieces.len() > MIN_PIECES_PER_TASK {
         let mid = pieces.len() / 2;
         let split = pieces[mid].output_offset;
@@ -338,19 +328,19 @@ fn write_pieces(sections: &[MergeSection<'_>], pieces: &[OutputPiece], base: u64
         let (left_out, right_out) = out.split_at_mut(at);
         let (left, right) = pieces.split_at(mid);
         rayon::join(
-            || write_pieces(sections, left, base, left_out),
-            || write_pieces(sections, right, split, right_out),
+            || write_pieces(splits, left, base, left_out),
+            || write_pieces(splits, right, split, right_out),
         );
         return;
     }
     let mut cursor = 0usize;
     for piece in pieces {
-        let bytes = sections
+        let bytes = splits
             .get(piece.section as usize)
             .and_then(|section| {
                 let start = usize::try_from(piece.input_offset).ok()?;
                 let len = usize::try_from(piece.len).ok()?;
-                section.data.get(start..start.checked_add(len)?)
+                section.data().get(start..start.checked_add(len)?)
             })
             .unwrap_or(&[]);
         let Some(start) = usize::try_from(piece.output_offset - base).ok() else {
@@ -367,37 +357,6 @@ fn write_pieces(sections: &[MergeSection<'_>], pieces: &[OutputPiece], base: u64
     }
     if let Some(rest) = out.get_mut(cursor..) {
         rest.fill(0);
-    }
-}
-
-/// A piece during splitting.
-#[derive(Clone, Copy, Debug, Default)]
-struct Piece {
-    offset: u64,
-    hash: u64,
-}
-
-/// The split pieces of all sections.
-struct Split<'s, 'a> {
-    sections: &'s [MergeSection<'a>],
-    piece_start: &'s [usize],
-    pieces: &'s [Piece],
-}
-
-impl<'s, 'a> Split<'s, 'a> {
-    /// The pieces of `section`.
-    fn row(&self, section: usize) -> &'s [Piece] {
-        &self.pieces[self.piece_start[section]..self.piece_start[section + 1]]
-    }
-
-    /// The bytes of piece `local` of `section`, whose pieces are `row`.
-    fn bytes(&self, section: usize, local: usize, row: &[Piece]) -> &'a [u8] {
-        let data = self.sections[section].data;
-        let start = row[local].offset as usize;
-        let end = row
-            .get(local + 1)
-            .map_or(data.len(), |next| next.offset as usize);
-        &data[start..end]
     }
 }
 
@@ -443,122 +402,16 @@ fn check_groups(groups: &[MergeGroup]) -> Result<(), InputError> {
     Ok(())
 }
 
-/// Counts the pieces of one section, validating it.
-fn count_pieces(kind: MergeKind, data: &[u8]) -> Result<usize, (u64, MergeProblem)> {
-    let len = data.len();
-    match kind {
-        MergeKind::Strings { char_size } => {
-            let unit = usize::from(char_size);
-            let remainder = len % unit;
-            if remainder != 0 {
-                return Err((
-                    (len - remainder) as u64,
-                    MergeProblem::SizeNotMultiple { unit: unit as u64 },
-                ));
-            }
-            if unit == 1 {
-                if data.last().is_some_and(|&last| last != 0) {
-                    let start = data.iter().rposition(|&b| b == 0).map_or(0, |p| p + 1);
-                    return Err((start as u64, MergeProblem::UnterminatedString));
-                }
-                return Ok(data.iter().filter(|&&b| b == 0).count());
-            }
-            let is_nul = |c: &[u8]| c.iter().all(|&b| b == 0);
-            if data
-                .chunks_exact(unit)
-                .next_back()
-                .is_some_and(|c| !is_nul(c))
-            {
-                let start = data
-                    .chunks_exact(unit)
-                    .rposition(is_nul)
-                    .map_or(0, |p| (p + 1) * unit);
-                return Err((start as u64, MergeProblem::UnterminatedString));
-            }
-            Ok(data.chunks_exact(unit).filter(|c| is_nul(c)).count())
-        }
-        MergeKind::Fixed { entry_size } => {
-            let size_error = (0, MergeProblem::SizeNotMultiple { unit: entry_size });
-            let unit = usize::try_from(entry_size).map_err(|_| size_error)?;
-            if !len.is_multiple_of(unit) {
-                return Err((
-                    (len - len % unit) as u64,
-                    MergeProblem::SizeNotMultiple { unit: entry_size },
-                ));
-            }
-            Ok(len / unit)
-        }
-    }
-}
-
-/// Writes the start offset and hash of each piece of a validated section.
-fn split_pieces(kind: MergeKind, group: u32, data: &[u8], pieces: &mut [Piece]) {
-    let hash = |bytes: &[u8]| {
-        let mut h = hasher();
-        h.write_u32(group);
-        h.write(bytes);
-        h.finish()
-    };
-    match kind {
-        MergeKind::Strings { char_size } => {
-            // Find the pieces sequentially, temporarily storing each piece's
-            // end in `hash`, then hash them in parallel.
-            let unit = usize::from(char_size);
-            let mut start = 0usize;
-            let mut slots = pieces.iter_mut();
-            let mut record = |end: usize| {
-                if let Some(slot) = slots.next() {
-                    *slot = Piece {
-                        offset: start as u64,
-                        hash: end as u64,
-                    };
-                }
-                start = end;
-            };
-            if unit == 1 {
-                for (position, _) in data.iter().enumerate().filter(|&(_, &b)| b == 0) {
-                    record(position + 1);
-                }
-            } else {
-                for (index, _) in data
-                    .chunks_exact(unit)
-                    .enumerate()
-                    .filter(|(_, c)| c.iter().all(|&b| b == 0))
-                {
-                    record((index + 1) * unit);
-                }
-            }
-            pieces
-                .par_iter_mut()
-                .with_min_len(MIN_PIECES_PER_TASK)
-                .for_each(|slot| {
-                    let bytes = data
-                        .get(slot.offset as usize..slot.hash as usize)
-                        .unwrap_or(&[]);
-                    slot.hash = hash(bytes);
-                });
-        }
-        MergeKind::Fixed { entry_size } => {
-            // Validated to fit usize by `count_pieces`.
-            let unit = entry_size as usize;
-            pieces
-                .par_iter_mut()
-                .with_min_len(MIN_PIECES_PER_TASK)
-                .zip(data.par_chunks_exact(unit))
-                .enumerate()
-                .for_each(|(index, (slot, bytes))| {
-                    *slot = Piece {
-                        offset: (index * unit) as u64,
-                        hash: hash(bytes),
-                    };
-                });
-        }
-    }
-}
-
 fn shard_of(hash: u64) -> usize {
     // hashbrown uses the low bits for buckets and the top 7 for tags.
     (hash >> 32) as usize & (SHARDS - 1)
+}
+
+/// Mixes the group number into a piece hash, so that equal pieces of
+/// different groups land in different buckets. Group 0 keeps the hash.
+#[inline]
+fn group_hash(hash: u64, group: u32) -> u64 {
+    hash ^ u64::from(group).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 fn align_to(value: u64, alignment: u64) -> Option<u64> {
@@ -566,87 +419,225 @@ fn align_to(value: u64, alignment: u64) -> Option<u64> {
     value.checked_add(mask).map(|v| v & !mask)
 }
 
-/// Splits, deduplicates and lays out mergeable sections.
+/// Deduplicates and lays out split mergeable sections (phase 2).
 ///
-/// `sections` must be in input order: that order decides which copy of a
-/// piece is kept and where it goes. Must run inside the caller's rayon pool;
-/// the result is the same for any thread count.
+/// `inputs` lists the live split sections in input order, each with its
+/// group: that order decides which copy of a piece is kept and where it
+/// goes. Each section's kind must equal its group's, and its alignment must
+/// not exceed the group's.
+///
+/// `live_pieces`, if given, has one bit per piece of every input, numbered
+/// consecutively: piece `p` of `inputs[i]` is bit
+/// `inputs[..i].num_pieces() + p`. Pieces whose bit is clear get no output
+/// offset and do not count as occurrences. `None` means every piece is live.
+///
+/// Must run inside the caller's rayon pool; the result is the same for any
+/// thread count.
+///
+/// # Errors
+///
+/// [`InputError`] if a group is invalid (a character size other than 1, 2 or
+/// 4, a zero entry size, an alignment that is not a power of two), an input
+/// names a group that does not exist or does not match it, the liveness
+/// bitmap has the wrong length, there are 2^32 pieces or more, or a merged
+/// section's size overflows.
+pub fn merge_split_sections<'s, 'a>(
+    groups: &[MergeGroup],
+    inputs: &[MergeInput<'s, 'a>],
+    live_pieces: Option<&BitSet>,
+) -> Result<MergedSections<'s, 'a>, InputError> {
+    let layout = lay_out(groups, inputs, live_pieces)?;
+    Ok(layout.into_merged(
+        Splits::Borrowed(inputs.iter().map(|input| input.split).collect()),
+        inputs.iter().map(|input| input.group).collect(),
+    ))
+}
+
+/// One mergeable input section for [`merge_sections`].
+#[derive(Clone, Copy, Debug)]
+pub struct MergeSection<'a> {
+    /// Index of the section's group in the slice of [`MergeGroup`]s.
+    pub group: u32,
+    /// The section's bytes, zero-copy from the input mapping.
+    pub data: &'a [u8],
+}
+
+/// Splits, deduplicates and lays out mergeable sections: both phases at once.
+///
+/// Each section is split with its group's kind and alignment (phase 1, in
+/// parallel), then all are merged with every piece live (phase 2).
+/// `sections` must be in input order. Must run inside the caller's rayon
+/// pool; the result is the same for any thread count.
 ///
 /// # Errors
 ///
 /// [`MergeError::Malformed`] for the lowest-numbered malformed section, or
-/// [`MergeError::Input`] if a group is invalid (a character size other than
-/// 1, 2 or 4, a zero entry size, an alignment that is not a power of two), a
-/// section names a group that does not exist, or there are more than
-/// `u32::MAX` pieces.
+/// [`MergeError::Input`] if a group is invalid, a section names a group that
+/// does not exist, or phase 2 fails.
 pub fn merge_sections<'a>(
     groups: &[MergeGroup],
     sections: &[MergeSection<'a>],
-) -> Result<MergedSections<'a>, MergeError> {
+) -> Result<MergedSections<'a, 'a>, MergeError> {
     check_groups(groups)?;
-    if let Some(section) = sections
-        .iter()
-        .find(|section| section.group as usize >= groups.len())
-    {
-        return Err(InputError::OutOfRange {
-            what: "merge group",
-            index: u64::from(section.group),
-            len: groups.len(),
-        }
-        .into());
-    }
-    if u32::try_from(sections.len()).is_err() {
-        return Err(InputError::TooLarge("merge section count").into());
-    }
-    let kind_of = |section: &MergeSection<'_>| groups[section.group as usize].kind;
-
-    // 1. Split.
-    let counts: Vec<Result<usize, (u64, MergeProblem)>> = sections
-        .par_iter()
-        .map(|section| count_pieces(kind_of(section), section.data))
-        .collect();
-    let mut piece_start = Vec::with_capacity(sections.len() + 1);
-    piece_start.push(0usize);
-    let mut total = 0usize;
-    for (index, count) in counts.iter().enumerate() {
-        match *count {
-            Ok(count) => {
-                total = total
-                    .checked_add(count)
-                    .ok_or(InputError::TooLarge("merge piece count"))?;
-                piece_start.push(total);
-            }
-            Err((offset, problem)) => {
-                return Err(MergeError::Malformed(MalformedMerge {
-                    section: index,
-                    offset,
-                    problem,
-                }));
-            }
-        }
-    }
-    drop(counts);
-    if u32::try_from(total).is_err() {
-        return Err(InputError::TooLarge("merge piece count").into());
-    }
-    let mut pieces = vec![Piece::default(); total];
-    let mut unit = vec![(); sections.len()];
-    for_each_row_mut(&piece_start, &mut pieces, &mut unit, &|row, slots, ()| {
-        let section = &sections[row];
-        split_pieces(kind_of(section), section.group, section.data, slots);
-    });
-
-    let split = Split {
-        sections,
-        piece_start: &piece_start,
-        pieces: &pieces,
+    let group_of = |section: &MergeSection<'_>| {
+        groups
+            .get(section.group as usize)
+            .ok_or(InputError::OutOfRange {
+                what: "merge group",
+                index: u64::from(section.group),
+                len: groups.len(),
+            })
     };
+    for section in sections {
+        group_of(section)?;
+    }
+    let split = |section: &MergeSection<'a>| match group_of(section) {
+        Ok(group) => split_section(section.data, group.kind, group.alignment),
+        // Checked above.
+        Err(_) => Err(MalformedMerge {
+            offset: 0,
+            problem: MergeProblem::InvalidEntrySize { size: 0 },
+        }),
+    };
+    // Collect options rather than a `Result`, which rayon cannot collect as
+    // an indexed iterator.
+    let mut splits: Vec<Option<SplitSection<'a>>> = Vec::with_capacity(sections.len());
+    sections
+        .par_iter()
+        .map(|section| split(section).ok())
+        .collect_into_vec(&mut splits);
+    let splits: Vec<SplitSection<'a>> = match splits.into_iter().collect() {
+        Some(splits) => splits,
+        None => {
+            // Report the lowest-numbered malformed section.
+            let (section, malformed) = sections
+                .iter()
+                .enumerate()
+                .find_map(|(index, section)| split(section).err().map(|error| (index, error)))
+                .unwrap_or((
+                    0,
+                    MalformedMerge {
+                        offset: 0,
+                        problem: MergeProblem::InvalidEntrySize { size: 0 },
+                    },
+                ));
+            return Err(MergeError::Malformed { section, malformed });
+        }
+    };
+    let inputs: Vec<MergeInput<'_, 'a>> = splits
+        .iter()
+        .zip(sections)
+        .map(|(split, section)| MergeInput {
+            group: section.group,
+            split,
+        })
+        .collect();
+    let layout = lay_out(groups, &inputs, None)?;
+    drop(inputs);
+    Ok(layout.into_merged(
+        Splits::Owned(splits),
+        sections.iter().map(|section| section.group).collect(),
+    ))
+}
 
-    // 2. Deduplicate: keep the lowest piece number for each content. Each
-    // distinct content gets a slot in its shard's `leaders` vector; a piece
-    // records its (shard, slot) so that finding its leader afterwards needs
-    // no second hash probe.
-    let shards: Vec<Mutex<Shard<'a>>> = (0..SHARDS)
+/// The split sections a [`MergedSections`] refers to: borrowed from the
+/// backend after [`merge_split_sections`], owned after [`merge_sections`].
+#[derive(Clone, Debug)]
+enum Splits<'s, 'a> {
+    Borrowed(Vec<&'s SplitSection<'a>>),
+    Owned(Vec<SplitSection<'a>>),
+}
+
+impl<'a> Splits<'_, 'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(splits) => splits.len(),
+            Self::Owned(splits) => splits.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, section: usize) -> Option<&SplitSection<'a>> {
+        match self {
+            Self::Borrowed(splits) => splits.get(section).copied(),
+            Self::Owned(splits) => splits.get(section),
+        }
+    }
+}
+
+/// Everything phase 2 computes, without the borrowed inputs.
+struct Layout {
+    groups: Vec<MergedGroup>,
+    piece_base: Vec<usize>,
+    output_offset: Vec<u64>,
+}
+
+impl Layout {
+    fn into_merged<'s, 'a>(
+        self,
+        splits: Splits<'s, 'a>,
+        section_groups: Vec<u32>,
+    ) -> MergedSections<'s, 'a> {
+        MergedSections {
+            splits,
+            section_groups,
+            groups: self.groups,
+            piece_base: self.piece_base,
+            output_offset: self.output_offset,
+        }
+    }
+}
+
+/// Phase 2 proper: validates, deduplicates and lays out.
+fn lay_out(
+    groups: &[MergeGroup],
+    inputs: &[MergeInput<'_, '_>],
+    live: Option<&BitSet>,
+) -> Result<Layout, InputError> {
+    check_groups(groups)?;
+    if u32::try_from(inputs.len()).is_err() {
+        return Err(InputError::TooLarge("merge section count"));
+    }
+    let mut piece_base = Vec::with_capacity(inputs.len() + 1);
+    piece_base.push(0usize);
+    let mut total = 0usize;
+    for (index, input) in inputs.iter().enumerate() {
+        let group = groups
+            .get(input.group as usize)
+            .ok_or(InputError::OutOfRange {
+                what: "merge group",
+                index: u64::from(input.group),
+                len: groups.len(),
+            })?;
+        if input.split.kind() != group.kind || input.split.alignment() > group.alignment {
+            return Err(InputError::Mismatch {
+                what: "merge section kind or alignment and its group's",
+                index: index as u64,
+            });
+        }
+        total = total
+            .checked_add(input.split.num_pieces())
+            .ok_or(InputError::TooLarge("merge piece count"))?;
+        piece_base.push(total);
+    }
+    // Piece numbers are u32, with `DEAD_LEADER` reserved.
+    if u32::try_from(total).map_or(true, |total| total == DEAD_LEADER) {
+        return Err(InputError::TooLarge("merge piece count"));
+    }
+    if let Some(live) = live
+        && live.len() != total
+    {
+        return Err(InputError::Mismatch {
+            what: "merge piece liveness bitmap length and piece count",
+            index: live.len() as u64,
+        });
+    }
+
+    // 1. Deduplicate: keep the lowest live piece number for each content.
+    // Each distinct content gets a slot in its shard's `leaders` vector; a
+    // piece records its (shard, slot) so that finding its leader afterwards
+    // needs no second hash probe.
+    let shards: Vec<Mutex<Shard<'_>>> = (0..SHARDS)
         .map(|_| {
             let capacity = total / SHARDS / 2;
             Mutex::new(Shard {
@@ -655,57 +646,68 @@ pub fn merge_sections<'a>(
             })
         })
         .collect();
-    let mut slot_of = vec![0u64; total];
+    let mut slot_of = vec![DEAD_SLOT; total];
+    let mut unit = vec![(); inputs.len()];
     for_each_row_mut(
-        &piece_start,
+        &piece_base,
         &mut slot_of,
         &mut unit,
         &|section, slots, ()| {
-            let row = split.row(section);
-            let group = sections[section].group;
-            let base = split.piece_start[section];
-            slots
-                .par_iter_mut()
-                .with_min_len(MIN_PIECES_PER_TASK)
-                .enumerate()
-                .for_each(|(local, slot_ref)| {
-                    let bytes = split.bytes(section, local, row);
-                    let hash = row[local].hash;
-                    let index = (base + local) as u32;
-                    let shard_index = shard_of(hash);
-                    let mut guard = shards[shard_index]
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    let shard = &mut *guard;
-                    let entry = shard.table.entry(
-                        hash,
-                        |unique| {
-                            unique.hash == hash && unique.group == group && unique.bytes == bytes
-                        },
-                        |unique| unique.hash,
-                    );
-                    let slot = match entry {
-                        Entry::Occupied(occupied) => {
-                            let slot = occupied.get().slot;
-                            let leader = &mut shard.leaders[slot as usize];
-                            *leader = (*leader).min(index);
-                            slot
-                        }
-                        Entry::Vacant(vacant) => {
-                            // Fewer slots than pieces, so this fits in u32.
-                            let slot = shard.leaders.len() as u32;
-                            vacant.insert(Unique {
-                                hash,
-                                group,
-                                slot,
-                                bytes,
-                            });
-                            shard.leaders.push(index);
-                            slot
-                        }
-                    };
-                    *slot_ref = ((shard_index as u64) << 32) | u64::from(slot);
-                });
+            let input = &inputs[section];
+            let split = input.split;
+            let group = input.group;
+            let hashes = split.hashes();
+            let base = piece_base[section];
+            let insert = |(local, slot_ref): (usize, &mut u64)| {
+                let index = base + local;
+                if live.is_some_and(|live| !live.get(index)) {
+                    return;
+                }
+                let bytes = split.bytes_of(local);
+                let hash = group_hash(hashes.get(local).copied().unwrap_or(0), group);
+                // `total` fits in u32, checked above.
+                let index = index as u32;
+                let shard_index = shard_of(hash);
+                let mut guard = shards[shard_index]
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let shard = &mut *guard;
+                let entry = shard.table.entry(
+                    hash,
+                    |unique| unique.hash == hash && unique.group == group && unique.bytes == bytes,
+                    |unique| unique.hash,
+                );
+                let slot = match entry {
+                    Entry::Occupied(occupied) => {
+                        let slot = occupied.get().slot;
+                        let leader = &mut shard.leaders[slot as usize];
+                        *leader = (*leader).min(index);
+                        slot
+                    }
+                    Entry::Vacant(vacant) => {
+                        // Fewer slots than pieces, so this fits in u32.
+                        let slot = shard.leaders.len() as u32;
+                        vacant.insert(Unique {
+                            hash,
+                            group,
+                            slot,
+                            bytes,
+                        });
+                        shard.leaders.push(index);
+                        slot
+                    }
+                };
+                *slot_ref = ((shard_index as u64) << 32) | u64::from(slot);
+            };
+            if slots.len() <= MIN_PIECES_PER_TASK {
+                slots.iter_mut().enumerate().for_each(insert);
+            } else {
+                slots
+                    .par_iter_mut()
+                    .with_min_len(MIN_PIECES_PER_TASK)
+                    .enumerate()
+                    .for_each(insert);
+            }
         },
     );
     let shard_leaders: Vec<Vec<u32>> = shards
@@ -720,20 +722,26 @@ pub fn merge_sections<'a>(
     let leader: Vec<u32> = slot_of
         .par_iter()
         .with_min_len(MIN_PIECES_PER_TASK)
-        .map(|&slot_ref| shard_leaders[(slot_ref >> 32) as usize][slot_ref as u32 as usize])
+        .map(|&slot_ref| {
+            if slot_ref == DEAD_SLOT {
+                DEAD_LEADER
+            } else {
+                shard_leaders[(slot_ref >> 32) as usize][slot_ref as u32 as usize]
+            }
+        })
         .collect();
     drop(slot_of);
     drop(shard_leaders);
 
-    // 3 and 4. Tail merge and lay out each group.
-    let mut members = CsrBuilder::with_capacity(groups.len(), sections.len());
-    for (index, section) in sections.iter().enumerate() {
-        members.push(section.group as usize, index);
+    // 2 and 3. Tail merge and lay out each group.
+    let mut members = CsrBuilder::with_capacity(groups.len(), inputs.len());
+    for (index, input) in inputs.iter().enumerate() {
+        members.push(input.group as usize, index);
     }
     let members = members.build()?;
     let out_offset: Vec<AtomicU64> = (0..total)
         .into_par_iter()
-        .map(|_| AtomicU64::new(0))
+        .map(|_| AtomicU64::new(DEAD_OFFSET))
         .collect();
     let merged: Vec<Result<MergedGroup, InputError>> = groups
         .par_iter()
@@ -742,7 +750,8 @@ pub fn merge_sections<'a>(
             layout_group(
                 group,
                 members.row(group_index),
-                &split,
+                inputs,
+                &piece_base,
                 &leader,
                 &out_offset,
             )
@@ -750,23 +759,22 @@ pub fn merge_sections<'a>(
         .collect();
     let groups = merged.into_iter().collect::<Result<Vec<_>, _>>()?;
 
-    // Every other piece takes its leader's offset. Leaders are only read.
+    // Every other live piece takes its leader's offset. Leaders are only
+    // read.
     (0..total)
         .into_par_iter()
         .with_min_len(MIN_PIECES_PER_TASK)
         .for_each(|index| {
-            let lead = leader[index] as usize;
-            if lead != index {
-                let value = out_offset[lead].load(Ordering::Relaxed);
+            let lead = leader[index];
+            if lead != DEAD_LEADER && lead as usize != index {
+                let value = out_offset[lead as usize].load(Ordering::Relaxed);
                 out_offset[index].store(value, Ordering::Relaxed);
             }
         });
 
-    Ok(MergedSections {
-        sections: sections.to_vec(),
+    Ok(Layout {
         groups,
-        piece_start,
-        input_offset: pieces.par_iter().map(|piece| piece.offset).collect(),
+        piece_base,
         output_offset: out_offset
             .into_par_iter()
             .map(AtomicU64::into_inner)
@@ -779,23 +787,26 @@ pub fn merge_sections<'a>(
 fn layout_group(
     group: &MergeGroup,
     members: &[usize],
-    split: &Split<'_, '_>,
+    inputs: &[MergeInput<'_, '_>],
+    piece_base: &[usize],
     leader: &[u32],
     out_offset: &[AtomicU64],
 ) -> Result<MergedGroup, InputError> {
     // Leaders of this group, in input order.
     let mut leaders: Vec<Leader<'_>> = Vec::new();
     for &section in members {
-        let row = split.row(section);
-        let base = split.piece_start[section];
-        for (local, piece) in row.iter().enumerate() {
+        let split = inputs[section].split;
+        let base = piece_base[section];
+        let row = &leader[base..piece_base[section + 1]];
+        for (local, &lead) in row.iter().enumerate() {
             let index = base + local;
-            if leader[index] as usize == index {
+            if lead as usize == index {
+                let (start, end) = split.bounds(local);
                 leaders.push(Leader {
                     piece: index as u32,
                     section: section as u32,
-                    input_offset: piece.offset,
-                    bytes: split.bytes(section, local, row),
+                    input_offset: start as u64,
+                    bytes: split.data().get(start..end).unwrap_or(&[]),
                 });
             }
         }
@@ -874,7 +885,7 @@ mod tests {
         }
     }
 
-    fn contents(merged: &MergedSections<'_>, group: usize) -> Vec<u8> {
+    fn contents(merged: &MergedSections<'_, '_>, group: usize) -> Vec<u8> {
         let size = merged.group(group).unwrap().size() as usize;
         let mut out = vec![0xff; size];
         merged.write_group(group, &mut out).unwrap();
@@ -899,8 +910,89 @@ mod tests {
         assert_eq!(merged.output_offset(0, 8), None);
         assert_eq!(merged.output_offset(2, 0), None);
         let found = merged.piece_at(1, 6).unwrap();
-        assert_eq!(found.addend, 2);
-        assert_eq!(merged.piece_output_offset(found.piece), Some(0));
+        assert_eq!(
+            found,
+            PieceRef {
+                piece: 1,
+                addend: 2
+            }
+        );
+        assert_eq!(merged.piece_output_offset(1, found.piece), Some(0));
+        assert_eq!(merged.piece_output_offset(1, 2), None);
+        assert_eq!(merged.first_piece(1), Some(2));
+        assert_eq!(merged.section_group(1), Some(0));
+    }
+
+    #[test]
+    fn two_phases_match_the_wrapper() {
+        let datas: [&[u8]; 3] = [b"foo\0bar\0", b"baz\0foo\0", b"bar\0qux\0"];
+        let group = strings(false);
+        let splits: Vec<SplitSection<'_>> = datas
+            .iter()
+            .map(|data| split_section(data, group.kind, 1).unwrap())
+            .collect();
+        let inputs: Vec<MergeInput<'_, '_>> = splits
+            .iter()
+            .map(|split| MergeInput { group: 0, split })
+            .collect();
+        let merged = merge_split_sections(&[group], &inputs, None).unwrap();
+        let sections: Vec<MergeSection<'_>> = datas
+            .iter()
+            .map(|data| MergeSection { group: 0, data })
+            .collect();
+        let wrapped = merge_sections(&[group], &sections).unwrap();
+        assert_eq!(merged.groups(), wrapped.groups());
+        assert_eq!(contents(&merged, 0), b"foo\0bar\0baz\0qux\0");
+    }
+
+    #[test]
+    fn dead_pieces_get_no_storage() {
+        let group = strings(false);
+        let a = split_section(b"foo\0bar\0", group.kind, 1).unwrap();
+        let b = split_section(b"bar\0foo\0", group.kind, 1).unwrap();
+        let inputs = [
+            MergeInput {
+                group: 0,
+                split: &a,
+            },
+            MergeInput {
+                group: 0,
+                split: &b,
+            },
+        ];
+        // Piece 0 of `a` ("foo") is dead, so `b`'s "foo" leads.
+        let mut live = BitSet::new(4);
+        for bit in 1..4 {
+            live.insert(bit);
+        }
+        let merged = merge_split_sections(&[group], &inputs, Some(&live)).unwrap();
+        assert_eq!(contents(&merged, 0), b"bar\0foo\0");
+        assert_eq!(merged.output_offset(0, 1), None);
+        assert_eq!(merged.output_offset(0, 5), Some(1));
+        assert_eq!(merged.output_offset(1, 6), Some(6));
+        assert!(matches!(
+            merge_split_sections(&[group], &inputs, Some(&BitSet::new(3))),
+            Err(InputError::Mismatch { .. })
+        ));
+        let wide = MergeGroup {
+            kind: MergeKind::Strings { char_size: 2 },
+            ..group
+        };
+        assert!(matches!(
+            merge_split_sections(&[wide], &inputs, None),
+            Err(InputError::Mismatch { .. })
+        ));
+        let aligned = split_section(b"x\0", group.kind, 4).unwrap();
+        let input = [MergeInput {
+            group: 0,
+            split: &aligned,
+        }];
+        assert!(merge_split_sections(&[group], &input, None).is_err());
+        let wider = MergeGroup {
+            alignment: 8,
+            ..group
+        };
+        assert!(merge_split_sections(&[wider], &input, None).is_ok());
     }
 
     #[test]
@@ -961,7 +1053,7 @@ mod tests {
             alignment: 2,
             tail_merge: true,
         };
-        // "a\0" is a byte suffix of "\0a\0\0"? No: pieces are "a", "ba".
+        // Pieces are "a" and "ba" in 2-byte characters; "a" is a suffix.
         let data = [b'a', 0, 0, 0, b'b', 0, b'a', 0, 0, 0];
         let merged = merge_sections(
             &[group],
@@ -993,20 +1085,24 @@ mod tests {
         let err = merge_sections(&[strings(false), wide], &[odd, unterminated]).unwrap_err();
         assert_eq!(
             err,
-            MergeError::Malformed(MalformedMerge {
+            MergeError::Malformed {
                 section: 0,
-                offset: 2,
-                problem: MergeProblem::SizeNotMultiple { unit: 2 },
-            })
+                malformed: MalformedMerge {
+                    offset: 2,
+                    problem: MergeProblem::SizeNotMultiple { unit: 2 },
+                },
+            }
         );
         let err = merge_sections(&[strings(false)], &[unterminated]).unwrap_err();
         assert_eq!(
             err,
-            MergeError::Malformed(MalformedMerge {
+            MergeError::Malformed {
                 section: 0,
-                offset: 3,
-                problem: MergeProblem::UnterminatedString,
-            })
+                malformed: MalformedMerge {
+                    offset: 3,
+                    problem: MergeProblem::UnterminatedString,
+                },
+            }
         );
         let fixed = MergeGroup {
             kind: MergeKind::Fixed { entry_size: 0 },
@@ -1025,7 +1121,7 @@ mod tests {
             merge_sections(&[strings(false)], &[bad_group]),
             Err(MergeError::Input(_))
         ));
-        if let MergeError::Malformed(malformed) =
+        if let MergeError::Malformed { malformed, .. } =
             merge_sections(&[strings(false)], &[unterminated]).unwrap_err()
         {
             let error = malformed.into_error("a.o", 0x40);
