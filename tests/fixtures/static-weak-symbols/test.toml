@@ -1,0 +1,25 @@
+# Weak symbol resolution:
+# - an undefined weak function and object resolve to null
+# - a weak undefined reference does not extract an archive member (libhook.a)
+# - a strong definition overrides a weak one that comes first on the command line
+# Static variant of the `weak-symbols` fixture: the same program linked with
+# -static, so it runs through the M1 static pipeline instead of the
+# default (PIE, dynamic) one.
+description = "weak definitions and weak undefined references (static)"
+compile = [
+  "cc -O2 -c main.c",
+  "cc -O2 -c weak.c",
+  "cc -O2 -c strong.c",
+  "cc -O2 -c hook.c",
+  "ar rcs libhook.a hook.o",
+]
+driver = "cc"
+link = "-static -o out main.o weak.o strong.o libhook.a"
+run = "./out"
+expect.stdout = """
+optional_hook: absent
+weak_data: absent
+only_weak: weak default
+overridden: strong
+"""
+expect.readelf = ["!hook_member_marker"]

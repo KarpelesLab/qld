@@ -1,0 +1,28 @@
+# Constructor and destructor priorities. `constructor(N)` goes to
+# .init_array.0000N, which the default linker script sorts by priority and
+# places before plain .init_array entries (kept in link order). A raw
+# .init_array.00150 pointer is sorted the same way. .fini_array runs in
+# reverse order.
+# Static variant of the `init-array-priority` fixture: the same program linked with
+# -static, so it runs through the M1 static pipeline instead of the
+# default (PIE, dynamic) one.
+description = "init_array/fini_array ordering with priorities across objects (static)"
+compile = ["cc -O2 -c a.c", "cc -O2 -c b.c", "cc -O2 -c main.c"]
+driver = "cc"
+link = "-static -o out main.o a.o b.o"
+run = "./out"
+expect.stdout = """
+ctor 101 (b)
+ctor 150 (raw section, a)
+ctor 200 (a)
+ctor default (main)
+ctor default (a)
+ctor default (b)
+main
+dtor default (b)
+dtor default (a)
+dtor 300 (b)
+dtor 101 (a)
+"""
+expect.readelf = [".init_array", ".fini_array", "INIT_ARRAY", "FINI_ARRAY"]
+determinism = true

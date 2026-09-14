@@ -1,0 +1,22 @@
+# Intentional difference from GNU ld (docs/compatibility.md, "Archive
+# resolution order"): libfoo.a's member needs a symbol from libbar.a, which
+# appears *earlier* on the command line and has already been scanned. GNU ld
+# fails with an undefined reference; qld, like lld and mold, extracts the
+# member anyway and the program links and runs.
+# Static variant of the `archive-order` fixture: the same program linked with
+# -static, so it runs through the M1 static pipeline instead of the
+# default (PIE, dynamic) one.
+description = "archive back-reference: GNU ld rejects, qld accepts (static)"
+compile = [
+  "cc -O2 -c main.c",
+  "cc -O2 -c foo.c",
+  "cc -O2 -c bar.c",
+  "ar rcs libfoo.a foo.o",
+  "ar rcs libbar.a bar.o",
+]
+driver = "cc"
+link = "-static -o out main.o libbar.a libfoo.a"
+gnu_ld = "fail"
+run = "./out"
+expect.stdout = "foo calls bar: bar\n"
+diff.skip = "GNU ld cannot link this fixture"
