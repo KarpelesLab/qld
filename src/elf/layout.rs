@@ -36,12 +36,15 @@ use crate::elf::read::consts::{
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 
+use super::arch::Arch;
+use super::arch::thunk::{self, Thunks};
 use super::ehframe::EhFrames;
 use super::export::Mode;
 use super::inputs::ElfInput;
 use super::merge::Merged;
 use super::object::SectionKind;
 use super::place::Placement;
+use super::refs::Refs;
 use super::rules::{RuleSet, SortMode, Synthetic, priority};
 use super::sections::{NONE, Sections};
 use super::synth::Synth;
@@ -189,11 +192,22 @@ pub struct Tls {
 }
 
 impl Tls {
-    /// The thread pointer's address for local-exec offsets (variant II: the
-    /// TLS block ends at the thread pointer).
+    /// The thread pointer's address for local-exec offsets.
+    ///
+    /// x86-64 uses variant II: the TLS block ends at the thread pointer.
+    /// AArch64 uses variant I: the thread pointer is below the block, with
+    /// a thread control block between them, rounded up to the block's
+    /// alignment ([`Arch::tcb_size`]).
     #[must_use]
-    pub fn tp(&self) -> u64 {
+    pub fn tp(&self, arch: Arch) -> u64 {
         let align = self.align.max(1);
+        if arch.tls_variant1() {
+            let tcb = arch
+                .tcb_size()
+                .checked_add(align.wrapping_sub(1))
+                .map_or(arch.tcb_size(), |v| v & !align.wrapping_sub(1));
+            return self.start.wrapping_sub(tcb);
+        }
         let size = self
             .memsz
             .checked_add(align.wrapping_sub(1))
@@ -269,6 +283,9 @@ pub struct Layout<'a> {
     /// `NOCROSSREFS` lists: output section names, and whether the list is
     /// `NOCROSSREFS_TO` (only references to the first section are checked).
     pub nocrossrefs: Vec<(bool, Vec<Vec<u8>>)>,
+    /// Range-extension thunks with their addresses, sorted by output
+    /// section and destination.
+    pub thunks: Vec<thunk::Placed>,
 }
 
 impl Layout<'_> {
@@ -286,12 +303,33 @@ impl Layout<'_> {
     pub fn by_name(&self, name: &[u8]) -> Option<&OutSection<'_>> {
         self.sections.iter().find(|s| s.name == name)
     }
+
+    /// The address of the range-extension thunk that callers in output
+    /// section `output` use to reach `target`.
+    #[must_use]
+    pub fn thunk_for(&self, output: u32, target: u64) -> Option<u64> {
+        let at = self
+            .thunks
+            .binary_search_by_key(&(output, target), |t| (t.output, t.target))
+            .ok()?;
+        self.thunks.get(at).map(|t| t.address)
+    }
+
+    /// The output section (its index in `Placement::outputs`) that holds
+    /// section header index `shndx`.
+    #[must_use]
+    pub fn output_of_shndx(&self, shndx: u32) -> Option<u32> {
+        let position = usize::try_from(shndx.checked_sub(1)?).ok()?;
+        self.sections.get(position).map(|s| s.output)
+    }
 }
 
 /// Everything layout reads.
 pub struct LayoutInput<'l, 'a> {
     /// Options.
     pub options: &'l LinkOptions,
+    /// Relocation target resolution, for range-extension thunks.
+    pub refs: Refs<'l, 'a>,
     /// Rules.
     pub rules: &'l RuleSet<'l>,
     /// Inputs.
@@ -368,9 +406,31 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 ///
 /// Returns [`Error::Limit`] when the image does not fit the address space.
 pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
+    input.synth.arch.check_options(input.options)?;
     if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
         return crate::elf::script_layout::layout(input, script, placed);
     }
+    if !input.synth.arch.needs_thunks() {
+        return layout_once(input, &Thunks::default());
+    }
+    // Reserving thunk space moves everything after it, which can put more
+    // branches out of range: repeat until the set of thunks stops changing.
+    let mut thunks = Thunks::default();
+    for _ in 0..thunk::MAX_ROUNDS {
+        let layout = layout_once(input, &thunks)?;
+        let next = thunk::plan(input, &layout, &thunks);
+        if next == thunks {
+            return Ok(layout);
+        }
+        thunks = next;
+    }
+    Err(Error::Internal(
+        "range-extension thunks did not converge".into(),
+    ))
+}
+
+/// One round of layout, reserving space for `thunks`.
+fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layout<'a>> {
     let placement = input.placement;
     let sections = input.sections;
     let files = input.files;
@@ -502,6 +562,11 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
                 });
                 offset = add(offset, size)?;
             }
+            let pool = thunks.size_of(u32::try_from(output_index).unwrap_or(NONE));
+            if pool != 0 {
+                offset = add(align_up(offset, 4)?, pool)?;
+                align = align.max(4);
+            }
             Ok((placed, offset, align))
         })
         .collect();
@@ -612,7 +677,13 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
 
     // 3. Segment plan (before addresses: the header size depends on it).
     let mode = input.mode;
-    let separate = input.options.separate_code.unwrap_or(SeparateCode::Code);
+    let separate = input.options.separate_code.unwrap_or({
+        if input.synth.arch.separate_code_by_default() {
+            SeparateCode::Code
+        } else {
+            SeparateCode::None
+        }
+    });
     let perm = |section: &OutSection<'_>| -> u32 {
         let mut flags = PF_R;
         if section.flags & SHF_EXECINSTR != 0 {
@@ -710,7 +781,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         .options
         .max_page_size
         .filter(|p| p.is_power_of_two())
-        .unwrap_or(DEFAULT_PAGE);
+        .unwrap_or_else(|| input.synth.arch.default_max_page());
     let default_base = if mode.pic { 0 } else { DEFAULT_BASE };
     let base = input
         .options
@@ -851,6 +922,28 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         if !tbss {
             dot = end;
         }
+    }
+    let mut placed_thunks: Vec<thunk::Placed> = Vec::new();
+    if !thunks.is_empty() {
+        for section in &mut out_sections {
+            if thunks.size_of(section.output) == 0 {
+                continue;
+            }
+            for (offset, bytes) in thunks.render(section.output, section.addr) {
+                section.data.push((offset, bytes));
+            }
+        }
+        for entry in &thunks.entries {
+            let Some(section) = out_sections.iter().find(|s| s.output == entry.output) else {
+                continue;
+            };
+            placed_thunks.push(thunk::Placed {
+                output: entry.output,
+                target: entry.target,
+                address: section.addr.wrapping_add(entry.offset),
+            });
+        }
+        placed_thunks.sort_unstable();
     }
     let end = align_up(dot, 8)?;
     place_empty_until(NONE, dot, &mut output_places);
@@ -1105,6 +1198,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     let bss_start = bss_start.unwrap_or(edata);
     Ok(Layout {
         sections: out_sections,
+        thunks: placed_thunks,
         output_places,
         section_addr,
         section_shndx,

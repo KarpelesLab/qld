@@ -1,0 +1,18 @@
+# M4: range-extension thunks. The `bl`/`b` destinations are 512 MiB away,
+# past the 128 MiB a direct branch reaches, so the link only succeeds if the
+# linker inserts thunks; the three callers of the same destination share
+# one. The far branches are guarded by a zero byte in `.data`, so the
+# program runs to its `write` and `exit` without taking them.
+description = "AArch64 range-extension thunks for out-of-range branches"
+compile = ["cc -c far.s"]
+link = "-static -e _start -o out far.o"
+run = "./out"
+expect.stdout = "thunks work\n"
+expect.exit = 7
+expect.readelf = [
+  "AArch64",
+  "EXEC (Executable file)",
+  "!INTERP",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

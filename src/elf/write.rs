@@ -21,17 +21,15 @@ use crate::args::LinkOptions;
 use crate::debug::tombstone::{DeadTarget, SectionTombstone, Tombstones};
 use crate::diag::{Collect, Diagnostic, DiagnosticSink, Severity};
 use crate::elf::read::Relocations;
-use crate::elf::read::consts::x86_64::{
-    R_X86_64_COPY, R_X86_64_DTPMOD64, R_X86_64_IRELATIVE, R_X86_64_JUMP_SLOT, R_X86_64_PLT32,
-    R_X86_64_PLT32_BND, R_X86_64_RELATIVE,
-};
-use crate::elf::read::consts::{EM_X86_64, ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR, reloc_name};
+use crate::elf::read::consts::{ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::output::{ChunkRange, OutputFile};
 use crate::symbols::SymbolFlags;
 
-use super::arch::x86_64::{self, ApplyError, Kind, PLT_ENTRY_SIZE};
+use super::arch::{
+    self, ApplyError, Arch, DynKind, GotKind, Kind, RelaxValues, Width, width_bytes,
+};
 use super::defined::LinkerSymbols;
 use super::dynsym::{self, DynamicPlan};
 use super::ehframe::EhSection;
@@ -43,8 +41,9 @@ use super::reloc::{self, Context, Dynamic};
 use super::rules::Synthetic;
 use super::scan::{ScanResult, location};
 use super::symtab::{SymtabPlan, write_strtab, write_symtab};
-use super::synth::{GotKind, Owner, SlotReloc, got_slot_relocs, write_build_id_header};
+use super::synth::{Owner, SlotReloc, got_slot_relocs, write_build_id_header};
 use super::values::Addresses;
+use crate::arch::aarch64::Field as A64Field;
 
 /// What one output chunk holds.
 #[derive(Clone, Copy, Debug)]
@@ -101,31 +100,6 @@ fn push_code_padding(
             ));
         }
         cursor = cursor.max(offset.saturating_add(size));
-    }
-}
-
-/// Fills `out` with the longest x86 no-op instructions, as BFD's
-/// `bfd_arch_i386_fill` does.
-fn write_nops(out: &mut [u8]) {
-    const NOPS: [&[u8]; 10] = [
-        &[0x90],
-        &[0x66, 0x90],
-        &[0x0f, 0x1f, 0x00],
-        &[0x0f, 0x1f, 0x40, 0x00],
-        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
-        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
-        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
-        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-        &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-    ];
-    let mut rest = out;
-    while !rest.is_empty() {
-        let n = rest.len().min(10);
-        let nop = NOPS.get(n.saturating_sub(1)).copied().unwrap_or(&[0x90]);
-        let (head, tail) = rest.split_at_mut(n.min(nop.len()));
-        head.copy_from_slice(nop.get(..head.len()).unwrap_or_default());
-        rest = tail;
     }
 }
 
@@ -487,7 +461,7 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             Ok(())
         }
         Chunk::Nop => {
-            write_nops(out);
+            input.context.arch.write_nops(out);
             Ok(())
         }
         Chunk::Data(position, index) => {
@@ -520,7 +494,7 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     let pic = input.addresses.synth.mode.is_some_and(|m| m.pic);
     let e_type = if pic { ET_DYN } else { ET_EXEC };
     header[16..18].copy_from_slice(&e_type.to_le_bytes());
-    header[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+    header[18..20].copy_from_slice(&input.context.arch.machine().to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[24..32].copy_from_slice(&input.entry.to_le_bytes());
     let phoff = if layout.segments.is_empty() {
@@ -656,24 +630,28 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
         Synthetic::GotPlt => write_got_plt(input, out),
         Synthetic::Plt => write_plt(input, out)?,
         Synthetic::PltSec => {
+            let arch = synth.arch;
             let (base, ..) = addresses
                 .layout
                 .synthetic(Synthetic::PltSec)
                 .unwrap_or_default();
-            for (index, entry) in out.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            let size = arch.plt_entry_size(synth.plt_flags());
+            let step = usize::try_from(size).unwrap_or(16);
+            for (index, entry) in out.chunks_exact_mut(step).enumerate() {
                 let index64 = u64::try_from(index).unwrap_or(u64::MAX);
-                let address = base.saturating_add(index64.saturating_mul(PLT_ENTRY_SIZE));
+                let address = base.saturating_add(index64.saturating_mul(size));
                 let slot = addresses.igot_address(index).unwrap_or(0);
-                x86_64::write_plt_jump(entry, address, slot, true)
+                arch.write_plt_jump(entry, address, slot, synth.plt_flags())
                     .map_err(|_| Error::Internal("PLT slot out of range".into()))?;
             }
         }
         Synthetic::PltGot => {
+            let arch = synth.arch;
             let (base, ..) = addresses
                 .layout
                 .synthetic(Synthetic::PltGot)
                 .unwrap_or_default();
-            let size = if synth.ibt { 16usize } else { 8 };
+            let size = usize::try_from(arch.plt_got_entry_size(synth.plt_flags())).unwrap_or(8);
             for (index, owner) in synth.plt_got.iter().enumerate() {
                 let start = index.saturating_mul(size);
                 let Some(entry) = out.get_mut(start..start.saturating_add(size)) else {
@@ -681,7 +659,7 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
                 };
                 let address = base.saturating_add(u64::try_from(start).unwrap_or(0));
                 let slot = addresses.got_address(owner).unwrap_or(0);
-                x86_64::write_plt_jump(entry, address, slot, synth.ibt)
+                arch.write_plt_jump(entry, address, slot, synth.plt_flags())
                     .map_err(|_| Error::Internal("PLT GOT slot out of range".into()))?;
             }
         }
@@ -754,7 +732,7 @@ fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
                 }
                 GotKind::TpOff => {
                     let word = match relocs[0] {
-                        SlotReloc::None => value.wrapping_sub(tls.tp()),
+                        SlotReloc::None => value.wrapping_sub(tls.tp(synth.arch)),
                         _ => 0,
                     };
                     put(address, word);
@@ -803,13 +781,11 @@ fn write_got_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
                 symbol_value(addresses, owner)
             } else {
                 let lazy = addresses.lazy_plt_address(index64).unwrap_or(0);
-                // The lazy entry: with IBT, the whole `.plt` entry; without,
-                // the `push` that follows the jump.
-                if synth.ibt {
-                    lazy
-                } else {
-                    lazy.wrapping_add(6)
-                }
+                let plt = addresses
+                    .layout
+                    .synthetic(Synthetic::Plt)
+                    .map_or(0, |(addr, ..)| addr);
+                synth.arch.lazy_slot_value(plt, lazy, synth.plt_flags())
             };
             *slot = value.to_le_bytes();
         }
@@ -827,22 +803,24 @@ fn write_got_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
 fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     let addresses = input.addresses;
     let synth = addresses.synth;
+    let arch = synth.arch;
+    let flags = synth.plt_flags();
     let (base, ..) = addresses
         .layout
         .synthetic(Synthetic::Plt)
         .unwrap_or_default();
     let range = || Error::Internal("PLT slot out of range".into());
     if !synth.dynamic() {
+        let size = arch.iplt_entry_size();
+        let step = usize::try_from(size).unwrap_or(16);
         for (index, entry) in out
-            .as_chunks_mut::<16>()
-            .0
-            .iter_mut()
+            .chunks_exact_mut(step)
             .enumerate()
             .take(synth.iplt.len())
         {
-            let stub = base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(16));
+            let stub = base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(size));
             let slot = addresses.igot_address(index).unwrap_or(0);
-            x86_64::write_iplt(entry, stub, slot).map_err(|_| range())?;
+            arch.write_iplt(entry, stub, slot).map_err(|_| range())?;
         }
         return Ok(());
     }
@@ -850,17 +828,19 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         .layout
         .synthetic(Synthetic::GotPlt)
         .map_or(0, |(addr, ..)| addr);
-    let (entries, _) = out.as_chunks_mut::<16>();
-    let Some((header, rest)) = entries.split_first_mut() else {
+    let header_size = usize::try_from(arch.plt_header_size(flags)).unwrap_or(16);
+    let Some((header, rest)) = out.split_at_mut_checked(header_size) else {
         return Ok(());
     };
-    x86_64::write_plt_header(header, base, got_plt).map_err(|_| range())?;
-    for (index, entry) in rest.iter_mut().enumerate() {
+    arch.write_plt_header(header, base, got_plt, flags)
+        .map_err(|_| range())?;
+    let step = usize::try_from(arch.plt_entry_size(flags)).unwrap_or(16);
+    for (index, entry) in rest.chunks_exact_mut(step).enumerate() {
         let index64 = u64::try_from(index).unwrap_or(u64::MAX);
         let address = addresses.lazy_plt_address(index64).unwrap_or(0);
         let slot = addresses.igot_address(index).unwrap_or(0);
         let reloc_index = u32::try_from(index).map_err(|_| range())?;
-        x86_64::write_plt_entry(entry, address, slot, reloc_index, base, synth.ibt)
+        arch.write_plt_entry(entry, address, slot, reloc_index, base, flags)
             .map_err(|_| range())?;
     }
     Ok(())
@@ -879,12 +859,13 @@ fn put_rela(out: &mut [u8], offset: u64, symbol: u32, r_type: u32, addend: i64) 
 fn write_rela_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
+    let irelative = synth.arch.dyn_reloc(DynKind::Irelative);
     let (entries, _) = out.as_chunks_mut::<24>();
     if !synth.dynamic() {
         for (index, (owner, entry)) in synth.iplt.iter().zip(entries.iter_mut()).enumerate() {
             let slot = addresses.igot_address(index).unwrap_or(0);
             let resolver = symbol_value(addresses, owner);
-            put_rela(entry, slot, 0, R_X86_64_IRELATIVE, resolver as i64);
+            put_rela(entry, slot, 0, irelative, resolver as i64);
         }
         return;
     }
@@ -902,13 +883,13 @@ fn write_rela_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
                     entry,
                     slot,
                     input.dynamic.index_of(id),
-                    R_X86_64_JUMP_SLOT,
+                    synth.arch.dyn_reloc(DynKind::JumpSlot),
                     0,
                 );
             }
             _ => {
                 let resolver = symbol_value(addresses, owner);
-                put_rela(entry, slot, 0, R_X86_64_IRELATIVE, resolver as i64);
+                put_rela(entry, slot, 0, irelative, resolver as i64);
             }
         }
     }
@@ -927,17 +908,17 @@ struct DynReloc {
     packable: bool,
 }
 
-fn dyn_reloc(offset: u64, symbol: u32, r_type: u32, addend: i64) -> DynReloc {
-    let class = match r_type {
-        R_X86_64_RELATIVE => 0,
-        R_X86_64_IRELATIVE => 2,
+fn dyn_reloc(arch: Arch, offset: u64, symbol: u32, kind: DynKind, addend: i64) -> DynReloc {
+    let class = match kind {
+        DynKind::Relative => 0,
+        DynKind::Irelative => 2,
         _ => 1,
     };
     DynReloc {
         class,
         symbol,
         offset,
-        r_type,
+        r_type: arch.dyn_reloc(kind),
         addend,
         packable: false,
     }
@@ -956,6 +937,7 @@ fn collect_dyn_relocs(
     let Some(mode) = synth.mode else {
         return Vec::new();
     };
+    let arch = context.arch;
     let tls = addresses.layout.tls.unwrap_or_default();
     let mut relocs: Vec<DynReloc> = Vec::new();
     for (list, kind) in [
@@ -981,18 +963,20 @@ fn collect_dyn_relocs(
                 match reloc {
                     SlotReloc::None => {}
                     SlotReloc::Relative => {
-                        let mut reloc = dyn_reloc(at, 0, R_X86_64_RELATIVE, value as i64);
+                        let mut reloc = dyn_reloc(arch, at, 0, DynKind::Relative, value as i64);
                         reloc.packable = true;
                         relocs.push(reloc);
                     }
-                    SlotReloc::Symbolic(r_type) => relocs.push(dyn_reloc(at, symbol, r_type, 0)),
-                    SlotReloc::Module(r_type) => {
-                        let addend = if r_type == R_X86_64_DTPMOD64 {
+                    SlotReloc::Symbolic(dyn_kind) => {
+                        relocs.push(dyn_reloc(arch, at, symbol, dyn_kind, 0));
+                    }
+                    SlotReloc::Module(dyn_kind) => {
+                        let addend = if dyn_kind == DynKind::DtpMod {
                             0
                         } else {
                             value.wrapping_sub(tls.start) as i64
                         };
-                        relocs.push(dyn_reloc(at, 0, r_type, addend));
+                        relocs.push(dyn_reloc(arch, at, 0, dyn_kind, addend));
                     }
                 }
             }
@@ -1002,7 +986,7 @@ fn collect_dyn_relocs(
         && let Some(address) =
             addresses.got_entry_address(Owner::Local { file: 0, symbol: 0 }, GotKind::TlsLd)
     {
-        relocs.push(dyn_reloc(address, 0, R_X86_64_DTPMOD64, 0));
+        relocs.push(dyn_reloc(arch, address, 0, DynKind::DtpMod, 0));
     }
     for copy in &synth.copies {
         let address = addresses
@@ -1011,9 +995,10 @@ fn collect_dyn_relocs(
             .copied()
             .unwrap_or(0);
         relocs.push(dyn_reloc(
+            arch,
             address,
             plan.index_of(copy.symbol),
-            R_X86_64_COPY,
+            DynKind::Copy,
             0,
         ));
     }
@@ -1160,7 +1145,7 @@ fn section_dyn_relocs(
         else {
             continue;
         };
-        skip = decision.class.kind.skips_next();
+        skip = decision.class.skip_next;
         if decision.problem.is_some() {
             continue;
         }
@@ -1170,14 +1155,19 @@ fn section_dyn_relocs(
             Dynamic::Relative => {
                 let owner = Addresses::owner(&target, file_index, rel.symbol);
                 let (s, a) = target_value(addresses, &target, owner, rel.addend);
-                let mut reloc =
-                    dyn_reloc(place, 0, R_X86_64_RELATIVE, s.wrapping_add_signed(a) as i64);
+                let mut reloc = dyn_reloc(
+                    context.arch,
+                    place,
+                    0,
+                    DynKind::Relative,
+                    s.wrapping_add_signed(a) as i64,
+                );
                 reloc.packable = reloc::packable(section.header.sh_addralign, rel.offset);
                 out.push(reloc);
             }
-            Dynamic::Symbolic(r_type) => {
+            Dynamic::Symbolic(dyn_kind) => {
                 let symbol = target.global.map_or(0, |id| plan.index_of(id));
-                out.push(dyn_reloc(place, symbol, r_type, rel.addend));
+                out.push(dyn_reloc(context.arch, place, symbol, dyn_kind, rel.addend));
             }
         }
     }
@@ -1274,18 +1264,6 @@ fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
     }
 }
 
-/// The byte width of a relocation field.
-fn width_bytes(width: x86_64::Width) -> usize {
-    use x86_64::Width as W;
-    match width {
-        W::None => 0,
-        W::W64 => 8,
-        W::U32 | W::I32 => 4,
-        W::Any16 | W::I16 => 2,
-        W::Any8 | W::I8 => 1,
-    }
-}
-
 /// Why a relocation's target section is not in the output, if it is not.
 fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
     let id = refs.target_section(target)?;
@@ -1353,6 +1331,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         input.tombstones.for_section(section.name)
     };
     let executable = input.context.mode.executable() || !input.context.mode.dynamic;
+    let arch = input.context.arch;
     let order = file.position.raw();
     let mut skip = false;
     for rel in relas.iter() {
@@ -1390,7 +1369,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
             continue; // Reported by the scan.
         };
         let class = decision.class;
-        skip = class.kind.skips_next();
+        skip = class.skip_next;
         if class.kind == Kind::None || (alloc && decision.problem.is_some()) {
             continue;
         }
@@ -1402,7 +1381,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
             && let Some(value) = tombstone.get(dead)
         {
             let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-            let _ = x86_64::write_value(out, rel.offset, class.width, value);
+            let _ = arch::write_value(out, rel.offset, class.width, value);
             continue;
         }
         let resolved = addresses.symbol_address(&target, rel.addend);
@@ -1418,7 +1397,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 }
                 let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
                 let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-                let _ = x86_64::write_value(out, rel.offset, class.width, value);
+                let _ = arch::write_value(out, rel.offset, class.width, value);
                 continue;
             }
         };
@@ -1429,7 +1408,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 s = stub;
             }
             if class.kind == Kind::Pc
-                && matches!(rel.r_type, R_X86_64_PLT32 | R_X86_64_PLT32_BND)
+                && arch.is_branch(rel.r_type)
                 && flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
                 && let Some(plt) = addresses.plt_address(owner)
             {
@@ -1438,56 +1417,94 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         }
         let sa = s.wrapping_add_signed(a);
         let tls = addresses.layout.tls.unwrap_or_default();
-        let got_pc = |kind: GotKind| -> Result<u64, ApplyError> {
-            let entry = addresses
-                .got_entry_address(owner, kind)
-                .ok_or(ApplyError::BadInstruction)?;
-            Ok(entry.wrapping_add_signed(a).wrapping_sub(place))
+        let tp = tls.tp(arch);
+        let slot_address = || -> Result<u64, ApplyError> {
+            addresses
+                .got_entry_address(owner, class.slot)
+                .ok_or(ApplyError::BadInstruction)
         };
+        let put =
+            |out: &mut [u8], value: u64| arch::write_value(out, rel.offset, class.width, value);
+        let page = crate::arch::aarch64::page;
         let result = match class.kind {
             Kind::None => Ok(()),
             Kind::Abs => match decision.dynamic {
                 Dynamic::Symbolic(_) => Ok(()),
-                _ => x86_64::write_value(out, rel.offset, class.width, sa),
+                _ => put(out, sa),
             },
-            Kind::Pc => x86_64::write_value(out, rel.offset, class.width, sa.wrapping_sub(place)),
-            Kind::GotPc => got_pc(GotKind::Address)
-                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
-            Kind::GotEntry => match addresses.got_address(owner) {
-                Some(entry) => x86_64::write_value(
+            Kind::Pc
+                if matches!(target.def, super::refs::Def::Undefined { .. })
+                    && sa == 0
+                    && arch
+                        .nop_undefined_branch(out, rel.offset, rel.r_type)
+                        .unwrap_or(false) =>
+            {
+                Ok(())
+            }
+            Kind::Pc => {
+                // A branch that cannot reach its target goes through the
+                // range-extension thunk layout placed for this output
+                // section (`elf::arch::thunk`).
+                let mut sa = sa;
+                if class.width == Width::Field(A64Field::Branch26)
+                    && !crate::arch::aarch64::branch_in_range(place, sa)
+                    && let Some(output) = addresses
+                        .layout
+                        .section_shndx
+                        .get(id.index())
+                        .copied()
+                        .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
+                    && let Some(thunk) = addresses.layout.thunk_for(output, sa)
+                {
+                    sa = thunk;
+                }
+                put(out, sa.wrapping_sub(place))
+            }
+            Kind::Page => put(out, page(sa).wrapping_sub(page(place))),
+            Kind::Got => {
+                slot_address().and_then(|g| put(out, g.wrapping_add_signed(a).wrapping_sub(place)))
+            }
+            Kind::GotPage => slot_address().and_then(|g| {
+                put(
+                    out,
+                    page(g.wrapping_add_signed(a)).wrapping_sub(page(place)),
+                )
+            }),
+            Kind::GotAbs => slot_address().and_then(|g| put(out, g.wrapping_add_signed(a))),
+            Kind::GotPageOff => slot_address().and_then(|g| {
+                put(
+                    out,
+                    g.wrapping_add_signed(a)
+                        .wrapping_sub(page(addresses.got_base())),
+                )
+            }),
+            Kind::GotSlotRel => slot_address().and_then(|g| {
+                put(
+                    out,
+                    g.wrapping_sub(addresses.got_base()).wrapping_add_signed(a),
+                )
+            }),
+            Kind::GdToIe | Kind::DescToIe => slot_address().and_then(|g| {
+                arch.relax_tls(
                     out,
                     rel.offset,
-                    class.width,
-                    entry
-                        .wrapping_sub(addresses.got_base())
-                        .wrapping_add_signed(a),
-                ),
-                None => Err(ApplyError::BadInstruction),
-            },
-            Kind::GotTpOff => got_pc(GotKind::TpOff)
-                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
-            Kind::TlsGd => got_pc(GotKind::TlsGd)
-                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
-            Kind::TlsDesc => got_pc(GotKind::TlsDesc)
-                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
-            Kind::TlsLd => got_pc(GotKind::TlsLd)
-                .and_then(|v| x86_64::write_value(out, rel.offset, class.width, v)),
-            Kind::GdToIe | Kind::DescToIe => got_pc(GotKind::TpOff)
-                .and_then(|v| x86_64::relax_tls_ie(out, rel.offset, class.kind, v as i64)),
+                    class.kind,
+                    rel.r_type,
+                    RelaxValues {
+                        tpoff: sa.wrapping_sub(tp) as i64,
+                        got: g,
+                        got_pc: g.wrapping_add_signed(a).wrapping_sub(place) as i64,
+                        place,
+                    },
+                )
+            }),
             Kind::RelaxGotPc => {
-                x86_64::relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
+                arch.relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
             }
-            Kind::RelaxGotPcNoPic => x86_64::relax_got(out, rel.offset, class.kind, sa as i64),
-            Kind::GotRel => x86_64::write_value(
+            Kind::RelaxGotPcNoPic => arch.relax_got(out, rel.offset, class.kind, sa as i64),
+            Kind::GotRel => put(out, sa.wrapping_sub(addresses.got_base())),
+            Kind::GotBasePc => put(
                 out,
-                rel.offset,
-                class.width,
-                sa.wrapping_sub(addresses.got_base()),
-            ),
-            Kind::GotBasePc => x86_64::write_value(
-                out,
-                rel.offset,
-                class.width,
                 addresses
                     .got_base()
                     .wrapping_add_signed(a)
@@ -1495,31 +1512,50 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
             ),
             Kind::Size => {
                 let size = target.raw.map_or(0, |r| r.st_size);
-                x86_64::write_value(out, rel.offset, class.width, size.wrapping_add_signed(a))
+                put(out, size.wrapping_add_signed(a))
             }
-            Kind::TpOff => {
-                x86_64::write_value(out, rel.offset, class.width, sa.wrapping_sub(tls.tp()))
+            // An undefined (weak) TLS symbol has no thread pointer offset;
+            // GNU ld and lld write the addend, as for an absolute value.
+            Kind::TpOff if matches!(target.def, super::refs::Def::Undefined { .. }) => {
+                put(out, a as u64)
+            }
+            Kind::TpOff => put(out, sa.wrapping_sub(tp)),
+            Kind::DtpOff if matches!(target.def, super::refs::Def::Undefined { .. }) => {
+                put(out, a as u64)
             }
             Kind::DtpOff => {
                 let value = if alloc && executable {
-                    sa.wrapping_sub(tls.tp())
+                    sa.wrapping_sub(tp)
                 } else {
                     sa.wrapping_sub(tls.start)
                 };
-                x86_64::write_value(out, rel.offset, class.width, value)
+                put(out, value)
             }
             Kind::GdToLe | Kind::LdToLe | Kind::IeToLe | Kind::DescToLe | Kind::DescCallToLe => {
-                x86_64::relax_tls(
+                // Local-dynamic code takes the start of the module's TLS
+                // block as its base, so that is what the relaxed sequence
+                // must compute.
+                let tpoff = if class.kind == Kind::LdToLe {
+                    tls.start.wrapping_sub(tp) as i64
+                } else {
+                    sa.wrapping_sub(tp) as i64
+                };
+                arch.relax_tls(
                     out,
                     rel.offset,
                     class.kind,
-                    sa.wrapping_sub(tls.tp()) as i64,
+                    rel.r_type,
+                    RelaxValues {
+                        tpoff,
+                        got: 0,
+                        got_pc: 0,
+                        place,
+                    },
                 )
             }
         };
         if let Err(error) = result {
-            let type_name = reloc_name(EM_X86_64, rel.r_type)
-                .map_or_else(|| rel.r_type.to_string(), str::to_owned);
+            let type_name = arch.reloc_label(rel.r_type);
             let name = symbol_name(refs, file_index, rel.symbol);
             let message = match error {
                 ApplyError::Overflow => {
@@ -1673,12 +1709,12 @@ fn write_eh_frame(
             let Some(target) = refs.target(eh.file, rel.symbol as usize) else {
                 continue;
             };
-            let Ok(class) = x86_64::classify(
+            let Ok(class) = input.context.arch.classify(
                 rel.r_type,
                 rel.addend,
                 eh.data,
                 rel.offset,
-                x86_64::ClassifyContext::static_exec(false),
+                super::arch::ClassifyContext::static_exec(false),
             ) else {
                 continue;
             };
@@ -1696,7 +1732,7 @@ fn write_eh_frame(
                 Kind::Pc => sa.wrapping_sub(place),
                 _ => continue,
             };
-            if x86_64::write_value(out, local, class.width, value).is_err() {
+            if arch::write_value(out, local, class.width, value).is_err() {
                 input.diagnostics.emit(
                     Diagnostic::error("relocation in .eh_frame out of range".to_string())
                         .at(location(refs, eh.file, eh.index, rel.offset)),

@@ -29,11 +29,11 @@ use rayon::prelude::*;
 
 use crate::diag::{Diagnostic, Location};
 use crate::elf::read::Relocations;
-use crate::elf::read::consts::{EM_X86_64, SHF_ALLOC, reloc_name};
+use crate::elf::read::consts::SHF_ALLOC;
 use crate::ids::SymbolId;
 use crate::symbols::SymbolFlags;
 
-use super::arch::x86_64::{ClassifyError, Kind};
+use super::arch::{Arch, ClassifyError, Kind};
 use super::object::SectionKind;
 use super::refs::{Def, Refs};
 use super::reloc::{self, Context, Dynamic, LocalNeed, Problem};
@@ -190,8 +190,8 @@ pub fn location(refs: &Refs<'_, '_>, file: usize, section: u32, offset: u64) -> 
     }
 }
 
-fn type_name(r_type: u32) -> String {
-    reloc_name(EM_X86_64, r_type).map_or_else(|| r_type.to_string(), str::to_owned)
+fn type_name(arch: Arch, r_type: u32) -> String {
+    arch.reloc_label(r_type)
 }
 
 fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileScan {
@@ -241,8 +241,9 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
         let Relocations::Rela(relas) = relocations else {
             result.errors.push(
                 Diagnostic::error(format!(
-                    "{}: SHT_REL relocations are not supported for x86-64",
-                    file.display()
+                    "{}: SHT_REL relocations are not supported for {}",
+                    file.display(),
+                    context.arch.emulation()
                 ))
                 .order(order),
             );
@@ -290,12 +291,16 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
                     Ok(decision) => decision,
                     Err(error) => {
                         let what = match error {
-                            ClassifyError::Unsupported => {
-                                format!("unsupported relocation type {}", type_name(rel.r_type))
-                            }
+                            ClassifyError::Unsupported => format!(
+                                "unsupported relocation type {}",
+                                type_name(context.arch, rel.r_type)
+                            ),
                             ClassifyError::BadTlsInstruction => format!(
-                                "{} must be followed by a call to __tls_get_addr",
-                                reloc_name(EM_X86_64, rel.r_type).unwrap_or("TLS relocation")
+                                "{} is not part of a TLS sequence qld can link",
+                                context
+                                    .arch
+                                    .reloc_name(rel.r_type)
+                                    .unwrap_or("a TLS relocation")
                             ),
                         };
                         result.errors.push(
@@ -306,14 +311,14 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
                         continue;
                     }
                 };
-            let kind = decision.class.kind;
-            skip = kind.skips_next();
-            if kind == Kind::None {
+            let class = decision.class;
+            skip = class.skip_next;
+            if class.kind == Kind::None {
                 continue;
             }
-            result.uses_got_base |= kind.uses_got_base();
+            result.uses_got_base |= class.uses_got_base();
             result.tls_ld |= decision.tls_ld;
-            result.static_tls |= kind.needs_gottpoff();
+            result.static_tls |= class.needs_gottpoff();
             if let Def::Undefined { weak: false } = target.def
                 && let Some(symbol) = target.global
                 && !eh_frame
@@ -332,17 +337,17 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
                 let what = match problem {
                     Problem::NeedsPic => format!(
                         "relocation {} cannot be used against symbol '{name}'; recompile with -fPIC",
-                        type_name(rel.r_type)
+                        type_name(context.arch, rel.r_type)
                     ),
                     Problem::LocalExecTls => format!(
                         "relocation {} against '{name}' cannot be used with this output; \
                          recompile with -fPIC",
-                        type_name(rel.r_type)
+                        type_name(context.arch, rel.r_type)
                     ),
                     Problem::NoCopyReloc => format!(
                         "unresolvable relocation {} against symbol '{name}'; recompile with -fPIC \
                          or remove '-z nocopyreloc'",
-                        type_name(rel.r_type)
+                        type_name(context.arch, rel.r_type)
                     ),
                 };
                 result.errors.push(
@@ -368,7 +373,7 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             match target.global {
                 Some(id) => {
                     let mut flags = decision.flags;
-                    if !matches!(rel.r_type, crate::elf::read::consts::x86_64::R_X86_64_PLT32) {
+                    if !context.arch.is_branch(rel.r_type) {
                         flags |= SymbolFlags::ADDRESS_TAKEN;
                     }
                     if !flags.is_empty() {

@@ -1,0 +1,33 @@
+# M4: the four TLS models in an executable, once with GCC's TLS descriptors
+# and once with the traditional `__tls_get_addr` sequences. Everything is in
+# the executable, so all of it relaxes to local-exec: no TLS dynamic
+# relocation and no GOT entry may be left, and `__tls_get_addr` must not be
+# called.
+description = "AArch64 TLS: general-dynamic, local-dynamic, initial-exec and local-exec relaxed to local-exec"
+compile = [
+  "cc -O2 -fPIE -mtls-dialect=desc -c tls.c -o tls-desc.o",
+  "cc -O2 -fPIE -mtls-dialect=trad -c tls.c -o tls-trad.o",
+]
+driver = "cc"
+link = [
+  "-pie -o out-desc tls-desc.o",
+  "-pie -o out-trad tls-trad.o",
+]
+output = "out-desc"
+run = "./out-desc && ./out-trad"
+expect.stdout = "tls 31\ntls 31\n"
+expect.readelf = [
+  "AArch64",
+  "TLS",
+  "!R_AARCH64_TLSDESC",
+  "!R_AARCH64_TLS_DTPMOD64",
+  "!R_AARCH64_TLS_TPREL64",
+  "!__tls_get_addr",
+]
+expect.readelf_files."out-trad" = [
+  "TLS",
+  "!R_AARCH64_TLS_DTPMOD64",
+  "!__tls_get_addr",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

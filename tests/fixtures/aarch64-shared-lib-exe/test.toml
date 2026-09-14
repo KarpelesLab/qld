@@ -1,0 +1,34 @@
+# M4: a shared library and an executable linked against it. Covers the
+# AArch64 PLT and GOT of a shared object, a copy relocation for the
+# library's data, the callback that needs --export-dynamic, and a TLS
+# variable of the library read from the executable (initial-exec through a
+# TPREL GOT entry).
+description = "AArch64 shared library plus executable, with a callback and library TLS"
+compile = ["cc -O2 -fPIC -c greet.c", "cc -O2 -fPIE -c main.c"]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libgreet.so -o libgreet.so greet.o",
+  "-o out main.o -L. -lgreet -Wl,-rpath,$ORIGIN -rdynamic",
+]
+run = "./out"
+expect.stdout = """
+hello from libgreet (tls=5)
+callback: 10
+greet_calls=1 lib_tls=5
+"""
+expect.readelf = [
+  "AArch64",
+  "Shared library: [libgreet.so]",
+  "$ORIGIN",
+  "exe_callback_qld",
+  "R_AARCH64_JUMP_SLOT",
+  "R_AARCH64_TLS_TPREL64",
+]
+expect.readelf_files."libgreet.so" = [
+  "DYN (",
+  "Library soname: [libgreet.so]",
+  "R_AARCH64_TLSDESC",
+  "greet_calls_qld",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true
