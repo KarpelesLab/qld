@@ -67,7 +67,11 @@ See [architecture.md](architecture.md#module-layout) for the layout and
 - **Input is untrusted.** Parsing code never panics on malformed input: no
   `unwrap`, no unchecked indexing, no arithmetic that can overflow on offsets
   or sizes. Use checked arithmetic and return `Error::Malformed { file, offset, what }`.
-  The fuzz targets enforce this.
+  Modules that parse untrusted bytes (`input`, `elf/read`, `script`, and
+  the future COFF and Mach-O readers) put
+  `#![deny(clippy::arithmetic_side_effects)]` at the top of their module, so
+  every unchecked `+` is a compile error there. Randomized truncation and
+  corruption tests check that nothing panics.
 - **Determinism.** No `HashMap` iteration order in outputs, no
   dependence on the order parallel tasks finish, and no timestamps unless an
   option asks for them. If you collect results in parallel, sort them by input

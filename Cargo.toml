@@ -40,8 +40,8 @@ missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
-# Parsers handle untrusted input: arithmetic on offsets must be checked.
-arithmetic_side_effects = "warn"
+# `arithmetic_side_effects` is enabled per module, in the modules that parse
+# untrusted input (see docs/development.md), not crate-wide.
 
 [profile.release]
 opt-level = 3
