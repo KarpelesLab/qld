@@ -13,9 +13,11 @@
 //! - [`section`]: `SHF_COMPRESSED` and `.zdebug_*` input sections, and
 //!   compressed output sections.
 //! - [`tombstone`]: values for relocations whose target was discarded.
+//! - [`dwarf`]: lazy `file:line` lookup for diagnostics.
 
 #![deny(clippy::arithmetic_side_effects)]
 
 pub mod compress;
+pub mod dwarf;
 pub mod section;
 pub mod tombstone;

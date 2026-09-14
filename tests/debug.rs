@@ -454,6 +454,453 @@ fn compressed_output_sections_accepted_by_binutils() {
 }
 
 // ---------------------------------------------------------------------------
+// Line lookup
+// ---------------------------------------------------------------------------
+
+const LINES_HEADER: &str = r#"
+static inline int header_helper(int y) {
+  int z = y * 2;
+  if (z > 10)
+    z -= 3;
+  return z;
+}
+"#;
+
+const LINES_SOURCE: &str = r#"
+#include "lines.h"
+struct point { int x, y; };
+
+static int twice(int v) { return v * 2; }
+
+int compute(struct point *p, int n) {
+  int total = 0;
+  for (int i = 0; i < n; i++) {
+    total += p[i].x * twice(p[i].y);
+    if (total > 1000)
+      total = header_helper(total);
+  }
+  return total;
+}
+
+#line 500 "generated.y"
+int generated(int a) {
+  return a + 42;
+}
+#line 24 "lines.c"
+
+int caller(void) {
+  struct point pts[4] = { {1, 2}, {3, 4}, {5, 6}, {7, 8} };
+  int r = compute(pts, 4);
+  r += generated(r);
+  return r + header_helper(r);
+}
+"#;
+
+/// Asks `addr2line` for the source position of each offset in `section`.
+/// Returns `None` if addr2line reports that it cannot read the DWARF.
+///
+/// Without `section`, the offsets are addresses (for `llvm-addr2line`, on
+/// objects with a single code section).
+fn addr2line(
+    tool: &Path,
+    obj: &Path,
+    section: Option<&str>,
+    offsets: &[u64],
+) -> Option<Vec<Option<(String, u32)>>> {
+    let mut cmd = Command::new(tool);
+    cmd.arg("-e").arg(obj);
+    if let Some(section) = section {
+        cmd.args(["-j", section]);
+    }
+    for offset in offsets {
+        cmd.arg(format!("{offset:#x}"));
+    }
+    let out = cmd.env("LC_ALL", "C").output().expect("addr2line");
+    if !out.status.success() || String::from_utf8_lossy(&out.stderr).contains("DWARF error") {
+        return None;
+    }
+    let lines = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| {
+            let line = line.split(" (discriminator").next().unwrap_or(line);
+            let (file, number) = line.rsplit_once(':')?;
+            let number: u32 = number.trim().parse().ok()?;
+            (file != "??" && number != 0).then(|| (file.to_string(), number))
+        })
+        .collect();
+    Some(lines)
+}
+
+/// Compiles the line test program in many configurations and compares
+/// qld's line lookup with `addr2line` at every few bytes of every code
+/// section.
+#[test]
+fn line_lookup_matches_addr2line() {
+    use qld::debug::dwarf::LineLookup;
+    use qld::elf::read::{Elf32Le, ElfFormat};
+
+    let Some(tool) = find_program("addr2line") else {
+        return skip("addr2line not found");
+    };
+    let dir = scratch_dir("lines");
+    std::fs::write(dir.join("lines.h"), LINES_HEADER).unwrap();
+    let mut configs: Vec<(String, Vec<&str>)> = Vec::new();
+    for version in ["-gdwarf-2", "-gdwarf-3", "-gdwarf-4", "-gdwarf-5"] {
+        configs.push((format!("gcc {version} -O0"), vec![version, "-O0"]));
+        configs.push((
+            format!("gcc {version} -O2 sections"),
+            vec![version, "-O2", "-ffunction-sections"],
+        ));
+    }
+    configs.push(("gcc dwarf64".into(), vec!["-gdwarf-5", "-gdwarf64", "-O1"]));
+    configs.push((
+        "gcc dwarf64 v4".into(),
+        vec!["-gdwarf-4", "-gdwarf64", "-O1"],
+    ));
+    configs.push(("gcc zlib".into(), vec!["-gdwarf-5", "-O1", "-gz=zlib"]));
+    configs.push(("gcc zstd".into(), vec!["-gdwarf-4", "-O1", "-gz=zstd"]));
+    configs.push((
+        "gcc split".into(),
+        vec!["-gdwarf-5", "-O1", "-gsplit-dwarf"],
+    ));
+    configs.push((
+        "gcc split v4".into(),
+        vec!["-gdwarf-4", "-O1", "-gsplit-dwarf"],
+    ));
+    configs.push(("gcc -m32".into(), vec!["-gdwarf-5", "-O1", "-m32"]));
+    configs.push((
+        "gcc -m32 v2".into(),
+        vec!["-gdwarf-2", "-O1", "-m32", "-ffunction-sections"],
+    ));
+
+    let mut compared = 0usize;
+    let mut built = 0usize;
+    let cc = find_program("gcc");
+    let clang = find_program("clang");
+    let mut jobs: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+    if let Some(cc) = &cc {
+        for (label, flags) in &configs {
+            jobs.push((
+                label.clone(),
+                cc.clone(),
+                flags.iter().map(|s| s.to_string()).collect(),
+            ));
+        }
+    }
+    if let Some(clang) = &clang {
+        for (label, flags) in [
+            ("clang v5", vec!["-gdwarf-5", "-O1"]),
+            ("clang v4", vec!["-gdwarf-4", "-O2", "-ffunction-sections"]),
+            ("clang split", vec!["-gdwarf-5", "-O1", "-gsplit-dwarf"]),
+        ] {
+            jobs.push((
+                label.into(),
+                clang.clone(),
+                flags.iter().map(|s| s.to_string()).collect(),
+            ));
+        }
+    }
+    for (index, (label, compiler, flags)) in jobs.iter().enumerate() {
+        let src = dir.join("lines.c");
+        std::fs::write(&src, LINES_SOURCE).unwrap();
+        let obj = dir.join(format!("lines{index}.o"));
+        let ok = Command::new(compiler)
+            .current_dir(&dir)
+            .args(["-g", "-c"])
+            .args(flags)
+            .arg("-o")
+            .arg(&obj)
+            .arg("lines.c")
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            println!("{label}: compiler rejected the flags, skipped");
+            continue;
+        }
+        built += 1;
+        let data = std::fs::read(&obj).unwrap();
+        let is_32 = data[4] == 1;
+        fn check<F: ElfFormat>(data: &[u8], obj: &Path, tool: &Path, label: &str) -> usize {
+            let object = ObjectFile::<F>::parse(data, Source::new(obj)).unwrap();
+            let lookup = LineLookup::parse(&object).unwrap();
+            assert!(
+                lookup.problems().is_empty(),
+                "{label}: {:?}",
+                lookup.problems()
+            );
+            assert!(!lookup.is_empty(), "{label}: no line information found");
+            let code: Vec<_> = object
+                .elf()
+                .enumerate_sections()
+                .filter(|(_, h)| h.sh_flags & 0x4 != 0 && h.sh_size != 0) // SHF_EXECINSTR
+                .collect();
+            let mut compared = 0;
+            for &(index, header) in &code {
+                let name =
+                    String::from_utf8_lossy(object.section_name(&header).unwrap()).into_owned();
+                let offsets: Vec<u64> = (0..header.sh_size).step_by(3).collect();
+                // GNU addr2line cannot read some valid DWARF (for example
+                // gcc's -gdwarf64 objects); fall back to llvm-addr2line
+                // where addresses are unambiguous.
+                let expected = match addr2line(tool, obj, Some(&name), &offsets) {
+                    Some(expected) => expected,
+                    None => match find_program("llvm-addr2line") {
+                        Some(llvm) if code.len() == 1 => {
+                            addr2line(&llvm, obj, None, &offsets).expect("llvm-addr2line")
+                        }
+                        _ => {
+                            println!("{label}: addr2line cannot read this object, skipped");
+                            return compared;
+                        }
+                    },
+                };
+                assert_eq!(expected.len(), offsets.len());
+                let mut found_any = false;
+                for (offset, expected) in offsets.iter().zip(expected) {
+                    let actual = lookup.find(index, *offset).map(|s| (s.file, s.line));
+                    found_any |= actual.is_some();
+                    assert_eq!(actual, expected, "{label}: {name}+{offset:#x}");
+                    compared += 1;
+                }
+                assert!(found_any, "{label}: nothing found in {name}");
+            }
+            compared
+        }
+        compared += if is_32 {
+            check::<Elf32Le>(&data, &obj, &tool, label)
+        } else {
+            check::<Elf64Le>(&data, &obj, &tool, label)
+        };
+    }
+    if built == 0 {
+        return skip("no C compiler");
+    }
+    println!("compared {compared} positions in {built} objects");
+}
+
+/// Line lookup on the committed objects (runs without any tools). The
+/// expected values come from `addr2line` 2.46.
+#[test]
+fn line_lookup_committed_fixtures() {
+    use qld::debug::dwarf::{LineLookup, source_location};
+
+    let data = std::fs::read(data_dir().join("lines-dwarf5.o")).unwrap();
+    let object =
+        ObjectFile::<Elf64Le>::parse(&data, Source::new(Path::new("lines-dwarf5.o"))).unwrap();
+    let section = |name: &[u8]| object.elf().section_by_name(name).unwrap().0;
+    let lookup = LineLookup::parse(&object).unwrap();
+    assert!(lookup.problems().is_empty());
+    let at = |section, offset| lookup.find(section, offset).map(|s| (s.file, s.line));
+    assert_eq!(
+        at(section(b".text.compute"), 0x10),
+        Some(("/src/lines.c".into(), 9))
+    );
+    assert_eq!(
+        at(section(b".text.generated"), 0),
+        Some(("/src/generated.y".into(), 500))
+    );
+    assert_eq!(at(section(b".debug_info"), 0), None);
+    let one_shot = source_location(&object, section(b".text.generated"), 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (one_shot.file.as_str(), one_shot.line),
+        ("/src/generated.y", 500)
+    );
+
+    let data = std::fs::read(data_dir().join("lines-dwarf4-zlib.o")).unwrap();
+    let object =
+        ObjectFile::<Elf64Le>::parse(&data, Source::new(Path::new("lines-dwarf4-zlib.o"))).unwrap();
+    let text = object.elf().section_by_name(b".text").unwrap().0;
+    let lookup = LineLookup::parse(&object).unwrap();
+    assert!(lookup.problems().is_empty());
+    let at = |offset| lookup.find(text, offset).map(|s| (s.file, s.line));
+    assert_eq!(at(0x30), Some(("/src/lines.c".into(), 7)));
+    assert_eq!(at(0x90), Some(("/src/lines.c".into(), 11)));
+}
+
+// ---------------------------------------------------------------------------
+// Randomized corruption: nothing may panic
+// ---------------------------------------------------------------------------
+
+/// Multiplier for the number of mutations (`QLD_FUZZ_SCALE`, default 1),
+/// for longer runs by hand.
+fn fuzz_scale() -> usize {
+    std::env::var("QLD_FUZZ_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n.max(1) as u64) as usize
+    }
+}
+
+/// Truncates or flips bytes of `valid`, `rounds` times, handing each
+/// mutant to `check`.
+fn mutate(valid: &[u8], rounds: usize, seed: u64, mut check: impl FnMut(&[u8])) {
+    let mut rng = Rng(seed | 1);
+    for round in 0..rounds {
+        let mut data = valid.to_vec();
+        match round % 4 {
+            0 => data.truncate(rng.below(valid.len() + 1)),
+            1 => {
+                let at = rng.below(data.len());
+                if let Some(b) = data.get_mut(at) {
+                    *b ^= 1 << rng.below(8);
+                }
+            }
+            2 => {
+                for _ in 0..1 + rng.below(8) {
+                    let at = rng.below(data.len());
+                    if let Some(b) = data.get_mut(at) {
+                        *b = rng.next() as u8;
+                    }
+                }
+            }
+            _ => {
+                let at = rng.below(data.len());
+                if let Some(b) = data.get_mut(at) {
+                    *b ^= rng.next() as u8 | 1;
+                }
+                data.truncate(at + rng.below(data.len() - at + 1));
+            }
+        }
+        check(&data);
+    }
+}
+
+#[test]
+fn inflate_survives_corruption() {
+    let expected = std::fs::read(data_dir().join("mixed.bin")).unwrap();
+    let mut streams = vec![std::fs::read(data_dir().join("mixed.z")).unwrap()];
+    for level in [0, 1, 6, 9] {
+        streams.push(zlib_compress_chunked(
+            &expected[..8000],
+            Level::new(level),
+            3000,
+        ));
+    }
+    let mut out = vec![0u8; expected.len()];
+    for (i, stream) in streams.iter().enumerate() {
+        let size = if i == 0 { expected.len() } else { 8000 };
+        mutate(
+            stream,
+            1500 * fuzz_scale(),
+            0xdead_beef + i as u64,
+            |data| {
+                let _ = zlib_decompress_into(data, &mut out[..size]);
+                let _ = qld::debug::compress::inflate_into(
+                    data.get(2..).unwrap_or_default(),
+                    &mut out[..size],
+                );
+            },
+        );
+    }
+    // Pure noise.
+    let mut rng = Rng(12345);
+    for _ in 0..500 * fuzz_scale() {
+        let len = rng.below(300);
+        let mut data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        if data.len() >= 2 {
+            data[0] = 0x78;
+            data[1] = 0x9c;
+        }
+        let _ = zlib_decompress_into(&data, &mut out[..1000]);
+    }
+}
+
+#[test]
+fn zstd_survives_corruption() {
+    let expected = std::fs::read(data_dir().join("mixed.bin")).unwrap();
+    let mut out = vec![0u8; expected.len()];
+    for (i, name) in ["mixed.l3.zst", "mixed.l19.zst"].iter().enumerate() {
+        let stream = std::fs::read(data_dir().join(name)).unwrap();
+        mutate(&stream, 3000 * fuzz_scale(), 0x5eed + i as u64, |data| {
+            let _ = Codec::Zstd.decompress_into(data, &mut out);
+        });
+    }
+    let mut rng = Rng(777);
+    for _ in 0..1000 * fuzz_scale() {
+        let len = rng.below(200);
+        let mut data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        if data.len() >= 6 {
+            data[..4].copy_from_slice(&0xfd2f_b528u32.to_le_bytes());
+            data[4] &= 0xf7; // clear the reserved bit, keep the rest random
+        }
+        let _ = Codec::Zstd.decompress_into(&data, &mut out[..500]);
+    }
+}
+
+/// Corrupts the debug and relocation sections of the committed objects
+/// (the rest of the file is kept intact so that parsing reaches the DWARF
+/// readers).
+#[test]
+fn dwarf_survives_corruption() {
+    use qld::debug::dwarf::LineLookup;
+
+    for (seed, name) in [(1u64, "lines-dwarf5.o"), (2, "lines-dwarf4-zlib.o")] {
+        let original = std::fs::read(data_dir().join(name)).unwrap();
+        let object = ObjectFile::<Elf64Le>::parse(&original, Source::new(Path::new(name))).unwrap();
+        let ranges: Vec<(usize, usize)> = object
+            .elf()
+            .enumerate_sections()
+            .filter(|(_, h)| {
+                let n = object.section_name(h).unwrap();
+                n.starts_with(b".debug") || n.starts_with(b".rela.debug")
+            })
+            .map(|(_, h)| (h.sh_offset as usize, h.sh_size as usize))
+            .collect();
+        let queries: Vec<(u32, u64)> = object
+            .elf()
+            .enumerate_sections()
+            .filter(|(_, h)| h.sh_flags & 0x4 != 0)
+            .flat_map(|(i, h)| (0..h.sh_size).step_by(7).map(move |o| (i, o)))
+            .collect();
+        let mut rng = Rng(seed * 0x9e37_79b9);
+        for round in 0..3000 * fuzz_scale() {
+            let mut data = original.clone();
+            let (start, size) = ranges[rng.below(ranges.len())];
+            for _ in 0..1 + rng.below(if round % 2 == 0 { 2 } else { 16 }) {
+                let at = start + rng.below(size);
+                data[at] = match rng.below(3) {
+                    0 => data[at] ^ (1 << rng.below(8)),
+                    1 => rng.next() as u8,
+                    _ => [0, 0xff, 0x80, 0x7f][rng.below(4)],
+                };
+            }
+            let Ok(object) = ObjectFile::<Elf64Le>::parse(&data, Source::new(Path::new(name)))
+            else {
+                continue;
+            };
+            if let Ok(lookup) = LineLookup::parse(&object) {
+                for &(section, offset) in &queries {
+                    let _ = lookup.find(section, offset);
+                }
+            }
+        }
+        // Truncated files.
+        mutate(&original, 300, seed, |data| {
+            if let Ok(object) = ObjectFile::<Elf64Le>::parse(data, Source::new(Path::new(name))) {
+                let _ = LineLookup::parse(&object);
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tombstones
 // ---------------------------------------------------------------------------
 
