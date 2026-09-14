@@ -1,0 +1,17 @@
+# M4: C++ exceptions on AArch64 need `.eh_frame` to be relocated correctly
+# and `.eh_frame_hdr` to be sorted, so that the unwinder finds the FDE of a
+# frame two calls deep.
+description = "C++ exceptions across two frames, for AArch64"
+compile = ["c++ -O2 -fPIE -c throw.cpp"]
+driver = "c++"
+link = "-pie -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "AArch64",
+  "GNU_EH_FRAME",
+  ".gcc_except_table",
+  "R_AARCH64_JUMP_SLOT",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

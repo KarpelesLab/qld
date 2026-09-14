@@ -1,0 +1,24 @@
+# M4: a linker script lays out a bare-metal AArch64 image: MEMORY regions,
+# `>REGION AT> REGION` load addresses, KEEP, NOLOAD and /DISCARD/. The
+# addresses and the relocated code are GNU ld's. `-z max-page-size` is given
+# because qld's script layout still assumes the x86-64 page size (see the
+# W20 report).
+description = "AArch64 bare-metal image laid out by a linker script"
+compile = ["cc -c boot.s"]
+link = "-T image.ld -z max-page-size=0x10000 --no-warn-rwx-segments -o out boot.o"
+expect.readelf = [
+  "AArch64",
+  "Entry point address:               0x40000000",
+  ".vectors          PROGBITS        0000000040000000",
+  ".text             PROGBITS        0000000040000004 010004 000028",
+  ".rodata           PROGBITS        0000000040000030 010030 000010",
+  ".data             PROGBITS        0000000080000000",
+  ".bss              NOBITS          0000000080000008",
+  "0x0000000040000040 0x000008 0x000010 RW",
+  "0000000040000040     0 NOTYPE  GLOBAL DEFAULT  ABS _sidata",
+  "0000000080100000     0 NOTYPE  GLOBAL DEFAULT",
+  "!.comment",
+  "!INTERP",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true
