@@ -266,6 +266,9 @@ pub struct Layout<'a> {
     /// Header space (ELF header and program headers) addresses were
     /// computed with.
     pub headers_reserved: u64,
+    /// `NOCROSSREFS` lists: output section names, and whether the list is
+    /// `NOCROSSREFS_TO` (only references to the first section are checked).
+    pub nocrossrefs: Vec<(bool, Vec<Vec<u8>>)>,
 }
 
 impl Layout<'_> {
@@ -1123,6 +1126,7 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         warnings: Vec::new(),
         phoff: EHDR_SIZE,
         headers_reserved: 0,
+        nocrossrefs: Vec::new(),
     })
 }
 

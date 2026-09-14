@@ -863,6 +863,63 @@ fn orphan_handling_error_names_the_section() {
     );
 }
 
+#[test]
+fn nocrossrefs_prohibits_references_between_sections() {
+    require_tools!();
+    let dir = scratch("nocrossrefs");
+    assemble(&dir, "start", START);
+    assemble(&dir, "main", MAIN);
+    // `main` (in .text) reads `counter` (in .data), and .data holds a
+    // pointer to `main`.
+    let script = FLASH_SCRIPT.replace(
+        "ENTRY(reset_handler)",
+        "ENTRY(reset_handler)\nNOCROSSREFS(.text .data)\n",
+    );
+    fs::write(dir.join("ncr.ld"), &script).unwrap();
+    let args = ["-T", "ncr.ld", "start.o", "main.o", "-o", "out"];
+    let (ok, stderr) = qld_only(&dir, &args);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("prohibited cross reference from .text to `counter' in .data"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("prohibited cross reference from .data to `main' in .text"),
+        "{stderr}"
+    );
+    if let Some(ld) = gnu_ld() {
+        let gnu = run(
+            &dir,
+            &ld,
+            &["-T", "ncr.ld", "start.o", "main.o", "-o", "gnu"],
+        );
+        let gnu_err = String::from_utf8_lossy(&gnu.stderr);
+        assert!(!gnu.status.success(), "{gnu_err}");
+        for line in gnu_err.lines().filter(|l| l.contains("prohibited")) {
+            let (_, message) = line.split_once("prohibited").unwrap_or(("", line));
+            assert!(
+                stderr.contains(message.trim()),
+                "GNU: {line}\nqld: {stderr}"
+            );
+        }
+    }
+
+    // NOCROSSREFS_TO only checks references to the first section, so
+    // .data -> .text stays legal while .text -> .data does not.
+    let script = script.replace("NOCROSSREFS(.text .data)", "NOCROSSREFS_TO(.data .text)");
+    fs::write(dir.join("ncr.ld"), &script).unwrap();
+    let (ok, stderr) = qld_only(&dir, &args);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("prohibited cross reference from .text to `counter' in .data"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("from .data to `main'"),
+        "references to the first section only: {stderr}"
+    );
+}
+
 /// Truncated and corrupted scripts must give errors, never panics.
 #[test]
 fn corrupted_scripts_never_panic() {

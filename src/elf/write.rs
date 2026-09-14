@@ -1370,6 +1370,12 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         let Some(target) = refs.target(file_index, rel.symbol as usize) else {
             continue;
         };
+        if let Some((from, to)) = prohibited_cross_reference(input, id, &target) {
+            let name = cross_reference_name(refs, file_index, rel.symbol, &target);
+            report(format!(
+                "prohibited cross reference from {from} to `{name}' in {to}"
+            ));
+        }
         let flags = target
             .global
             .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
@@ -1530,6 +1536,81 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         }
     }
     Ok(())
+}
+
+/// The output section names of a reference from input section `from` to
+/// `target` when a `NOCROSSREFS` list prohibits it, as GNU ld checks: both
+/// output sections are in one list and differ, and for `NOCROSSREFS_TO`
+/// the target is in the list's first section.
+fn prohibited_cross_reference(
+    input: &WriteInput<'_, '_, '_>,
+    from: SectionId,
+    target: &super::refs::Target,
+) -> Option<(String, String)> {
+    let addresses = input.addresses;
+    let layout = addresses.layout;
+    if layout.nocrossrefs.is_empty() {
+        return None;
+    }
+    let name_of = |shndx: u32| -> Option<&[u8]> {
+        let position = usize::try_from(shndx.checked_sub(1)?).ok()?;
+        layout.sections.get(position).map(|s| s.name)
+    };
+    let shndx_of = |id: SectionId| layout.section_shndx.get(id.index()).copied();
+    let from_name = name_of(shndx_of(from)?)?;
+    let to_shndx = match target.def {
+        super::refs::Def::Section { file, section, .. } => {
+            shndx_of(addresses.refs.sections.id(file, section)?)?
+        }
+        super::refs::Def::Linker(id) => {
+            u32::from(super::defined::linker_shndx(addresses, input.linker, id)?)
+        }
+        _ => return None,
+    };
+    let to_name = name_of(to_shndx)?;
+    if from_name == to_name {
+        return None;
+    }
+    let listed = |names: &[Vec<u8>], name: &[u8]| names.iter().any(|n| n.as_slice() == name);
+    layout
+        .nocrossrefs
+        .iter()
+        .any(|(first_only, names)| {
+            let target_listed = if *first_only {
+                names.first().is_some_and(|n| n.as_slice() == to_name)
+            } else {
+                listed(names, to_name)
+            };
+            target_listed && listed(names, from_name)
+        })
+        .then(|| {
+            (
+                String::from_utf8_lossy(from_name).into_owned(),
+                String::from_utf8_lossy(to_name).into_owned(),
+            )
+        })
+}
+
+/// The name a cross-reference error uses for a symbol: GNU ld names a
+/// section symbol after its input section, which has no symbol name.
+fn cross_reference_name(
+    refs: &Refs<'_, '_>,
+    file: usize,
+    symbol: u32,
+    target: &super::refs::Target,
+) -> String {
+    if target.is_section_symbol()
+        && let super::refs::Def::Section { section, .. } = target.def
+        && let Some(name) = refs
+            .files
+            .get(file)
+            .and_then(|f| f.object.as_ref())
+            .and_then(|o| o.section(section))
+            .map(|s| String::from_utf8_lossy(s.name).into_owned())
+    {
+        return name;
+    }
+    symbol_name(refs, file, symbol)
 }
 
 fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {

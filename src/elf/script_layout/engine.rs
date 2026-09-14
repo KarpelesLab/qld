@@ -22,23 +22,21 @@
 
 use hashbrown::HashMap;
 
-use crate::args::{MagicMode, OutputKind};
+use crate::args::MagicMode;
 use crate::diag::Diagnostic;
 use crate::elf::layout::{
     CompressedOutput, EHDR_SIZE, Layout, LayoutInput, Member, OutSection, PHDR_SIZE, Placed,
     Trailer, add_trailers, entsize_of, member_size, set_links, synthetic_flags,
 };
 use crate::elf::object::SectionKind;
-use crate::elf::read::consts::{
-    SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS,
-};
+use crate::elf::read::consts::{SHF_ALLOC, SHF_TLS, SHF_WRITE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS};
 use crate::elf::rules::Synthetic;
 use crate::elf::sections::NONE;
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::script::{
-    AssignKind, Assignment, DataSize, EvalContext, EvalError, Expr, Fill, OutputSectionType,
-    SortMode, Span, Value, ValueSection, align_up, eval, eval_absolute, eval_dot_assignment,
+    AssignKind, Assignment, EvalContext, EvalError, Expr, Fill, OutputSectionType, SortMode, Span,
+    Value, ValueSection, align_up, eval, eval_absolute, eval_dot_assignment,
     eval_symbol_assignment, fill_pattern,
 };
 
@@ -196,7 +194,6 @@ struct Engine<'e, 'l, 'a> {
     headers_size: u64,
     max_page: u64,
     common_page: u64,
-    raw_output: bool,
     /// `-z relro`, dropped as GNU ld does when no section with contents
     /// lies between `DATA_SEGMENT_ALIGN` and `DATA_SEGMENT_RELRO_END`.
     relro: bool,
@@ -685,7 +682,6 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
                                 out.data.push((offset, data));
                             }
                         }
-                        let _ = DataSize::Byte;
                         self.dot = self.dot.wrapping_add(size.bytes());
                     }
                     Item::Asciz(text) => {
@@ -1380,7 +1376,7 @@ fn build_entries(
             }
             let sub = placement.sub.get(id.index()).copied().unwrap_or(0);
             let (size, align) = member_size(input, member)?;
-            let rule = *rules.entry((output, sub)).or_insert_with(|| {
+            rules.entry((output, sub)).or_insert_with(|| {
                 let stmt = placed.stmt(script, output)?;
                 let description = stmt.items.iter().find_map(|item| match item {
                     Item::Input { description, index } if *index == sub => Some(description),
@@ -1404,7 +1400,6 @@ fn build_entries(
                     files,
                 })
             });
-            let _ = rule;
             if let Some(list) = lists.get_mut(output as usize) {
                 list.push((
                     Entry {
@@ -1888,7 +1883,6 @@ fn layout_with<'a>(
         headers_size,
         max_page,
         common_page,
-        raw_output,
         relro: relro_effective,
         span: Span::default(),
         by_name,
@@ -2366,7 +2360,6 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
             }
         }
     }
-    let regular = out_sections.len();
     let (section_symbols, shstrtab) = add_trailers(input, &mut out_sections)?;
 
     // Program headers.
@@ -2420,7 +2413,6 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         interp: position_of_synthetic(Synthetic::Interp),
         eh_frame_hdr: position_of_synthetic(Synthetic::EhFrameHdr),
     };
-    let _ = regular;
     let result = super::segments::assign(&segment_input, &mut out_sections)?;
     set_links(&mut out_sections, input.synth);
     let shstrtab_len = u64::try_from(shstrtab.len()).unwrap_or(u64::MAX);
@@ -2563,10 +2555,6 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         .iter()
         .map(|w| Diagnostic::warning(w.clone()))
         .collect();
-    let _ = MagicMode::Normal;
-    let _ = OutputKind::Executable;
-    let _ = SHF_EXECINSTR;
-    let _ = engine.raw_output;
     Ok(Layout {
         sections: out_sections,
         output_places,
@@ -2590,6 +2578,11 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         warnings,
         phoff: result.phoff,
         headers_reserved: engine.headers_size,
+        nocrossrefs: script
+            .nocrossrefs
+            .iter()
+            .map(|list| (list.to, list.sections.clone()))
+            .collect(),
     })
 }
 

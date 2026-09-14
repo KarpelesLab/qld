@@ -232,7 +232,7 @@ impl Loader<'_> {
 
     /// Applies a script's non-layout commands, and returns the in-memory
     /// input script holding its input lists, if it has any.
-    fn absorb(&mut self, script: &Script, path: &Path) -> Result<Option<Vec<u8>>> {
+    fn absorb(&mut self, script: &Script, _path: &Path) -> Result<Option<Vec<u8>>> {
         let mut inputs = Vec::new();
         for command in &script.commands {
             match &command.kind {
@@ -285,7 +285,6 @@ impl Loader<'_> {
         if inputs.is_empty() {
             return Ok(None);
         }
-        let _ = path;
         Ok(Some(inputs))
     }
 }
