@@ -70,13 +70,27 @@ pub fn version_line() -> String {
 
 /// Runs a link described by `options`.
 ///
+/// Parallel stages run in a rayon pool with `options.threads` threads (one
+/// per core when unset), created for the duration of the link. To run in a
+/// pool you already own, call the format driver (such as [`elf::link`])
+/// inside your pool's `install` instead.
+///
 /// # Errors
 ///
-/// Returns [`Error::Unimplemented`] until the milestone 1 pipeline lands, and
-/// after that any fatal error from the link.
-pub fn link(options: &LinkOptions, _diagnostics: &dyn DiagnosticSink) -> Result<()> {
-    let _ = options;
-    Err(Error::Unimplemented(
-        "linking (roadmap M1: static ELF x86-64)".into(),
-    ))
+/// Returns any fatal error from the link, including
+/// [`Error::Unimplemented`] for targets and features not supported yet.
+pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
+    let mut pool = rayon::ThreadPoolBuilder::new();
+    if let Some(threads) = options.threads {
+        pool = pool.num_threads(threads);
+    }
+    let pool = pool
+        .build()
+        .map_err(|error| Error::Internal(format!("cannot create thread pool: {error}")))?;
+    pool.install(|| match options.target.map(|target| target.format) {
+        None | Some(BinaryFormat::Elf) => elf::link(options, diagnostics),
+        Some(format) => Err(Error::Unimplemented(format!(
+            "{format:?} output (see ROADMAP.md)"
+        ))),
+    })
 }
