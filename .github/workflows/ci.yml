@@ -36,6 +36,51 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gcc g++ binutils libc6-dev libstdc++-13-dev
       - run: cargo test --all-features --test fixtures -- --ignored --nocapture
 
+  pe-windows:
+    name: PE images run on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+          path-type: inherit
+      - name: Link the PE fixtures with qld
+        shell: msys2 {0}
+        run: cargo test --all-features --test coff_link
+        env:
+          QLD_REQUIRE_COFF_TOOLS: "1"
+      - name: Run the images qld produced
+        shell: pwsh
+        run: |
+          $root = "target/tmp/coff-link"
+          $cases = @(
+            @{ exe = "$root/console-hello-world/qld.exe";        expect = "hello from qld" },
+            @{ exe = "$root/dll-with-import-library/client.exe";  expect = "hello from the dll" },
+            @{ exe = "$root/cxx-exceptions/qld.exe";              expect = "caught boom" },
+            @{ exe = "$root/thread-local-storage/qld.exe";        expect = "8" },
+            @{ exe = "$root/auto-import/auto.exe";                expect = "hello from the dll" }
+          )
+          $failed = 0
+          foreach ($case in $cases) {
+            if (-not (Test-Path $case.exe)) {
+              Write-Host "MISSING $($case.exe)"; $failed = 1; continue
+            }
+            Push-Location (Split-Path $case.exe)
+            $out = & (".\" + (Split-Path $case.exe -Leaf)) 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            Pop-Location
+            if ($code -ne 0 -or -not ($out -match [regex]::Escape($case.expect))) {
+              Write-Host "FAIL $($case.exe): exit $code, output: $out"; $failed = 1
+            } else {
+              Write-Host "PASS $($case.exe)"
+            }
+          }
+          exit $failed
+
   lint:
     name: fmt, clippy, docs
     runs-on: ubuntu-latest

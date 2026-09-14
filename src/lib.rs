@@ -88,6 +88,7 @@ pub fn version_line() -> String {
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
     let run = || match options.target.map(|target| target.format) {
         None | Some(BinaryFormat::Elf) => elf::link(options, diagnostics),
+        Some(BinaryFormat::Pe) => coff::link(options, diagnostics),
         Some(format) => Err(Error::Unimplemented(format!(
             "{format:?} output (see ROADMAP.md)"
         ))),
