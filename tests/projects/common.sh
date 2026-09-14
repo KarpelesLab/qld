@@ -10,6 +10,9 @@
 # `qc++`, `qclang` and `qclang++` compiler wrappers that point the drivers
 # at them. When QLD_LINK_LOG is set, every link is appended to it (working
 # directory and argv), which is what reproducing a failing link needs.
+# When QLD_LINK_COMPARE names a directory, every link is also done with GNU
+# ld from the same inputs and timed (see ldcompare.py), for links whose
+# inputs do not outlive the build (rustc's).
 #
 # These scripts are for manual and nightly runs; `cargo test` never runs them.
 
@@ -22,6 +25,7 @@ case "$QLD" in /*) ;; *) QLD="$(pwd)/$QLD" ;; esac
 case "$SCRATCH" in /*) ;; *) SCRATCH="$(pwd)/$SCRATCH" ;; esac
 mkdir -p "$SCRATCH/bin" "$SCRATCH/src" "$SCRATCH/build"
 QLD_BIN="$SCRATCH/bin"
+QLD_PROJECTS=${QLD_PROJECTS:-$(cd "$(dirname "$0")" && pwd)}
 
 # Wrappers are written to a temporary file and renamed into place, so that
 # concurrent builds sharing $SCRATCH never see a missing or partial `ld`
@@ -42,7 +46,20 @@ put_script "$QLD_BIN/ld" <<EOF
 if [ -n "\${QLD_LINK_LOG:-}" ]; then
   # One write per line, so that parallel links do not interleave.
   line="cd '\$(pwd)' &&"
-  for a in "\$@"; do line="\$line '\$a'"; done
+  for a in "\$@"; do
+    # Compiler drivers pass long command lines in temporary response files;
+    # keep a copy so that the link can be replayed.
+    case "\$a" in
+      @*)
+        if [ -f "\${a#@}" ]; then
+          mkdir -p "\${QLD_LINK_LOG}.rsp"
+          copy="\${QLD_LINK_LOG}.rsp/\$\$-\$(basename "\${a#@}")"
+          cp "\${a#@}" "\$copy" && a="@\$copy"
+        fi
+        ;;
+    esac
+    line="\$line '\$a'"
+  done
   tmp="\${QLD_LINK_LOG}.\$\$"
   printf '%s\n' "\$line" > "\$tmp" && cat "\$tmp" >> "\$QLD_LINK_LOG"
   rm -f "\$tmp"
@@ -55,6 +72,9 @@ if [ -n "\$help" ] && [ -z "\${QLD_NO_HELP_WORKAROUND:-}" ]; then
     echo "qld: supported emulations: elf_x86_64 elf_i386 elf32_x86_64"
   fi
   exit 0
+fi
+if [ -n "\${QLD_LINK_COMPARE:-}" ]; then
+  exec python3 "$QLD_PROJECTS/ldcompare.py" "$QLD" "\$@"
 fi
 exec "$QLD" "\$@"
 EOF
@@ -85,7 +105,7 @@ EOF
 fetch() {
   f="$SCRATCH/src/$(basename "$1")"
   if [ ! -f "$f" ]; then
-    curl -fL --retry 3 -o "$f.part" "$1"
+    curl -fsSL --retry 3 -o "$f.part" "$1"
     mv "$f.part" "$f"
   fi
   printf '%s\n' "$f"
