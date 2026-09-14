@@ -1,0 +1,18 @@
+# M4: the AArch64 counterpart of `hello-static-c`. Static glibc, so every
+# TLS access in libc relaxes to local-exec and the IFUNC stubs of the string
+# functions are resolved by `.rela.plt` IRELATIVE relocations.
+description = "static hello world in C, for AArch64"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "AArch64",
+  "EXEC (Executable file)",
+  "!INTERP",
+  "!.dynamic",
+  "!R_AARCH64_JUMP_SLOT",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

@@ -22,193 +22,17 @@
 
 use crate::elf::read::consts::x86_64::*;
 
-/// What a relocation computes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// Nothing to do.
-    None,
-    /// `S + A`.
-    Abs,
-    /// `S + A - P`.
-    Pc,
-    /// `GOT entry + A - P`: needs a GOT entry for the symbol.
-    GotPc,
-    /// Relaxed `GOTPCRELX`: `S + A - P`, with the instruction rewritten.
-    RelaxGotPc,
-    /// Relaxed `REX_GOTPCRELX` to an immediate operand: `S`.
-    RelaxGotPcNoPic,
-    /// `GOT entry - GOT base + A` (`GOT32`, `GOT64`): needs a GOT entry.
-    GotEntry,
-    /// `S + A - GOT base` (`GOTOFF64`, `PLTOFF64`).
-    GotRel,
-    /// `GOT base + A - P` (`GOTPC32`, `GOTPC64`).
-    GotBasePc,
-    /// `Z + A`.
-    Size,
-    /// `S + A - TP`.
-    TpOff,
-    /// `S + A - TLS block start` in non-allocated sections, `S + A - TP` in
-    /// allocated ones (local-dynamic code relaxed to local-exec).
-    DtpOff,
-    /// General-dynamic → local-exec; the next relocation is consumed.
-    GdToLe,
-    /// Local-dynamic → local-exec; the next relocation is consumed.
-    LdToLe,
-    /// Initial-exec → local-exec.
-    IeToLe,
-    /// TLS descriptor → local-exec.
-    DescToLe,
-    /// TLS descriptor call → `nop`.
-    DescCallToLe,
-    /// General-dynamic → initial-exec; the next relocation is consumed.
-    GdToIe,
-    /// TLS descriptor → initial-exec (`lea` → `mov` from the GOT).
-    DescToIe,
-    /// Initial-exec kept: `TP offset GOT entry + A - P`.
-    GotTpOff,
-    /// General-dynamic kept: `module/offset GOT pair + A - P`.
-    TlsGd,
-    /// Local-dynamic kept: `module GOT pair + A - P`.
-    TlsLd,
-    /// TLS descriptor kept: `descriptor GOT pair + A - P`.
-    TlsDesc,
-}
-
-impl Kind {
-    /// Whether the relocation needs a GOT entry for its symbol.
-    #[must_use]
-    pub fn needs_got(self) -> bool {
-        matches!(self, Self::GotPc | Self::GotEntry)
-    }
-
-    /// Whether the relocation uses the GOT base (so `_GLOBAL_OFFSET_TABLE_`
-    /// must exist).
-    #[must_use]
-    pub fn uses_got_base(self) -> bool {
-        matches!(self, Self::GotEntry | Self::GotRel | Self::GotBasePc)
-    }
-
-    /// Whether the relocation consumes the relocation that follows it (the
-    /// call to `__tls_get_addr`).
-    #[must_use]
-    pub fn skips_next(self) -> bool {
-        matches!(self, Self::GdToLe | Self::LdToLe | Self::GdToIe)
-    }
-
-    /// Whether the relocation is an initial-exec access through a GOT
-    /// entry holding the thread pointer offset.
-    #[must_use]
-    pub fn needs_gottpoff(self) -> bool {
-        matches!(self, Self::GdToIe | Self::DescToIe | Self::GotTpOff)
-    }
-
-    /// Whether the relocation is a TLS access.
-    #[must_use]
-    pub fn is_tls(self) -> bool {
-        matches!(
-            self,
-            Self::TpOff
-                | Self::DtpOff
-                | Self::GdToLe
-                | Self::LdToLe
-                | Self::IeToLe
-                | Self::DescToLe
-                | Self::DescCallToLe
-                | Self::GdToIe
-                | Self::DescToIe
-                | Self::GotTpOff
-                | Self::TlsGd
-                | Self::TlsLd
-                | Self::TlsDesc
-        )
-    }
-}
-
-/// How TLS accesses to one variable are linked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TlsMode {
-    /// The variable is in the executable being linked: relax to local-exec.
-    LocalExec,
-    /// An executable accessing a shared library's variable: relax
-    /// general-dynamic and descriptors to initial-exec.
-    InitialExec,
-    /// A shared object: keep the dynamic models.
-    Dynamic,
-}
-
-/// What [`classify`] needs to know besides the relocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClassifyContext {
-    /// GOT-indirect accesses may be rewritten into direct ones.
-    pub relax_got: bool,
-    /// The output is position-independent, so an address cannot become an
-    /// immediate operand.
-    pub pic: bool,
-    /// How TLS accesses to the relocation's symbol are linked.
-    pub tls: TlsMode,
-    /// How local-dynamic accesses are linked: by the kind of output, not
-    /// the variable.
-    pub tls_ld: TlsMode,
-    /// The relocated section holds code (`SHF_EXECINSTR`), so a plain
-    /// `R_X86_64_GOTPCREL` on a `mov` can be relaxed as GNU ld does.
-    pub code: bool,
-}
-
-impl ClassifyContext {
-    /// The context of a static executable: everything relaxes.
-    #[must_use]
-    pub const fn static_exec(relax_got: bool) -> Self {
-        Self {
-            relax_got,
-            pic: false,
-            tls: TlsMode::LocalExec,
-            tls_ld: TlsMode::LocalExec,
-            code: false,
-        }
-    }
-}
-
-/// How the computed value is stored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Width {
-    /// Nothing is written.
-    None,
-    /// 8 bytes.
-    W64,
-    /// 4 bytes, zero-extended by the processor.
-    U32,
-    /// 4 bytes, sign-extended.
-    I32,
-    /// 2 bytes, signed or unsigned.
-    Any16,
-    /// 2 bytes, signed.
-    I16,
-    /// 1 byte, signed or unsigned.
-    Any8,
-    /// 1 byte, signed.
-    I8,
-}
-
-/// A classified relocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Class {
-    /// What to compute.
-    pub kind: Kind,
-    /// How to store it.
-    pub width: Width,
-}
-
-/// Why a relocation cannot be handled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClassifyError {
-    /// The type is unknown or not valid in a relocatable object.
-    Unsupported,
-    /// A TLS relaxation found an instruction it cannot rewrite.
-    BadTlsInstruction,
-}
+pub use super::{
+    ApplyError, Class, ClassifyContext, ClassifyError, GotKind, Kind, RelaxValues, TlsMode, Width,
+    write_value,
+};
 
 const fn class(kind: Kind, width: Width) -> Class {
-    Class { kind, width }
+    Class::new(kind, width)
+}
+
+const fn got(kind: Kind, width: Width, slot: GotKind) -> Class {
+    Class::new(kind, width).through(slot)
 }
 
 /// Reads byte `offset - back` of `data`, if it exists.
@@ -265,10 +89,10 @@ pub fn classify(
             {
                 class(K::RelaxGotPc, W::I32)
             } else {
-                class(K::GotPc, W::I32)
+                class(K::Got, W::I32)
             }
         }
-        R_X86_64_GOTPCREL64 => class(K::GotPc, W::W64),
+        R_X86_64_GOTPCREL64 => class(K::Got, W::W64),
         R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
             let op = byte_before(data, offset, 2);
             let modrm = byte_before(data, offset, 1);
@@ -284,11 +108,11 @@ pub fn classify(
                 {
                     class(K::RelaxGotPcNoPic, W::I32)
                 }
-                _ => class(K::GotPc, W::I32),
+                _ => class(K::Got, W::I32),
             }
         }
-        R_X86_64_GOT32 => class(K::GotEntry, W::I32),
-        R_X86_64_GOT64 | R_X86_64_GOTPLT64 => class(K::GotEntry, W::W64),
+        R_X86_64_GOT32 => class(K::GotSlotRel, W::I32),
+        R_X86_64_GOT64 | R_X86_64_GOTPLT64 => class(K::GotSlotRel, W::W64),
         R_X86_64_GOTOFF64 | R_X86_64_PLTOFF64 => class(K::GotRel, W::W64),
         R_X86_64_GOTPC32 => class(K::GotBasePc, W::I32),
         R_X86_64_GOTPC64 => class(K::GotBasePc, W::W64),
@@ -304,13 +128,13 @@ pub fn classify(
             let call = (byte_after(data, offset, 6), byte_after(data, offset, 7));
             let lea = byte_before(data, offset, 4);
             match context.tls {
-                TlsMode::Dynamic => class(K::TlsGd, W::I32),
+                TlsMode::Dynamic => got(K::Got, W::I32, GotKind::TlsGd),
                 mode => match (lea, call) {
                     (Some(0x66), (Some(0x48), Some(0xe8)) | (Some(0xff), Some(0x15))) => {
                         if mode == TlsMode::LocalExec {
-                            class(K::GdToLe, W::None)
+                            class(K::GdToLe, W::None).skipping()
                         } else {
-                            class(K::GdToIe, W::None)
+                            class(K::GdToIe, W::None).skipping()
                         }
                     }
                     _ => return Err(ClassifyError::BadTlsInstruction),
@@ -319,22 +143,22 @@ pub fn classify(
         }
         R_X86_64_TLSLD => {
             if context.tls_ld != TlsMode::LocalExec {
-                return Ok(class(K::TlsLd, W::I32));
+                return Ok(got(K::Got, W::I32, GotKind::TlsLd));
             }
             let after = (byte_after(data, offset, 4), byte_after(data, offset, 5));
             match after {
-                (Some(0xe8), _) | (Some(0xff), Some(0x15)) => class(K::LdToLe, W::None),
+                (Some(0xe8), _) | (Some(0xff), Some(0x15)) => class(K::LdToLe, W::None).skipping(),
                 _ => return Err(ClassifyError::BadTlsInstruction),
             }
         }
         R_X86_64_GOTTPOFF => match context.tls {
             TlsMode::LocalExec => class(K::IeToLe, W::None),
-            _ => class(K::GotTpOff, W::I32),
+            _ => got(K::Got, W::I32, GotKind::TpOff),
         },
         R_X86_64_GOTPC32_TLSDESC => match context.tls {
             TlsMode::LocalExec => class(K::DescToLe, W::None),
             TlsMode::InitialExec => class(K::DescToIe, W::None),
-            TlsMode::Dynamic => class(K::TlsDesc, W::I32),
+            TlsMode::Dynamic => got(K::Got, W::I32, GotKind::TlsDesc),
         },
         R_X86_64_TLSDESC_CALL => match context.tls {
             TlsMode::Dynamic => class(K::None, W::None),
@@ -342,17 +166,6 @@ pub fn classify(
         },
         _ => return Err(ClassifyError::Unsupported),
     })
-}
-
-/// Why a relocation could not be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApplyError {
-    /// The value does not fit the field.
-    Overflow,
-    /// The field lies outside the section.
-    OutOfBounds,
-    /// A relaxation found an instruction it cannot rewrite.
-    BadInstruction,
 }
 
 fn slot<const N: usize>(out: &mut [u8], at: u64) -> Result<&mut [u8; N], ApplyError> {
@@ -372,52 +185,29 @@ fn put(out: &mut [u8], at: u64, back: i64, value: u8) -> Result<(), ApplyError> 
     Ok(())
 }
 
-/// Writes `value` into the field of width `width` at `offset`, checking that
-/// it fits.
-///
-/// # Errors
-///
-/// [`ApplyError::Overflow`] or [`ApplyError::OutOfBounds`].
-pub fn write_value(
-    out: &mut [u8],
-    offset: u64,
-    width: Width,
-    value: u64,
-) -> Result<(), ApplyError> {
-    let signed = value as i64;
-    match width {
-        Width::None => {}
-        Width::W64 => *slot::<8>(out, offset)? = value.to_le_bytes(),
-        Width::U32 => {
-            let v = u32::try_from(value).map_err(|_| ApplyError::Overflow)?;
-            *slot::<4>(out, offset)? = v.to_le_bytes();
-        }
-        Width::I32 => {
-            let v = i32::try_from(signed).map_err(|_| ApplyError::Overflow)?;
-            *slot::<4>(out, offset)? = v.to_le_bytes();
-        }
-        Width::Any16 => {
-            if i16::try_from(signed).is_err() && u16::try_from(value).is_err() {
-                return Err(ApplyError::Overflow);
-            }
-            *slot::<2>(out, offset)? = (value as u16).to_le_bytes();
-        }
-        Width::I16 => {
-            let v = i16::try_from(signed).map_err(|_| ApplyError::Overflow)?;
-            *slot::<2>(out, offset)? = v.to_le_bytes();
-        }
-        Width::Any8 => {
-            if i8::try_from(signed).is_err() && u8::try_from(value).is_err() {
-                return Err(ApplyError::Overflow);
-            }
-            *slot::<1>(out, offset)? = [value as u8];
-        }
-        Width::I8 => {
-            let v = i8::try_from(signed).map_err(|_| ApplyError::Overflow)?;
-            *slot::<1>(out, offset)? = [v as u8];
-        }
+/// Fills `out` with the longest x86 no-op instructions, as BFD's
+/// `bfd_arch_i386_fill` does.
+pub fn write_nops(out: &mut [u8]) {
+    const NOPS: [&[u8]; 10] = [
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    let mut rest = out;
+    while !rest.is_empty() {
+        let n = rest.len().min(10);
+        let nop = NOPS.get(n.saturating_sub(1)).copied().unwrap_or(&[0x90]);
+        let (head, tail) = rest.split_at_mut(n.min(nop.len()));
+        head.copy_from_slice(nop.get(..head.len()).unwrap_or_default());
+        rest = tail;
     }
-    Ok(())
 }
 
 fn write_i32(out: &mut [u8], at: u64, value: i64) -> Result<(), ApplyError> {
@@ -482,12 +272,21 @@ const GD_TO_LE: [u8; 16] = [
     0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x8d, 0x80, 0, 0, 0, 0,
 ];
 
-/// Relaxes a TLS access to local-exec. `tpoff` is `S + A - TP`.
+/// Relaxes a TLS access to local-exec or initial-exec.
 ///
 /// # Errors
 ///
 /// [`ApplyError`] for unrecognized instruction sequences.
-pub fn relax_tls(out: &mut [u8], offset: u64, kind: Kind, tpoff: i64) -> Result<(), ApplyError> {
+pub fn relax_tls(
+    out: &mut [u8],
+    offset: u64,
+    kind: Kind,
+    values: RelaxValues,
+) -> Result<(), ApplyError> {
+    if matches!(kind, Kind::GdToIe | Kind::DescToIe) {
+        return relax_tls_ie(out, offset, kind, values.got_pc);
+    }
+    let tpoff = values.tpoff;
     let start = |back: u64| offset.checked_sub(back).ok_or(ApplyError::BadInstruction);
     let copy = |out: &mut [u8], at: u64, bytes: &[u8]| -> Result<(), ApplyError> {
         let at = usize::try_from(at).map_err(|_| ApplyError::OutOfBounds)?;
@@ -582,16 +381,7 @@ const GD_TO_IE: [u8; 16] = [
 
 /// Relaxes a general-dynamic or descriptor access to initial-exec.
 /// `got_pc` is `GOT entry + A - P`, with `A` the relocation's addend.
-///
-/// # Errors
-///
-/// [`ApplyError`] for unrecognized instruction sequences.
-pub fn relax_tls_ie(
-    out: &mut [u8],
-    offset: u64,
-    kind: Kind,
-    got_pc: i64,
-) -> Result<(), ApplyError> {
+fn relax_tls_ie(out: &mut [u8], offset: u64, kind: Kind, got_pc: i64) -> Result<(), ApplyError> {
     match kind {
         Kind::GdToIe => {
             let start = offset.checked_sub(4).ok_or(ApplyError::BadInstruction)?;
@@ -741,6 +531,22 @@ pub fn write_iplt(out: &mut [u8], stub: u64, slot_address: u64) -> Result<(), Ap
 mod tests {
     use super::*;
 
+    /// A relaxation that only needs the thread pointer offset.
+    fn tpoff(tpoff: i64) -> RelaxValues {
+        RelaxValues {
+            tpoff,
+            ..RelaxValues::default()
+        }
+    }
+
+    /// A relaxation that only needs the GOT entry's PC-relative offset.
+    fn got_pc(got_pc: i64) -> RelaxValues {
+        RelaxValues {
+            got_pc,
+            ..RelaxValues::default()
+        }
+    }
+
     #[test]
     fn relaxes_mov_to_lea() {
         // mov foo@GOTPCREL(%rip), %rax
@@ -764,7 +570,7 @@ mod tests {
             ClassifyContext::static_exec(false),
         )
         .unwrap();
-        assert_eq!(class.kind, Kind::GotPc);
+        assert_eq!(class.kind, Kind::Got);
     }
 
     #[test]
@@ -784,10 +590,10 @@ mod tests {
             ClassifyContext::static_exec(true),
         )
         .unwrap();
-        assert_eq!(data.kind, Kind::GotPc);
+        assert_eq!(data.kind, Kind::Got);
         let call = [0xff, 0x15, 0, 0, 0, 0];
         let class = classify(R_X86_64_GOTPCREL, -4, &call, 2, code_context).unwrap();
-        assert_eq!(class.kind, Kind::GotPc);
+        assert_eq!(class.kind, Kind::Got);
     }
 
     #[test]
@@ -812,11 +618,11 @@ mod tests {
     fn relaxes_initial_exec() {
         // movq foo@gottpoff(%rip), %rax
         let mut code = vec![0x48, 0x8b, 0x05, 0, 0, 0, 0];
-        relax_tls(&mut code, 3, Kind::IeToLe, -0x14).unwrap();
+        relax_tls(&mut code, 3, Kind::IeToLe, tpoff(-0x14)).unwrap();
         assert_eq!(code, [0x48, 0xc7, 0xc0, 0xf0, 0xff, 0xff, 0xff]);
         let mut bad = vec![0x0f, 0x0b, 0x05, 0, 0, 0, 0];
         assert_eq!(
-            relax_tls(&mut bad, 3, Kind::IeToLe, 0),
+            relax_tls(&mut bad, 3, Kind::IeToLe, tpoff(0)),
             Err(ApplyError::BadInstruction)
         );
     }
@@ -852,7 +658,8 @@ mod tests {
             code: true,
         };
         let kept = classify(R_X86_64_TLSGD, -4, &code, 4, shared).unwrap();
-        assert_eq!(kept.kind, Kind::TlsGd);
+        assert_eq!(kept.kind, Kind::Got);
+        assert_eq!(kept.slot, GotKind::TlsGd);
         let ie = ClassifyContext {
             tls: TlsMode::InitialExec,
             tls_ld: TlsMode::LocalExec,
@@ -861,11 +668,11 @@ mod tests {
         let mut gd = code.clone();
         let ie_class = classify(R_X86_64_TLSGD, -4, &gd, 4, ie).unwrap();
         assert_eq!(ie_class.kind, Kind::GdToIe);
-        relax_tls_ie(&mut gd, 4, Kind::GdToIe, 0x100 - 4).unwrap();
+        relax_tls(&mut gd, 4, Kind::GdToIe, got_pc(0x100 - 4)).unwrap();
         assert_eq!(&gd[..12], &GD_TO_IE[..12]);
         assert_eq!(&gd[12..], &(0x100i32 - 12).to_le_bytes());
         assert_eq!(class.kind, Kind::GdToLe);
-        relax_tls(&mut code, 4, Kind::GdToLe, -8 - 4).unwrap();
+        relax_tls(&mut code, 4, Kind::GdToLe, tpoff(-8 - 4)).unwrap();
         assert_eq!(&code[..12], &GD_TO_LE[..12]);
         assert_eq!(&code[12..], &(-8i32).to_le_bytes());
     }

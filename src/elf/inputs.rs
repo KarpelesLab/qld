@@ -599,7 +599,7 @@ pub fn collect<'a>(
         walker.add(id, entry.attrs, &entry.what, &entry.found_as)?;
     }
     let target = walker.target.unwrap_or(Target::X86_64_LINUX);
-    if target.arch != Architecture::X86_64 {
+    if !matches!(target.arch, Architecture::X86_64 | Architecture::Aarch64) {
         return Err(Error::Unimplemented(format!(
             "linking for {:?} (roadmap M4: more ELF architectures)",
             target.arch
@@ -947,6 +947,19 @@ impl<'a> Walker<'a, '_> {
             InputName::Path(path) => {
                 let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
                 let fs = RealFileSystem;
+                // GNU ld: an absolute path in a script that itself lies in
+                // the sysroot is looked up under the sysroot. Without this a
+                // cross link picks up the host's `/lib64/libc.so.6`.
+                if path.is_absolute()
+                    && let Some(sysroot) = self.search.sysroot
+                    && script.starts_with(sysroot)
+                {
+                    let mut inside = sysroot.to_path_buf();
+                    inside.extend(path.components().skip(1));
+                    if crate::input::FileSystem::is_file(&fs, &inside) {
+                        return Ok(Source::Path(inside));
+                    }
+                }
                 let resolved = crate::input::search::apply_sysroot(&path, self.search.sysroot);
                 if crate::input::FileSystem::is_file(&fs, &resolved) {
                     return Ok(Source::Path(resolved));

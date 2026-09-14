@@ -257,6 +257,19 @@ succeed. The error message names the missing search path.
 - A fatal plugin message ends the link. The `qld` binary exits inside the
   plugin's callback as GNU ld does; a library caller gets an error instead.
 
+### AArch64
+
+- TLSDESC is bound eagerly through `.rela.dyn`, as lld does; GNU ld uses a
+  lazy TLSDESC PLT (`DT_TLSDESC_PLT`/`DT_TLSDESC_GOT`). Both work under glibc.
+- A preemptible function that also has a GOT entry goes through `.plt.got`,
+  which GNU ld's AArch64 port does not have, so `.plt` has one fewer entry.
+- Only the PLT header gets a `bti c` landing pad, as in GNU ld: entries are
+  reached by direct branches.
+- `-z separate-code` is off by default, matching GNU ld.
+- Range-extension thunks are pooled per output section, so a single output
+  section holding more than 128 MiB of code reports a relocation overflow
+  instead of splitting the pool.
+
 ### Linker scripts
 
 qld's script parser follows GNU ld's grammar and tokenization (including its
@@ -309,6 +322,21 @@ Diagnostics, map files and `--print-*` output demangle names unless
   where `c++filt` garbles them.
 - Not yet demangled (left as-is): C++20 `requires` clauses and a few other
   recent Itanium extensions that `llvm-cxxfilt` handles.
+
+### PE/COFF output (MinGW flavor)
+
+- Input sections are ordered inside an output section by archive-member
+  position; GNU ld uses extraction order. Addresses stay self-consistent.
+- `IMAGE_COMDAT_SELECT_LARGEST` picks the largest copy within one resolution
+  round; an earlier round's claim is final.
+- The output symbol table carries globals and section symbols, not locals.
+- MSVC import-library helper objects (`__IMPORT_DESCRIPTOR_*`,
+  `__NULL_IMPORT_DESCRIPTOR`, `*_NULL_THUNK_DATA`) are dropped and the import
+  directory is synthesized instead.
+- `.pdata` is always sorted by address.
+- `.drectve` `-defaultlib:`/`-include:` are honoured from command-line objects
+  but not from archive members extracted later.
+- `--out-implib` writes the long `dlltool` form of an import library.
 
 ### PE/COFF inputs (MinGW flavor)
 

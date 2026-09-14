@@ -1,0 +1,20 @@
+# M4: a dynamic PIE against glibc. Covers the AArch64 PLT header and
+# entries, `.got.plt` slots that point back at the header for lazy binding,
+# JUMP_SLOT and GLOB_DAT relocations, and the 64 KiB maximum page size.
+description = "dynamic PIE hello world in C, for AArch64"
+compile = ["cc -O2 -fPIE -c hello.c"]
+driver = "cc"
+link = "-pie -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, dynamic world (20)\n"
+expect.readelf = [
+  "AArch64",
+  "DYN (",
+  "INTERP",
+  "ld-linux-aarch64.so.1",
+  "R_AARCH64_JUMP_SLOT",
+  "R_AARCH64_RELATIVE",
+  "0x10000",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

@@ -47,12 +47,11 @@ use rayon::prelude::*;
 use crate::args::{DiscardMode, LinkOptions, StripMode};
 use crate::elf::read::consts::x86_64::R_X86_64_NONE;
 use crate::elf::read::consts::{
-    ELFOSABI_GNU, EM_X86_64, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_GROUP, SHF_INFO_LINK,
-    SHF_LINK_ORDER, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_LORESERVE,
-    SHN_UNDEF, SHN_XINDEX, SHT_GROUP, SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NOTE, SHT_NULL,
-    SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL,
-    STB_LOCAL, STB_WEAK, STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT, STV_HIDDEN,
-    STV_INTERNAL, STV_PROTECTED,
+    ELFOSABI_GNU, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_GROUP, SHF_INFO_LINK, SHF_LINK_ORDER,
+    SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_LORESERVE, SHN_UNDEF,
+    SHN_XINDEX, SHT_GROUP, SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NOTE, SHT_NULL, SHT_PROGBITS, SHT_REL,
+    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL, STB_LOCAL, STB_WEAK,
+    STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
 };
 use crate::elf::read::{RawSymbol, Relocation, Relocations, SectionIndex};
 use crate::error::{Error, Result};
@@ -352,6 +351,8 @@ struct Plan<'a> {
     shoff: u64,
     file_size: u64,
     os_abi: u8,
+    /// `e_machine` of the output, taken from the inputs.
+    machine: u16,
 }
 
 fn align_to(value: u64, align: u64) -> Result<u64> {
@@ -403,6 +404,9 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
     let mut file_groups: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
     let mut file_plans: Vec<FilePlan> = (0..files.len()).map(|_| FilePlan::default()).collect();
     let mut os_abi = 0u8;
+    let machine = crate::elf::arch::Arch::of_files(files)
+        .unwrap_or_default()
+        .machine();
     let mut kept: KeptGroups<'a> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6b65_7074));
     for (file_index, file) in files.iter().enumerate() {
@@ -875,6 +879,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         shoff,
         file_size,
         os_abi,
+        machine,
     })
 }
 
@@ -1563,7 +1568,7 @@ fn write_header(plan: &Plan<'_>, out: &mut [u8]) {
     header[6] = 1; // EV_CURRENT
     header[7] = plan.os_abi;
     header[16..18].copy_from_slice(&ET_REL.to_le_bytes());
-    header[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+    header[18..20].copy_from_slice(&plan.machine.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[40..48].copy_from_slice(&plan.shoff.to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());

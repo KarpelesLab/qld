@@ -37,7 +37,7 @@ use rayon::prelude::*;
 use crate::args::LinkOptions;
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::consts::{
-    DT_RPATH, DT_RUNPATH, EM_X86_64, SHN_UNDEF, STB_LOCAL, STB_WEAK, VER_NDX_GLOBAL, VER_NDX_LOCAL,
+    DT_RPATH, DT_RUNPATH, SHN_UNDEF, STB_LOCAL, STB_WEAK, VER_NDX_GLOBAL, VER_NDX_LOCAL,
 };
 use crate::elf::read::{Elf64Le, SharedObject, Source as ElfSource, VersionKind};
 use crate::error::{Error, Result};
@@ -93,8 +93,8 @@ impl<'a> SharedInput<'a> {
         as_needed: bool,
     ) -> Result<Self> {
         let elf = SharedObject::<Elf64Le>::parse(data, source)?;
-        if elf.elf().header().e_machine != EM_X86_64 {
-            return Err(source.malformed(18, "ELF machine (incompatible with elf_x86_64)"));
+        if crate::elf::arch::Arch::from_machine(elf.elf().header().e_machine).is_none() {
+            return Err(source.malformed(18, "ELF machine (not an architecture qld links)"));
         }
         let needed_name = elf.soname().unwrap_or(found_as).to_vec();
         Ok(Self {
@@ -615,7 +615,9 @@ fn load_dependencies(
                 }
                 let id = table.load_path(&path).ok()?;
                 let ok = SharedObject::<Elf64Le>::parse(table.data(id), ElfSource::new(&path))
-                    .is_ok_and(|so| so.elf().header().e_machine == EM_X86_64);
+                    .is_ok_and(|so| {
+                        crate::elf::arch::Arch::from_machine(so.elf().header().e_machine).is_some()
+                    });
                 ok.then_some((id, path))
             })
         };

@@ -75,7 +75,7 @@ disables this.
 | --- | --- |
 | x86-64 | `GOTPCRELX`/`REX_GOTPCRELX` → direct `lea`/`mov`/`call`/`jmp`; TLS GD/LD/IE/TLSDESC → LE (and GD → IE for shared libraries) |
 | i386 | `GOT32X` → direct; TLS relaxations |
-| AArch64 | ADRP+LDR GOT → ADRP+ADD; ADRP+ADD → ADR+NOP; TLSDESC → IE/LE |
+| AArch64 | TLS GD/LD/IE → LE, TLSDESC → IE/LE (done); ADRP+LDR GOT → ADRP+ADD and ADRP+ADD → ADR+NOP (not yet: they need relocation-pair lookahead, and GNU ld does not do them either) |
 | RISC-V | `CALL` → `JAL`, `LUI`+`ADDI` → GP-relative, `ALIGN` handling; section sizes shrink, so layout iterates |
 | LoongArch | PCALA/GOT/call relaxations (size-changing) |
 

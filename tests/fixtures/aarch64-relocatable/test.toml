@@ -1,0 +1,22 @@
+# M4: `-r` on AArch64. The partial link keeps `e_machine`, rewrites the
+# relocations against the merged sections, and the result links and runs
+# like the objects it came from.
+description = "relocatable output (-r) on AArch64, then a final link"
+compile = ["cc -O2 -fPIE -c part_a.c", "cc -O2 -fPIE -c part_b.c"]
+driver = "cc"
+link = [
+  "-r -nostdlib -o combined.o part_a.o part_b.o",
+  "-pie -o out combined.o",
+]
+output = "out"
+run = "./out"
+expect.stdout = "sum 226\n"
+expect.readelf = ["AArch64", "DYN ("]
+expect.readelf_files."combined.o" = [
+  "AArch64",
+  "REL (Relocatable file)",
+  "R_AARCH64_ADR_PREL_PG_HI21",
+  "R_AARCH64_ADD_ABS_LO12_NC",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

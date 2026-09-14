@@ -342,6 +342,7 @@ fn link_inputs<'a>(
         mode,
         relax: options.relax,
         copy_relocs: options.copy_relocs,
+        arch: super::arch::Arch::of(options, files),
     };
     let scan = scan::scan(&refs, &context);
     for file in &scan.files {
@@ -412,7 +413,10 @@ fn link_inputs<'a>(
     };
     eh_frames.finalize(&refs);
 
-    let mut synth = Synth::default();
+    let mut synth = Synth {
+        arch: context.arch,
+        ..Synth::default()
+    };
     synth.plan_entries(&refs, &scan, mode);
     // DT_RELR is for position-independent output; GNU ld ignores the
     // option otherwise.
@@ -425,7 +429,7 @@ fn link_inputs<'a>(
     synth.ibt = synth::plan_ibt(files, options);
     synth.build_id = synth::plan_build_id(options);
     synth.property_note = synth::plan_property_note(files, options);
-    synth.interp = synth::plan_interp(options, mode);
+    synth.interp = synth::plan_interp(options, mode, context.arch);
     synth.fde_count = u64::try_from(eh_frames.live_fdes()).unwrap_or(0);
     synth.eh_frame_hdr = options.eh_frame_hdr && synth.fde_count > 0;
     synth.eh_frame_end = eh_frames.sections.iter().any(|s| s.size > 0);
@@ -481,6 +485,7 @@ fn link_inputs<'a>(
         .any(|o| o.exec_stack);
     let mut layout = layout::layout(&LayoutInput {
         options,
+        refs,
         rules: &rule_set,
         files,
         sections: &sections,
@@ -523,6 +528,7 @@ fn link_inputs<'a>(
             synth.relr_size = size;
             layout = layout::layout(&LayoutInput {
                 options,
+                refs,
                 rules: &rule_set,
                 files,
                 sections: &sections,
@@ -602,6 +608,7 @@ fn link_inputs<'a>(
         if !sizes.is_empty() {
             layout = layout::layout(&LayoutInput {
                 options,
+                refs,
                 rules: &rule_set,
                 files,
                 sections: &sections,

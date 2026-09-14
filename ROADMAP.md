@@ -172,8 +172,13 @@ binary.
 In priority order. Each one needs its relocations, thunks and relaxations,
 and TLS models.
 
-- [ ] **AArch64**: range extension thunks, ADRP/ADD relaxation, TLSDESC,
-      BTI/PAC properties, `-z force-bti`, erratum 843419 workaround
+- [~] **AArch64**: done — the static and dynamic relocation set, range
+      extension thunks, PLT/GOT, all four TLS models with TLSDESC and the TLS
+      relaxations, BTI properties, `-r`, and script layout. Outstanding:
+      ADRP+LDR→ADRP+ADD and ADRP+ADD→ADR+NOP relaxations (need relocation
+      lookahead), the Cortex-A53 erratum workarounds and `-z pac-plt` (both
+      rejected with a clear error), `-z force-bti` (needs an option), and the
+      lazy TLSDESC PLT (qld binds eagerly, as lld does)
 - [ ] **RISC-V 64/32**: linker relaxation with section shrinking (iterative
       layout), `__global_pointer$`, attribute section merging
 - [ ] **i386**: GOT-relative relocations, `-z ibtplt`, TLS GNU dialect
@@ -184,6 +189,13 @@ and TLS models.
 - [ ] **LoongArch64**, **s390x**
 - [ ] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths)
+
+**Status:** AArch64 is the second architecture. Validation without an arm64
+machine: every fixture links with qld and with `aarch64-unknown-linux-gnu-ld`,
+and the relocated code is compared symbol by symbol from `objdump -d` (all
+symbols identical except padding splits in the static glibc links). The
+`arm64-linux` CI job runs the fixtures natively on an `ubuntu-24.04-arm`
+runner.
 
 **Exit criteria:** For each architecture, the fixture suite passes under
 `qemu-user`, and a Debian or Alpine userland package set builds with qld as
@@ -244,18 +256,25 @@ drops the FFI entirely).
 
 ## M7: PE/COFF (MinGW flavor)
 
-- [x] COFF object and archive parsing, `.drectve` linker directives (reading; resolution is part of the linker work below)
-- [ ] Short import libraries (MSVC/LLVM style) and long import libraries
+- [x] COFF object and archive parsing, `.drectve` linker directives
+- [x] Short import libraries (MSVC/LLVM style) and long import libraries
       (GNU dlltool `.idata$N` objects); linking directly against `.dll` files
-- [ ] PE32+ (x86-64) then PE32 (i386), then ARM64
-- [ ] EXE and DLL output, `--out-implib`, `.def` files, `--export-all-symbols`,
+- [~] PE32+ (x86-64) done; PE32 (i386) and ARM64 not started
+- [x] EXE and DLL output, `--out-implib`, `.def` files, `--export-all-symbols`,
       export and import tables, base relocations, TLS directory
-- [ ] x86-64 SEH: `.pdata`/`.xdata` handling. i386 SafeSEH.
-- [ ] Auto-import and runtime pseudo-relocations (`--enable-auto-import`,
+- [~] x86-64 SEH: `.pdata`/`.xdata` handling (sorted). i386 SafeSEH not started.
+- [x] Auto-import and runtime pseudo-relocations (`--enable-auto-import`,
       `__RUNTIME_PSEUDO_RELOC_LIST__`)
-- [ ] Resources (`.rsrc` from windres objects), subsystem and OS version fields,
+- [x] Resources (`.rsrc` from windres objects), subsystem and OS version fields,
       `--dynamicbase`, `--nxcompat`, `--high-entropy-va`, deterministic timestamps
-- [ ] DWARF in PE for MinGW debugging
+- [x] DWARF in PE for MinGW debugging
+
+**Status:** qld links MinGW x86-64 console executables and DLLs end to end; a
+`-B` shim through `x86_64-w64-mingw32-gcc` produces a PE32+ image whose
+sections, data directories and relocated code match GNU ld's. Nothing has been
+executed yet: Wine is not installed here, so the `pe-windows` CI job runs the
+images on a Windows runner. The PE command-line options are being implemented
+(W22); until then only the plain console link works through the driver.
 
 **Exit criteria:** A MinGW-w64 GCC and a clang cross toolchain can use qld to
 build and run a C/C++ test suite under Wine and on a Windows CI runner. qld

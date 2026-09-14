@@ -330,47 +330,20 @@ impl<'x, 'a> Addresses<'x, 'a> {
     /// output, its PLT entry).
     #[must_use]
     pub fn iplt_address(&self, owner: Owner) -> Option<u64> {
-        self.synth.iplt.index(owner)?;
-        if self.synth.dynamic() {
-            return self.plt_address(owner);
-        }
-        let index = u64::try_from(self.synth.iplt.index(owner)?).ok()?;
-        let (base, ..) = self.layout.synthetic(Synthetic::Plt)?;
-        base.checked_add(index.checked_mul(super::arch::x86_64::IPLT_ENTRY_SIZE)?)
+        iplt_address(self.synth, self.layout, owner)
     }
 
     /// The address code jumps to for `owner`'s PLT entry: `.plt.sec` with
     /// IBT, `.plt` without, or `.plt.got`.
     #[must_use]
     pub fn plt_address(&self, owner: Owner) -> Option<u64> {
-        use super::arch::x86_64::{PLT_ENTRY_SIZE, PLT_GOT_ENTRY_SIZE};
-        if let Some(index) = self.synth.plt_got.index(owner) {
-            let entry = if self.synth.ibt {
-                PLT_ENTRY_SIZE
-            } else {
-                PLT_GOT_ENTRY_SIZE
-            };
-            let (base, ..) = self.layout.synthetic(Synthetic::PltGot)?;
-            return base.checked_add(u64::try_from(index).ok()?.checked_mul(entry)?);
-        }
-        if !self.synth.dynamic() {
-            return self.iplt_address(owner);
-        }
-        let index = self.synth.plt_index(owner)?;
-        if self.synth.ibt {
-            let (base, ..) = self.layout.synthetic(Synthetic::PltSec)?;
-            base.checked_add(index.checked_mul(PLT_ENTRY_SIZE)?)
-        } else {
-            self.lazy_plt_address(index)
-        }
+        plt_address(self.synth, self.layout, owner)
     }
 
     /// The address of lazy `.plt` entry `index` (after the header).
     #[must_use]
     pub fn lazy_plt_address(&self, index: u64) -> Option<u64> {
-        use super::arch::x86_64::PLT_ENTRY_SIZE;
-        let (base, ..) = self.layout.synthetic(Synthetic::Plt)?;
-        base.checked_add(index.checked_add(1)?.checked_mul(PLT_ENTRY_SIZE)?)
+        lazy_plt_address(self.synth, self.layout, index)
     }
 
     /// The address of the address GOT entry for `owner`.
@@ -418,4 +391,53 @@ impl<'x, 'a> Addresses<'x, 'a> {
             },
         }
     }
+}
+
+/// The canonical address of an IFUNC: its PLT stub, or its PLT entry in a
+/// dynamic output.
+///
+/// Free functions because layout needs PLT addresses to plan
+/// range-extension thunks, before [`Addresses`] exists.
+#[must_use]
+pub fn iplt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
+    synth.iplt.index(owner)?;
+    if synth.dynamic() {
+        return plt_address(synth, layout, owner);
+    }
+    let index = u64::try_from(synth.iplt.index(owner)?).ok()?;
+    let (base, ..) = layout.synthetic(Synthetic::Plt)?;
+    base.checked_add(index.checked_mul(synth.arch.iplt_entry_size())?)
+}
+
+/// The address code jumps to for `owner`'s PLT entry: `.plt.sec` with IBT,
+/// `.plt` without, or `.plt.got`.
+#[must_use]
+pub fn plt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
+    let arch = synth.arch;
+    let flags = synth.plt_flags();
+    if let Some(index) = synth.plt_got.index(owner) {
+        let entry = arch.plt_got_entry_size(flags);
+        let (base, ..) = layout.synthetic(Synthetic::PltGot)?;
+        return base.checked_add(u64::try_from(index).ok()?.checked_mul(entry)?);
+    }
+    if !synth.dynamic() {
+        return iplt_address(synth, layout, owner);
+    }
+    let index = synth.plt_index(owner)?;
+    if let Some((base, ..)) = layout.synthetic(Synthetic::PltSec) {
+        return base.checked_add(index.checked_mul(arch.plt_entry_size(flags))?);
+    }
+    lazy_plt_address(synth, layout, index)
+}
+
+/// The address of lazy `.plt` entry `index`, after the header.
+#[must_use]
+pub fn lazy_plt_address(synth: &Synth, layout: &Layout<'_>, index: u64) -> Option<u64> {
+    let arch = synth.arch;
+    let flags = synth.plt_flags();
+    let (base, ..) = layout.synthetic(Synthetic::Plt)?;
+    base.checked_add(
+        arch.plt_header_size(flags)
+            .checked_add(index.checked_mul(arch.plt_entry_size(flags))?)?,
+    )
 }
