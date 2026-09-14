@@ -20,3 +20,9 @@ rm -f libatoms-arm64.a libatoms-x86_64.a
 
 yaml2obj libqld.yaml -o libqld-arm64.dylib
 yaml2obj libchained.yaml -o libchained-x86_64.dylib
+
+# The v5 stubs are llvm-readtapi conversions of the v4 ones. Its v5 writer
+# drops undefined symbols, so Foundation-v5.tbd has its "undefined_symbols"
+# section added back by hand; `llvm-readtapi -compare` checks the pair.
+llvm-readtapi libSystem-v4.tbd --filetype=tbd-v5 -o libSystem-v5.tbd
+# llvm-readtapi Foundation-v4.tbd --filetype=tbd-v5 -o Foundation-v5.tbd

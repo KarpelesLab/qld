@@ -1797,6 +1797,80 @@ fn tbd_conversions_with_llvm_readtapi() {
     }
 }
 
+/// Compares each library's per-architecture symbols with `llvm-nm`, which
+/// merges the platforms of an architecture.
+#[test]
+fn tbd_symbols_match_llvm_nm() {
+    for name in [
+        "libSystem-v4.tbd",
+        "libSystem-v5.tbd",
+        "Foundation-v4.tbd",
+        "Foundation-v5.tbd",
+        "libobjc-v3.tbd",
+    ] {
+        let path = data_dir().join(name);
+        let Some(text) = run_tool("llvm-nm", &[], &path) else {
+            return;
+        };
+        let parsed = stub(name);
+        let mut expected: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        let mut current = None;
+        for line in text.lines() {
+            if let Some(header) = line.strip_suffix("):")
+                && let Some((install, arch)) = header.split_once(" (for architecture ")
+            {
+                current = Some((install.to_owned(), arch.to_owned()));
+                expected.entry(current.clone().unwrap()).or_default();
+                continue;
+            }
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let (kind, symbol) = match fields.as_slice() {
+                [kind, symbol] => (*kind, *symbol),
+                [_, kind, symbol] => (*kind, *symbol),
+                _ => continue,
+            };
+            let kind = match kind {
+                "U" => "undefined",
+                "w" => "weak-undefined",
+                "W" => "weak",
+                _ => "defined",
+            };
+            expected
+                .get_mut(current.as_ref().expect("llvm-nm header"))
+                .unwrap()
+                .push(format!("{kind} {symbol}"));
+        }
+        assert!(!expected.is_empty(), "{name}");
+        for ((install, arch), mut symbols) in expected {
+            symbols.sort();
+            let lib = parsed.library(&install).expect("library listed by llvm-nm");
+            let mut actual: Vec<String> = Vec::new();
+            for t in lib.targets.iter().filter(|t| t.arch_name == arch) {
+                for s in lib.exports_for(t) {
+                    let kind = if s.kind == StubSymbolKind::Weak {
+                        "weak"
+                    } else {
+                        "defined"
+                    };
+                    actual.push(format!("{kind} {}", s.name));
+                }
+                for section in lib.undefineds.iter().filter(|s| s.applies_to(t)) {
+                    actual.extend(section.symbols.iter().map(|n| format!("undefined {n}")));
+                    actual.extend(
+                        section
+                            .weak_symbols
+                            .iter()
+                            .map(|n| format!("weak-undefined {n}")),
+                    );
+                }
+            }
+            actual.sort();
+            actual.dedup();
+            assert_eq!(actual, symbols, "{name}: {install} {arch}");
+        }
+    }
+}
+
 /// Reads the `.tbd` files of an installed macOS SDK, when there is one.
 #[test]
 fn tbd_macos_sdk() {
@@ -1852,6 +1926,67 @@ fn tbd_macos_sdk() {
         }
     }
     println!("parsed {parsed} SDK text stubs");
+}
+
+/// Parses every `.tbd` file under `$QLD_TBD_CORPUS` (for example an SDK or
+/// the LLVM test inputs), reporting all failures at once. Files under a
+/// directory named `invalid` are expected to fail or parse; they only must
+/// not panic.
+#[test]
+fn tbd_corpus_from_env() {
+    let Some(root) = std::env::var_os("QLD_TBD_CORPUS") else {
+        println!("SKIPPED: QLD_TBD_CORPUS is not set");
+        return;
+    };
+    let mut pending = vec![PathBuf::from(root)];
+    let mut failures = Vec::new();
+    let mut parsed = 0;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "tbd") {
+                let data = std::fs::read(&path).unwrap();
+                if !matches!(
+                    qld::input::identify(&data),
+                    qld::input::FileFormat::Text(qld::input::identify::TextKind::Tbd)
+                ) {
+                    // Placeholder files named `.tbd` that are not stubs.
+                    continue;
+                }
+                let result = TextStub::parse(&data, src(&path));
+                let invalid = path
+                    .to_string_lossy()
+                    .rsplit(['/', '\\'])
+                    .any(|c| c == "invalid" || c.contains("invalid-"));
+                match result {
+                    Ok(_) => parsed += 1,
+                    Err(e) if !invalid => failures.push(e.to_string()),
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    println!("parsed {parsed} text stubs");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn tbd_crlf_line_endings() {
+    for name in ["libSystem-v4.tbd", "libobjc-v3.tbd", "Foundation-v5.tbd"] {
+        let data = fixture(name);
+        let crlf = String::from_utf8(data)
+            .unwrap()
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n");
+        let path = data_dir().join(name);
+        let converted = TextStub::parse(crlf.as_bytes(), src(&path)).unwrap();
+        assert_eq!(stub_views(&stub(name)), stub_views(&converted), "{name}");
+    }
 }
 
 #[test]
