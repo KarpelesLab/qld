@@ -1,11 +1,54 @@
 //! The ELF link driver: runs the pipeline in `docs/architecture.md` for an ELF
 //! target, from resolved options to a written output file.
 //!
-//! **Workstream W8** implements this.
+//! Each stage lives in its own module; this file only sequences them and
+//! turns problems into diagnostics:
+//!
+//! 1. [`inputs`]: search paths, archives, input scripts; then the thread
+//!    pool is sized from the input size unless `--threads` was given;
+//! 2. [`resolve_symbols`] with [`ElfRules`], then COMDAT deduplication;
+//! 3. [`place`]: output section assignment;
+//! 4. linker-defined symbols ([`defined`]);
+//! 5. `.eh_frame` splitting, `--gc-sections` and `--why-live` ([`gc`]);
+//! 6. the relocation scan ([`scan`]) and undefined symbols;
+//! 7. common symbols, merged sections, `--icf` ([`icf`]), live `.eh_frame`
+//!    records;
+//! 8. synthetic sections and the symbol table plan;
+//! 9. [`layout`], symbol addresses, [`write`](mod@write), and the link map
+//!    ([`map`]).
 
-use crate::args::LinkOptions;
-use crate::diag::DiagnosticSink;
+use std::time::Instant;
+
+use crate::args::{LinkOptions, MagicMode, OutputKind, StripMode};
+use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
+use crate::input::FileTable;
+use crate::passes::IcfMode;
+use crate::symbols::{SymbolName, SymbolTable, resolve_symbols};
+
+use super::common;
+use super::defined;
+use super::ehframe;
+use super::gc;
+use super::icf;
+use super::inputs::{self, InternalNames, parse_number};
+use super::layout::{self, LayoutInput, TrailerSizes};
+use super::map;
+use super::merge;
+use super::object::{ParseConfig, WrapTable};
+use super::place;
+use super::refs::{Def, Refs};
+use super::resolve::{self, ElfRules};
+use super::rules::RuleSet;
+use super::scan::{self, UndefinedRef};
+use super::sections::Sections;
+use super::symtab;
+use super::synth::{self, Synth};
+use super::values::Addresses;
+use super::write::{self, WriteInput};
+
+/// At most this many references are listed per undefined symbol.
+const MAX_REFERENCES: usize = 3;
 
 /// Links an ELF output described by `options`.
 ///
@@ -13,10 +56,434 @@ use crate::error::{Error, Result};
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unimplemented`] until milestone M1 lands.
+/// Returns [`Error::Unimplemented`] for output kinds of later milestones,
+/// [`Error::Reported`] when errors were reported to `diagnostics`, and any
+/// I/O or parse error.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
-    let _ = (options, diagnostics);
-    Err(Error::Unimplemented(
-        "linking (roadmap M1: static ELF x86-64)".into(),
-    ))
+    match options.kind {
+        OutputKind::StaticExecutable | OutputKind::Executable => {}
+        OutputKind::Pie | OutputKind::StaticPie => {
+            return Err(Error::Unimplemented(
+                "position-independent executables (roadmap M2: dynamic ELF)".into(),
+            ));
+        }
+        OutputKind::Shared => {
+            return Err(Error::Unimplemented(
+                "shared objects (roadmap M2: dynamic ELF)".into(),
+            ));
+        }
+        OutputKind::Relocatable => {
+            return Err(Error::Unimplemented(
+                "relocatable output (roadmap M2: dynamic ELF)".into(),
+            ));
+        }
+    }
+    // `-plugin` needs no check here: compiler drivers always pass it, and
+    // an IR input is reported as Unimplemented (M6) when it is loaded.
+    check_supported(options)?;
+    let timing = std::env::var_os("QLD_TIMING").is_some();
+    let start = Instant::now();
+    let lap = |what: &str| {
+        if timing {
+            eprintln!(
+                "qld: {what}: {:.1} ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    };
+
+    let wrap = WrapTable::new(&options.wrap);
+    let internal = InternalNames::new(options);
+    let table = FileTable::new();
+    let config = ParseConfig {
+        strip_debug: options.strip >= StripMode::Debug,
+        wrap: &wrap,
+    };
+    let mut inputs = inputs::collect(options, &table, &internal, config)?;
+    lap("inputs");
+
+    match input_sized_threads(options, &table) {
+        Some(threads) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| Error::Internal(format!("cannot create thread pool: {e}")))?;
+            pool.install(|| link_inputs(options, diagnostics, &mut inputs, &internal, &lap))
+        }
+        None => link_inputs(options, diagnostics, &mut inputs, &internal, &lap),
+    }
+}
+
+/// Rejects options whose effect is not implemented yet, rather than
+/// silently producing a different binary.
+fn check_supported(options: &LinkOptions) -> Result<()> {
+    let unimplemented = |what: &str, milestone: &str| {
+        Err(Error::Unimplemented(format!(
+            "{what} (roadmap {milestone})"
+        )))
+    };
+    if !options.section_starts.is_empty() {
+        return unimplemented("--section-start, -Ttext, -Tdata and -Tbss", "M3");
+    }
+    if options.rodata_segment.is_some() || options.ldata_segment.is_some() {
+        return unimplemented("-Trodata-segment and -Tldata-segment", "M3");
+    }
+    if options.magic != MagicMode::Normal {
+        return unimplemented("-n/--nmagic and -N/--omagic", "M3");
+    }
+    if options.default_script.is_some() {
+        return unimplemented("--default-script", "M3");
+    }
+    if let Some(format) = &options.output_format
+        && !matches!(format.as_str(), "elf64-x86-64" | "elf64-x86_64")
+    {
+        return unimplemented(&format!("--oformat {format}"), "M3");
+    }
+    if options.emit_relocs {
+        return unimplemented("--emit-relocs", "M2");
+    }
+    if options
+        .compress_debug_sections
+        .as_deref()
+        .is_some_and(|c| c != "none")
+    {
+        return unimplemented("--compress-debug-sections", "M5");
+    }
+    for (name, expr) in &options.defsym {
+        if inputs::parse_defsym(expr).is_none() {
+            return unimplemented(
+                &format!("--defsym {name}={expr}: expressions beyond `symbol+offset`"),
+                "M3",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Input bytes per worker thread when `--threads` is not given.
+const BYTES_PER_THREAD: u64 = 16 << 20;
+/// Most threads used when `--threads` is not given.
+const MAX_DEFAULT_THREADS: usize = 32;
+
+/// The thread count for a link whose thread count was not set explicitly:
+/// one thread per [`BYTES_PER_THREAD`] of input, at most
+/// [`MAX_DEFAULT_THREADS`] and the current pool's size. `None` keeps the
+/// current pool.
+///
+/// Small links are dominated by the fixed cost of spreading tiny tasks over
+/// many threads (a static "hello world" takes 10 ms on one thread and 28 ms
+/// on 64). The output does not depend on the thread count.
+fn input_sized_threads(options: &LinkOptions, table: &FileTable) -> Option<usize> {
+    if options.threads.is_some() {
+        return None;
+    }
+    let bytes: u64 = table
+        .iter()
+        .filter(|(_, file)| file.parent().is_none())
+        .map(|(_, file)| u64::try_from(file.data().len()).unwrap_or(u64::MAX))
+        .fold(0u64, u64::saturating_add);
+    let wanted = usize::try_from(bytes.div_ceil(BYTES_PER_THREAD))
+        .unwrap_or(usize::MAX)
+        .clamp(1, MAX_DEFAULT_THREADS);
+    (wanted < rayon::current_num_threads()).then_some(wanted)
+}
+
+/// Everything after input collection, run in the link's thread pool.
+fn link_inputs<'a>(
+    options: &LinkOptions,
+    diagnostics: &dyn DiagnosticSink,
+    inputs: &mut inputs::Inputs<'a>,
+    internal: &InternalNames,
+    lap: &(dyn Fn(&str) + Sync),
+) -> Result<()> {
+    let rules = ElfRules {
+        allow_multiple_definition: options.allow_multiple_definition,
+    };
+    let mut symbols = SymbolTable::new();
+    let resolution = resolve_symbols(&mut symbols, &rules, &mut inputs.files)?;
+    let files = &inputs.files;
+    lap("resolution");
+
+    let mut sections = Sections::new(files, &resolution)?;
+    resolve::deduplicate_comdat(files, &mut sections);
+    resolve::redirect_discarded(&symbols, &rules, files, &resolution, &sections);
+    let mut errors = resolve::report_duplicates(files, &resolution, &sections, diagnostics);
+    report_gnu_warnings(files, &symbols, diagnostics);
+
+    let rule_set = RuleSet::default_rules();
+    let placement = place::place(&rule_set, files, &sections);
+    let linker = defined::register(&symbols, &placement, options);
+    lap("placement");
+
+    let mut eh_frames = ehframe::split(files, &sections)?;
+    if options.gc_sections {
+        let refs = Refs {
+            files,
+            symbols: &symbols,
+            resolution: &resolution,
+            sections: &sections,
+        };
+        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
+        if options.print_gc_sections {
+            gc::print_removed(&refs, &removed, diagnostics);
+        }
+        if !options.why_live.is_empty() {
+            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
+        }
+        for id in &removed {
+            if let Some(slot) = sections.live.get_mut(id.index()) {
+                *slot = false;
+            }
+        }
+        eh_frames
+            .sections
+            .retain(|s| sections.live.get(s.id.index()).copied().unwrap_or(false));
+        lap("gc");
+    }
+
+    let refs = Refs {
+        files,
+        symbols: &symbols,
+        resolution: &resolution,
+        sections: &sections,
+    };
+    let scan = scan::scan(&refs, options.relax);
+    for file in &scan.files {
+        for error in &file.errors {
+            diagnostics.emit(error.clone());
+            errors = errors.saturating_add(1);
+        }
+    }
+    errors = errors.saturating_add(report_undefined(&refs, &scan, options, diagnostics));
+    if errors > 0 && !options.noinhibit_exec {
+        return Err(Error::Reported { errors });
+    }
+    lap("scan");
+
+    let commons = common::allocate(&refs);
+    let merged = merge::merge(files, &sections, &placement, options.optimize >= 2)?;
+    lap("merge");
+    let icf_mode = match options.icf.as_deref() {
+        Some("all") => Some(IcfMode::All),
+        Some("safe") => Some(IcfMode::Safe),
+        _ => None,
+    };
+    if let Some(mode) = icf_mode {
+        let fold_into = icf::fold(
+            &refs,
+            &placement,
+            &merged,
+            mode,
+            options.print_icf_sections,
+            diagnostics,
+        )?;
+        sections.apply_folding(fold_into);
+        lap("icf");
+    }
+    let refs = Refs {
+        files,
+        symbols: &symbols,
+        resolution: &resolution,
+        sections: &sections,
+    };
+    eh_frames.finalize(&refs);
+
+    let mut synth = Synth::default();
+    synth.plan_entries(&symbols, &scan);
+    synth.build_id = synth::plan_build_id(options);
+    synth.property_note = synth::plan_property_note(files, options);
+    synth.fde_count = u64::try_from(eh_frames.live_fdes()).unwrap_or(0);
+    synth.eh_frame_hdr = options.eh_frame_hdr && synth.fde_count > 0;
+    synth.eh_frame_end = eh_frames.sections.iter().any(|s| s.size > 0);
+    synth.common = (commons.size, commons.align);
+
+    let plan = symtab::plan(&refs, &linker, options);
+    let trailers = TrailerSizes {
+        symtab: plan.symtab_size(),
+        strtab: if plan.is_empty() {
+            0
+        } else {
+            u64::try_from(plan.strtab_size).unwrap_or(u64::MAX)
+        },
+        first_global: u32::try_from(plan.first_global).unwrap_or(0),
+    };
+    let exec_stack = files
+        .iter()
+        .filter_map(|f| f.object.as_ref())
+        .any(|o| o.exec_stack);
+    let layout = layout::layout(&LayoutInput {
+        options,
+        rules: &rule_set,
+        files,
+        sections: &sections,
+        placement: &placement,
+        merged: &merged,
+        eh_frames: &eh_frames,
+        synth: &synth,
+        trailers,
+        exec_stack,
+    })?;
+    lap("layout");
+
+    let addresses = Addresses::new(
+        refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
+    );
+    let entry = entry_address(&addresses, options, diagnostics);
+    write::write(&WriteInput {
+        options,
+        addresses: &addresses,
+        symtab: &plan,
+        linker: &linker,
+        entry,
+        diagnostics,
+    })?;
+    map::write(options, &addresses, &plan)?;
+    lap("write");
+    Ok(())
+}
+
+/// Reports undefined symbols, lld-style. Returns the number of errors.
+fn report_undefined(
+    refs: &Refs<'_, '_>,
+    scan: &scan::ScanResult,
+    options: &LinkOptions,
+    diagnostics: &dyn DiagnosticSink,
+) -> usize {
+    let mut all: Vec<UndefinedRef> = scan
+        .files
+        .iter()
+        .flat_map(|f| f.undefined.iter().copied())
+        .collect();
+    all.sort_unstable_by_key(|r| (r.symbol, r.file, r.section, r.offset));
+    let mut errors = 0usize;
+    let mut groups: Vec<&[UndefinedRef]> = all.chunk_by(|a, b| a.symbol == b.symbol).collect();
+    groups.sort_by_key(|group| group.first().map(|r| (r.file, r.section, r.offset)));
+    let ignore = matches!(
+        options.unresolved_symbols,
+        Some(
+            crate::args::UnresolvedSymbols::IgnoreAll
+                | crate::args::UnresolvedSymbols::IgnoreInObjectFiles
+        )
+    );
+    for group in groups {
+        let Some(first) = group.first() else {
+            continue;
+        };
+        let name = refs.symbols.name(first.symbol);
+        if ignore
+            || options
+                .ignore_unresolved_symbols
+                .iter()
+                .any(|s| s.as_bytes() == name.bytes())
+        {
+            continue;
+        }
+        let order = refs.files.get(first.file).map_or(0, |f| f.position.raw());
+        let mut diagnostic = if options.warn_unresolved_symbols {
+            Diagnostic::warning(format!("undefined symbol: {}", name.display()))
+        } else {
+            Diagnostic::error(format!("undefined symbol: {}", name.display()))
+        };
+        diagnostic = diagnostic.order(order);
+        for reference in group.iter().take(MAX_REFERENCES) {
+            diagnostic = diagnostic.at(scan::location(
+                refs,
+                reference.file,
+                reference.section,
+                reference.offset,
+            ));
+        }
+        if group.len() > MAX_REFERENCES {
+            diagnostic = diagnostic.note(format!(
+                "referenced {} more times",
+                group.len().saturating_sub(MAX_REFERENCES)
+            ));
+        }
+        diagnostics.emit(diagnostic);
+        if !options.warn_unresolved_symbols {
+            errors = errors.saturating_add(1);
+        }
+    }
+    for name in &options.require_defined {
+        let defined = refs
+            .symbols
+            .lookup(&SymbolName::new(name.as_bytes()))
+            .is_some_and(|id| !matches!(refs.global_target(id, false).def, Def::Undefined { .. }));
+        if !defined {
+            diagnostics.emit(Diagnostic::error(format!(
+                "required symbol '{name}' is not defined"
+            )));
+            errors = errors.saturating_add(1);
+        }
+    }
+    errors
+}
+
+/// Emits the messages of `.gnu.warning.SYM` sections whose symbol is
+/// referenced (and of plain `.gnu.warning` sections), as GNU ld does.
+fn report_gnu_warnings(
+    files: &[super::inputs::ElfInput<'_>],
+    symbols: &SymbolTable<'_>,
+    diagnostics: &dyn DiagnosticSink,
+) {
+    for file in files {
+        let Some(object) = &file.object else {
+            continue;
+        };
+        for &index in &object.warnings {
+            let Some(section) = object.section(index) else {
+                continue;
+            };
+            let symbol = section.name.strip_prefix(b".gnu.warning.");
+            let used = match symbol {
+                Some(name) => symbols.lookup(&SymbolName::new(name)).is_some_and(|id| {
+                    symbols
+                        .flags(id)
+                        .contains(crate::symbols::SymbolFlags::REFERENCED)
+                }),
+                None => section.name == b".gnu.warning",
+            };
+            if !used {
+                continue;
+            }
+            let text = object.elf.section_data(&section.header).unwrap_or_default();
+            let text = text.split(|&b| b == 0).next().unwrap_or_default();
+            diagnostics.emit(
+                Diagnostic::warning(String::from_utf8_lossy(text).into_owned())
+                    .order(file.position.raw()),
+            );
+        }
+    }
+}
+
+fn entry_address(
+    addresses: &Addresses<'_, '_>,
+    options: &LinkOptions,
+    diagnostics: &dyn DiagnosticSink,
+) -> u64 {
+    let name = options.entry.as_deref().unwrap_or("_start");
+    if let Some(value) = parse_number(name) {
+        return value;
+    }
+    let found = addresses
+        .refs
+        .symbols
+        .lookup(&SymbolName::new(name.as_bytes()))
+        .filter(|&id| {
+            !matches!(
+                addresses.refs.global_target(id, false).def,
+                Def::Undefined { .. }
+            )
+        })
+        .and_then(|id| addresses.globals.get(id.index()).copied());
+    match found {
+        Some(value) => value,
+        None => {
+            let text = addresses.layout.by_name(b".text").map_or(0, |s| s.addr);
+            diagnostics.emit(Diagnostic::warning(format!(
+                "cannot find entry symbol {name}; defaulting to {text:#x}"
+            )));
+            text
+        }
+    }
 }

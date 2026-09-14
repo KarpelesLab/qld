@@ -1,0 +1,16 @@
+# --wrap=SYMBOL in a static link: undefined references to SYMBOL resolve to
+# __wrap_SYMBOL, and references to __real_SYMBOL resolve to SYMBOL. Static
+# variant of the `wrap` fixture. Unlike a dynamic link, libc's own internal
+# malloc calls come from archive members and are wrapped as well (GNU ld does
+# the same), so only a lower bound on the count is checked.
+description = "--wrap for a local function and for malloc (static)"
+compile = ["cc -O2 -fno-builtin -c main.c", "cc -O2 -c wrap.c", "cc -O2 -c compute.c"]
+driver = "cc"
+link = "-static -o out main.o wrap.o compute.o -Wl,--wrap=compute -Wl,--wrap=malloc"
+run = "./out"
+expect.stdout = """
+wrapped compute(4)
+compute(4) = 41
+direct from defining object = 40
+wrapped malloc calls: at least 2
+"""

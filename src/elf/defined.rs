@@ -1,0 +1,215 @@
+//! Linker-defined symbols.
+//!
+//! GNU ld's default script defines symbols that mark layout boundaries
+//! (`_end`, `__bss_start`, `__init_array_start`, …) with `PROVIDE`
+//! semantics: only when something references them and nothing defines them.
+//! qld does the same after resolution, by replacing the (undefined or lazy)
+//! definition with a [`LINKER_FILE`] definition whose index is a slot in
+//! [`LinkerSymbols`]. `__start_SEC`/`__stop_SEC` are defined for every output
+//! section whose name is a C identifier. Values are computed after layout.
+
+#![deny(clippy::arithmetic_side_effects)]
+
+use rayon::prelude::*;
+
+use crate::args::LinkOptions;
+use crate::ids::SymbolId;
+use crate::symbols::{
+    Definition, DefinitionKind, InputPosition, SymbolFlags, SymbolName, SymbolTable,
+};
+
+use super::inputs::{DefsymExpr, parse_defsym};
+use super::place::Placement;
+use super::refs::LINKER_FILE;
+use super::rules::is_c_identifier;
+
+/// What a linker-defined symbol's value is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Value {
+    /// The ELF header (`__ehdr_start`).
+    EhdrStart,
+    /// The start of the image (`__executable_start`).
+    ExecutableStart,
+    /// End of the text segment (`_etext`, `etext`, `__etext`).
+    Etext,
+    /// End of initialized data (`_edata`, `edata`).
+    Edata,
+    /// Start of `.bss` (`__bss_start`).
+    BssStart,
+    /// End of the image (`_end`, `end`).
+    End,
+    /// Start of the named output section of the default rules.
+    SectionStart(&'static str),
+    /// End of the named output section of the default rules.
+    SectionEnd(&'static str),
+    /// Start of output section (by placement index): `__start_SEC`.
+    OutputStart(u32),
+    /// End of output section (by placement index): `__stop_SEC`.
+    OutputEnd(u32),
+    /// `_GLOBAL_OFFSET_TABLE_`.
+    GotBase,
+    /// `__rela_iplt_start`.
+    RelaIpltStart,
+    /// `__rela_iplt_end`.
+    RelaIpltEnd,
+    /// `--defsym`, by index in the options.
+    Defsym(usize),
+}
+
+/// Whether a symbol gets hidden visibility (`PROVIDE_HIDDEN`).
+#[must_use]
+pub fn is_hidden(value: Value) -> bool {
+    matches!(
+        value,
+        Value::EhdrStart
+            | Value::SectionStart(_)
+            | Value::SectionEnd(_)
+            | Value::RelaIpltStart
+            | Value::RelaIpltEnd
+            | Value::GotBase
+    )
+}
+
+const FIXED: &[(&str, Value)] = &[
+    ("__ehdr_start", Value::EhdrStart),
+    ("__executable_start", Value::ExecutableStart),
+    ("_etext", Value::Etext),
+    ("etext", Value::Etext),
+    ("__etext", Value::Etext),
+    ("_edata", Value::Edata),
+    ("edata", Value::Edata),
+    ("__bss_start", Value::BssStart),
+    ("_end", Value::End),
+    ("end", Value::End),
+    (
+        "__preinit_array_start",
+        Value::SectionStart(".preinit_array"),
+    ),
+    ("__preinit_array_end", Value::SectionEnd(".preinit_array")),
+    ("__init_array_start", Value::SectionStart(".init_array")),
+    ("__init_array_end", Value::SectionEnd(".init_array")),
+    ("__fini_array_start", Value::SectionStart(".fini_array")),
+    ("__fini_array_end", Value::SectionEnd(".fini_array")),
+    ("__tdata_start", Value::SectionStart(".tdata")),
+    ("_GLOBAL_OFFSET_TABLE_", Value::GotBase),
+    ("__rela_iplt_start", Value::RelaIpltStart),
+    ("__rela_iplt_end", Value::RelaIpltEnd),
+];
+
+/// The linker-defined symbols of a link.
+#[derive(Debug, Default)]
+pub struct LinkerSymbols {
+    /// `(symbol, value)`, in slot order.
+    pub entries: Vec<(SymbolId, Value)>,
+    /// Output sections referenced by `__start_`/`__stop_` symbols, which
+    /// GC keeps.
+    pub start_stop_outputs: Vec<u32>,
+}
+
+impl LinkerSymbols {
+    /// The value kind of slot `index`.
+    #[must_use]
+    pub fn get(&self, index: u32) -> Option<(SymbolId, Value)> {
+        self.entries.get(index as usize).copied()
+    }
+
+    /// Whether `_GLOBAL_OFFSET_TABLE_` is defined.
+    #[must_use]
+    pub fn uses_got_base(&self) -> bool {
+        self.entries.iter().any(|(_, v)| *v == Value::GotBase)
+    }
+}
+
+fn wanted(symbols: &SymbolTable<'_>, id: SymbolId) -> bool {
+    matches!(
+        symbols.definition_kind(id),
+        DefinitionKind::Undefined | DefinitionKind::Lazy
+    ) && symbols
+        .flags(id)
+        .intersects(SymbolFlags::REFERENCED | SymbolFlags::WEAK_REFERENCED)
+}
+
+/// Defines the linker symbols that are referenced and not otherwise defined.
+#[must_use]
+pub fn register(
+    symbols: &SymbolTable<'_>,
+    placement: &Placement<'_>,
+    options: &LinkOptions,
+) -> LinkerSymbols {
+    let mut result = LinkerSymbols::default();
+    let define = |id: SymbolId, value: Value, result: &mut LinkerSymbols| {
+        let slot = u32::try_from(result.entries.len()).unwrap_or(u32::MAX);
+        symbols.replace_definition(
+            id,
+            &Definition {
+                kind: DefinitionKind::Regular,
+                file: LINKER_FILE,
+                index: slot,
+                position: InputPosition::from_raw(u64::MAX),
+                aux: 0,
+            },
+        );
+        result.entries.push((id, value));
+    };
+    for &(name, value) in FIXED {
+        if let Some(id) = symbols.lookup(&SymbolName::new(name.as_bytes()))
+            && wanted(symbols, id)
+        {
+            define(id, value, &mut result);
+        }
+    }
+
+    // __start_SEC / __stop_SEC.
+    let mut start_stop: Vec<(SymbolId, bool, &[u8])> = symbols
+        .names()
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            if name.version().is_some() {
+                return None;
+            }
+            let bytes = name.bytes();
+            let (start, section) = match bytes.strip_prefix(b"__start_") {
+                Some(rest) => (true, rest),
+                None => (false, bytes.strip_prefix(b"__stop_")?),
+            };
+            let id = SymbolId::new(index);
+            (is_c_identifier(section) && wanted(symbols, id)).then_some((id, start, section))
+        })
+        .collect();
+    start_stop.sort_unstable_by_key(|(id, _, _)| *id);
+    for (id, start, section) in start_stop {
+        let output = placement
+            .outputs
+            .iter()
+            .position(|o| o.name == section)
+            .and_then(|o| u32::try_from(o).ok());
+        if let Some(output) = output {
+            let value = if start {
+                Value::OutputStart(output)
+            } else {
+                Value::OutputEnd(output)
+            };
+            define(id, value, &mut result);
+            result.start_stop_outputs.push(output);
+        }
+    }
+    result.start_stop_outputs.sort_unstable();
+    result.start_stop_outputs.dedup();
+
+    // --defsym: resolution already made the internal file the definition.
+    for (index, (name, _)) in options.defsym.iter().enumerate() {
+        if let Some(id) = symbols.lookup(&SymbolName::new(name.as_bytes()))
+            && symbols.definition(id).file.index() == 0
+        {
+            result.entries.push((id, Value::Defsym(index)));
+        }
+    }
+    result
+}
+
+/// The parsed `--defsym` expression for slot value `Defsym(index)`.
+#[must_use]
+pub fn defsym_expr(options: &LinkOptions, index: usize) -> Option<DefsymExpr> {
+    options.defsym.get(index).and_then(|(_, e)| parse_defsym(e))
+}

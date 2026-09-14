@@ -1,0 +1,24 @@
+# Archive resolution that GNU ld accepts, where qld must make the same choices:
+# - when two archives define a symbol, the first one on the command line wins
+# - members are extracted only when referenced, so libb.a's duplicate
+#   definition of `provider` is never pulled in and no error is reported
+# - an unreferenced member (unused.o) stays out even if it has a conflict
+# Static variant of the `archive-first-wins` fixture: the same program linked with
+# -static, so it runs through the M1 static pipeline instead of the
+# default (PIE, dynamic) one.
+description = "first archive wins; unreferenced members are not extracted (static)"
+compile = [
+  "cc -O2 -c main.c",
+  "cc -O2 -c provider_a.c",
+  "cc -O2 -c provider_b.c",
+  "cc -O2 -c other_b.c",
+  "cc -O2 -c unused.c",
+  "ar rcs liba.a provider_a.o unused.o",
+  "ar rcs libb.a provider_b.o other_b.o",
+]
+driver = "cc"
+link = "-static -o out main.o liba.a libb.a"
+run = "./out"
+expect.stdout = "provider: a\nother: from b\n"
+expect.readelf = ["!unused_member_marker", "!provider_b_marker"]
+determinism = true

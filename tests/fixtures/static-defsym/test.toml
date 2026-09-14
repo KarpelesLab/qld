@@ -1,0 +1,16 @@
+# --defsym: an absolute symbol, an alias of a function, and an expression
+# relative to another symbol.
+# Static variant of the `defsym` fixture: the same program linked with
+# -static, so it runs through the M1 static pipeline instead of the
+# default (PIE, dynamic) one.
+description = "--defsym absolute values, aliases and expressions (static)"
+compile = ["cc -O2 -fno-pie -c main.c"]
+driver = "cc"
+link = "-static -o out main.o -Wl,--defsym=magic_marker=0x1234 -Wl,--defsym=alias_function=real_function -Wl,--defsym=second_entry=table+8"
+run = "./out"
+expect.stdout = """
+magic_marker=0x1234
+alias_function()=7
+second_entry=22
+"""
+expect.readelf = ["ABS magic_marker", "alias_function", "second_entry"]

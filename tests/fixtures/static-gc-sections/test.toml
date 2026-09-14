@@ -1,0 +1,23 @@
+# --gc-sections with -ffunction-sections/-fdata-sections: unreferenced
+# functions and data are removed, including everything in dead.o, while
+# referenced code and data survive.
+# Static variant of the `gc-sections` fixture: the same program linked with
+# -static, so it runs through the M1 static pipeline instead of the
+# default (PIE, dynamic) one.
+description = "--gc-sections removes dead functions and data (static)"
+compile = [
+  "cc -O2 -ffunction-sections -fdata-sections -c main.c",
+  "cc -O2 -ffunction-sections -fdata-sections -c dead.c",
+]
+driver = "cc"
+link = "-static -o out main.o dead.o -Wl,--gc-sections"
+run = "./out"
+expect.stdout = "42\n"
+expect.readelf = [
+  "live_function_qld",
+  "live_data_qld",
+  "!dead_function_qld",
+  "!dead_data_qld",
+  "!dead_object_function_qld",
+]
+determinism = true
