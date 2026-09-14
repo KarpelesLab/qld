@@ -139,7 +139,14 @@ an error if a second one is attempted concurrently.
    >>> note: 'cos' is defined in libm.so.6 (/usr/lib64/libm.so); did you forget -lm?
    ```
    The index of search-path libraries is built lazily, only after an error has
-   already happened, so successful links pay nothing for it.
+   already happened, so successful links pay nothing for it. It reads each
+   shared library's `.dynsym` and each archive's symbol index, follows
+   `GROUP`/`INPUT` linker scripts, and takes about 20 ms for all of
+   `/usr/lib64` on this project's development machine. Suggestions prefer
+   earlier search paths, then shared over static, and name the flag that
+   would actually find the file (`-lm`, else `-l:file`, else the path). A
+   library that is on the link line but was dropped by `--as-needed`, or
+   linked static-only, gets its own explanation.
 3. **Version-aware matching.** A reference to `memcpy@GLIBC_2.14` against a
    library that only provides `memcpy@GLIBC_2.2.5` gets a message that names
    the versions available, not a bare "undefined symbol".

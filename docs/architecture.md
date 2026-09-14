@@ -307,5 +307,8 @@ configured thread count.
   one. They are sorted by input position before reporting, so the output is
   deterministic.
 - Location info is `file(member):(section+offset)`, and source file:line is
-  added when DWARF is available. It is computed lazily, only when a
-  diagnostic is actually emitted.
+  added when DWARF is available (`debug::dwarf::LineLookup`). It is computed
+  lazily, only when a diagnostic is actually emitted.
+- Undefined-symbol errors get hints from `hints::Hinter` (missing `-l`,
+  version mismatches, near-miss names), built only after the link has
+  already failed. Names are shown demangled through `demangle`.
