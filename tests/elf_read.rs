@@ -754,8 +754,19 @@ fn compare_with_readelf(path: &Path, inv: &Inventory) {
                 let ours = inv.relr.iter().find(|(n, _)| n == name).unwrap();
                 assert_eq!(ours.1, *places, "{}: {name} RELR places", path.display());
             }
+            RRelSec::Rel(_) if inv.relr.iter().any(|(n, _)| n == name) => {
+                // Older readelf (2.42 on Ubuntu 24.04) prints RELR sections without the
+                // "which relocate N locations" wording, and its entry list
+                // doesn't parse as ordinary relocations: nothing to compare.
+            }
             RRelSec::Rel(entries) => {
-                let ours = inv.relocs.iter().find(|r| &r.name == name).unwrap();
+                let ours = inv
+                    .relocs
+                    .iter()
+                    .find(|r| &r.name == name)
+                    .unwrap_or_else(|| {
+                        panic!("{}: readelf lists {name}, qld doesn't", path.display())
+                    });
                 assert_eq!(ours.entries.len(), *count, "{}: {name}", path.display());
                 assert_eq!(entries.len(), *count, "{}: {name} lines", path.display());
                 for (i, (r, o)) in entries.iter().zip(&ours.entries).enumerate() {

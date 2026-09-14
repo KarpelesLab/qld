@@ -1,11 +1,15 @@
 //! `--gc-sections` (pipeline stage 7): builds the section graph and runs
 //! [`crate::passes::gc`].
 //!
-//! **Edges** come from the relocations of allocated sections (to the section
+//! **Edges** come from the relocations of allocated sections and of note
+//! sections, allocated or not (to the section
 //! defining each target), from `SHF_LINK_ORDER` (the linked-to section keeps
 //! its dependent), from COMDAT groups (members live together), and from
 //! `.eh_frame`: a live function keeps its LSDA and personality routine, but
 //! FDEs themselves do not keep functions alive ([`EhFrames::gc_edges`]).
+//! Other non-allocated sections (debug info) are roots but add no edges, or
+//! they would keep every function they describe alive. Notes do add edges,
+//! as in GNU ld and lld: SystemTap's `.note.stapsdt` keeps `.stapsdt.base`.
 //!
 //! **Roots** are the entry point, `-u`/`--require-defined` symbols and
 //! `--defsym` targets, `KEEP` sections of the layout rules (init/fini
@@ -20,7 +24,7 @@ use rayon::prelude::*;
 
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::Relocations;
-use crate::elf::read::consts::{SHF_ALLOC, SHF_LINK_ORDER};
+use crate::elf::read::consts::{SHF_ALLOC, SHF_LINK_ORDER, SHT_NOTE};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::passes::{SectionGraph, collect_garbage};
@@ -147,7 +151,7 @@ pub fn collect(
             && let Some(input) = object.section(index)
             && input.relocs != 0
             && input.kind != SectionKind::EhFrame
-            && input.header.sh_flags & SHF_ALLOC != 0
+            && contributes_edges(input.header.sh_flags, input.header.sh_type)
             && let Some(Ok(Some(relocations))) = object
                 .section(input.relocs)
                 .map(|r| object.elf.relocation_section(input.relocs, &r.header))
@@ -268,7 +272,7 @@ fn relocation_count(refs: &Refs<'_, '_>, section: SectionId) -> usize {
     };
     if input.relocs == 0
         || input.kind == SectionKind::EhFrame
-        || input.header.sh_flags & SHF_ALLOC == 0
+        || !contributes_edges(input.header.sh_flags, input.header.sh_type)
     {
         return 0;
     }
@@ -281,6 +285,13 @@ fn relocation_count(refs: &Refs<'_, '_>, section: SectionId) -> usize {
         Some(Ok(Some(relocations))) => relocations.relocations.len(),
         _ => 0,
     }
+}
+
+/// Whether a live section's relocations are GC edges: allocated sections and
+/// notes. Debug and other non-allocated sections only reference code; they
+/// must not keep it alive.
+fn contributes_edges(flags: u64, sh_type: u32) -> bool {
+    flags & SHF_ALLOC != 0 || sh_type == SHT_NOTE
 }
 
 /// Prints `--print-gc-sections` lines for removed allocated sections.

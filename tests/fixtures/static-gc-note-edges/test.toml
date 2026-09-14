@@ -1,0 +1,12 @@
+# Regression: qld removed glibc's .stapsdt.base under --gc-sections because
+# relocations in non-allocated sections were never GC edges (Ubuntu's glibc
+# has SystemTap probes).
+description = "--gc-sections follows note relocations, not debug relocations"
+compile = ["as -o start.o start.s"]
+link = "-static --gc-sections -o out start.o"
+run = "./out"
+expect.exit = 5
+expect.readelf = [".stapsdt.base", "!.text.unused"]
+targets = ["x86_64-linux-gnu"]
+determinism = true
+diff.ignore = [".comment", ".note.gnu.property"]

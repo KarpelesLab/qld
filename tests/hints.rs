@@ -93,6 +93,12 @@ fn archive(scratch: &Scratch, members: &[(&str, &str)], output: &str) -> PathBuf
 }
 
 fn tools() -> bool {
+    // The fixtures are ELF shared objects and archives: `cc` must produce ELF,
+    // which it doesn't on Windows (MinGW) or macOS (Mach-O).
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: the host compiler does not produce ELF");
+        return false;
+    }
     if have("cc") && have("ar") {
         true
     } else {
