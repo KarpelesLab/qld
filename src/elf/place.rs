@@ -14,8 +14,8 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::elf::read::consts::{
-    SHF_ALLOC, SHF_EXECINSTR, SHF_GNU_RETAIN, SHF_INFO_LINK, SHF_LINK_ORDER, SHF_MERGE,
-    SHF_STRINGS, SHF_TLS, SHF_WRITE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS,
+    SHF_ALLOC, SHF_EXECINSTR, SHF_GNU_RETAIN, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE,
+    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS,
 };
 use crate::ids::SectionId;
 
@@ -246,7 +246,6 @@ pub fn place<'a>(rules: &RuleSet, files: &[ElfInput<'a>], sections: &Sections) -
             (None, false) => SHT_PROGBITS,
         };
     }
-    let _ = (SHF_INFO_LINK, SHF_LINK_ORDER);
 
     Placement {
         outputs,

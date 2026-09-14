@@ -547,9 +547,6 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
         shstrtab.push(0);
     }
     let shstrtab_len = u64::try_from(shstrtab.len()).unwrap_or(u64::MAX);
-    let symtab_position = out_sections
-        .iter()
-        .position(|s| s.trailer == Trailer::Symtab);
     let strtab_position = out_sections
         .iter()
         .position(|s| s.trailer == Trailer::Strtab);
@@ -566,7 +563,6 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
             _ => {}
         }
     }
-    let _ = symtab_position;
 
     // 3. Segment plan (before addresses: the header size depends on it).
     let separate = input.options.separate_code.unwrap_or(SeparateCode::Code);

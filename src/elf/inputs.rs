@@ -463,7 +463,7 @@ impl<'a> Walker<'a, '_> {
                 let mut input = self.input(InputPosition::new(input_number, 0), InputRole::Object);
                 input.file = Some(file);
                 if attrs.lazy {
-                    input.lazy_names = defined_names(file, self.config)?;
+                    input.lazy_names = defined_names(file)?;
                 } else {
                     input.live_at_start = true;
                 }
@@ -552,13 +552,12 @@ impl<'a> Walker<'a, '_> {
             }
             None => {
                 // No index: learn what each member defines by reading it.
-                let config = self.config;
                 let members = self.files.get_mut(first..).unwrap_or_default();
                 members.par_iter_mut().try_for_each(|input| -> Result<()> {
                     if let Some(member_file) = input.file
                         && matches!(member_file.format(), FileFormat::Elf(i) if i.is_relocatable())
                     {
-                        input.lazy_names = defined_names(member_file, config)?;
+                        input.lazy_names = defined_names(member_file)?;
                     }
                     Ok(())
                 })?;
@@ -586,8 +585,7 @@ impl<'a> Walker<'a, '_> {
                 | CommandKind::OutputArch(_)
                 | CommandKind::SearchDir(_)
                 | CommandKind::Target(_) => continue,
-                other => {
-                    let _ = other;
+                _ => {
                     return Err(Error::Unimplemented(format!(
                         "linker script {}{} beyond INPUT/GROUP (roadmap M3: linker scripts)",
                         file.path().display(),
@@ -659,13 +657,12 @@ impl<'a> Walker<'a, '_> {
 
 /// The global symbols an object defines, for lazy objects and archives
 /// without an index.
-fn defined_names<'a>(file: &'a InputFile, config: ParseConfig<'a>) -> Result<Vec<SymbolName<'a>>> {
+fn defined_names(file: &InputFile) -> Result<Vec<SymbolName<'_>>> {
     let source = match file.member() {
         Some(member) => ElfSource::member(file.path(), member),
         None => ElfSource::new(file.path()),
     };
     let object = ObjectFile::<Elf64Le>::parse(file.data(), source)?;
-    let _ = config;
     let symbols = object.symbols();
     let mut names = Vec::new();
     for symbol in symbols.globals() {

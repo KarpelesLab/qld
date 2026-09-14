@@ -22,7 +22,7 @@ use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::Relocations;
 use crate::elf::read::consts::{SHF_ALLOC, SHF_LINK_ORDER};
 use crate::error::{Error, Result};
-use crate::ids::{FileId, SectionId};
+use crate::ids::SectionId;
 use crate::passes::{SectionGraph, collect_garbage};
 use crate::symbols::SymbolName;
 
@@ -127,10 +127,6 @@ pub fn collect(
                 .map(|_| SectionId::new(index))
         }));
     }
-    // Sections of symbols the internal file references (entry, -u) were
-    // added above; sections defining symbols of the internal file itself
-    // are not sections.
-    let _ = FileId::new(0);
 
     let edge_count = |section: SectionId| -> usize {
         let base = relocation_count(refs, section);

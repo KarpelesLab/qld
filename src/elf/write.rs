@@ -11,20 +11,19 @@
 
 use crate::args::LinkOptions;
 use crate::diag::{Diagnostic, DiagnosticSink};
+use crate::elf::read::Relocations;
 use crate::elf::read::consts::{
-    EM_X86_64, ET_EXEC, SHF_ALLOC, STT_GNU_IFUNC, reloc_name, x86_64::R_X86_64_IRELATIVE,
+    EM_X86_64, ET_EXEC, SHF_ALLOC, reloc_name, x86_64::R_X86_64_IRELATIVE,
 };
-use crate::elf::read::{Relocations, SectionIndex};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::output::{ChunkRange, OutputFile};
 
-use super::arch::x86_64::{self, ApplyError, Kind, Width};
+use super::arch::x86_64::{self, ApplyError, Kind};
 use super::defined::LinkerSymbols;
 use super::ehframe::EhSection;
 use super::layout::{EHDR_SIZE, Layout, Member, PHDR_SIZE, SHDR_SIZE, Trailer};
 use super::object::SectionKind;
-use super::refs::Def;
 use super::rules::Synthetic;
 use super::scan::location;
 use super::symtab::{SymtabPlan, write_strtab, write_symtab};
@@ -263,7 +262,6 @@ fn write_section_headers(layout: &Layout<'_>, out: &mut [u8]) -> Result<()> {
 fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u8]) -> Result<()> {
     let addresses = input.addresses;
     let synth = addresses.synth;
-    let refs = &addresses.refs;
     match kind {
         Synthetic::None => {}
         Synthetic::BuildId => {
@@ -340,7 +338,6 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
             write_eh_frame_hdr(addresses, out);
         }
     }
-    let _ = refs;
     Ok(())
 }
 
@@ -611,9 +608,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
             };
             report(message);
         }
-        let _ = Width::None;
     }
-    let _ = (Def::Absolute(0), STT_GNU_IFUNC, SectionIndex::Absolute);
     Ok(())
 }
 

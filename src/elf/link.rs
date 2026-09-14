@@ -4,16 +4,18 @@
 //! Each stage lives in its own module; this file only sequences them and
 //! turns problems into diagnostics:
 //!
-//! 1. [`inputs`](super::inputs): search paths, archives, input scripts;
+//! 1. [`inputs`]: search paths, archives, input scripts; then the thread
+//!    pool is sized from the input size unless `--threads` was given;
 //! 2. [`resolve_symbols`] with [`ElfRules`], then COMDAT deduplication;
-//! 3. [`place`](super::place): output section assignment;
-//! 4. linker-defined symbols ([`defined`](super::defined));
-//! 5. `.eh_frame` splitting and `--gc-sections` ([`gc`](super::gc));
-//! 6. the relocation scan ([`scan`](super::scan)) and undefined symbols;
-//! 7. common symbols, merged sections, live `.eh_frame` records;
+//! 3. [`place`]: output section assignment;
+//! 4. linker-defined symbols ([`defined`]);
+//! 5. `.eh_frame` splitting, `--gc-sections` and `--why-live` ([`gc`]);
+//! 6. the relocation scan ([`scan`]) and undefined symbols;
+//! 7. common symbols, merged sections, `--icf` ([`icf`]), live `.eh_frame`
+//!    records;
 //! 8. synthetic sections and the symbol table plan;
-//! 9. [`layout`](super::layout), symbol addresses, and
-//!    [`write`](super::write).
+//! 9. [`layout`], symbol addresses, [`write`](mod@write), and the link map
+//!    ([`map`]).
 
 use std::time::Instant;
 
@@ -211,13 +213,7 @@ fn link_inputs<'a>(
             errors = errors.saturating_add(1);
         }
     }
-    errors = errors.saturating_add(report_undefined(
-        &refs,
-        &scan,
-        options,
-        internal,
-        diagnostics,
-    ));
+    errors = errors.saturating_add(report_undefined(&refs, &scan, options, diagnostics));
     if errors > 0 && !options.noinhibit_exec {
         return Err(Error::Reported { errors });
     }
@@ -310,7 +306,6 @@ fn report_undefined(
     refs: &Refs<'_, '_>,
     scan: &scan::ScanResult,
     options: &LinkOptions,
-    internal: &InternalNames,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
     let mut all: Vec<UndefinedRef> = scan
@@ -380,7 +375,6 @@ fn report_undefined(
             errors = errors.saturating_add(1);
         }
     }
-    let _ = internal;
     errors
 }
 
