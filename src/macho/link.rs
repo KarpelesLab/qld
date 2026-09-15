@@ -94,6 +94,14 @@ pub fn link_to_bytes(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) ->
     if !options.darwin.aliases.is_empty() {
         return Err(Error::Unimplemented("-alias (roadmap M8)".into()));
     }
+    if options.darwin.bundle_loader.is_some() {
+        return Err(Error::Unimplemented("-bundle_loader (roadmap M8)".into()));
+    }
+    if options.init.is_some() {
+        return Err(Error::Unimplemented(
+            "-init (LC_ROUTINES_64, roadmap M8)".into(),
+        ));
+    }
     let archs = match options.darwin.archs.as_slice() {
         [] => vec![infer_arch(options)?],
         archs => archs.to_vec(),
@@ -181,6 +189,32 @@ fn link_arch(
     arch: Arch,
     diagnostics: &dyn DiagnosticSink,
 ) -> Result<Vec<u8>> {
+    // Archive members extracted during resolution may ask for more
+    // libraries with LC_LINKER_OPTION; link again with them.
+    let mut options = std::borrow::Cow::Borrowed(options);
+    for _ in 0..8 {
+        match link_arch_once(&options, arch, diagnostics)? {
+            Attempt::Done(bytes) => return Ok(bytes),
+            Attempt::MoreInputs(more) => options.to_mut().darwin.inputs.extend(more),
+        }
+    }
+    Err(Error::Internal(
+        "LC_LINKER_OPTION requests did not settle".into(),
+    ))
+}
+
+enum Attempt {
+    Done(Vec<u8>),
+    MoreInputs(Vec<crate::args::darwin::DarwinInput>),
+}
+
+/// One link attempt for `arch`.
+#[allow(clippy::too_many_lines)]
+fn link_arch_once(
+    options: &LinkOptions,
+    arch: Arch,
+    diagnostics: &dyn DiagnosticSink,
+) -> Result<Attempt> {
     let config = Config::new(options, arch, infer_platform(options, arch))?;
     let table = FileTable::new();
     let collected = inputs::collect(options, &config, &table, diagnostics)?;
@@ -189,6 +223,12 @@ fn link_arch(
 
     let mut symbols = SymbolTable::new();
     let resolution = resolve_symbols(&mut symbols, &MachRules, &mut files)?;
+    let more = inputs::missing_linker_options(options, &collected, &files, |index| {
+        resolution.is_live(crate::ids::FileId::new(index))
+    });
+    if !more.is_empty() {
+        return Ok(Attempt::MoreInputs(more));
+    }
     let duplicates = report_duplicates(
         resolution.duplicates(),
         &files,
@@ -463,7 +503,7 @@ fn link_arch(
             },
         )?;
     }
-    Ok(image)
+    Ok(Attempt::Done(image))
 }
 
 /// Sets `reserved1` of the sections the indirect symbol table indexes.

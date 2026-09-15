@@ -287,12 +287,22 @@ pub fn plan(link: &Link<'_>, entries: &mut Entries) -> Result<EhFramePlan> {
 
 fn attach(entries: &mut Entries, function: Place, length: u64, lsda: Option<Place>, fde: u64) {
     let length = u32::try_from(length).unwrap_or(u32::MAX);
-    if let Some(entry) = entries.entries.iter_mut().find(|e| e.function == function) {
+    let key = match function {
+        Place::Atom { atom, offset } => Some((atom, offset)),
+        _ => None,
+    };
+    if let Some(entry) = key
+        .and_then(|key| entries.by_place.get(&key).copied())
+        .and_then(|index| entries.entries.get_mut(index))
+    {
         entry.length = length;
         entry.lsda = lsda;
         entry.fde = Some(fde);
         entry.personality = None;
         return;
+    }
+    if let Some(key) = key {
+        entries.by_place.insert(key, entries.entries.len());
     }
     entries.entries.push(Entry {
         function,

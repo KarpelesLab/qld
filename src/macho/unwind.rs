@@ -75,6 +75,8 @@ pub struct Entries {
     /// Functions (global atom index, offset) with a compact unwind record
     /// that does not defer to DWARF: their FDEs are dropped.
     pub compact: HashMap<(usize, i64), usize>,
+    /// The entry of each function (global atom index, offset).
+    pub by_place: HashMap<(usize, i64), usize>,
 }
 
 fn dwarf_mode(arm64: bool) -> u32 {
@@ -229,6 +231,7 @@ pub fn collect(link: &Link<'_>) -> Result<Entries> {
             }
         }
     }
+    result.by_place = by_place;
     Ok(result)
 }
 

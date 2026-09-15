@@ -88,7 +88,8 @@ impl Addresses<'_, '_> {
                 self.object_symbol(usize::try_from(*file).ok()?, *symbol)
             }
             SymbolDef::Common { .. } => {
-                let index = self.synthetic.commons.iter().position(|&c| c == id)?;
+                // In symbol order, so sorted.
+                let index = self.synthetic.commons.binary_search(&id).ok()?;
                 let section = self.layout.find(SectionKind::Common)?;
                 Some(Value::Address(
                     section

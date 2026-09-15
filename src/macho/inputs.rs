@@ -231,6 +231,9 @@ pub struct Collected<'t> {
     /// The build version of the first object, for links without
     /// `-platform_version`.
     pub first_platform: Option<(u32, PackedVersion, PackedVersion)>,
+    /// Every library and framework requested, on the command line or by
+    /// `LC_LINKER_OPTION`.
+    pub requested: Vec<DarwinInput>,
 }
 
 impl std::fmt::Debug for Collected<'_> {
@@ -548,11 +551,11 @@ pub fn collect<'t>(
         }
     }
     let mut extra = Vec::new();
-    for request in requested {
-        match resolve_spec(&search, &request) {
+    for request in &requested {
+        match resolve_spec(&search, request) {
             Ok(path) => extra.push(Pending {
                 path,
-                input: request,
+                input: request.clone(),
             }),
             Err(Error::NotFound(message)) => {
                 diagnostics.emit(Diagnostic::warning(format!(
@@ -563,13 +566,64 @@ pub fn collect<'t>(
         }
     }
     walker.walk(&extra)?;
+    requested.extend(specs);
 
     Ok(Collected {
         table,
         entries: walker.entries,
         dylibs: walker.dylibs,
         first_platform: walker.first_platform,
+        requested,
     })
+}
+
+/// The `LC_LINKER_OPTION` libraries and frameworks of the live objects in
+/// `files` that `collected` did not link, and that the search paths can
+/// find. Archive members extracted during resolution can ask for libraries
+/// the first collection never saw.
+#[must_use]
+pub fn missing_linker_options(
+    options: &LinkOptions,
+    collected: &Collected<'_>,
+    files: &[MachInput<'_>],
+    live: impl Fn(usize) -> bool,
+) -> Vec<DarwinInput> {
+    let search = SearchPaths::new(options);
+    let mut out: Vec<DarwinInput> = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        if !live(index) {
+            continue;
+        }
+        let Some(object) = &file.object else {
+            continue;
+        };
+        let Ok(hints) = object.file.linker_option_hints() else {
+            continue;
+        };
+        for hint in hints {
+            let kind = match hint {
+                LinkerOptionHint::Library(name) => {
+                    DarwinInputKind::Library(String::from_utf8_lossy(name).into_owned())
+                }
+                LinkerOptionHint::Framework(name) => DarwinInputKind::Framework {
+                    name: String::from_utf8_lossy(name).into_owned(),
+                    suffix: None,
+                },
+                LinkerOptionHint::Other => continue,
+            };
+            let input = DarwinInput {
+                kind,
+                mode: LoadMode::Normal,
+                force_load: false,
+            };
+            let known = collected.requested.iter().any(|r| r.kind == input.kind)
+                || out.iter().any(|r| r.kind == input.kind);
+            if !known && resolve_spec(&search, &input).is_ok() {
+                out.push(input);
+            }
+        }
+    }
+    out
 }
 
 fn resolve_spec(search: &SearchPaths, input: &DarwinInput) -> Result<PathBuf> {

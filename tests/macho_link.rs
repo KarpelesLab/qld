@@ -1100,16 +1100,27 @@ fn bundles_and_export_lists() {
     let greet = compile("bundle", "greet.c", arch, &[]);
     let list = dir.join("exports.txt");
     std::fs::write(&list, "# only greet\n_greet\n").unwrap();
+    let plist = dir.join("Info.plist");
+    std::fs::write(&plist, "<plist>qld</plist>\n").unwrap();
     let mut args = base_args(arch);
     args.extend(strings(&[
         "-bundle",
         greet.to_str().unwrap(),
         "-exported_symbols_list",
         list.to_str().unwrap(),
+        "-sectcreate",
+        "__TEXT",
+        "__info_plist",
+        plist.to_str().unwrap(),
         "-lSystem",
     ]));
     let bundle = dir.join("greet.bundle");
     let bytes = link_and_compare(&args, &bundle);
+    let needle = b"<plist>qld</plist>\n";
+    assert!(
+        bytes.windows(needle.len()).any(|w| w == needle),
+        "-sectcreate contents missing"
+    );
     let file = MachOFile::parse(&bytes, Source::new(&bundle)).unwrap();
     assert_eq!(file.header().file_type, qld::macho::read::consts::MH_BUNDLE);
     if let Some(trie) = objdump(&["--macho", "--exports-trie"], &bundle) {
@@ -1200,6 +1211,56 @@ fn clang_driver_uses_qld() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert_eq!(run(&output).unwrap(), expected);
+    }
+}
+
+#[test]
+fn linker_options_from_archive_members() {
+    let arch = "arm64";
+    if !clang_for(arch) {
+        skip(
+            "linker_options_from_archive_members",
+            "clang cannot target arm64-apple-macos",
+        );
+        return;
+    }
+    let dir = scratch("autolink");
+    let member = compile("autolink", "autolink-arm64.s", arch, &[]);
+    let archive = dir.join("librelease.a");
+    if !make_archive(&archive, &[&member]) {
+        skip(
+            "linker_options_from_archive_members",
+            "neither llvm-ar nor libtool works",
+        );
+        return;
+    }
+    let main = dir.join("main.c");
+    std::fs::write(
+        &main,
+        "void release(void *);\nint main(void) { release(0); return 0; }\n",
+    )
+    .unwrap();
+    let main_object = dir.join("main.o");
+    assert!(tool_works(
+        "clang",
+        &[
+            "--target=arm64-apple-macos13",
+            "-c",
+            main.to_str().unwrap(),
+            "-o",
+            main_object.to_str().unwrap()
+        ]
+    ));
+    let mut args = base_args(arch);
+    args.extend(strings(&[
+        main_object.to_str().unwrap(),
+        archive.to_str().unwrap(),
+        "-lSystem",
+    ]));
+    let exe = dir.join("autolink");
+    link_and_compare(&args, &exe);
+    if let Some(dylibs) = objdump(&["--macho", "--dylibs-used"], &exe) {
+        assert!(dylibs.contains("libc++"), "{dylibs}");
     }
 }
 
