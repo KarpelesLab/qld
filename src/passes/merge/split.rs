@@ -111,6 +111,12 @@ impl fmt::Display for MalformedMerge {
 
 impl std::error::Error for MalformedMerge {}
 
+std::thread_local! {
+    /// The section (by address) and piece of this thread's last
+    /// [`SplitSection::piece_at`] on a string section.
+    static LAST_PIECE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// A location inside a piece of one split section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PieceRef {
@@ -203,10 +209,7 @@ impl<'a> SplitSection<'a> {
             MergeKind::Strings { .. } => {
                 // The section fits in 4 GiB, so the offset fits in u32.
                 let offset = u32::try_from(offset).ok()?;
-                let piece = self
-                    .starts
-                    .partition_point(|&start| start <= offset)
-                    .checked_sub(1)?;
+                let piece = self.string_piece_at(offset)?;
                 let start = *self.starts.get(piece)?;
                 Some(PieceRef {
                     piece: u32::try_from(piece).ok()?,
@@ -218,6 +221,43 @@ impl<'a> SplitSection<'a> {
                 addend: offset % entry_size,
             }),
         }
+    }
+
+    /// The piece of a string section that covers `offset`.
+    ///
+    /// References into a merge section usually walk it forwards (DWARF's
+    /// `.debug_str_offsets` lists strings in order), so the piece of the
+    /// last lookup, and the one after it, are tried before the binary
+    /// search. The cache is per thread and only a hint: every answer is
+    /// checked against the section's own starts, so the result is the same
+    /// as the search's.
+    #[inline]
+    fn string_piece_at(&self, offset: u32) -> Option<usize> {
+        let covers = |piece: usize| -> bool {
+            let start = self.starts.get(piece).copied();
+            let end = self
+                .starts
+                .get(piece.wrapping_add(1))
+                .copied()
+                .unwrap_or(u32::try_from(self.data.len()).unwrap_or(u32::MAX));
+            start.is_some_and(|start| start <= offset && offset < end)
+        };
+        let key = std::ptr::from_ref(self) as usize;
+        let (last_key, last_piece) = LAST_PIECE.with(std::cell::Cell::get);
+        if last_key == key {
+            for piece in [last_piece, last_piece.wrapping_add(1)] {
+                if covers(piece) {
+                    LAST_PIECE.with(|cell| cell.set((key, piece)));
+                    return Some(piece);
+                }
+            }
+        }
+        let piece = self
+            .starts
+            .partition_point(|&start| start <= offset)
+            .checked_sub(1)?;
+        LAST_PIECE.with(|cell| cell.set((key, piece)));
+        Some(piece)
     }
 
     /// Byte range of `piece`; `(0, 0)` if it does not exist. Validated at
