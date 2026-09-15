@@ -240,8 +240,9 @@ pub fn collect(link: &Link<'_>) -> Result<Entries> {
 pub fn is_code(segname: &[u8], sectname: &[u8], flags: u32) -> bool {
     use crate::macho::read::consts::{S_ATTR_PURE_INSTRUCTIONS, SECTION_ATTRIBUTES, SECTION_TYPE};
     let kind = flags & SECTION_TYPE;
-    if kind != 0 && kind != 0x6 {
-        // Not S_REGULAR or S_COALESCED.
+    if kind != crate::macho::read::consts::S_REGULAR
+        && kind != crate::macho::read::consts::S_COALESCED
+    {
         return false;
     }
     if is_consumed(segname, sectname, flags) {

@@ -600,7 +600,9 @@ pub fn plan(
             input_sections,
             b"__TEXT",
             b"__eh_frame",
-            S_REGULAR,
+            // S_COALESCED | S_ATTR_NO_TOC | S_ATTR_STRIP_STATIC_SYMS, as the
+            // compilers mark it.
+            0x6000_000b,
             SectionKind::EhFrame,
             synthetic.eh_frame,
             3,
