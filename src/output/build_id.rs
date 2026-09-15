@@ -36,7 +36,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use super::chunks::{ChunkRange, LayoutError};
-use super::hash::{Md5, Sha1, xxh64};
+use super::hash::{Md5, Sha1, Xxh64, xxh64};
 pub use super::random::random_uuid;
 use crate::args::BuildId;
 use rayon::prelude::*;
@@ -106,6 +106,79 @@ pub fn apply_build_id(
         field.copy_from_slice(&id);
     }
     Ok(Some(id))
+}
+
+/// The block hash of a content-derived build-id mode, fed incrementally.
+///
+/// [`BlockHasher::finish`] gives the same digest as the one-shot leaf hash
+/// [`compute_build_id`] applies to a block, so digests computed piecewise
+/// (by the write backing, see [`crate::output::OutputFile`]) combine into
+/// the same build-id.
+#[derive(Clone)]
+pub(super) enum BlockHasher {
+    Fast(Xxh64),
+    Md5(Md5),
+    Sha1(Sha1),
+}
+
+impl std::fmt::Debug for BlockHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fast(_) => "BlockHasher::Fast",
+            Self::Md5(_) => "BlockHasher::Md5",
+            Self::Sha1(_) => "BlockHasher::Sha1",
+        })
+    }
+}
+
+impl BlockHasher {
+    /// A fresh hasher for `kind`, or `None` if `kind` is not content-derived.
+    pub(super) fn new(kind: &BuildId) -> Option<Self> {
+        match kind {
+            BuildId::Fast => Some(Self::Fast(Xxh64::new(0))),
+            BuildId::Md5 => Some(Self::Md5(Md5::new())),
+            BuildId::Sha1 => Some(Self::Sha1(Sha1::new())),
+            BuildId::None | BuildId::Uuid | BuildId::Hex(_) => None,
+        }
+    }
+
+    pub(super) fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Fast(h) => h.update(data),
+            Self::Md5(h) => h.update(data),
+            Self::Sha1(h) => h.update(data),
+        }
+    }
+
+    /// Feeds `count` zero bytes.
+    pub(super) fn update_zeros(&mut self, mut count: u64) {
+        const ZEROS: [u8; 4096] = [0; 4096];
+        while count > 0 {
+            let take = usize::try_from(count)
+                .unwrap_or(ZEROS.len())
+                .min(ZEROS.len());
+            self.update(ZEROS.get(..take).unwrap_or(&ZEROS));
+            count = count.saturating_sub(take as u64);
+        }
+    }
+
+    pub(super) fn finish(self) -> Vec<u8> {
+        match self {
+            Self::Fast(h) => h.finish().to_be_bytes().to_vec(),
+            Self::Md5(h) => h.finalize().to_vec(),
+            Self::Sha1(h) => h.finalize().to_vec(),
+        }
+    }
+}
+
+/// The build-id of a content-derived `kind` from its block digests, in block
+/// order. Returns `None` if `kind` is not content-derived.
+pub(super) fn combine_digests(kind: &BuildId, digests: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut hasher = BlockHasher::new(kind)?;
+    for digest in digests {
+        hasher.update(digest);
+    }
+    Some(hasher.finish())
 }
 
 /// Two-level parallel hash: `leaf` over every block, then `leaf` over the
@@ -183,6 +256,33 @@ mod tests {
         let mut expected = vec![7u8; 4096];
         expected[100..120].fill(0);
         assert_eq!(compute_build_id(&BuildId::Sha1, &expected).unwrap(), id_a);
+    }
+
+    #[test]
+    fn piecewise_block_hashes_match() {
+        let image: Vec<u8> = (0..(BLOCK_SIZE * 3 + 77))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        for kind in [BuildId::Fast, BuildId::Md5, BuildId::Sha1] {
+            let digests: Vec<Vec<u8>> = image
+                .chunks(BLOCK_SIZE)
+                .map(|block| {
+                    let mut hasher = BlockHasher::new(&kind).unwrap();
+                    let (a, b) = block.split_at(block.len() / 3);
+                    hasher.update(a);
+                    hasher.update(b);
+                    hasher.finish()
+                })
+                .collect();
+            assert_eq!(
+                combine_digests(&kind, &digests),
+                compute_build_id(&kind, &image),
+                "{kind:?}"
+            );
+        }
+        let mut zeros = BlockHasher::new(&BuildId::Sha1).unwrap();
+        zeros.update_zeros(10_000);
+        assert_eq!(zeros.finish(), Sha1::digest(&[0; 10_000]));
     }
 
     #[test]

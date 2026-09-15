@@ -52,6 +52,10 @@ impl WritePhase {
 pub enum Backing {
     /// A writable shared mapping of the output file.
     Mapped,
+    /// Chunks rendered into heap buffers and written to the output file with
+    /// positional writes (`pwrite`); nothing else of the image is held in
+    /// memory.
+    Written,
     /// A heap buffer written to the destination at commit, because mapping
     /// was not possible (a pipe, a device, or a file system without mmap).
     Buffered,

@@ -217,7 +217,7 @@ pub fn write(input: &WriteInput<'_, '_>, contents: &[Vec<u8>]) -> Result<()> {
         },
     )?;
     {
-        let bytes = output.as_mut_slice();
+        let bytes = output.as_mut_slice()?;
         write_headers(input, bytes)?;
         for (section, data) in layout.sections.iter().zip(contents) {
             if section.is_bss() || data.is_empty() {
