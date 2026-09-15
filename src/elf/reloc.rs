@@ -2,7 +2,7 @@
 //! writer so the two always agree.
 //!
 //! [`decide`] combines the instruction-level classification
-//! ([`x86_64::classify`]) with what the dynamic linker needs, following
+//! (`arch::x86_64::classify` and its AArch64 counterpart) with what the dynamic linker needs, following
 //! lld's model:
 //!
 //! - **GOT, TLS and PLT accesses** set per-symbol needs ([`SymbolFlags`]),

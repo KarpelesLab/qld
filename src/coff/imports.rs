@@ -139,7 +139,7 @@ impl Groups {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Malformed`](crate::Error::Malformed) if the export
+    /// Returns [`crate::Error::Malformed`] if the export
     /// directory cannot be read.
     pub fn add_dll(&mut self, image: &PeImage<'_>, position: u32, fallback: &[u8]) -> Result<()> {
         let Some(directory) = image.exports()? else {

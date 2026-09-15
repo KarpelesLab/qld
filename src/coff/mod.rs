@@ -19,7 +19,7 @@
 //! | [`defined`] | The symbols MinGW's C runtime expects the linker to define |
 //! | [`reloc`] | Symbol addresses, relocation application, base relocations |
 //! | [`symtab`] | The image's COFF symbol table |
-//! | [`write`] | Headers, section contents and the image checksum |
+//! | [`write`](mod@write) | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
 //!
 //! Not implemented yet: `-r`, `--gc-sections`, local symbols in the output

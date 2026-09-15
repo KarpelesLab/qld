@@ -9,10 +9,10 @@
 //! 3. [`resolve_symbols_with`] with [`CoffRules`] and [`ComdatHook`], which
 //!    claims COMDAT groups before each round's symbols are inserted;
 //! 4. `--alternatename` and weak-external aliases, then common symbols;
-//! 5. [`layout`](super::layout): output sections, grouped-section ordering,
+//! 5. [`super::layout`]: output sections, grouped-section ordering,
 //!    RVAs and file offsets;
-//! 6. [`defined`](super::defined): the symbols MinGW's C runtime expects;
-//! 7. [`write`](super::write): relocations, base relocations and the image.
+//! 6. [`super::defined`]: the symbols MinGW's C runtime expects;
+//! 7. [`super::write`](mod@super::write): relocations, base relocations and the image.
 //!
 //! Base relocations are found while relocating, so `.reloc` is sized in a
 //! second layout pass. It is the last section, so no address moves and the

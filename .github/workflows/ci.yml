@@ -132,6 +132,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features
       - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   msrv:
     name: MSRV 1.89
