@@ -24,6 +24,7 @@
 //! | [`addr`] | Final addresses of symbols and synthetic entries |
 //! | [`sections`] | Section contents |
 //! | [`unwind`], [`eh_frame`] | `__unwind_info` and `__eh_frame` |
+//! | [`objc_stubs`] | `_objc_msgSend$selector` stubs, generated as an object |
 //! | [`fixups`] | Chained fixups and rebase/bind opcodes |
 //! | [`trie`] | The export trie |
 //! | [`symtab`], [`stabs`] | Symbol tables and the STABS debug map |
@@ -42,6 +43,7 @@ pub mod fixups;
 pub mod inputs;
 pub mod layout;
 pub mod link;
+pub mod objc_stubs;
 pub mod object;
 pub mod read;
 pub mod reloc;
