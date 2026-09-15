@@ -708,6 +708,9 @@ pub struct LinkOptions {
     /// The PE/COFF options of GNU ld's MinGW emulations. Only PE links read
     /// them.
     pub pe: PeArgs,
+    /// The Apple ld64 options that have no GNU equivalent. Only Mach-O
+    /// links read them.
+    pub darwin: crate::args::darwin::DarwinArgs,
     /// LTO plugin paths (`-plugin`) and their options (`-plugin-opt`).
     pub plugins: Vec<(PathBuf, Vec<String>)>,
     /// `-plugin-save-temps`: keep the files an LTO plugin generates.

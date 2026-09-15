@@ -1,0 +1,77 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1336
+compatibility-version: 1
+reexported-libraries:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    libraries:       [ '/usr/lib/system/libdyld.dylib', '/usr/lib/system/libsystem_c.dylib',
+                       '/usr/lib/system/libsystem_malloc.dylib',
+                       '/usr/lib/system/libsystem_pthread.dylib',
+                       '/usr/lib/system/libsystem_kernel.dylib' ]
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ ___crashreporter_info__, _mach_init_routine ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libdyld.dylib'
+current-version: 1122.1
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ __NSGetExecutablePath, __dyld_get_image_name, __tlv_atexit,
+                       __tlv_bootstrap, _dladdr, _dlclose, _dlerror, _dlopen, _dlsym,
+                       dyld_stub_binder ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libsystem_c.dylib'
+current-version: 1534.40.2
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ ___stack_chk_fail, ___stack_chk_guard, ___stderrp, ___stdoutp,
+                       _abort, _atexit, _exit, _fflush, _fprintf, _fputs, _getenv,
+                       _memcmp, _memcpy, _memmove, _memset, _printf, _putchar, _puts,
+                       _snprintf, _sprintf, _strcmp, _strcpy, _strlen, _strncmp ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libsystem_malloc.dylib'
+current-version: 474.0.13
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ _calloc, _free, _malloc, _realloc ]
+    weak-symbols:    [ _malloc_zone_weak_hook ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libsystem_pthread.dylib'
+current-version: 519
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ _pthread_create, _pthread_join, _pthread_self ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libsystem_kernel.dylib'
+current-version: 10002.1
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ ___error, _close, _getpid, _open, _read, _write ]
+...
