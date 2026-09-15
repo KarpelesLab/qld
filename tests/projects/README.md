@@ -70,6 +70,7 @@ The `ld` wrapper also:
 | `elfdiff.py REF CAND [--relocs] [--sections]` | Dynamic symbols (name, version, type, binding, visibility, defined or not) and `DT_*` entries of two ELF files, normalized as in `tests/differential.rs` |
 | `elfdiff-tree.sh GNU_TREE QLD_TREE` | `elfdiff.py` over every executable and shared object two build trees share |
 | `linktime.py LOG OUTPUT QLD [--keep DIR]` | Replays a logged link with qld and GNU ld: best-of-N wall time and output size |
+| `output-backing.py QLD --outdir DIR WORKLOAD...` | Times each output backing (`QLD_OUTPUT_BACKING`) on logged links or a synthetic debug-info link, per file system and thread count, and checks the outputs are identical; results in [output-backing.md](output-backing.md) |
 | `ldcompare.py` | The wrapper's `QLD_LINK_COMPARE` mode, for inputs that do not outlive the build |
 | `gcdiff.py LOG OUTPUT QLD` | Sections only one of the linkers removed with `--gc-sections` |
 | `relocdiff.py REF CAND [TYPE]` | Dynamic relocations named by the symbol they patch |
