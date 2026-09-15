@@ -122,8 +122,11 @@ const MIN_PARALLEL_CHUNK: usize = 1024;
 const MIN_PARALLEL_LOOKUP: usize = 1 << 16;
 /// The sort of pass 2 (about 45 ns per new name), in new names.
 const MIN_PARALLEL_SORT: usize = 1 << 17;
-/// The linear steps of passes 2 and 3 (a few ns per element), in elements.
-const MIN_PARALLEL_LINEAR: usize = 1 << 19;
+/// The linear steps of passes 2 and 3 (a few ns per element, but touching
+/// cold pending records and hash slots), in elements. At 2^19, clang's
+/// first round (298,000 new names from archive indexes) ran them on one
+/// thread; at 2^17 its resolution takes 6 ms less on 16 and 64 threads.
+const MIN_PARALLEL_LINEAR: usize = 1 << 17;
 /// Growing the per-symbol state vectors (29 bytes per symbol, mostly page
 /// faults on fresh memory).
 const MIN_PARALLEL_GROW: usize = 1 << 17;
