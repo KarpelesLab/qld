@@ -1,4 +1,4 @@
-//! Input resolution for a PE link: from [`InputSpec`]s to the file list
+//! Input resolution for a PE link: from [`InputSpec`](crate::args::InputSpec)s to the file list
 //! symbol resolution works on.
 //!
 //! The walk mirrors [`crate::elf::inputs`]: command-line files are mapped in
