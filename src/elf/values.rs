@@ -223,13 +223,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
             let kept = refs.sections.resolve(id)?;
             return Some(self.section_address(kept)?.wrapping_add(offset));
         }
-        let kind = refs
-            .files
-            .get(file)?
-            .object
-            .as_ref()?
-            .section(section)?
-            .kind;
+        let kind = *refs.sections.kind.get(id.index())?;
         match kind {
             SectionKind::Merge => {
                 if let Some(group) = self.merged.group_of(id) {
@@ -299,13 +293,9 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 section,
                 value,
             } => {
-                let merge = self
-                    .refs
-                    .files
-                    .get(file)
-                    .and_then(|f| f.object.as_ref())
-                    .and_then(|o| o.section(section))
-                    .is_some_and(|s| s.kind == SectionKind::Merge);
+                // Only numbered sections (of live objects) are in the output;
+                // for others every path below gives `None`.
+                let merge = self.refs.sections.kind_in(file, section) == Some(SectionKind::Merge);
                 if merge && target.is_section_symbol() {
                     let offset = value.checked_add_signed(addend)?;
                     return Some((self.section_offset_address(file, section, offset)?, 0));

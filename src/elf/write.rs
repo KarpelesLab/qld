@@ -1190,13 +1190,8 @@ fn offset_address(
     base: u64,
     offset: u64,
 ) -> u64 {
-    let merge = addresses
-        .refs
-        .files
-        .get(file)
-        .and_then(|f| f.object.as_ref())
-        .and_then(|o| o.section(section))
-        .is_some_and(|s| s.kind == SectionKind::Merge);
+    // Callers pass a section of the output, which always has an ID.
+    let merge = addresses.refs.sections.kind_in(file, section) == Some(SectionKind::Merge);
     if merge {
         return addresses
             .section_offset_address(file, section, offset)

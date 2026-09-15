@@ -95,6 +95,7 @@ pub struct Refs<'r, 'a> {
 
 impl<'a> Refs<'_, 'a> {
     /// The global symbol ID of symbol `index` of `file`, if it is global.
+    #[inline]
     #[must_use]
     pub fn global_id(&self, file: usize, index: usize) -> Option<SymbolId> {
         let object = self.files.get(file)?.object.as_ref()?;
@@ -106,6 +107,7 @@ impl<'a> Refs<'_, 'a> {
     }
 
     /// Resolves symbol `index` of `file`.
+    #[inline(always)]
     #[must_use]
     pub fn target(&self, file: usize, index: usize) -> Option<Target> {
         let object = self.files.get(file)?.object.as_ref()?;
@@ -124,6 +126,7 @@ impl<'a> Refs<'_, 'a> {
     }
 
     /// Resolves global symbol `id`; `weak` is the binding of the reference.
+    #[inline(always)]
     #[must_use]
     pub fn global_target(&self, id: SymbolId, weak: bool) -> Target {
         let def = self.symbols.definition(id);
@@ -208,6 +211,7 @@ impl<'a> Refs<'_, 'a> {
     }
 }
 
+#[inline(always)]
 fn local_def(
     file: usize,
     index: usize,
