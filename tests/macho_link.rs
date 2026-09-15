@@ -55,6 +55,39 @@ fn skip(test: &str, why: &str) {
     eprintln!("skipping {test}: {why}");
 }
 
+/// `llvm-<name>`, or `<name>` when only that exists (Xcode ships the LLVM
+/// tools without the prefix: `objdump`, `nm`, `lipo`, `dwarfdump`).
+fn tool(name: &str) -> String {
+    let prefixed = format!("llvm-{name}");
+    if Command::new(&prefixed).arg("--version").output().is_ok() {
+        return prefixed;
+    }
+    if Command::new(name).arg("--version").output().is_ok() {
+        return name.to_owned();
+    }
+    prefixed
+}
+
+/// Creates a static archive of `objects` with `llvm-ar`, or Xcode's
+/// `libtool`.
+fn make_archive(archive: &Path, objects: &[&Path]) -> bool {
+    let _ = std::fs::remove_file(archive);
+    let mut llvm_ar = Command::new("llvm-ar");
+    llvm_ar
+        .args(["--format=darwin", "rcs"])
+        .arg(archive)
+        .args(objects);
+    if llvm_ar.output().is_ok_and(|o| o.status.success()) {
+        return true;
+    }
+    Command::new("libtool")
+        .args(["-static", "-o"])
+        .arg(archive)
+        .args(objects)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn tool_works(tool: &str, args: &[&str]) -> bool {
     Command::new(tool)
         .args(args)
@@ -230,7 +263,7 @@ fn check_signature(data: &[u8]) {
 }
 
 fn objdump(args: &[&str], file: &Path) -> Option<String> {
-    let output = Command::new("llvm-objdump")
+    let output = Command::new(tool("objdump"))
         .args(args)
         .arg(file)
         .output()
@@ -483,7 +516,14 @@ fn link_and_compare(args: &[String], output: &Path) -> Vec<u8> {
             .status()
             .unwrap();
         assert!(status.success(), "ld64.lld failed on {args:?}");
-        if let (Some(ours), Some(theirs)) = (summarize(output), summarize(&reference)) {
+        if let (Some(mut ours), Some(mut theirs)) = (summarize(output), summarize(&reference)) {
+            // lld rewrites Objective-C metadata (relative method lists,
+            // class names and method types merged into __cstring), which
+            // qld does not.
+            if args.iter().any(|a| a == "-lobjc") {
+                ours.sections.clear();
+                theirs.sections.clear();
+            }
             assert_eq!(ours, theirs, "{}: qld vs ld64.lld", output.display());
         }
     }
@@ -650,7 +690,7 @@ fn cxx_exceptions() {
 
 /// The address of symbol `name` in `file`, from `llvm-nm`.
 fn nm_address(file: &Path, name: &str) -> Option<u64> {
-    let output = Command::new("llvm-nm").arg(file).output().ok()?;
+    let output = Command::new(tool("nm")).arg(file).output().ok()?;
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|l| {
@@ -686,7 +726,7 @@ fn dwarf_unwind_information() {
         link_and_compare(&args, &exe);
         // The FDE in __eh_frame covers call_through.
         if let (Ok(frames), Some(function)) = (
-            Command::new("llvm-dwarfdump")
+            Command::new(tool("dwarfdump"))
                 .arg("--eh-frame")
                 .arg(&exe)
                 .output(),
@@ -732,7 +772,7 @@ fn dead_stripping() {
             ("_unused_caller", false),
             ("_unused_data", false),
         ] {
-            if tool_works("llvm-nm", &["--version"]) {
+            if tool_works(&tool("nm"), &["--version"]) {
                 assert_eq!(
                     nm_address(&exe, name).is_some(),
                     kept,
@@ -767,27 +807,18 @@ fn debug_map(binary: &Path) -> Option<Vec<String>> {
 #[test]
 fn stabs_debug_map() {
     let arch = "arm64";
-    if !clang_for(arch) || !tool_works("llvm-ar", &["--version"]) {
-        skip(
-            "stabs_debug_map",
-            "clang for arm64-apple-macos or llvm-ar missing",
-        );
+    if !clang_for(arch) {
+        skip("stabs_debug_map", "clang cannot target arm64-apple-macos");
         return;
     }
     let dir = scratch("stabs");
     let main = compile("stabs", "tlv.c", arch, &["-g"]);
     let other = compile("stabs", "tlv_other.c", arch, &["-g"]);
     let archive = dir.join("libother.a");
-    let _ = std::fs::remove_file(&archive);
-    assert!(tool_works(
-        "llvm-ar",
-        &[
-            "--format=darwin",
-            "rcs",
-            archive.to_str().unwrap(),
-            other.to_str().unwrap()
-        ]
-    ));
+    if !make_archive(&archive, &[&other]) {
+        skip("stabs_debug_map", "neither llvm-ar nor libtool works");
+        return;
+    }
     let mut args = base_args(arch);
     args.extend(strings(&[
         main.to_str().unwrap(),
@@ -833,20 +864,21 @@ fn stabs_debug_map() {
 
 #[test]
 fn universal_binary() {
-    if !clang_for("arm64") || !clang_for("x86_64") || !tool_works("llvm-lipo", &["-version"]) {
+    let lipo = tool("lipo");
+    if !clang_for("arm64") || !clang_for("x86_64") || Command::new(&lipo).output().is_err() {
         skip(
             "universal_binary",
-            "clang for both architectures or llvm-lipo missing",
+            "clang for both architectures or lipo missing",
         );
         return;
     }
     let dir = scratch("universal");
-    // Fat inputs: an object and an archive.
+    // A fat input object.
     let hello_arm = compile("universal", "hello.c", "arm64", &[]);
     let hello_x86 = compile("universal", "hello.c", "x86_64", &[]);
     let fat_object = dir.join("hello-fat.o");
     assert!(tool_works(
-        "llvm-lipo",
+        &lipo,
         &[
             "-create",
             hello_arm.to_str().unwrap(),
@@ -888,11 +920,7 @@ fn universal_binary() {
             assert_eq!(slice.offset % 0x1000, 0);
         }
     }
-    let info = Command::new("llvm-lipo")
-        .arg("-info")
-        .arg(&exe)
-        .output()
-        .unwrap();
+    let info = Command::new(&lipo).arg("-info").arg(&exe).output().unwrap();
     let info = String::from_utf8_lossy(&info.stdout);
     assert!(info.contains("x86_64") && info.contains("arm64"), "{info}");
 
@@ -1003,6 +1031,175 @@ fn range_extension_thunks() {
     }
     if host_can_run(arch) {
         assert_eq!(run(&exe).unwrap(), "near\nfar\n");
+    }
+}
+
+#[test]
+fn legacy_dyld_info() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "legacy_dyld_info",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("legacy", "hello.c", arch, &[]);
+        let root = syslibroot();
+        let mut args = os(&[
+            "-arch",
+            arch,
+            "-platform_version",
+            "macos",
+            "11.0",
+            "11.0",
+            "-syslibroot",
+            root.to_str().unwrap(),
+            object.to_str().unwrap(),
+            "-lSystem",
+        ]);
+        let (bytes, _) = link_bytes(&args).unwrap();
+        let commands: Vec<u32> = load_commands(&bytes).iter().map(|c| c.0).collect();
+        assert!(commands.contains(&qld::macho::read::consts::LC_DYLD_INFO_ONLY));
+        assert!(!commands.contains(&LC_DYLD_CHAINED_FIXUPS));
+        let exe = scratch("legacy").join(format!("hello-{arch}"));
+        std::fs::write(&exe, &bytes).unwrap();
+        make_executable(&exe);
+        if let Some(tables) = objdump(&["--macho", "--bind", "--rebase"], &exe) {
+            assert!(tables.contains("_printf"), "{arch}: {tables}");
+            assert!(
+                tables
+                    .lines()
+                    .any(|l| l.contains("__data") && l.contains("pointer")),
+                "{arch}: {tables}"
+            );
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "hello from qld 3 42\n");
+        }
+
+        // -fixup_chains overrides the deployment target.
+        args.push("-fixup_chains".into());
+        let (bytes, _) = link_bytes(&args).unwrap();
+        let commands: Vec<u32> = load_commands(&bytes).iter().map(|c| c.0).collect();
+        assert!(commands.contains(&LC_DYLD_CHAINED_FIXUPS));
+    }
+}
+
+#[test]
+fn bundles_and_export_lists() {
+    let arch = "arm64";
+    if !clang_for(arch) {
+        skip(
+            "bundles_and_export_lists",
+            "clang cannot target arm64-apple-macos",
+        );
+        return;
+    }
+    let dir = scratch("bundle");
+    let greet = compile("bundle", "greet.c", arch, &[]);
+    let list = dir.join("exports.txt");
+    std::fs::write(&list, "# only greet\n_greet\n").unwrap();
+    let mut args = base_args(arch);
+    args.extend(strings(&[
+        "-bundle",
+        greet.to_str().unwrap(),
+        "-exported_symbols_list",
+        list.to_str().unwrap(),
+        "-lSystem",
+    ]));
+    let bundle = dir.join("greet.bundle");
+    let bytes = link_and_compare(&args, &bundle);
+    let file = MachOFile::parse(&bytes, Source::new(&bundle)).unwrap();
+    assert_eq!(file.header().file_type, qld::macho::read::consts::MH_BUNDLE);
+    if let Some(trie) = objdump(&["--macho", "--exports-trie"], &bundle) {
+        assert!(trie.contains("_greet"), "{trie}");
+        assert!(!trie.contains("_greet_count"), "{trie}");
+        assert!(!trie.contains("_greet_weak"), "{trie}");
+    }
+    if let Some(symbols) = Command::new(tool("nm"))
+        .arg("-m")
+        .arg(&bundle)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    {
+        assert!(
+            symbols
+                .lines()
+                .any(|l| l.contains("_greet_count") && l.contains("non-external")),
+            "{symbols}"
+        );
+    }
+}
+
+#[test]
+fn objective_c() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "objective_c",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("objc", "objc.m", arch, &[]);
+        for dead_strip in [false, true] {
+            let mut args = base_args(arch);
+            args.extend(strings(&[object.to_str().unwrap(), "-lobjc", "-lSystem"]));
+            if dead_strip {
+                args.push("-dead_strip".to_owned());
+            }
+            let exe = scratch("objc").join(format!("objc-{arch}-{dead_strip}"));
+            link_and_compare(&args, &exe);
+            if let Some(headers) = objdump(&["--macho", "--section-headers"], &exe) {
+                for section in ["__objc_classlist", "__objc_catlist", "__objc_imageinfo"] {
+                    assert!(headers.contains(section), "{arch}: {section}:\n{headers}");
+                }
+            }
+            if host_can_run(arch) {
+                assert_eq!(run(&exe).unwrap(), "objc 42\n");
+            }
+        }
+    }
+}
+
+/// On macOS: Apple clang links through the `qld` binary (as `ld64.qld`,
+/// with `-fuse-ld`) against the real SDK, and the program runs.
+#[test]
+fn clang_driver_uses_qld() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping clang_driver_uses_qld: needs macOS");
+        return;
+    }
+    let dir = scratch("driver");
+    let linker = dir.join("ld64.qld");
+    let _ = std::fs::remove_file(&linker);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_qld"), &linker).unwrap();
+    for (source, expected) in [
+        ("hello.c", "hello from qld 3 42\n"),
+        ("exceptions.cpp", "caught 84 after 10 cleanups\n"),
+    ] {
+        let output = dir.join(source.replace('.', "-"));
+        let compiler = if source.ends_with(".cpp") {
+            "clang++"
+        } else {
+            "clang"
+        };
+        let result = Command::new(compiler)
+            .arg(format!("-fuse-ld={}", linker.display()))
+            .arg(data_dir().join(source))
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{compiler} -fuse-ld=ld64.qld {source}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(run(&output).unwrap(), expected);
     }
 }
 
