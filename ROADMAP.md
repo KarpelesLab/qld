@@ -304,10 +304,12 @@ test suite on arm64 and x86_64 CI runners with `-fuse-ld=qld`. A Rust
 `aarch64-apple-darwin` binary runs. A universal binary passes `lipo -info`
 and runs natively on both architectures.
 
-**Status:** everything above except `-r`, arm64e and LTO is implemented and
-validated structurally against `ld64.lld` on Linux (`tests/macho_link.rs`).
-The `macho-macos` CI job links against the real SDK and runs the outputs; the
-exit criteria are not claimed until that job is green.
+**Status:** everything above except `-r`, arm64e and LTO is implemented.
+`tests/macho_link.rs` compares against `ld64.lld` on Linux, and the
+`macho-macos` CI job (green since 7d6e198) links C, C++ (exceptions, TLV) and
+Objective-C fixtures with Apple clang against the real SDK and runs them on
+arm64 and, under Rosetta, x86_64. Still open for the exit criteria: a broader
+test suite through `-fuse-ld`, and a Rust `aarch64-apple-darwin` binary.
 
 ---
 
