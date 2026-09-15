@@ -1,0 +1,27 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/libc++.1.dylib'
+current-version: 1500.65
+compatibility-version: 1
+reexported-libraries:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    libraries:       [ '/usr/lib/libc++abi.dylib' ]
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ __ZNSt3__14coutE, __ZdlPv, __Znwm, __ZNSt9exceptionD2Ev ]
+    weak-symbols:    [ __ZNSt3__122__libcpp_verbose_abortEPKcz ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/libc++abi.dylib'
+current-version: 1500.65
+compatibility-version: 1
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ __ZTIi, __ZTIPKc, __ZTISt9exception, __ZTVN10__cxxabiv117__class_type_infoE,
+                       __ZTVN10__cxxabiv120__si_class_type_infoE, __ZSt9terminatev,
+                       ___cxa_allocate_exception, ___cxa_begin_catch, ___cxa_end_catch,
+                       ___cxa_free_exception, ___cxa_rethrow, ___cxa_throw,
+                       ___gxx_personality_v0, __Unwind_Resume, ___cxa_atexit ]
+...

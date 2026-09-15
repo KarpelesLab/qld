@@ -849,3 +849,58 @@ pub const DYLD_CHAINED_IMPORT_ADDEND64: u32 = 3;
 pub const DYLD_CHAINED_SYMBOL_UNCOMPRESSED: u32 = 0;
 /// Symbol names are zlib-compressed.
 pub const DYLD_CHAINED_SYMBOL_ZLIB: u32 = 1;
+/// `dyld_chained_ptr_64_rebase` / `_bind` with unslid address targets.
+pub const DYLD_CHAINED_PTR_64: u16 = 2;
+/// `dyld_chained_ptr_64_rebase` / `_bind` with image-relative targets.
+pub const DYLD_CHAINED_PTR_64_OFFSET: u16 = 6;
+/// A page of `dyld_chained_starts_in_segment` with no fixups.
+pub const DYLD_CHAINED_PTR_START_NONE: u16 = 0xffff;
+
+// ---------------------------------------------------------------------------
+// Binding and rebasing (`LC_DYLD_INFO`)
+// ---------------------------------------------------------------------------
+
+/// Ordinal of the image itself.
+pub const BIND_SPECIAL_DYLIB_SELF: i32 = 0;
+/// Ordinal of the main executable (bundles with `-bundle_loader`).
+pub const BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE: i32 = -1;
+/// Flat lookup in every loaded image (`-undefined dynamic_lookup`).
+pub const BIND_SPECIAL_DYLIB_FLAT_LOOKUP: i32 = -2;
+/// Weak definition coalescing lookup.
+pub const BIND_SPECIAL_DYLIB_WEAK_LOOKUP: i32 = -3;
+/// `REBASE_TYPE_POINTER`.
+pub const REBASE_TYPE_POINTER: u8 = 1;
+/// `REBASE_OPCODE_DONE`.
+pub const REBASE_OPCODE_DONE: u8 = 0x00;
+/// `REBASE_OPCODE_SET_TYPE_IMM`.
+pub const REBASE_OPCODE_SET_TYPE_IMM: u8 = 0x10;
+/// `REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB`.
+pub const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
+/// `REBASE_OPCODE_ADD_ADDR_ULEB`.
+pub const REBASE_OPCODE_ADD_ADDR_ULEB: u8 = 0x30;
+/// `REBASE_OPCODE_DO_REBASE_IMM_TIMES`.
+pub const REBASE_OPCODE_DO_REBASE_IMM_TIMES: u8 = 0x50;
+/// `REBASE_OPCODE_DO_REBASE_ULEB_TIMES`.
+pub const REBASE_OPCODE_DO_REBASE_ULEB_TIMES: u8 = 0x60;
+/// `BIND_TYPE_POINTER`.
+pub const BIND_TYPE_POINTER: u8 = 1;
+/// `BIND_SYMBOL_FLAGS_WEAK_IMPORT`.
+pub const BIND_SYMBOL_FLAGS_WEAK_IMPORT: u8 = 0x1;
+/// `BIND_OPCODE_DONE`.
+pub const BIND_OPCODE_DONE: u8 = 0x00;
+/// `BIND_OPCODE_SET_DYLIB_ORDINAL_IMM`.
+pub const BIND_OPCODE_SET_DYLIB_ORDINAL_IMM: u8 = 0x10;
+/// `BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB`.
+pub const BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB: u8 = 0x20;
+/// `BIND_OPCODE_SET_DYLIB_SPECIAL_IMM`.
+pub const BIND_OPCODE_SET_DYLIB_SPECIAL_IMM: u8 = 0x30;
+/// `BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM`.
+pub const BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: u8 = 0x40;
+/// `BIND_OPCODE_SET_TYPE_IMM`.
+pub const BIND_OPCODE_SET_TYPE_IMM: u8 = 0x50;
+/// `BIND_OPCODE_SET_ADDEND_SLEB`.
+pub const BIND_OPCODE_SET_ADDEND_SLEB: u8 = 0x60;
+/// `BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB`.
+pub const BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x70;
+/// `BIND_OPCODE_DO_BIND`.
+pub const BIND_OPCODE_DO_BIND: u8 = 0x90;

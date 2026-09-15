@@ -74,7 +74,7 @@ pub struct PlatformVersion {
 }
 
 /// How a dylib or framework input is linked.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LoadMode {
     /// A plain `LC_LOAD_DYLIB` (or an ordinary archive member search).
     #[default]
@@ -93,7 +93,7 @@ pub enum LoadMode {
 }
 
 /// What a Darwin input names.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DarwinInputKind {
     /// A file path.
     File(PathBuf),
@@ -111,7 +111,7 @@ pub enum DarwinInputKind {
 }
 
 /// One Darwin input, in command-line order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DarwinInput {
     /// What the input names.
     pub kind: DarwinInputKind,
