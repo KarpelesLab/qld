@@ -66,7 +66,7 @@ pub fn parse_gnu_with<S: AsRef<OsStr>>(
 ) -> Result<ParseOutcome> {
     let (flavor, first) = select_flavor(args)?;
     match flavor {
-        Flavor::Darwin => parse_darwin(args),
+        Flavor::Darwin => parse_darwin_with(args, reader),
         Flavor::Gnu => {
             let raw: Vec<Vec<u8>> = args
                 .get(first..)
@@ -83,24 +83,39 @@ pub fn parse_gnu_with<S: AsRef<OsStr>>(
 
 /// Parses an Apple ld64 command line.
 ///
-/// Only `-v`, `--version` and `--help` are recognized so far.
+/// `args` includes `argv[0]` (and may start with `-flavor darwin`).
+/// Response files and `-filelist` files are read with [`std::fs::read`];
+/// see [`crate::args::darwin`] for the option table.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unimplemented`] for anything that would need a link.
+/// Returns [`Error::Option`] for unknown, unsupported or malformed options
+/// and [`Error::Io`] for unreadable response files.
 pub fn parse_darwin<S: AsRef<OsStr>>(args: &[S]) -> Result<ParseOutcome> {
-    for arg in args.iter().skip(1) {
-        let arg = arg.as_ref();
-        if arg == "-help" || arg == "--help" {
-            return Ok(ParseOutcome::Help);
-        }
-        if arg == "-v" || arg == "-version" || arg == "--version" {
-            return Ok(ParseOutcome::Version);
-        }
-    }
-    Err(Error::Unimplemented(
-        "the ld64 command line (roadmap M8: Mach-O)".into(),
-    ))
+    parse_darwin_with(args, &FsReader)
+}
+
+/// Like [`parse_darwin`], but reads `@response` and `-filelist` files through
+/// `reader`.
+///
+/// # Errors
+///
+/// As for [`parse_darwin`].
+pub fn parse_darwin_with<S: AsRef<OsStr>>(
+    args: &[S],
+    reader: &dyn FileReader,
+) -> Result<ParseOutcome> {
+    let first = match args.get(1) {
+        Some(arg) if arg.as_ref() == "-flavor" => 3,
+        _ => 1,
+    };
+    let rest: Vec<&OsStr> = args
+        .get(first..)
+        .unwrap_or_default()
+        .iter()
+        .map(AsRef::as_ref)
+        .collect();
+    crate::args::darwin::parse(&rest, reader)
 }
 
 /// Chooses the command-line flavor.

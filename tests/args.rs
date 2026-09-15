@@ -1042,10 +1042,10 @@ fn flavor_dispatch() {
         other => panic!("{other:?}"),
     };
     assert_eq!(options.output, Some(PathBuf::from("x")));
-    assert!(matches!(
-        parse_gnu_with(&["ld64.qld", "-arch", "arm64", "a.o"], &no_files),
-        Err(Error::Unimplemented(_))
-    ));
+    match parse_gnu_with(&["ld64.qld", "-arch", "arm64", "a.o"], &no_files) {
+        Ok(ParseOutcome::Link(options)) => assert_eq!(options.flavor, Flavor::Darwin),
+        other => panic!("{other:?}"),
+    }
     assert!(matches!(
         parse_gnu_with(&["ld64.qld", "-v"], &no_files),
         Ok(ParseOutcome::Version)
