@@ -59,6 +59,19 @@ jobs:
           QLD_REQUIRE_TOOLS: "1"
           QLD_FIXTURE: aarch64
 
+  macho-macos:
+    name: Mach-O links run on macOS
+    runs-on: macos-latest
+    env:
+      QLD_REQUIRE_MACHO_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # x86_64 slices of the fixtures run under Rosetta on the arm64 runner.
+      - run: softwareupdate --install-rosetta --agree-to-license || true
+      - run: cargo test --all-features --test macho_link -- --nocapture
+
   pe-windows:
     name: PE images run on Windows
     runs-on: windows-latest
