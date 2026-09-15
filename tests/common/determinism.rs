@@ -3,7 +3,9 @@
 //!
 //! Used by fixtures with `determinism = true`. Linkers without `--threads`
 //! (GNU ld, gold) are relinked once without it, which still checks that the
-//! harness and the fixture are stable.
+//! harness and the fixture are stable. qld is also relinked with every
+//! output backing (`QLD_OUTPUT_BACKING`), which must not change a byte, and
+//! with `--build-id=sha1` under every backing, compared with each other.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -17,6 +19,42 @@ pub fn thread_counts() -> Vec<usize> {
         .map_or(4, |n| n.get())
         .max(4);
     vec![1, 2, n]
+}
+
+/// Values of `QLD_OUTPUT_BACKING` relinked with qld; the first is compared
+/// with the others for the build-id variants.
+const BACKINGS: [&str; 3] = ["write", "mmap", "memory"];
+
+/// One determinism relink.
+struct Variant {
+    label: String,
+    extra: Vec<String>,
+    vars: Vec<(String, String)>,
+    /// The variant whose outputs this one must match, instead of the first
+    /// link's.
+    compare_with: Option<&'static str>,
+}
+
+impl Variant {
+    fn new(label: String, extra: &[&str]) -> Self {
+        Self {
+            label,
+            extra: extra.iter().map(|s| (*s).to_string()).collect(),
+            vars: Vec::new(),
+            compare_with: None,
+        }
+    }
+
+    fn var(mut self, backing: &str) -> Self {
+        self.vars
+            .push(("QLD_OUTPUT_BACKING".to_string(), backing.to_string()));
+        self
+    }
+
+    fn compare_with(mut self, label: &'static str) -> Self {
+        self.compare_with = Some(label);
+        self
+    }
 }
 
 /// Compares the files named in `outputs` between two directories.
@@ -65,21 +103,47 @@ pub fn check(
     log: &mut Log,
 ) -> Result<String, Status> {
     let outputs = fixture.link_outputs();
-    let variants: Vec<(String, Vec<String>)> = if linker.supports_threads() {
+    let mut variants: Vec<Variant> = if linker.supports_threads() {
         thread_counts()
             .into_iter()
-            .map(|n| (format!("threads-{n}"), vec![format!("--threads={n}")]))
+            .map(|n| Variant::new(format!("threads-{n}"), &[&format!("--threads={n}")]))
             .collect()
     } else {
-        vec![("relink".to_string(), Vec::new())]
+        vec![Variant::new("relink".to_string(), &[])]
     };
+    if *linker == Linker::Qld {
+        // Every output backing writes the same bytes, with and without a
+        // build-id (hashed while writing with `write`, over the finished
+        // image with the others).
+        for backing in BACKINGS {
+            variants.push(Variant::new(format!("backing-{backing}"), &[]).var(backing));
+        }
+        for backing in BACKINGS {
+            variants.push(
+                Variant::new(format!("build-id-{backing}"), &["--build-id=sha1"])
+                    .var(backing)
+                    .compare_with("build-id-write"),
+            );
+        }
+    }
     let mut problems = String::new();
-    for (label, extra) in &variants {
+    for variant in &variants {
+        let Variant {
+            label,
+            extra,
+            vars,
+            compare_with,
+        } = variant;
         let dir = scratch.join(label);
         fixture::fresh_dir(&dir)?;
         fixture::copy_dir(pristine, &dir)
             .map_err(|e| Status::Fail(format!("cannot copy {}: {e}", pristine.display())))?;
-        match fixture::link(fixture, env, linker, &dir, extra, log) {
+        let reference = match compare_with {
+            Some(other) => scratch.join(other),
+            None => reference.to_path_buf(),
+        };
+        let reference = reference.as_path();
+        match fixture::link_with_vars(fixture, env, linker, &dir, extra, vars, log) {
             Ok(()) => {}
             Err(LinkError::Unimplemented(message)) => return Err(Status::skip(message)),
             Err(LinkError::Failed(message)) => {
@@ -89,16 +153,15 @@ pub fn check(
             }
             Err(LinkError::Status(status)) => return Err(status),
         }
+        if reference == dir {
+            continue;
+        }
         if let Err(message) = compare_outputs(reference, &dir, &outputs) {
-            let _ = writeln!(
-                problems,
-                "output differs with {}:\n{message}",
-                extra.join(" ")
-            );
+            let _ = writeln!(problems, "output differs with {label}:\n{message}");
         }
     }
     if problems.is_empty() {
-        let labels: Vec<&str> = variants.iter().map(|(label, _)| label.as_str()).collect();
+        let labels: Vec<&str> = variants.iter().map(|v| v.label.as_str()).collect();
         Ok(format!("deterministic across {}", labels.join(", ")))
     } else {
         Err(Status::Fail(format!(

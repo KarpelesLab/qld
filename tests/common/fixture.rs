@@ -817,6 +817,19 @@ pub fn link(
     extra: &[String],
     log: &mut Log,
 ) -> Result<(), LinkError> {
+    link_with_vars(fixture, env, linker, dir, extra, &[], log)
+}
+
+/// [`link`], with extra environment variables for the link commands.
+pub fn link_with_vars(
+    fixture: &Fixture,
+    env: &TargetEnv,
+    linker: &Linker,
+    dir: &Path,
+    extra: &[String],
+    vars: &[(String, String)],
+    log: &mut Log,
+) -> Result<(), LinkError> {
     let linker_binary = linker.binary(env)?;
     for line in &fixture.links {
         let words = process::split_words(line).map_err(Status::Fail)?;
@@ -862,6 +875,11 @@ pub fn link(
         };
         command.current_dir(dir).env("LC_ALL", "C");
         env.apply_env(&mut command);
+        let mut description = description;
+        for (var, value) in vars {
+            command.env(var, value);
+            description = format!("{var}={value} {description}");
+        }
         let output = process::run(&mut command, fixture.timeout)
             .map_err(|e| Status::Fail(format!("cannot run `{description}`: {e}")))?;
         log.command(&description, &output);

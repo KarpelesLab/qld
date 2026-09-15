@@ -36,9 +36,11 @@ mod chunks;
 mod file;
 pub mod hash;
 mod mmap;
+mod positional;
 mod random;
 mod stats;
+mod written;
 
 pub use chunks::{ChunkRange, LayoutError, split_chunks, validate_layout, write_chunks};
-pub use file::{FileMode, Finished, OutputFile, OutputOptions, ReplaceStrategy};
+pub use file::{BackingPolicy, FileMode, Finished, OutputFile, OutputOptions, ReplaceStrategy};
 pub use stats::{Backing, WritePhase, WriteStats};

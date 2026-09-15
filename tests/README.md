@@ -135,6 +135,9 @@ first link, then relinked in fresh directories with `--threads=1`, `2` and N
 (N = available parallelism, at least 4); every `-o` output must be
 byte-identical to the first link's. Linkers without `--threads` (GNU ld,
 gold) are relinked once without it, which still validates the fixture.
+qld is also relinked with each output backing (`QLD_OUTPUT_BACKING=write`,
+`mmap`, `memory`), whose outputs must match the first link's, and with
+`--build-id=sha1` under each backing, whose outputs must match each other.
 
 ## Differential runner
 

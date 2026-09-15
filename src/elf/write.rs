@@ -261,6 +261,13 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     // Chunks report into a collector; problems are emitted afterwards in
     // input order, so the diagnostics do not depend on scheduling.
     let collected = Collect::new();
+    let build_id = layout
+        .synthetic(Synthetic::BuildId)
+        .map(|(_, offset, _)| offset.saturating_add(16));
+    if let Some(offset) = build_id {
+        // Lets the write backing hash chunks as it writes them.
+        file.reserve_build_id(&input.options.build_id, offset);
+    }
     let local = WriteInput {
         options: input.options,
         addresses: input.addresses,
@@ -282,12 +289,12 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         write_chunk(&local, chunk, out)
     })?;
     emit_collected(collected, input)?;
-    if let Some((_, offset, _)) = layout.synthetic(Synthetic::BuildId) {
-        file.apply_build_id(&input.options.build_id, offset.saturating_add(16))?;
+    if let Some(offset) = build_id {
+        file.apply_build_id(&input.options.build_id, offset)?;
     }
     if let Some(format) = raw {
         let name = path.as_os_str().as_encoded_bytes().to_vec();
-        let bytes = super::rawout::render(format, layout, file.as_slice(), input.entry, &name)?;
+        let bytes = super::rawout::render(format, layout, file.as_slice()?, input.entry, &name)?;
         drop(file);
         let mut options = crate::output::OutputOptions::default();
         if format != super::rawout::Format::Binary {
@@ -296,7 +303,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         let size = u64::try_from(bytes.len())
             .map_err(|_| Error::Limit("raw output larger than the address space".into()))?;
         let mut out = OutputFile::create(&path, size, &options)?;
-        out.as_mut_slice().copy_from_slice(&bytes);
+        out.write_at(0, &bytes)?;
         out.finish()?;
         return Ok(());
     }

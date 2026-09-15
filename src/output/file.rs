@@ -5,10 +5,12 @@
 
 #![deny(clippy::arithmetic_side_effects)]
 
-use super::build_id;
+use super::build_id::{self, BlockHasher, build_id_size};
 use super::chunks::{self, ChunkRange, LayoutError};
 use super::mmap::map_output;
+use super::positional;
 use super::stats::{Backing, WritePhase, WriteStats};
+use super::written::{self, HashPlan, Precomputed};
 use crate::args::BuildId;
 use crate::error::{Error, Result};
 use memmap2::MmapMut;
@@ -51,6 +53,65 @@ pub enum ReplaceStrategy {
     Unlink,
 }
 
+/// Which backing [`OutputFile::create`] uses for a regular output file.
+/// See [`OutputFile`] ("Backings") for the tradeoffs.
+///
+/// Pipes, devices and paths under `/dev` and `/proc` are always buffered,
+/// and an output that cannot be mapped falls back to a buffer; an in-memory
+/// output ([`OutputFile::in_memory`]) is always [`Backing::Memory`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackingPolicy {
+    /// The `QLD_OUTPUT_BACKING` environment variable if it is set to a known
+    /// value (`mmap`, `write` or `memory`), otherwise
+    /// [`BackingPolicy::DEFAULT`].
+    #[default]
+    Auto,
+    /// Map the file writable ([`Backing::Mapped`]).
+    Mapped,
+    /// Write chunks with positional writes ([`Backing::Written`]), where the
+    /// platform supports them (Unix and Windows); elsewhere, map.
+    Written,
+    /// Build the image in a heap buffer and write it on commit
+    /// ([`Backing::Buffered`]).
+    Buffered,
+}
+
+impl BackingPolicy {
+    /// The environment variable read by [`BackingPolicy::Auto`].
+    pub const ENV: &'static str = "QLD_OUTPUT_BACKING";
+
+    /// What [`BackingPolicy::Auto`] means without the environment variable.
+    pub const DEFAULT: Self = Self::Written;
+
+    /// Parses a `QLD_OUTPUT_BACKING` value: `mmap`, `write` or `memory`
+    /// (also `mapped`, `written`, `pwrite`, `buffered`, `buffer`, `auto`).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(Self::Auto),
+            "mmap" | "mapped" => Some(Self::Mapped),
+            "write" | "written" | "pwrite" => Some(Self::Written),
+            "memory" | "buffer" | "buffered" => Some(Self::Buffered),
+            _ => None,
+        }
+    }
+
+    /// Resolves [`BackingPolicy::Auto`] from the environment and the default;
+    /// other values are returned as they are.
+    #[must_use]
+    pub fn resolve(self) -> Self {
+        match self {
+            Self::Auto => std::env::var(Self::ENV)
+                .ok()
+                .and_then(|value| Self::from_name(value.trim()))
+                .filter(|policy| *policy != Self::Auto)
+                .unwrap_or(Self::DEFAULT),
+            other => other,
+        }
+    }
+}
+
 /// Options for [`OutputFile::create`].
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +126,8 @@ pub struct OutputOptions {
     /// Close the last handle to an old output at least this large on a
     /// background thread (Unix only). `None` disables it.
     pub background_release_threshold: Option<u64>,
+    /// How the image is held while it is written.
+    pub backing: BackingPolicy,
 }
 
 impl OutputOptions {
@@ -80,6 +143,7 @@ impl Default for OutputOptions {
             replace: ReplaceStrategy::Rename,
             sync: false,
             background_release_threshold: Some(Self::DEFAULT_RELEASE_THRESHOLD),
+            backing: BackingPolicy::Auto,
         }
     }
 }
@@ -88,22 +152,58 @@ impl Default for OutputOptions {
 enum Storage {
     Mapped(MmapMut),
     Buffer(Vec<u8>),
+    /// Nothing in memory: chunks go straight to the destination file.
+    Positional(Positional),
+}
+
+/// State of the write backing.
+struct Positional {
+    len: usize,
+    /// Whether anything has been written to the file yet.
+    written: bool,
+    /// The build-id announced by [`OutputFile::reserve_build_id`].
+    plan: Option<HashPlan>,
+    /// Block digests computed while writing, valid while nothing else is
+    /// written.
+    precomputed: Option<Precomputed>,
+}
+
+impl Positional {
+    /// Records a write that the precomputed digests do not account for.
+    fn touch(&mut self) {
+        self.written = true;
+        self.precomputed = None;
+    }
 }
 
 impl Storage {
-    fn as_slice(&self) -> &[u8] {
+    fn len(&self) -> usize {
         match self {
-            Self::Mapped(map) => map,
-            Self::Buffer(buf) => buf,
+            Self::Mapped(map) => map.len(),
+            Self::Buffer(buf) => buf.len(),
+            Self::Positional(state) => state.len,
         }
     }
+}
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        match self {
-            Self::Mapped(map) => map,
-            Self::Buffer(buf) => buf,
-        }
+/// The file behind a destination that owns one.
+fn destination_file(destination: &Destination) -> Option<&File> {
+    match destination {
+        Destination::Temp { file, .. } | Destination::Direct { file } => Some(file),
+        Destination::Stream { .. } | Destination::Memory | Destination::Done => None,
     }
+}
+
+/// An I/O error, naming `path` when there is one.
+fn io_error(path: Option<&Path>, error: io::Error) -> Error {
+    match path {
+        Some(path) => Error::io(path, error),
+        None => Error::from(error),
+    }
+}
+
+fn no_file() -> Error {
+    Error::Internal("positional output without a file".into())
 }
 
 /// Where the bytes go on finish.
@@ -124,15 +224,41 @@ enum Destination {
 ///
 /// Create one with [`OutputFile::create`] (a file) or
 /// [`OutputFile::in_memory`] (a byte vector), fill it through
-/// [`OutputFile::as_mut_slice`] or [`OutputFile::split_chunks`], optionally
-/// apply a build-id, then call [`OutputFile::finish`]. Dropping it without
-/// finishing removes the partially written file.
+/// [`OutputFile::write_chunks`] and [`OutputFile::write_at`] (or the whole
+/// image, [`OutputFile::as_mut_slice`]), optionally apply a build-id, then
+/// call [`OutputFile::finish`]. Dropping it without finishing removes the
+/// partially written file.
+///
+/// # Backings
+///
+/// The final size is known before the first byte is written, so a regular
+/// output file is created at full length with `set_len` (sparse, reading as
+/// zeros). Its bytes are then held in one of three ways, chosen by
+/// [`OutputOptions::backing`] and reported by [`OutputFile::backing`]:
+///
+/// - [`Backing::Written`] (the default): [`OutputFile::write_chunks`] gives
+///   each chunk a zeroed heap buffer, and consecutive chunks are written to
+///   the file with one positional write per region of about 1 MiB. No image
+///   is kept in memory; memory use peaks at the largest chunks being written
+///   at once. A build-id announced with [`OutputFile::reserve_build_id`] is
+///   hashed from the buffers as they are written; otherwise the file is read
+///   back. Whole-image access ([`OutputFile::as_mut_slice`],
+///   [`OutputFile::split_chunks`]) reads the file into a heap buffer that is
+///   written back on commit, so a writer that needs the whole image should
+///   ask for it before writing chunks, when it costs only the allocation.
+/// - [`Backing::Mapped`]: the file is mapped writable and chunks are slices
+///   of the mapping. Page faults on a new file contend in the file system as
+///   threads are added: on btrfs, 16 threads wrote 1 GiB 2–3 times slower
+///   through a mapping than with positional writes.
+/// - [`Backing::Buffered`]: a zeroed heap buffer written out on commit. Also
+///   the fallback when mapping fails.
+///
+/// The output bytes, including the build-id, are identical with every
+/// backing.
 ///
 /// # Replacement strategy
 ///
-/// The final size is known before the first byte is written, so the output
-/// is created at full length and mapped writable. How the new file replaces
-/// an existing one is a [`ReplaceStrategy`]. Every strategy creates a new
+/// How the new file replaces an existing one is a [`ReplaceStrategy`]. Every strategy creates a new
 /// inode instead of truncating the old file, so a running copy of the old
 /// output does not make the link fail with `ETXTBSY`, readers that have it
 /// open or mapped (including qld itself, when an input is also the output)
@@ -172,7 +298,6 @@ enum Destination {
 /// even when it resolves to a regular file: `-o /dev/stdout` with stdout
 /// redirected to a file must write into that file, not replace the
 /// `/dev/stdout` symlink (which a link running as root could otherwise do).
-/// The in-memory buffer is also the fallback when mapping fails.
 ///
 /// # Releasing a large old output
 ///
@@ -286,21 +411,35 @@ impl OutputFile {
         };
         out.stats.background_release = out.release.is_some();
 
-        let file = match &out.destination {
-            Destination::Temp { file, .. } | Destination::Direct { file } => Some(file),
-            Destination::Stream { .. } | Destination::Memory | Destination::Done => None,
-        };
         let mut storage = None;
-        if let Some(file) = file {
+        if let Some(file) = destination_file(&out.destination) {
             file.set_len(size).map_err(|e| Error::io(path, e))?;
+            let policy = match options.backing.resolve() {
+                BackingPolicy::Written if !positional::SUPPORTED => BackingPolicy::Mapped,
+                policy => policy,
+            };
             if len != 0 {
-                storage = map_output(file, len).ok().map(Storage::Mapped);
+                storage = match policy {
+                    BackingPolicy::Written => Some((
+                        Backing::Written,
+                        Storage::Positional(Positional {
+                            len,
+                            written: false,
+                            plan: None,
+                            precomputed: None,
+                        }),
+                    )),
+                    BackingPolicy::Mapped | BackingPolicy::Auto => map_output(file, len)
+                        .ok()
+                        .map(|map| (Backing::Mapped, Storage::Mapped(map))),
+                    BackingPolicy::Buffered => None,
+                };
             }
         }
         out.storage = match storage {
-            Some(mapped) => {
-                out.stats.backing = Backing::Mapped;
-                mapped
+            Some((backing, storage)) => {
+                out.stats.backing = backing;
+                storage
             }
             None => Storage::Buffer(zeroed(len).map_err(|e| Error::io(path, e))?),
         };
@@ -339,7 +478,7 @@ impl OutputFile {
     /// Size of the image in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.storage.as_slice().len()
+        self.storage.len()
     }
 
     /// Whether the image is empty.
@@ -355,15 +494,82 @@ impl OutputFile {
     }
 
     /// The whole image.
-    #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
-        self.storage.as_slice()
+    ///
+    /// With [`Backing::Written`] this first reads the file into a heap
+    /// buffer, which is then used instead of positional writes (see
+    /// [`OutputFile`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the buffer cannot be allocated or the file
+    /// cannot be read back.
+    pub fn as_slice(&mut self) -> Result<&[u8]> {
+        self.as_mut_slice().map(|image| &*image)
     }
 
     /// The whole image, writable.
-    #[must_use]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.storage.as_mut_slice()
+    ///
+    /// With [`Backing::Written`] this first reads the file into a heap
+    /// buffer, which is then used instead of positional writes (see
+    /// [`OutputFile`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the buffer cannot be allocated or the file
+    /// cannot be read back.
+    pub fn as_mut_slice(&mut self) -> Result<&mut [u8]> {
+        self.materialize()?;
+        match &mut self.storage {
+            Storage::Mapped(map) => Ok(map),
+            Storage::Buffer(buf) => Ok(buf),
+            Storage::Positional(_) => Err(Error::Internal("output image not in memory".into())),
+        }
+    }
+
+    /// Replaces positional storage with a heap buffer holding the image.
+    fn materialize(&mut self) -> Result<()> {
+        let Storage::Positional(state) = &self.storage else {
+            return Ok(());
+        };
+        let path = self.path.as_deref();
+        let mut buf = zeroed(state.len).map_err(|e| io_error(path, e))?;
+        if state.written {
+            let file = destination_file(&self.destination).ok_or_else(no_file)?;
+            written::read_buffer(file, &mut buf, 0).map_err(|e| io_error(path, e))?;
+        }
+        self.storage = Storage::Buffer(buf);
+        Ok(())
+    }
+
+    /// Writes `bytes` at `offset` in the image, with any backing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if the range does not fit in the image,
+    /// and [`Error::Io`] if the write fails.
+    pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let range = ChunkRange::new(offset, bytes.len() as u64);
+        let len = self.len() as u64;
+        let path = self.path.as_deref();
+        let out_of_bounds = || layout_error(path, LayoutError::FieldOutOfBounds { range, len });
+        let end = range
+            .end()
+            .filter(|end| *end <= len)
+            .ok_or_else(out_of_bounds)?;
+        match &mut self.storage {
+            Storage::Positional(state) => {
+                let file = destination_file(&self.destination).ok_or_else(no_file)?;
+                state.touch();
+                written::write_buffer(file, bytes, offset).map_err(|e| io_error(path, e))?;
+            }
+            Storage::Mapped(map) => {
+                copy_range(map, offset, end, bytes).ok_or_else(out_of_bounds)?
+            }
+            Storage::Buffer(buf) => {
+                copy_range(buf, offset, end, bytes).ok_or_else(out_of_bounds)?
+            }
+        }
+        Ok(())
     }
 
     /// Statistics recorded so far.
@@ -379,44 +585,81 @@ impl OutputFile {
     }
 
     /// Splits the image into disjoint writable chunks; see
-    /// [`chunks::split_chunks`].
+    /// [`chunks::split_chunks`]. This needs the whole image, like
+    /// [`OutputFile::as_mut_slice`]; prefer [`OutputFile::write_chunks`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::Internal`] describing the [`LayoutError`] if the
-    /// layout is invalid.
+    /// layout is invalid, and [`Error::Io`] if the image cannot be held in
+    /// memory.
     pub fn split_chunks(&mut self, ranges: &[ChunkRange]) -> Result<Vec<&mut [u8]>> {
         let path = self.path.clone();
-        chunks::split_chunks(self.storage.as_mut_slice(), ranges)
+        chunks::validate_layout(ranges, self.len() as u64)
+            .map_err(|e| layout_error(path.as_deref(), e))?;
+        chunks::split_chunks(self.as_mut_slice()?, ranges)
             .map_err(|e| layout_error(path.as_deref(), e))
     }
 
     /// Writes every chunk in parallel with `write(index, chunk)`, and adds the
     /// elapsed time to [`WritePhase::Write`]; see [`chunks::write_chunks`].
     ///
+    /// Every chunk is zero-filled when `write` receives it, whatever the
+    /// backing, and `write` must only touch its own chunk. With
+    /// [`Backing::Written`] the chunk is a heap buffer written to the file
+    /// after `write` returns. If a chunk fails, other chunks may or may not
+    /// have been written.
+    ///
     /// # Errors
     ///
-    /// Returns an error for an invalid layout, or the first error (in layout
-    /// order) returned by `write`.
+    /// Returns an error for an invalid layout, the first error (in layout
+    /// order) returned by `write`, or [`Error::Io`] if writing the file
+    /// fails.
     pub fn write_chunks<F>(&mut self, ranges: &[ChunkRange], write: F) -> Result<()>
     where
         F: Fn(usize, &mut [u8]) -> Result<()> + Sync,
     {
         let start = Instant::now();
-        let path = self.path.clone();
-        let result = chunks::split_chunks(self.storage.as_mut_slice(), ranges)
-            .map_err(|e| layout_error(path.as_deref(), e))
-            .and_then(|slices| {
-                use rayon::prelude::*;
-                let results: Vec<Result<()>> = slices
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(index, chunk)| write(index, chunk))
-                    .collect();
-                results.into_iter().collect()
+        let path = self.path.as_deref();
+        let len = self.storage.len() as u64;
+        let result = chunks::validate_layout(ranges, len)
+            .map_err(|e| layout_error(path, e))
+            .and_then(|()| match &mut self.storage {
+                Storage::Positional(state) => {
+                    let (Some(file), Some(path)) = (destination_file(&self.destination), path)
+                    else {
+                        return Err(no_file());
+                    };
+                    // Digests computed while writing are only valid over a
+                    // file that holds nothing else.
+                    let plan = state.plan.as_ref().filter(|_| !state.written);
+                    let outcome = written::write_chunks(file, path, len, ranges, write, plan);
+                    state.touch();
+                    state.precomputed = outcome?;
+                    Ok(())
+                }
+                Storage::Mapped(map) => run_chunks(map, ranges, path, &write),
+                Storage::Buffer(buf) => run_chunks(buf, ranges, path, &write),
             });
         self.stats.record(WritePhase::Write, start.elapsed());
         result
+    }
+
+    /// Announces that [`OutputFile::apply_build_id`] will be called with
+    /// `kind` and `offset` once the chunks are written.
+    ///
+    /// This never changes the output. With [`Backing::Written`], the next
+    /// [`OutputFile::write_chunks`] then hashes the chunk buffers as it
+    /// writes them, so that `apply_build_id` does not have to read the file
+    /// back; that only works for a `write_chunks` call before anything else
+    /// is written. Other backings ignore it.
+    pub fn reserve_build_id(&mut self, kind: &BuildId, offset: u64) {
+        if let Storage::Positional(state) = &mut self.storage {
+            state.plan = BlockHasher::new(kind).map(|_| HashPlan {
+                kind: kind.clone(),
+                field: ChunkRange::new(offset, build_id_size(kind).unwrap_or(0) as u64),
+            });
+        }
     }
 
     /// Computes the build-id over the finished image with the field at
@@ -429,11 +672,67 @@ impl OutputFile {
     /// Returns an error if the field does not fit in the image.
     pub fn apply_build_id(&mut self, kind: &BuildId, offset: u64) -> Result<Option<Vec<u8>>> {
         let start = Instant::now();
-        let path = self.path.clone();
-        let result = build_id::apply_build_id(kind, self.storage.as_mut_slice(), offset)
-            .map_err(|e| layout_error(path.as_deref(), e));
+        let path = self.path.as_deref();
+        let result = match &mut self.storage {
+            Storage::Mapped(map) => {
+                build_id::apply_build_id(kind, map, offset).map_err(|e| layout_error(path, e))
+            }
+            Storage::Buffer(buf) => {
+                build_id::apply_build_id(kind, buf, offset).map_err(|e| layout_error(path, e))
+            }
+            Storage::Positional(_) => self.apply_build_id_positional(kind, offset),
+        };
         self.stats.record(WritePhase::BuildId, start.elapsed());
         result
+    }
+
+    /// [`OutputFile::apply_build_id`] for [`Backing::Written`]: the same
+    /// value, from block digests computed while writing or read back from
+    /// the file.
+    fn apply_build_id_positional(
+        &mut self,
+        kind: &BuildId,
+        offset: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(size) = build_id_size(kind) else {
+            return Ok(None);
+        };
+        let len = self.storage.len() as u64;
+        let path = self.path.as_deref();
+        let field = ChunkRange::new(offset, size as u64);
+        if field.end().is_none_or(|end| end > len) {
+            return Err(layout_error(
+                path,
+                LayoutError::FieldOutOfBounds { range: field, len },
+            ));
+        }
+        let (Storage::Positional(state), Some(file)) =
+            (&mut self.storage, destination_file(&self.destination))
+        else {
+            return Err(no_file());
+        };
+        let precomputed = state
+            .precomputed
+            .take()
+            .filter(|pre| pre.plan.kind == *kind && pre.plan.field == field);
+        let id = match written::finish_build_id(file, len, kind, field, precomputed)
+            .map_err(|e| io_error(path, e))?
+        {
+            Some(id) => id,
+            // `uuid` and literal ids do not depend on the contents.
+            None => match build_id::compute_build_id(kind, &[]) {
+                Some(id) => id,
+                None => return Ok(None),
+            },
+        };
+        // As with the other backings, the field is zeroed and then the id
+        // written over it.
+        let mut patch = vec![0u8; size];
+        if let Some(dest) = patch.get_mut(..id.len()) {
+            dest.copy_from_slice(&id);
+        }
+        self.write_at(offset, &patch)?;
+        Ok(Some(id))
     }
 
     /// Commits the output: writes out a buffered image, applies permissions,
@@ -456,11 +755,19 @@ impl OutputFile {
                 bytes = Some(match storage {
                     Storage::Buffer(buf) => buf,
                     Storage::Mapped(map) => map.to_vec(),
+                    // Only created with a file; nothing to return.
+                    Storage::Positional(_) => Vec::new(),
                 });
             }
             (Destination::Done, Some(_)) => {}
             (Destination::Stream { mut file }, Some(path)) => {
-                file.write_all(storage.as_slice())
+                let image: &[u8] = match &storage {
+                    Storage::Buffer(buf) => buf,
+                    Storage::Mapped(map) => map,
+                    // Only created for regular files.
+                    Storage::Positional(_) => &[],
+                };
+                file.write_all(image)
                     .and_then(|()| file.flush())
                     .map_err(|e| Error::io(path, e))?;
             }
@@ -572,6 +879,33 @@ fn too_large() -> io::Error {
     )
 }
 
+/// Copies `bytes` into `image[offset..end]`.
+fn copy_range(image: &mut [u8], offset: u64, end: u64, bytes: &[u8]) -> Option<()> {
+    let dest = image.get_mut(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)?;
+    dest.copy_from_slice(bytes);
+    Some(())
+}
+
+/// Runs `write` over the chunks of an in-memory image, in parallel.
+fn run_chunks<F>(
+    image: &mut [u8],
+    ranges: &[ChunkRange],
+    path: Option<&Path>,
+    write: &F,
+) -> Result<()>
+where
+    F: Fn(usize, &mut [u8]) -> Result<()> + Sync,
+{
+    use rayon::prelude::*;
+    let slices = chunks::split_chunks(image, ranges).map_err(|e| layout_error(path, e))?;
+    let results: Vec<Result<()>> = slices
+        .into_par_iter()
+        .enumerate()
+        .map(|(index, chunk)| write(index, chunk))
+        .collect();
+    results.into_iter().collect()
+}
+
 fn layout_error(path: Option<&Path>, error: LayoutError) -> Error {
     match path {
         Some(path) => Error::Internal(format!(
@@ -657,9 +991,17 @@ fn commit_file(file: &File, storage: Storage, options: &OutputOptions) -> io::Re
             drop(map);
         }
         Storage::Buffer(buf) => {
-            let mut writer = file;
-            writer.write_all(&buf)?;
+            if positional::SUPPORTED {
+                // Positional writes move the cursor on Windows, so write at
+                // an explicit offset.
+                written::write_buffer(file, &buf, 0)?;
+            } else {
+                let mut writer = file;
+                writer.write_all(&buf)?;
+            }
         }
+        // Everything is already in the file.
+        Storage::Positional(_) => {}
     }
     #[cfg(unix)]
     if let FileMode::Exact(mode) = options.mode {

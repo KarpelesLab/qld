@@ -17,7 +17,7 @@ mod xxh64;
 
 pub use md5::Md5;
 pub use sha1::Sha1;
-pub use xxh64::xxh64;
+pub use xxh64::{Xxh64, xxh64};
 
 /// Size of the blocks MD5 and SHA-1 compress.
 const BLOCK: usize = 64;
