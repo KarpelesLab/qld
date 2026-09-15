@@ -454,8 +454,13 @@ fn split_strings(data: &[u8], unit: usize, starts: &mut [u32], hashes: &mut [u64
         start = end;
     };
     if unit == 1 {
-        for (position, _) in data.iter().enumerate().filter(|&(_, &b)| b == 0) {
-            record(position + 1);
+        // A word at a time: strings average a few dozen bytes.
+        let mut position = 0usize;
+        while let Some(rest) = data.get(position..)
+            && let Some(nul) = crate::elf::read::strtab::find_nul(rest)
+        {
+            position += nul + 1;
+            record(position);
         }
     } else {
         for (index, _) in data
