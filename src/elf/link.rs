@@ -24,6 +24,8 @@
 
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
@@ -720,23 +722,38 @@ fn nonempty_outputs(
     sections: &Sections,
     placement: &place::Placement<'_>,
 ) -> Vec<bool> {
-    let mut nonempty = vec![false; placement.outputs.len()];
-    for (file_index, file) in files.iter().enumerate() {
-        let Some(object) = &file.object else {
-            continue;
-        };
-        for (index, section) in object.sections.iter().enumerate() {
-            let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(u32::MAX)) else {
-                continue;
+    let outputs = placement.outputs.len();
+    // Per file in parallel (a bit set per file would be as large as the
+    // output list, so each file lists what it fills), then combined.
+    let filled: Vec<Vec<u32>> = files
+        .par_iter()
+        .enumerate()
+        .map(|(file_index, file)| {
+            let mut filled = Vec::new();
+            let Some(object) = &file.object else {
+                return filled;
             };
-            if section.header.sh_size == 0 || !sections.is_live(id) {
-                continue;
+            for (index, section) in object.sections.iter().enumerate() {
+                let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(u32::MAX))
+                else {
+                    continue;
+                };
+                if section.header.sh_size == 0 || !sections.is_live(id) {
+                    continue;
+                }
+                if let Some(output) = placement.output_of(id)
+                    && filled.last() != Some(&output)
+                {
+                    filled.push(output);
+                }
             }
-            if let Some(output) = placement.output_of(id)
-                && let Some(slot) = nonempty.get_mut(output as usize)
-            {
-                *slot = true;
-            }
+            filled
+        })
+        .collect();
+    let mut nonempty = vec![false; outputs];
+    for output in filled.into_iter().flatten() {
+        if let Some(slot) = nonempty.get_mut(output as usize) {
+            *slot = true;
         }
     }
     nonempty

@@ -172,16 +172,22 @@ impl DynamicPlan {
 /// A string table under construction, deduplicating whole strings.
 struct StrTab {
     data: Vec<u8>,
-    /// Offsets of the strings added, keyed by their hash.
+    /// Offsets of the strings added one by one, keyed by their hash.
     seen: HashTable<(u64, u32)>,
+    /// (hash, offset) of the strings added by [`StrTab::add_all`], sorted.
+    bulk: Vec<(u64, u32)>,
     hasher: foldhash::fast::FixedState,
 }
+
+/// Strings that one parallel task of [`StrTab::add_all`] copies.
+const STRINGS_PER_TASK: usize = 4096;
 
 impl StrTab {
     fn new() -> Self {
         Self {
             data: vec![0],
             seen: HashTable::new(),
+            bulk: Vec::new(),
             hasher: foldhash::fast::FixedState::with_seed(0x6479_6e73),
         }
     }
@@ -189,8 +195,25 @@ impl StrTab {
     /// The string at `offset`, without its terminator.
     fn string_at(data: &[u8], offset: u32) -> &[u8] {
         let rest = data.get(offset as usize..).unwrap_or_default();
-        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let end = crate::elf::read::strtab::find_nul(rest).unwrap_or(rest.len());
         rest.get(..end).unwrap_or_default()
+    }
+
+    /// The offset of `text` if it was added already.
+    fn find(&self, hash: u64, text: &[u8]) -> Option<u32> {
+        let data = &self.data;
+        if let Some(&(_, offset)) = self.seen.find(hash, |&(h, offset)| {
+            h == hash && Self::string_at(data, offset) == text
+        }) {
+            return Some(offset);
+        }
+        let start = self.bulk.partition_point(|&(h, _)| h < hash);
+        self.bulk
+            .get(start..)?
+            .iter()
+            .take_while(|&&(h, _)| h == hash)
+            .find(|&&(_, offset)| Self::string_at(data, offset) == text)
+            .map(|&(_, offset)| offset)
     }
 
     fn add(&mut self, text: &[u8]) -> Result<u32> {
@@ -198,10 +221,7 @@ impl StrTab {
             return Ok(0);
         }
         let hash = self.hasher.hash_one(text);
-        let data = &self.data;
-        if let Some(&(_, offset)) = self.seen.find(hash, |&(h, offset)| {
-            h == hash && Self::string_at(data, offset) == text
-        }) {
+        if let Some(offset) = self.find(hash, text) {
             return Ok(offset);
         }
         let offset = u32::try_from(self.data.len())
@@ -210,6 +230,109 @@ impl StrTab {
         self.data.push(0);
         self.seen.insert_unique(hash, (hash, offset), |&(h, _)| h);
         Ok(offset)
+    }
+
+    /// Adds `texts` in order and returns their offsets: the same offsets
+    /// and contents as calling [`add`](Self::add) on each, in parallel.
+    ///
+    /// Hashing, finding strings already present, and copying run in
+    /// parallel. Duplicates within `texts` are found by sorting the new
+    /// strings by hash; the offsets are then assigned in order, where each
+    /// string's first occurrence takes the next free offset.
+    fn add_all(&mut self, texts: &[&[u8]]) -> Result<Vec<u32>> {
+        let too_large = || Error::Limit("dynamic string table larger than 4 GiB".into());
+        let this = &*self;
+        let found: Vec<(u64, Option<u32>)> = texts
+            .par_iter()
+            .with_min_len(STRINGS_PER_TASK)
+            .map(|&text| {
+                if text.is_empty() {
+                    return (0, Some(0));
+                }
+                let hash = this.hasher.hash_one(text);
+                (hash, this.find(hash, text))
+            })
+            .collect();
+        // New strings by (hash, position); the first of equal contents
+        // leads the others.
+        let mut order: Vec<u32> = (0..texts.len())
+            .filter(|&i| found[i].1.is_none())
+            .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
+            .collect();
+        order.par_sort_unstable_by_key(|&i| (found[i as usize].0, i));
+        let mut leader: Vec<u32> = (0..texts.len())
+            .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
+            .collect();
+        for run in order.chunk_by(|&a, &b| found[a as usize].0 == found[b as usize].0) {
+            for (at, &i) in run.iter().enumerate() {
+                let text = texts[i as usize];
+                if let Some(&first) = run[..at]
+                    .iter()
+                    .find(|&&j| leader[j as usize] == j && texts[j as usize] == text)
+                {
+                    leader[i as usize] = first;
+                }
+            }
+        }
+        drop(order);
+
+        let mut offsets = vec![0u32; texts.len()];
+        let mut cursor = self.data.len();
+        // Leaders, in order, with their offsets: what to copy.
+        let mut copies: Vec<(usize, u32)> = Vec::new();
+        for (i, &(_, existing)) in found.iter().enumerate() {
+            offsets[i] = match existing {
+                Some(offset) => offset,
+                None if leader[i] as usize == i => {
+                    let offset = u32::try_from(cursor).map_err(|_| too_large())?;
+                    cursor = cursor
+                        .checked_add(texts[i].len())
+                        .and_then(|c| c.checked_add(1))
+                        .ok_or_else(too_large)?;
+                    copies.push((i, offset));
+                    offset
+                }
+                None => offsets[leader[i] as usize],
+            };
+        }
+        u32::try_from(cursor).map_err(|_| too_large())?;
+        let start = self.data.len();
+        self.data.resize(cursor, 0);
+        {
+            // Each task copies a run of consecutive strings into its own
+            // slice of the new data.
+            // Offsets and lengths are below `cursor`, which fits in u32,
+            // so these sums cannot overflow.
+            type Task<'t, 'd> = (&'t [(usize, u32)], &'d mut [u8]);
+            let mut tasks: Vec<Task<'_, '_>> = Vec::new();
+            let mut rest = &mut self.data[start..];
+            let mut base = start;
+            for chunk in copies.chunks(STRINGS_PER_TASK) {
+                let end = chunk.last().map_or(base, |&(i, offset)| {
+                    (offset as usize)
+                        .saturating_add(texts[i].len())
+                        .saturating_add(1)
+                });
+                let (head, tail) = std::mem::take(&mut rest).split_at_mut(end.saturating_sub(base));
+                tasks.push((chunk, head));
+                rest = tail;
+                base = end;
+            }
+            tasks.into_par_iter().for_each(|(chunk, out)| {
+                let base = chunk.first().map_or(0, |&(_, offset)| offset as usize);
+                for &(i, offset) in chunk {
+                    let at = (offset as usize).saturating_sub(base);
+                    let text = texts[i];
+                    if let Some(dest) = out.get_mut(at..at.saturating_add(text.len())) {
+                        dest.copy_from_slice(text);
+                    }
+                }
+            });
+        }
+        self.bulk
+            .extend(copies.iter().map(|&(i, offset)| (found[i].0, offset)));
+        self.bulk.par_sort_unstable();
+        Ok(offsets)
     }
 }
 
@@ -499,7 +622,8 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
         })
         .collect();
     if gnu {
-        hashed.sort_by_key(|&(_, entry, bucket)| {
+        // Keys are unique, so an unstable sort orders like a stable one.
+        hashed.par_sort_unstable_by_key(|&(_, entry, bucket)| {
             let key = match entry {
                 Entry::Symbol(id) => (0u8, id.as_u32()),
                 Entry::Version(v) => (1u8, u32::from(v)),
@@ -602,10 +726,12 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
         .iter()
         .map(|f| dynstr.add(f.as_bytes()))
         .collect::<Result<_>>()?;
-    plan.names = Vec::with_capacity(plan.entries.len());
-    for &entry in &plan.entries {
-        plan.names.push(dynstr.add(entry_name(entry))?);
-    }
+    let texts: Vec<&[u8]> = plan
+        .entries
+        .par_iter()
+        .map(|&entry| entry_name(entry))
+        .collect();
+    plan.names = dynstr.add_all(&texts)?;
 
     // `.gnu.version`.
     if versioned {
@@ -1197,5 +1323,39 @@ pub fn write_dynamic(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mu
         };
         slot[0..8].copy_from_slice(&tag.to_le_bytes());
         slot[8..16].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_all_matches_adding_one_by_one() {
+        // Duplicates within the batch, strings present before it, empty
+        // strings, and enough strings for several parallel tasks.
+        let mut texts: Vec<Vec<u8>> = Vec::new();
+        for i in 0..20_000u32 {
+            texts.push(format!("sym{}", i % 7_001).into_bytes());
+            if i % 97 == 0 {
+                texts.push(Vec::new());
+                texts.push(b"libc.so.6".to_vec());
+            }
+        }
+        let refs: Vec<&[u8]> = texts.iter().map(Vec::as_slice).collect();
+        let mut one = StrTab::new();
+        let mut all = StrTab::new();
+        for table in [&mut one, &mut all] {
+            table.add(b"libc.so.6").unwrap();
+            table.add(b"sym5").unwrap();
+        }
+        let expected: Vec<u32> = refs.iter().map(|t| one.add(t).unwrap()).collect();
+        let offsets = all.add_all(&refs).unwrap();
+        assert_eq!(offsets, expected);
+        assert_eq!(all.data, one.data);
+        // Later single additions still find the batch's strings.
+        assert_eq!(all.add(b"sym42").unwrap(), one.add(b"sym42").unwrap());
+        assert_eq!(all.add(b"new").unwrap(), one.add(b"new").unwrap());
+        assert_eq!(all.data, one.data);
     }
 }
