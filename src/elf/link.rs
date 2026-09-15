@@ -352,12 +352,14 @@ fn link_inputs<'a>(
             resolution: &resolution,
             sections: &sections,
         };
-        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
+        let why_live = !options.why_live.is_empty();
+        let (removed, graph) =
+            gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live)?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
-        if !options.why_live.is_empty() {
-            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
+        if let Some(graph) = &graph {
+            gc::report_why_live(&refs, graph, &options.why_live, diagnostics);
         }
         for id in &removed {
             if let Some(slot) = sections.live.get_mut(id.index()) {
@@ -716,12 +718,14 @@ fn link_relocatable<'a>(
             sections: &sections,
         };
         let linker = defined::LinkerSymbols::default();
-        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
+        let why_live = !options.why_live.is_empty();
+        let (removed, graph) =
+            gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live)?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
-        if !options.why_live.is_empty() {
-            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
+        if let Some(graph) = &graph {
+            gc::report_why_live(&refs, graph, &options.why_live, diagnostics);
         }
         for &id in &removed {
             // Sections only relocatable output copies (`.note.GNU-stack`,

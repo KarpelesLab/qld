@@ -54,7 +54,7 @@ pub mod merge;
 
 pub use bitset::{AtomicBitSet, BitSet};
 pub use csr::{Csr, CsrBuilder, InputError};
-pub use gc::{GcMarker, LiveSet, ReferenceTree, collect_garbage, why_live};
+pub use gc::{GcMarker, LiveSet, ReferenceTree, collect_garbage, mark_reachable, why_live};
 pub use graph::{GraphBuilder, SectionGraph};
 pub use icf::{
     IcfGroup, IcfInput, IcfMode, IcfReloc, IcfReport, IcfResult, IcfSection, IcfTarget,
