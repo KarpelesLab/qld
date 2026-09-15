@@ -1,0 +1,23 @@
+# Regression: position-independent code in an executable reaching a TLS
+# variable of a shared library with the general-dynamic model is relaxed to
+# initial-exec. After the architecture refactor the writer looked up the wrong
+# GOT slot for the relaxed sequence and reported "cannot be applied to this
+# instruction" (seen linking clang, whose std::call_once uses such accesses).
+description = "general-dynamic TLS in an executable relaxed to initial-exec"
+compile = [
+  "cc -O2 -fPIC -c lib.c",
+  "cc -O2 -fPIC -ftls-model=global-dynamic -c main.c",
+]
+driver = "cc"
+link = [
+  "-shared -o libtls.so lib.o",
+  "-o out main.o -L. -Wl,--no-as-needed -ltls -Wl,-rpath,$ORIGIN",
+]
+run = "./out"
+expect.stdout = "tls=42\n"
+expect.readelf = ["R_X86_64_TPOFF64"]
+targets = ["x86_64-linux-gnu"]
+determinism = true
+# GNU ld keeps an unused __tls_get_addr PLT entry after relaxing the call away,
+# and an empty .eh_frame in a library with no functions; qld drops both.
+diff.ignore = ["R_X86_64_JUMP_SLOT __tls_get_addr", "[libtls.so] section: .eh_frame"]

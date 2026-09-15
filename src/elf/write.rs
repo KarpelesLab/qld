@@ -1491,20 +1491,26 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                     g.wrapping_sub(addresses.got_base()).wrapping_add_signed(a),
                 )
             }),
-            Kind::GdToIe | Kind::DescToIe => slot_address().and_then(|g| {
-                arch.relax_tls(
-                    out,
-                    rel.offset,
-                    class.kind,
-                    rel.r_type,
-                    RelaxValues {
-                        tpoff: sa.wrapping_sub(tp) as i64,
-                        got: g,
-                        got_pc: g.wrapping_add_signed(a).wrapping_sub(place) as i64,
-                        place,
-                    },
-                )
-            }),
+            // The relaxed sequence loads the thread pointer offset, so it
+            // reads the TpOff entry the scan reserved (see reloc.rs), not the
+            // slot the classification names for its unrelaxed form.
+            Kind::GdToIe | Kind::DescToIe => addresses
+                .got_entry_address(owner, GotKind::TpOff)
+                .ok_or(ApplyError::BadInstruction)
+                .and_then(|g| {
+                    arch.relax_tls(
+                        out,
+                        rel.offset,
+                        class.kind,
+                        rel.r_type,
+                        RelaxValues {
+                            tpoff: sa.wrapping_sub(tp) as i64,
+                            got: g,
+                            got_pc: g.wrapping_add_signed(a).wrapping_sub(place) as i64,
+                            place,
+                        },
+                    )
+                }),
             Kind::RelaxGotPc => {
                 arch.relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
             }
