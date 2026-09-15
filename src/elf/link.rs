@@ -190,11 +190,24 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
     if options.threads.is_some() {
         return None;
     }
-    let bytes: u64 = table
-        .iter()
-        .filter(|(_, file)| file.parent().is_none())
+    let top_level = || table.iter().filter(|(_, file)| file.parent().is_none());
+    let mut bytes: u64 = top_level()
         .map(|(_, file)| u64::try_from(file.data().len()).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add);
+    // Compressed debug sections count at their uncompressed size: inflating
+    // them and writing them out is the work (256 objects whose 320 MiB of
+    // debug information compress to under a megabyte linked on one thread).
+    // Only links that would get fewer than the most threads look, and only
+    // at section headers.
+    let most = BYTES_PER_THREAD.saturating_mul(MAX_DEFAULT_THREADS as u64);
+    if bytes < most {
+        for (_, file) in top_level() {
+            bytes = bytes.saturating_add(compressed_growth(file));
+            if bytes >= most {
+                break;
+            }
+        }
+    }
     let wanted = usize::try_from(bytes.div_ceil(BYTES_PER_THREAD))
         .unwrap_or(usize::MAX)
         .clamp(1, MAX_DEFAULT_THREADS);
@@ -202,6 +215,30 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
         return Some(wanted.min(available_threads()));
     }
     (wanted < rayon::current_num_threads()).then_some(wanted)
+}
+
+/// How many bytes the compressed sections of a relocatable ELF input grow
+/// by when inflated (0 for anything else, and for malformed files, which
+/// parsing reports later).
+fn compressed_growth(file: &crate::input::InputFile) -> u64 {
+    use crate::elf::read::{Elf64Le, ObjectFile, Source};
+    use crate::input::FileFormat;
+    if !matches!(file.format(), FileFormat::Elf(ident) if ident.is_relocatable()) {
+        return 0;
+    }
+    let Ok(object) = ObjectFile::<Elf64Le>::parse(file.data(), Source::new(file.path())) else {
+        return 0;
+    };
+    object
+        .elf()
+        .sections()
+        .iter()
+        .filter(|header| header.is_compressed())
+        .filter_map(|header| {
+            let (chdr, _) = object.compressed_data(&header).ok()??;
+            Some(chdr.ch_size.saturating_sub(header.sh_size))
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// Everything after input collection, run in the link's thread pool.
