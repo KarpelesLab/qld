@@ -49,7 +49,6 @@ use super::scan;
 use super::sections;
 use super::state::{Link, SymbolDef};
 use super::symtab::{self, ExportFilter};
-use super::thunks::Thunks;
 use super::trie;
 use super::write::{self, Commands, DylibLoad, HeaderInput, Linkedit};
 
@@ -313,8 +312,8 @@ fn link_arch(
         .saturating_add(commands_size)
         .saturating_add(write::headerpad(&config, &commands));
     layout.assign_addresses(&link, header_size)?;
-    let thunks = Thunks::default();
     fill_section_indices(&mut layout, &synthetic);
+    let thunks = super::thunks::plan(&link, &mut layout, &synthetic, header_size)?;
 
     // `__unwind_info` was sized with an upper bound; its exact size is known
     // once the code has addresses (which it does not change: it follows all

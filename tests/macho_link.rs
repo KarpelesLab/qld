@@ -916,6 +916,97 @@ fn universal_binary() {
 }
 
 #[test]
+fn range_extension_thunks() {
+    let arch = "arm64";
+    if !clang_for(arch) {
+        skip(
+            "range_extension_thunks",
+            "clang cannot target arm64-apple-macos",
+        );
+        return;
+    }
+    let dir = scratch("thunks");
+    let main = compile("thunks", "far_main.c", arch, &[]);
+    let far = compile("thunks", "far.c", arch, &[]);
+    let filler_source = dir.join("filler.s");
+    std::fs::write(
+        &filler_source,
+        ".text\n.globl _filler\n.p2align 2\n_filler:\n.space 0x8200000\nret\n.subsections_via_symbols\n",
+    )
+    .unwrap();
+    let filler = dir.join("filler.o");
+    assert!(tool_works(
+        "clang",
+        &[
+            "--target=arm64-apple-macos13",
+            "-c",
+            filler_source.to_str().unwrap(),
+            "-o",
+            filler.to_str().unwrap()
+        ]
+    ));
+    let mut args = base_args(arch);
+    args.extend(strings(&[
+        main.to_str().unwrap(),
+        filler.to_str().unwrap(),
+        far.to_str().unwrap(),
+        "-u",
+        "_filler",
+        "-lSystem",
+    ]));
+    // Hashing 130 MiB in a debug build is slow; the signature has its own
+    // tests, except on macOS where the binary runs.
+    if !host_can_run(arch) {
+        args.push("-no_adhoc_codesign".to_owned());
+    }
+    let exe = dir.join("far");
+    let mut ours: Vec<OsString> = args.iter().map(OsString::from).collect();
+    ours.push("-o".into());
+    ours.push((&exe).into());
+    let (bytes, _) = link_bytes(&ours).unwrap_or_else(|e| panic!("{e}"));
+    std::fs::write(&exe, &bytes).unwrap();
+    make_executable(&exe);
+
+    // main's calls go through thunks (adrp, add, br x16) that reach their
+    // targets.
+    // (Decoded here: llvm-objdump is slow on 130 MiB of code.)
+    if let (Some(main_address), Some(far_address)) =
+        (nm_address(&exe, "_main"), nm_address(&exe, "_far_function"))
+    {
+        assert!(far_address - main_address > 128 << 20);
+        // __TEXT starts at file offset 0.
+        let text = 0x1_0000_0000u64;
+        let word = |address: u64| u32_le(&bytes, (address - text) as usize);
+        let mut branches = Vec::new();
+        for offset in (0..0x30).step_by(4) {
+            let insn = word(main_address + offset);
+            if insn & 0xfc00_0000 == 0x9400_0000 {
+                let delta = (((insn & 0x03ff_ffff) << 6) as i32 >> 4) as i64;
+                branches.push((main_address + offset).wrapping_add(delta as u64));
+            }
+        }
+        assert_eq!(branches.len(), 2, "branches from main: {branches:x?}");
+        let mut destinations = Vec::new();
+        for thunk in branches {
+            assert!(thunk.abs_diff(main_address) < 128 << 20);
+            let adrp = word(thunk);
+            let add = word(thunk + 4);
+            assert_eq!(adrp & 0x9f00_001f, 0x9000_0010, "adrp x16 at {thunk:#x}");
+            assert_eq!(add & 0xffc0_03ff, 0x9100_0210, "add x16, x16 at {thunk:#x}");
+            assert_eq!(word(thunk + 8), 0xd61f_0200, "br x16 at {thunk:#x}");
+            let pages = ((((adrp >> 29) & 3) | (((adrp >> 5) & 0x7ffff) << 2)) << 11) as i32 >> 11;
+            let target = ((thunk & !0xfff) as i64 + ((pages as i64) << 12)) as u64
+                + u64::from((add >> 10) & 0xfff);
+            destinations.push(target);
+        }
+        assert!(destinations.contains(&far_address), "{destinations:x?}");
+    }
+    if host_can_run(arch) {
+        assert_eq!(run(&exe).unwrap(), "near\nfar\n");
+    }
+}
+
+#[test]
 fn undefined_symbols_are_reported() {
     if !clang_for("arm64") {
         skip(

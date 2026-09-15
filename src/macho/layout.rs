@@ -150,6 +150,22 @@ pub struct Layout {
     pub common_offset: Vec<u64>,
     /// Size of the Mach-O header and load commands.
     pub header_size: u64,
+    /// The atoms of each output section, in placement order (global
+    /// numbering).
+    pub members: Vec<Vec<usize>>,
+    /// Range-extension thunk islands: space reserved inside code sections.
+    pub islands: Vec<Island>,
+}
+
+/// Space for range-extension thunks inside a code section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Island {
+    /// Output section index.
+    pub section: usize,
+    /// Offset within the section.
+    pub offset: u64,
+    /// Size in bytes.
+    pub size: u64,
 }
 
 /// Sizes of the synthetic sections.
@@ -191,6 +207,32 @@ pub fn output_names<'s>(
 /// An atom placed in an output section: its sort key (order file position,
 /// cold), file and atom index.
 type Member = ((usize, bool), usize, usize);
+
+/// The file and file-local index of global atom `atom`.
+#[must_use]
+pub fn atom_location(link: &Link<'_>, atom: usize) -> (usize, usize) {
+    let atom32 = u32::try_from(atom).unwrap_or(u32::MAX);
+    // `atom_base` is sorted: the file is the last one starting at or before
+    // the atom.
+    let file = link
+        .atom_base
+        .partition_point(|&base| base <= atom32)
+        .saturating_sub(1);
+    // Files without atoms share their base with the next file; step to the
+    // one that owns atoms.
+    let mut owner = file;
+    while owner > 0
+        && link.atom_base.get(owner) == link.atom_base.get(owner.saturating_sub(1))
+        && link.object(owner).is_none()
+    {
+        owner = owner.saturating_sub(1);
+    }
+    let base = link.atom_base.get(owner).copied().unwrap_or(0);
+    (
+        owner,
+        usize::try_from(atom32.saturating_sub(base)).unwrap_or(0),
+    )
+}
 
 /// Reads an `-order_file`: one symbol per line, optionally prefixed with an
 /// architecture (`arm64:`) and an object file (`foo.o:`); `#` starts a
@@ -427,8 +469,15 @@ pub fn plan(
             }
         }
     }
+    let mut ordered: Vec<Vec<usize>> = vec![Vec::new(); builder.sections.len()];
     for (out, list) in members.iter_mut().enumerate() {
         list.sort_by_key(|&(key, _, _)| key);
+        if let Some(slot) = ordered.get_mut(out) {
+            *slot = list
+                .iter()
+                .map(|&(_, file, atom)| link.atom_id(file, atom))
+                .collect();
+        }
         let Some(out_section) = builder.sections.get_mut(out) else {
             continue;
         };
@@ -637,6 +686,11 @@ pub fn plan(
         }
     }
 
+    let members = order
+        .iter()
+        .map(|&old| ordered.get(old).cloned().unwrap_or_default())
+        .collect();
+
     Ok(Layout {
         sections,
         segments,
@@ -644,10 +698,67 @@ pub fn plan(
         atom_offset,
         common_offset,
         header_size: 0,
+        members,
+        islands: Vec::new(),
     })
 }
 
 impl Layout {
+    /// Places the atoms of code section `section` again, leaving an island
+    /// of `size` bytes after member `after` for each `(after, size)` of
+    /// `islands` (sorted by `after`). Replaces the section's islands.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Limit`] when the section grows past 2^64.
+    pub fn place_islands(
+        &mut self,
+        link: &Link<'_>,
+        section: usize,
+        islands: &[(usize, u64)],
+    ) -> Result<()> {
+        let Some(members) = self.members.get(section).cloned() else {
+            return Ok(());
+        };
+        self.islands.retain(|i| i.section != section);
+        let mut size = 0u64;
+        let mut next_island = islands.iter().peekable();
+        for (position, &atom) in members.iter().enumerate() {
+            let (file, local) = atom_location(link, atom);
+            let Some(info) = link.object(file).and_then(|o| o.atoms.atoms().get(local)) else {
+                continue;
+            };
+            let alignment = 1u64.checked_shl(info.align).unwrap_or(1);
+            let offset = align_up(size, alignment);
+            if let Some(slot) = self.atom_offset.get_mut(atom) {
+                *slot = offset;
+            }
+            size = offset
+                .checked_add(info.size)
+                .ok_or_else(|| Error::Limit("output section larger than 2^64".into()))?;
+            while let Some(&&(after, island_size)) = next_island.peek() {
+                if after != position {
+                    break;
+                }
+                next_island.next();
+                let offset = align_up(size, 4);
+                self.islands.push(Island {
+                    section,
+                    offset,
+                    size: island_size,
+                });
+                size = offset
+                    .checked_add(island_size)
+                    .ok_or_else(|| Error::Limit("output section larger than 2^64".into()))?;
+            }
+        }
+        if let Some(out) = self.sections.get_mut(section) {
+            out.size = size;
+            out.align = out.align.max(2);
+        }
+        Ok(())
+    }
+
     /// Assigns addresses and file offsets. `header_size` is the size of the
     /// Mach-O header, the load commands and the header padding.
     ///

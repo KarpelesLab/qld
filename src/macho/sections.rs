@@ -105,6 +105,9 @@ fn write_input(
     let arm64 = link.config.is_arm64();
     let index32 = u32::try_from(index).unwrap_or(u32::MAX);
     let mut fixups = Vec::new();
+    if arm64 && section.has_code() {
+        super::thunks::write(addresses.thunks, section.addr, out)?;
+    }
     for &(file, input) in &section.inputs {
         let file = to_usize(u64::from(file));
         let input = to_usize(u64::from(input));
