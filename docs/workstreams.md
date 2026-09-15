@@ -60,7 +60,7 @@ can work at the same time without colliding.
 | W19 | Linker-script layout and raw outputs (M3) | `src/elf/{rules,place,layout,write,defined,script_layout,rawout}*`, `tests/script_link*` | W3, W16 | merged (M3) |
 | W20 | AArch64 ELF (M4) | `src/elf/arch/**`, `src/arch/**`, thunk/relaxation hooks in `src/elf/{layout,write,scan,synth}.rs`, `tests/aarch64*` | W16 | merged |
 | W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | merged |
-| W23 | Write-based (`pwrite`) output backend | `src/output/**`, writer call sites in `src/elf/` and `src/coff/` | W5 | in progress |
+| W23 | Write-based (`pwrite`) output backend | `src/output/**`, writer call sites in `src/elf/` and `src/coff/` | W5 | merged (default) |
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -460,6 +460,8 @@ that cross workstream boundaries. The integrator does these between merges.
 | W20 | Script layout uses a 4 KiB page size instead of the architecture default (64 KiB on AArch64), so `-T` links need `-z max-page-size=0x10000` | open |
 | W20 | `--emit-relocs` maps relaxed relocations back to `R_X86_64_*` names; `-b binary` inputs are stamped `EM_X86_64`; `--icf=safe` treats every non-`PLT32` relocation as address-taking | open |
 | W20 | The fixture harness skips a non-host target when `qemu-<arch>` is missing even for fixtures with no `run` line | open |
+| W23 | Single-threaded links are 5–12% slower with the write backing (one extra copy); build-id with ~1 MiB sections reads blocks back; a 320 MiB synthetic link with `--build-id` spends ~600 ms in a stage that does not scale with threads under every backing | open |
+| Integrator | Regression from W20, found by W23: GD/TLSDESC→IE relaxations looked up the wrong GOT slot (clang-23 failed to link). Fixed, with fixture `tls-gd-to-ie-shared`; nothing in CI covered it before | done |
 | W21 | Wire `coff::link` into `crate::link` | done |
 | W21 | Run qld-built PE images on a Windows CI runner | done (`pe-windows` job) |
 | W21 | i386 (PE32) and ARM64 PE output; i386 SafeSEH; delay-load imports; `-r`, `--gc-sections`, `--icf`, `--wrap`, `--defsym` and linker scripts for PE | open |

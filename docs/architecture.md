@@ -214,25 +214,32 @@ knows its size, or at least an upper bound.
 
 The final file size is known before any byte is written. The writer then:
 
-1. Creates the output as a temporary file next to the final path, sets its
-   length and maps it writable. When mapping is impossible it writes to a
-   heap buffer instead. Pipes and devices (including anything under `/dev`
-   and `/proc`) are written into directly, never replaced.
+1. Creates the output as a temporary file next to the final path and sets
+   its length. By default the contents are then written with positional
+   writes (`pwrite`); mapping the file writable is the alternative, and
+   `QLD_OUTPUT_BACKING=write|mmap|memory` selects one for benchmarking. On
+   btrfs, mapped writes slow down as threads are added (page-fault
+   contention), while positional writes do not: clang-23's 137 MB link takes
+   0.29 s written versus 0.34–0.38 s mapped, with identical bytes; on tmpfs
+   the two tie. Reserving space with `fallocate` was measured and does not
+   help. Pipes and devices (including anything under `/dev` and `/proc`) are
+   written into directly, never replaced.
    On commit, the old output is unlinked and the temporary file renamed into
    place. This avoids `ETXTBSY` when the old output is running, leaves the old
    output intact if the link fails, and avoids the data flush that btrfs and
    ext4 trigger when a rename replaces an existing file (measured: 45 ms
    versus 270–550 ms for a 1 GiB output). Unlink-first and plain atomic
    rename are available as alternative strategies.
-2. Splits the mapping into disjoint `&mut [u8]` slices, one per output chunk.
-   This uses `split_at_mut` and is the one place that needs careful slicing,
-   but no `unsafe` aliasing.
+2. Groups the output chunks into regions of about 1 MiB. Each region gets a
+   zeroed buffer, and its chunks receive disjoint `&mut [u8]` slices of it
+   (with the mapped backing, slices of the mapping itself).
 3. Writes the chunks in parallel. Each chunk copies its input sections and
    applies relocations in place, reading relocation entries straight from the
-   input mapping.
+   input mapping; a finished region goes out in one positional write.
 4. Runs the post-write steps: a build-id hash computed over fixed-size blocks
-   in parallel and then combined, the Mach-O code signature, and the fat
-   header.
+   in parallel and then combined — hashed from the region buffers as they are
+   written, so nothing is read back in the common case, with the same value
+   as the mapped backing — the Mach-O code signature, and the fat header.
 
 Removing a large old output file can run on a background thread so that it
 doesn't hold up the link.
@@ -300,7 +307,7 @@ Who works where, and which files each task owns, is in
 | Global symbol table | sharded `hashbrown` tables behind per-shard locks, shard chosen by precomputed hash |
 | Per-symbol flags | `AtomicU32` bitsets |
 | Deduplication (merge sections, ICF) | sharded concurrent maps; ties broken by input order |
-| Output writing | disjoint mutable slices from one writable mapping |
+| Output writing | disjoint mutable slices of ~1 MiB region buffers, written with `pwrite` (or of one writable mapping) |
 
 Library users can run qld inside their own rayon pool
 (`ThreadPool::install`). Parallel stages run on whatever pool is current, so a
