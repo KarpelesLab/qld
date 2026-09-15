@@ -102,6 +102,9 @@ pub struct MachInput<'a> {
     pub uses: Vec<SymbolUse>,
     /// Members of a `-hidden-l` archive: their globals become private.
     pub hidden: bool,
+    /// Modification time of the object (or archive member), for the debug
+    /// map.
+    pub mtime: u64,
 }
 
 impl<'a> MachInput<'a> {
@@ -176,6 +179,7 @@ struct ObjectEntry {
     position: InputPosition,
     live: bool,
     hidden: bool,
+    mtime: u64,
 }
 
 enum Entry {
@@ -259,6 +263,7 @@ impl<'t> Collected<'t> {
             names: Vec::new(),
             uses: Vec::new(),
             hidden: false,
+            mtime: 0,
         };
         for (name, use_) in &internal.names {
             internal_input.names.push(SymbolName::new(name));
@@ -287,6 +292,7 @@ impl<'t> Collected<'t> {
                         names: Vec::new(),
                         uses: Vec::new(),
                         hidden: object.hidden,
+                        mtime: object.mtime,
                     });
                 }
                 Entry::Dylib(index, position) => {
@@ -303,6 +309,7 @@ impl<'t> Collected<'t> {
                         names: Vec::with_capacity(dylib.exports.len()),
                         uses: Vec::with_capacity(dylib.exports.len()),
                         hidden: false,
+                        mtime: 0,
                     };
                     for export in &dylib.exports {
                         input.names.push(SymbolName::new(&export.name));
@@ -657,6 +664,7 @@ impl<'t> Walker<'_, 't> {
                             position: InputPosition::new(position, 0),
                             live: true,
                             hidden: false,
+                            mtime: file_mtime(file.path()),
                         }));
                         Ok(())
                     }
@@ -779,11 +787,20 @@ impl<'t> Walker<'_, 't> {
             if live {
                 self.note_object(member_file)?;
             }
+            // The member's modification time, from its `ar` header, for the
+            // debug map.
+            let date = usize::try_from(member.header_offset)
+                .ok()
+                .and_then(|at| file.data().get(at.checked_add(16)?..at.checked_add(28)?))
+                .and_then(|field| std::str::from_utf8(field).ok())
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .unwrap_or(0);
             self.entries.push(Entry::Object(ObjectEntry {
                 id: member_id,
                 position: InputPosition::new(position, ordinal),
                 live,
                 hidden,
+                mtime: if zero_mtime() { 0 } else { date },
             }));
         }
         Ok(())
@@ -1092,6 +1109,24 @@ pub fn is_implicitly_linked(install_name: &[u8]) -> bool {
         return path.file_name().and_then(|f| f.to_str()) == Some(framework);
     }
     false
+}
+
+/// `ZERO_AR_DATE`: record zero modification times in the debug map, for
+/// reproducible outputs (ld64 and lld read it too).
+fn zero_mtime() -> bool {
+    std::env::var_os("ZERO_AR_DATE").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The modification time of `path` in seconds, for the debug map.
+fn file_mtime(path: &Path) -> u64 {
+    if zero_mtime() {
+        return 0;
+    }
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Whether an archive member defines an Objective-C class or category, for

@@ -747,6 +747,174 @@ fn dead_stripping() {
     }
 }
 
+/// The objects and symbols of `dsymutil --dump-debug-map`, without
+/// timestamps.
+fn debug_map(binary: &Path) -> Option<Vec<String>> {
+    let output = Command::new("dsymutil")
+        .arg("--dump-debug-map")
+        .arg(binary)
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| l.contains("filename:") || l.contains("sym:"))
+            .map(|l| l.split(", binAddr").next().unwrap_or(l).trim().to_owned())
+            .collect()
+    })
+}
+
+#[test]
+fn stabs_debug_map() {
+    let arch = "arm64";
+    if !clang_for(arch) || !tool_works("llvm-ar", &["--version"]) {
+        skip(
+            "stabs_debug_map",
+            "clang for arm64-apple-macos or llvm-ar missing",
+        );
+        return;
+    }
+    let dir = scratch("stabs");
+    let main = compile("stabs", "tlv.c", arch, &["-g"]);
+    let other = compile("stabs", "tlv_other.c", arch, &["-g"]);
+    let archive = dir.join("libother.a");
+    let _ = std::fs::remove_file(&archive);
+    assert!(tool_works(
+        "llvm-ar",
+        &[
+            "--format=darwin",
+            "rcs",
+            archive.to_str().unwrap(),
+            other.to_str().unwrap()
+        ]
+    ));
+    let mut args = base_args(arch);
+    args.extend(strings(&[
+        main.to_str().unwrap(),
+        archive.to_str().unwrap(),
+        "-lSystem",
+    ]));
+    let exe = dir.join("stabs");
+    link_and_compare(&args, &exe);
+    let Some(map) = debug_map(&exe) else {
+        skip("stabs_debug_map", "dsymutil missing");
+        return;
+    };
+    let joined = map.join("\n");
+    assert!(joined.contains("tlv-arm64.o'"), "{joined}");
+    assert!(
+        joined.contains("libother.a(tlv_other-arm64.o)'"),
+        "{joined}"
+    );
+    for symbol in [
+        "sym: _main, objAddr: 0x0",
+        "sym: _tlv_other",
+        "sym: _tlv_zero",
+    ] {
+        assert!(joined.contains(symbol), "{symbol} missing:\n{joined}");
+    }
+    let reference = PathBuf::from(format!("{}-lld", exe.display()));
+    if let Some(theirs) = debug_map(&reference).filter(|_| reference.exists()) {
+        let normalize = |lines: Vec<String>| {
+            let mut lines: Vec<String> = lines
+                .into_iter()
+                .map(|l| l.replace(&reference.display().to_string(), ""))
+                .collect();
+            lines.sort();
+            lines
+        };
+        assert_eq!(
+            normalize(map),
+            normalize(theirs),
+            "debug map: qld vs ld64.lld"
+        );
+    }
+}
+
+#[test]
+fn universal_binary() {
+    if !clang_for("arm64") || !clang_for("x86_64") || !tool_works("llvm-lipo", &["-version"]) {
+        skip(
+            "universal_binary",
+            "clang for both architectures or llvm-lipo missing",
+        );
+        return;
+    }
+    let dir = scratch("universal");
+    // Fat inputs: an object and an archive.
+    let hello_arm = compile("universal", "hello.c", "arm64", &[]);
+    let hello_x86 = compile("universal", "hello.c", "x86_64", &[]);
+    let fat_object = dir.join("hello-fat.o");
+    assert!(tool_works(
+        "llvm-lipo",
+        &[
+            "-create",
+            hello_arm.to_str().unwrap(),
+            hello_x86.to_str().unwrap(),
+            "-output",
+            fat_object.to_str().unwrap()
+        ]
+    ));
+    let root = syslibroot();
+    let args = os(&[
+        "-arch",
+        "arm64",
+        "-arch",
+        "x86_64",
+        "-platform_version",
+        "macos",
+        "13.0",
+        "13.0",
+        "-syslibroot",
+        root.to_str().unwrap(),
+        fat_object.to_str().unwrap(),
+        "-lSystem",
+    ]);
+    let (bytes, _) = link_bytes(&args).unwrap();
+    let exe = dir.join("hello-universal");
+    std::fs::write(&exe, &bytes).unwrap();
+    make_executable(&exe);
+
+    let fat = qld::macho::read::FatFile::parse(&bytes, Source::new(&exe)).unwrap();
+    assert_eq!(fat.slices().len(), 2);
+    for slice in fat.slices() {
+        let file = MachOFile::parse(slice.data, Source::new(&exe)).unwrap();
+        assert_eq!(file.header().file_type, MH_EXECUTE);
+        if slice.arch == qld::macho::read::Arch::ARM64 {
+            assert_eq!(slice.offset % 0x4000, 0);
+            assert_eq!(slice.align, 14);
+            check_signature(slice.data);
+        } else {
+            assert_eq!(slice.offset % 0x1000, 0);
+        }
+    }
+    let info = Command::new("llvm-lipo")
+        .arg("-info")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    let info = String::from_utf8_lossy(&info.stdout);
+    assert!(info.contains("x86_64") && info.contains("arm64"), "{info}");
+
+    // Each slice matches a thin link of the same architecture.
+    for (arch, slice_arch) in [
+        ("arm64", qld::macho::read::Arch::ARM64),
+        ("x86_64", qld::macho::read::Arch::X86_64),
+    ] {
+        let mut thin = os(&["-arch", arch]);
+        thin.extend(args.iter().skip(4).cloned());
+        let (thin_bytes, _) = link_bytes(&thin).unwrap();
+        let slice = fat.select(slice_arch).unwrap();
+        assert!(
+            slice.data == thin_bytes.as_slice(),
+            "{arch} slice differs from a thin link"
+        );
+    }
+    if cfg!(target_os = "macos") && host_can_run("arm64") {
+        assert_eq!(run(&exe).unwrap(), "hello from qld 3 42\n");
+    }
+}
+
 #[test]
 fn undefined_symbols_are_reported() {
     if !clang_for("arm64") {

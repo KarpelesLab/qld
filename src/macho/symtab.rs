@@ -197,7 +197,7 @@ pub fn build(
     addresses: &Addresses<'_, '_>,
     options: &LinkOptions,
     filter: &ExportFilter,
-    stabs: Vec<Nlist>,
+    debug_map: bool,
 ) -> Tables {
     let link = addresses.link;
     let layout = addresses.layout;
@@ -205,7 +205,9 @@ pub fn build(
     let config = link.config;
     let base = addresses.header_address();
 
-    let mut locals: Vec<Nlist> = stabs;
+    let mut locals: Vec<Nlist> = Vec::new();
+    // The object symbols in the table, for the debug map.
+    let mut origins: Vec<(usize, u32)> = Vec::new();
     let mut extdefs: Vec<(SymbolId, Nlist)> = Vec::new();
     let mut undefs: Vec<(SymbolId, Nlist)> = Vec::new();
     let mut exports: Vec<ExportEntry> = Vec::new();
@@ -237,6 +239,7 @@ pub fn build(
                     continue;
                 }
                 let _ = input;
+                origins.push((file, symbol.index));
                 locals.push(Nlist {
                     name: symbol.name.to_vec(),
                     n_type: N_SECT,
@@ -290,6 +293,9 @@ pub fn build(
                     if options.discard == DiscardMode::All {
                         continue;
                     }
+                    if n_type == N_SECT {
+                        origins.push((file, *symbol));
+                    }
                     locals.push(Nlist {
                         name: name.to_vec(),
                         n_type: n_type | N_PEXT,
@@ -321,6 +327,9 @@ pub fn build(
                     flags,
                     address: export_address,
                 });
+                if n_type == N_SECT {
+                    origins.push((file, *symbol));
+                }
                 extdefs.push((
                     id,
                     Nlist {
@@ -431,6 +440,11 @@ pub fn build(
     }
     extdefs.sort_by(|a, b| a.1.name.cmp(&b.1.name));
     undefs.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    if debug_map {
+        let mut stabs = super::stabs::build(addresses, &origins);
+        stabs.append(&mut locals);
+        locals = stabs;
+    }
 
     // Encode.
     let mut tables = Tables::default();
@@ -439,8 +453,10 @@ pub fn build(
     let mut symtab_index: HashMap<SymbolId, u32> = HashMap::new();
     let mut count = 0u32;
     let mut emit = |entry: &Nlist, tables: &mut Tables, strings: &mut Vec<u8>| {
+        // The table starts with " \0": offset 1 is the empty string (offset
+        // 0 would read as a space).
         let strx = if entry.name.is_empty() {
-            0
+            1
         } else if let Some(&offset) = string_offsets.get(&entry.name) {
             offset
         } else {

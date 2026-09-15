@@ -383,12 +383,7 @@ fn link_arch(
         linkedit.rebase = rebase;
         linkedit.bind = bind;
     }
-    let stabs = if config.debug_map {
-        super::stabs::build(&addresses)
-    } else {
-        Vec::new()
-    };
-    let tables = symtab::build(&addresses, options, &filter, stabs);
+    let tables = symtab::build(&addresses, options, &filter, config.debug_map);
     linkedit.exports = trie::build(&tables.exports);
     super::buf::pad_to(&mut linkedit.exports, 8);
     if commands.function_starts {
