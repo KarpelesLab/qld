@@ -238,60 +238,124 @@ pub fn place<'a>(
     placement
 }
 
+/// What [`Placement::compute_flags`] folds over the input sections of one
+/// output section (a run of them, in section order).
+#[derive(Clone, Copy, Debug)]
+struct FlagFold {
+    /// The union of the inputs' output flags.
+    flags: u64,
+    /// The type of the first input that is not `SHT_NOBITS`.
+    first_type: Option<u32>,
+    /// Whether every input is `SHT_NOBITS`.
+    all_nobits: bool,
+    /// The intersection of the inputs' flags, masked to MERGE and STRINGS.
+    merge_and: u64,
+    /// The first input's MERGE and STRINGS bits and merge entry size.
+    first_merge: (u64, u64),
+    /// Whether an input's MERGE/STRINGS bits or entry size differ from the
+    /// first's.
+    merge_mismatch: bool,
+}
+
+impl FlagFold {
+    /// The fold of one input section.
+    fn of(header: &crate::elf::read::SectionHeader) -> Self {
+        let bits = header.sh_flags & (SHF_MERGE | SHF_STRINGS);
+        let entsize = if bits & SHF_MERGE != 0 {
+            header.sh_entsize
+        } else {
+            0
+        };
+        let nobits = header.sh_type == SHT_NOBITS;
+        Self {
+            flags: header.sh_flags & OUTPUT_FLAG_MASK,
+            first_type: (!nobits).then_some(header.sh_type),
+            all_nobits: nobits,
+            merge_and: (SHF_MERGE | SHF_STRINGS) & header.sh_flags,
+            first_merge: (bits, entsize),
+            merge_mismatch: false,
+        }
+    }
+
+    /// The fold of `self`'s sections followed by `next`'s.
+    fn then(self, next: Self) -> Self {
+        Self {
+            flags: self.flags | next.flags,
+            first_type: self.first_type.or(next.first_type),
+            all_nobits: self.all_nobits && next.all_nobits,
+            merge_and: self.merge_and & next.merge_and,
+            first_merge: self.first_merge,
+            merge_mismatch: self.merge_mismatch
+                || next.merge_mismatch
+                || self.first_merge != next.first_merge,
+        }
+    }
+}
+
 impl Placement<'_> {
     /// Computes each output section's type and flags from its live input
     /// sections. Placement does this once; the driver repeats it after
     /// garbage collection, since GNU ld decides flags from the sections that
     /// survive it.
     pub fn compute_flags(&mut self, files: &[ElfInput<'_>], sections: &Sections) {
-        // Output types and flags from the inputs.
-        // (flags, first non-NOBITS type, all NOBITS, MERGE/STRINGS bits kept).
-        // As in GNU ld, the output keeps SHF_MERGE and SHF_STRINGS only if every
-        // input has the same two bits and, when merged, the same entry size.
-        let mut types: Vec<(u64, Option<u32>, bool, u64)> =
-            vec![(0, None, true, SHF_MERGE | SHF_STRINGS); self.outputs.len()];
-        let mut first_merge: Vec<Option<(u64, u64)>> = vec![None; self.outputs.len()];
-        for (file_index, file) in files.iter().enumerate() {
-            let Some(object) = &file.object else {
-                continue;
-            };
-            for index in 0..object.sections.len() {
-                let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(NONE)) else {
-                    continue;
+        // Output types and flags from the inputs, as a fold over the live
+        // input sections in section order. The fold is associative, so each
+        // file folds its own sections in parallel and the files' results are
+        // combined in file order. As in GNU ld, the output keeps SHF_MERGE
+        // and SHF_STRINGS only if every input has the same two bits and,
+        // when merged, the same entry size.
+        let out = &self.out;
+        let per_file: Vec<Vec<(u32, FlagFold)>> = files
+            .par_iter()
+            .enumerate()
+            .map(|(file_index, file)| {
+                let mut folds: Vec<(u32, FlagFold)> = Vec::new();
+                let Some(object) = &file.object else {
+                    return folds;
                 };
-                if !sections.is_live(id) {
-                    continue;
-                }
-                let output = self.out.get(id.index()).copied().unwrap_or(NONE);
-                let (Some(slot), Some(section)) =
-                    (types.get_mut(output as usize), object.sections.get(index))
-                else {
-                    continue;
-                };
-                let header = &section.header;
-                slot.0 |= header.sh_flags & OUTPUT_FLAG_MASK;
-                let bits = header.sh_flags & (SHF_MERGE | SHF_STRINGS);
-                let entsize = if bits & SHF_MERGE != 0 {
-                    header.sh_entsize
-                } else {
-                    0
-                };
-                match first_merge.get_mut(output as usize) {
-                    Some(first @ None) => *first = Some((bits, entsize)),
-                    Some(Some(first)) if *first != (bits, entsize) => slot.3 = 0,
-                    _ => {}
-                }
-                slot.3 &= header.sh_flags;
-                if header.sh_type != SHT_NOBITS {
-                    slot.2 = false;
-                    if slot.1.is_none() {
-                        slot.1 = Some(header.sh_type);
+                for (index, section) in object.sections.iter().enumerate() {
+                    let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(NONE))
+                    else {
+                        continue;
+                    };
+                    if !sections.is_live(id) {
+                        continue;
+                    }
+                    let output = out.get(id.index()).copied().unwrap_or(NONE);
+                    let fold = FlagFold::of(&section.header);
+                    // Files usually list an output's sections together, and
+                    // a file touches few outputs: a short list suffices.
+                    match folds.iter_mut().rev().find(|(o, _)| *o == output) {
+                        Some((_, existing)) => *existing = existing.then(fold),
+                        None => folds.push((output, fold)),
                     }
                 }
+                folds
+            })
+            .collect();
+        let mut folds: Vec<Option<FlagFold>> = vec![None; self.outputs.len()];
+        for (output, fold) in per_file.into_iter().flatten() {
+            if let Some(slot) = folds.get_mut(output as usize) {
+                *slot = Some(match *slot {
+                    Some(existing) => existing.then(fold),
+                    None => fold,
+                });
             }
         }
-        for (output, (flags, sh_type, all_nobits, merge_bits)) in self.outputs.iter_mut().zip(types)
-        {
+        for (output, fold) in self.outputs.iter_mut().zip(folds) {
+            let (flags, sh_type, all_nobits, merge_bits) = match fold {
+                Some(fold) => (
+                    fold.flags,
+                    fold.first_type,
+                    fold.all_nobits,
+                    if fold.merge_mismatch {
+                        0
+                    } else {
+                        fold.merge_and
+                    },
+                ),
+                None => (0, None, true, SHF_MERGE | SHF_STRINGS),
+            };
             // An output is mergeable only if every input section is.
             let flags = flags & !(SHF_MERGE | SHF_STRINGS) | (flags & merge_bits);
             output.flags = flags;
