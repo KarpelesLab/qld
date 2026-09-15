@@ -481,13 +481,16 @@ pub fn build(
 
     // Indirect symbols: __got, __thread_ptrs, __stubs.
     let indirect_entry = |id: SymbolId| -> u32 {
-        match (link.is_imported(id), symtab_index.get(&id)) {
-            (true, Some(&index)) => index,
-            (false, Some(&index)) if !matches!(addresses.symbol(id), Some(Value::Absolute(_))) => {
-                let _ = index;
-                INDIRECT_SYMBOL_LOCAL
-            }
-            (_, _) if matches!(addresses.symbol(id), Some(Value::Absolute(_))) => {
+        let bound = link.is_imported(id)
+            || addresses
+                .synthetic
+                .weak_bound
+                .get(id.index())
+                .copied()
+                .unwrap_or(false);
+        match symtab_index.get(&id) {
+            Some(&index) if bound => index,
+            _ if matches!(addresses.symbol(id), Some(Value::Absolute(_))) => {
                 INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS
             }
             _ => INDIRECT_SYMBOL_LOCAL,

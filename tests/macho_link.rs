@@ -437,6 +437,164 @@ fn output_is_deterministic() {
     assert!(outputs.windows(2).all(|w| w[0] == w[1]));
 }
 
+/// Links `args` (an ld64 command line without `-o`) with qld into
+/// `output`, and with `ld64.lld` into `output-lld` when it is available,
+/// checking that both have the same sections, exports, imports and dylibs.
+fn link_and_compare(args: &[String], output: &Path) -> Vec<u8> {
+    let mut ours: Vec<OsString> = args.iter().map(OsString::from).collect();
+    ours.push("-o".into());
+    ours.push(output.into());
+    let (bytes, _) = link_bytes(&ours).unwrap_or_else(|e| panic!("link failed: {e}"));
+    std::fs::write(output, &bytes).unwrap();
+    make_executable(output);
+    if let Some(lld) = ld64_lld() {
+        let mut reference = output.as_os_str().to_owned();
+        reference.push("-lld");
+        let reference = PathBuf::from(reference);
+        let status = Command::new(lld)
+            .args(args)
+            .arg("-o")
+            .arg(&reference)
+            .status()
+            .unwrap();
+        assert!(status.success(), "ld64.lld failed on {args:?}");
+        if let (Some(ours), Some(theirs)) = (summarize(output), summarize(&reference)) {
+            assert_eq!(ours, theirs, "{}: qld vs ld64.lld", output.display());
+        }
+    }
+    bytes
+}
+
+fn base_args(arch: &str) -> Vec<String> {
+    [
+        "-arch",
+        arch,
+        "-platform_version",
+        "macos",
+        "13.0",
+        "13.0",
+        "-syslibroot",
+        syslibroot().to_str().unwrap(),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect()
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| (*s).to_owned()).collect()
+}
+
+#[test]
+fn dylib_and_client() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "dylib_and_client",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("dylib");
+        let greet = compile("dylib", "greet.c", arch, &[]);
+        let client = compile("dylib", "use_greet.c", arch, &[]);
+        let lib_dir = dir.join(arch);
+        std::fs::create_dir_all(&lib_dir).unwrap();
+
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            "-dylib",
+            "-install_name",
+            "@rpath/libgreet.dylib",
+            "-current_version",
+            "1.2.3",
+            greet.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let lib = lib_dir.join("libgreet.dylib");
+        let bytes = link_and_compare(&args, &lib);
+        let file = MachOFile::parse(&bytes, Source::new(&lib)).unwrap();
+        assert_eq!(file.header().file_type, qld::macho::read::consts::MH_DYLIB);
+        if let Some(trie) = objdump(&["--macho", "--exports-trie"], &lib) {
+            for name in ["_greet", "_greet_count", "_greet_tls", "_greet_weak"] {
+                assert!(trie.contains(name), "{arch}: {name} not exported:\n{trie}");
+            }
+            assert!(
+                !trie.contains("_greet_hidden"),
+                "{arch}: hidden symbol exported"
+            );
+        }
+        if let Some(info) = objdump(&["--macho", "--dyld-info"], &lib) {
+            assert!(
+                info.lines()
+                    .any(|l| l.contains("weak") && l.contains("_greet_weak")),
+                "{arch}: weak definition not bound through weak lookup:\n{info}"
+            );
+        }
+
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            client.to_str().unwrap(),
+            &format!("-L{}", lib_dir.display()),
+            "-lgreet",
+            "-rpath",
+            "@executable_path",
+            "-U",
+            "_missing_weak",
+            "-lSystem",
+        ]));
+        let exe = lib_dir.join("use_greet");
+        link_and_compare(&args, &exe);
+        if let Some(info) = objdump(&["--macho", "--dyld-info"], &exe) {
+            assert!(
+                info.contains("_missing_weak (weak import)"),
+                "{arch}:\n{info}"
+            );
+            assert!(info.contains("libgreet"), "{arch}:\n{info}");
+        }
+        if host_can_run(arch) {
+            let stdout = run(&exe).unwrap();
+            assert!(stdout.contains("hello, dylib"), "{stdout}");
+        }
+    }
+}
+
+#[test]
+fn thread_local_variables() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "thread_local_variables",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let main = compile("tlv", "tlv.c", arch, &[]);
+        let other = compile("tlv", "tlv_other.c", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            main.to_str().unwrap(),
+            other.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let exe = scratch("tlv").join(format!("tlv-{arch}"));
+        let bytes = link_and_compare(&args, &exe);
+        let flags = MachOFile::parse(&bytes, Source::new(&exe))
+            .unwrap()
+            .header()
+            .flags;
+        assert_ne!(flags & qld::macho::read::consts::MH_HAS_TLV_DESCRIPTORS, 0);
+        if let Some(contents) = objdump(&["--macho", "-s", "-j", "__thread_vars"], &exe) {
+            // The offset fields: 0, 4, 0x50 and 0x48 into the template, in
+            // descriptor order.
+            assert!(contents.contains("__thread_vars"), "{contents}");
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "42 3 tls 6\n");
+        }
+    }
+}
+
 #[test]
 fn undefined_symbols_are_reported() {
     if !clang_for("arm64") {

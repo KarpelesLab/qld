@@ -15,6 +15,7 @@ use crate::macho::read::consts::{BIND_SPECIAL_DYLIB_FLAT_LOOKUP, BIND_SPECIAL_DY
 use super::layout::is_consumed;
 use super::reloc::{self, Place, Referent};
 use super::state::{Link, NONE, SymbolDef};
+use super::symtab::ExportFilter;
 
 /// One imported symbol.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +57,9 @@ pub struct Synthetic {
     pub loaded_dylibs: Vec<usize>,
     /// Whether every import from each dylib is weak.
     pub dylib_all_weak: Vec<bool>,
+    /// Exported weak definitions bound through dyld's weak lookup, by
+    /// symbol.
+    pub weak_bound: Vec<bool>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -71,9 +75,14 @@ struct Wants {
 /// # Errors
 ///
 /// Malformed relocations.
-pub fn scan(link: &Link<'_>, options: &crate::args::LinkOptions) -> Result<Synthetic> {
+pub fn scan(
+    link: &Link<'_>,
+    options: &crate::args::LinkOptions,
+    filter: &ExportFilter,
+) -> Result<Synthetic> {
     let count = link.symbols.len();
     let arm64 = link.config.is_arm64();
+    let weak_bound = weak_bound(link, filter);
     let per_file: Vec<Result<Vec<(SymbolId, Wants)>>> = (0..link.files.len())
         .into_par_iter()
         .map(|file| {
@@ -109,12 +118,13 @@ pub fn scan(link: &Link<'_>, options: &crate::args::LinkOptions) -> Result<Synth
                             continue;
                         };
                         let needs = reloc::needs(arm64, decoded.r_type);
-                        let imported = link.is_imported(id);
+                        let imported = link.is_imported(id)
+                            || weak_bound.get(id.index()).copied().unwrap_or(false);
                         out.push((
                             id,
                             Wants {
-                                got: needs.got,
-                                tlv: needs.tlv,
+                                got: needs.got && (needs.pointer || imported),
+                                tlv: needs.tlv && imported,
                                 stub: needs.stub && imported,
                                 used: true,
                             },
@@ -261,7 +271,13 @@ pub fn scan(link: &Link<'_>, options: &crate::args::LinkOptions) -> Result<Synth
                 let weak_ref = !link.strong_ref.get(index).copied().unwrap_or(true);
                 (ordinal, weak_dylib || weak_ref)
             }
-            Some(SymbolDef::DynamicLookup) => (BIND_SPECIAL_DYLIB_FLAT_LOOKUP, false),
+            Some(SymbolDef::DynamicLookup) => (
+                BIND_SPECIAL_DYLIB_FLAT_LOOKUP,
+                !link.strong_ref.get(index).copied().unwrap_or(true),
+            ),
+            Some(SymbolDef::Object { .. }) if weak_bound.get(index).copied().unwrap_or(false) => {
+                (BIND_SPECIAL_DYLIB_WEAK_LOOKUP, false)
+            }
             _ => continue,
         };
         synthetic.import_index[index] = to_u32(synthetic.imports.len());
@@ -272,6 +288,34 @@ pub fn scan(link: &Link<'_>, options: &crate::args::LinkOptions) -> Result<Synth
             weak,
         });
     }
-    let _ = BIND_SPECIAL_DYLIB_WEAK_LOOKUP;
+    synthetic.weak_bound = weak_bound;
     Ok(synthetic)
+}
+
+/// The exported weak definitions, which references bind through dyld's
+/// weak lookup so that one definition wins across images (as in ld64 and
+/// lld). Only chained fixups express this; the legacy form uses the
+/// definitions directly.
+fn weak_bound(link: &Link<'_>, filter: &ExportFilter) -> Vec<bool> {
+    let mut out = vec![false; link.symbols.len()];
+    if !link.config.chained_fixups {
+        return out;
+    }
+    for (index, slot) in out.iter_mut().enumerate() {
+        let Some(SymbolDef::Object { file, symbol }) = link.defs.get(index) else {
+            continue;
+        };
+        let file = usize::try_from(*file).unwrap_or(usize::MAX);
+        let Some(object) = link.object(file) else {
+            continue;
+        };
+        let Ok(entry) = object.file.symbols().get(*symbol) else {
+            continue;
+        };
+        *slot = entry.is_weak_def()
+            && !entry.is_private_external()
+            && !link.files.get(file).is_some_and(|f| f.hidden)
+            && filter.exports(entry.name);
+    }
+    out
 }

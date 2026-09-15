@@ -222,7 +222,8 @@ fn link_arch(
         diagnostics,
     )?;
     link.mark_live(options)?;
-    let synthetic = scan::scan(&link, options)?;
+    let filter = ExportFilter::new(options)?;
+    let synthetic = scan::scan(&link, options, &filter)?;
 
     let entry_id = config
         .entry
@@ -299,10 +300,9 @@ fn link_arch(
             compatibility_version: dylib.compatibility_version.0,
         });
     }
-    commands.no_undefs = !synthetic
-        .imports
-        .iter()
-        .any(|i| i.ordinal == crate::macho::read::consts::BIND_SPECIAL_DYLIB_FLAT_LOOKUP);
+    // Two-level namespace images set MH_NOUNDEFS even with flat lookups
+    // (`-undefined dynamic_lookup`), as ld64 and lld do.
+    commands.no_undefs = true;
     let (_, commands_size) = write::commands_size(&config, &layout, &commands);
     let header_size = 32u64
         .saturating_add(commands_size)
@@ -347,7 +347,6 @@ fn link_arch(
         linkedit.rebase = rebase;
         linkedit.bind = bind;
     }
-    let filter = ExportFilter::new(options)?;
     let stabs = if config.debug_map {
         super::stabs::build(&addresses)
     } else {
@@ -375,10 +374,11 @@ fn link_arch(
         commands.extra_flags |= MH_WEAK_DEFINES;
     }
     if synthetic.imports.iter().any(|i| {
-        matches!(
-            link.defs.get(i.symbol.index()),
-            Some(SymbolDef::Dylib { weak: true, .. })
-        )
+        i.ordinal == crate::macho::read::consts::BIND_SPECIAL_DYLIB_WEAK_LOOKUP
+            || matches!(
+                link.defs.get(i.symbol.index()),
+                Some(SymbolDef::Dylib { weak: true, .. })
+            )
     }) {
         commands.extra_flags |= MH_BINDS_TO_WEAK;
     }

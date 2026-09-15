@@ -449,6 +449,9 @@ pub trait Resolve {
     fn thunk(&self, from: u64, target: u64) -> Option<u64>;
     /// Whether address `address` is in a writable segment.
     fn writable(&self, address: u64) -> bool;
+    /// For an exported weak definition bound through dyld's weak lookup,
+    /// its import index.
+    fn weak_import(&self, id: SymbolId) -> Option<u32>;
 }
 
 fn range_error(what: &str, value: i64, place: u64) -> Error {
@@ -537,11 +540,15 @@ pub fn apply(
     let is_unsigned = (arm64 && decoded.r_type == ARM64_RELOC_UNSIGNED)
         || (!arm64 && decoded.r_type == X86_64_RELOC_UNSIGNED);
     if is_unsigned {
-        let value = resolve.value(target, addend)?;
+        let mut value = resolve.value(target, addend)?;
         // The offset field of a thread-local variable descriptor.
-        if section_type == S_THREAD_LOCAL_VARIABLES && at % 24 == 16 {
+        if section_type == S_THREAD_LOCAL_VARIABLES && decoded.offset % 24 == 16 {
             let address = address_of(value, "thread-local offset", place_address)?;
             return put64(out, at, address.wrapping_sub(resolve.tlv_template())).map(|()| None);
+        }
+        // Pointers to exported weak definitions bind through weak lookup.
+        if let Some(import) = symbol.and_then(|id| resolve.weak_import(id)) {
+            value = Value::Import(import, addend);
         }
         return match (decoded.length, value) {
             (3, Value::Absolute(v)) => put64(out, at, v).map(|()| None),
@@ -608,7 +615,7 @@ pub fn apply(
                 put_insn(out, at, insn)?;
             }
             ARM64_RELOC_PAGE21 | ARM64_RELOC_GOT_LOAD_PAGE21 | ARM64_RELOC_TLVP_LOAD_PAGE21 => {
-                let destination = indirect(
+                let (destination, _) = indirect(
                     decoded.r_type,
                     symbol,
                     target,
@@ -625,7 +632,7 @@ pub fn apply(
             ARM64_RELOC_PAGEOFF12
             | ARM64_RELOC_GOT_LOAD_PAGEOFF12
             | ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
-                let destination = indirect(
+                let (destination, relaxed) = indirect(
                     decoded.r_type,
                     symbol,
                     target,
@@ -633,6 +640,16 @@ pub fn apply(
                     resolve,
                     place_address,
                 )?;
+                let mut insn = insn;
+                if relaxed {
+                    // `ldr Xt, [Xn, #off]` becomes `add Xt, Xn, #off`.
+                    if insn & 0xbfc0_0000 != 0xb940_0000 {
+                        return Err(Error::Limit(format!(
+                            "relocation at {place_address:#x} expects an LDR instruction"
+                        )));
+                    }
+                    insn = (insn & 0x001f_ffff) | 0x9100_0000;
+                }
                 let mut scale = 0u32;
                 if insn & 0x3b00_0000 == 0x3900_0000 {
                     scale = insn >> 30;
@@ -695,12 +712,29 @@ pub fn apply(
                 (_, Some(id)) => resolve.got(id),
                 _ => None,
             };
-            slot.ok_or_else(|| {
-                Error::Internal(format!(
-                    "GOT relocation at {place_address:#x} without a slot"
-                ))
-            })?
-            .wrapping_add(addend as u64)
+            match slot {
+                Some(slot) => slot.wrapping_add(addend as u64),
+                None if decoded.r_type != X86_64_RELOC_GOT => {
+                    // Defined here: `movq foo@GOTPCREL(%rip)` becomes
+                    // `leaq foo(%rip)`.
+                    let opcode = at
+                        .checked_sub(2)
+                        .and_then(|i| out.get_mut(i))
+                        .ok_or_else(|| Error::Internal("relocation outside its section".into()))?;
+                    if *opcode != 0x8b {
+                        return Err(Error::Limit(format!(
+                            "relocation at {place_address:#x} expects a MOVQ instruction"
+                        )));
+                    }
+                    *opcode = 0x8d;
+                    address_of(resolve.value(target, addend)?, "GOT_LOAD", place_address)?
+                }
+                None => {
+                    return Err(Error::Internal(format!(
+                        "GOT relocation at {place_address:#x} without a slot"
+                    )));
+                }
+            }
         }
         X86_64_RELOC_SIGNED
         | X86_64_RELOC_SIGNED_1
@@ -736,22 +770,29 @@ fn indirect(
     addend: i64,
     resolve: &dyn Resolve,
     place_address: u64,
-) -> Result<u64> {
-    let slot = |slot: Option<u64>, what: &str| {
-        slot.ok_or_else(|| {
-            Error::Internal(format!(
-                "{what} relocation at {place_address:#x} without a slot"
-            ))
-        })
-    };
-    match r_type {
+) -> Result<(u64, bool)> {
+    let slot = match r_type {
         ARM64_RELOC_GOT_LOAD_PAGE21 | ARM64_RELOC_GOT_LOAD_PAGEOFF12 => {
-            slot(symbol.and_then(|id| resolve.got(id)), "GOT_LOAD")
+            symbol.and_then(|id| resolve.got(id))
         }
         ARM64_RELOC_TLVP_LOAD_PAGE21 | ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
-            slot(symbol.and_then(|id| resolve.tlv_pointer(id)), "TLVP_LOAD")
+            symbol.and_then(|id| resolve.tlv_pointer(id))
         }
-        _ => address_of(resolve.value(target, addend)?, "PAGE", place_address),
+        _ => {
+            return Ok((
+                address_of(resolve.value(target, addend)?, "PAGE", place_address)?,
+                false,
+            ));
+        }
+    };
+    match slot {
+        Some(slot) => Ok((slot, false)),
+        // No slot: the symbol is defined here, so the load is relaxed to
+        // the symbol's address.
+        None => Ok((
+            address_of(resolve.value(target, addend)?, "GOT_LOAD", place_address)?,
+            true,
+        )),
     }
 }
 
@@ -764,6 +805,9 @@ pub struct Needs {
     pub stub: bool,
     /// A `__thread_ptrs` slot.
     pub tlv: bool,
+    /// The slot is needed even for a symbol defined in the image (the
+    /// relocation cannot be relaxed to the symbol's address).
+    pub pointer: bool,
 }
 
 /// What a relocation of type `r_type` needs for its symbol.
@@ -771,10 +815,13 @@ pub struct Needs {
 pub fn needs(arm64: bool, r_type: u8) -> Needs {
     if arm64 {
         match r_type {
-            ARM64_RELOC_GOT_LOAD_PAGE21
-            | ARM64_RELOC_GOT_LOAD_PAGEOFF12
-            | ARM64_RELOC_POINTER_TO_GOT => Needs {
+            ARM64_RELOC_GOT_LOAD_PAGE21 | ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Needs {
                 got: true,
+                ..Needs::default()
+            },
+            ARM64_RELOC_POINTER_TO_GOT => Needs {
+                got: true,
+                pointer: true,
                 ..Needs::default()
             },
             ARM64_RELOC_TLVP_LOAD_PAGE21 | ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Needs {
@@ -789,8 +836,13 @@ pub fn needs(arm64: bool, r_type: u8) -> Needs {
         }
     } else {
         match r_type {
-            X86_64_RELOC_GOT_LOAD | X86_64_RELOC_GOT => Needs {
+            X86_64_RELOC_GOT_LOAD => Needs {
                 got: true,
+                ..Needs::default()
+            },
+            X86_64_RELOC_GOT => Needs {
+                got: true,
+                pointer: true,
                 ..Needs::default()
             },
             X86_64_RELOC_TLV => Needs {

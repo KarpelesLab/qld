@@ -82,6 +82,9 @@ impl Addresses<'_, '_> {
     pub fn symbol(&self, id: SymbolId) -> Option<Value> {
         match self.link.defs.get(id.index())? {
             SymbolDef::Object { file, symbol } => {
+                if let Some(import) = self.weak_import(id) {
+                    return Some(Value::Import(import, 0));
+                }
                 self.object_symbol(usize::try_from(*file).ok()?, *symbol)
             }
             SymbolDef::Common { .. } => {
@@ -183,6 +186,20 @@ impl Resolve for Addresses<'_, '_> {
 
     fn thunk(&self, from: u64, target: u64) -> Option<u64> {
         self.thunks.find(from, target)
+    }
+
+    fn weak_import(&self, id: SymbolId) -> Option<u32> {
+        if !self
+            .synthetic
+            .weak_bound
+            .get(id.index())
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let import = *self.synthetic.import_index.get(id.index())?;
+        (import != NONE).then_some(import)
     }
 
     fn writable(&self, address: u64) -> bool {
