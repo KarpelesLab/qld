@@ -32,7 +32,8 @@ boundaries, because nothing in the format guarantees that splitting is safe.
 - `.debug_*` references to dead code, which resolve to tombstones
 
 **Diagnostics:** `--print-gc-sections`, and `--why-live=<symbol>` prints the
-reference chain from a root.
+reference chain from a root. Marking walks relocations directly; the full
+reference graph is built only when `--why-live` needs it.
 
 ## Identical code folding
 
@@ -52,9 +53,11 @@ reference chain from a root.
 ## Merge sections
 
 `SHF_MERGE` sections are split into pieces (NUL-terminated strings for
-`SHF_STRINGS`, fixed-size entries otherwise) in parallel. The pieces go into
-a sharded concurrent map keyed by content hash. Output offsets are assigned
-by walking the pieces in input order.
+`SHF_STRINGS`, fixed-size entries otherwise) in parallel. Deduplication is lock-free: runs of input sections bucket
+their live pieces by hash shard in parallel, then one task per shard fills
+that shard's table in piece order, so the first occurrence always leads.
+Offsets of groups without tail merging are assigned in parallel over runs of
+sections, each laid out from 0 and shifted by its aligned start.
 
 - `-O2` enables **tail merging** of strings (`"bar"` shares the storage of
   `"foobar"`). It costs a suffix sort per output section, so it is off at `-O1`.

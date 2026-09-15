@@ -78,12 +78,19 @@ Integration tiers run on current stable.
 
 ## Benchmarks
 
-`benches/` contains drivers that capture a link once and replay it:
+`benches/` contains drivers that capture a link once and replay it (the full
+method, corpus and latest results are in
+[tests/projects/bench.md](../tests/projects/bench.md)):
 
-1. Build the project with `-Wl,--reproduce=repro.tar` (lld and mold support
-   this; qld will too) to capture every input and the command line.
-2. Replay the link with each linker: hyperfine for wall time, `/usr/bin/time`
-   for peak RSS, `perf stat` for CPU time.
+1. `benches/capture.py` records a link's command line and working directory
+   from a ninja target, a cargo build or a raw argv
+   (`tests/projects/bench-capture.sh` recaptures the whole corpus).
+2. `benches/run.py SPECS` replays each link with every linker at several
+   thread counts, interleaving runs so load changes affect all linkers
+   alike. It records wall time, CPU time and peak RSS (`wait4`), output size
+   and load average, and smoke-checks every output.
+3. `benches/run.py SPECS --determinism QLD` checks that qld's output is
+   identical across thread counts; `benches/report.py` renders tables.
 
 **Standard corpus:** clang (release and debug), chromium (debug), rustc,
 Linux kernel `vmlinux`, Firefox `libxul.so`, and a large debug-info Rust

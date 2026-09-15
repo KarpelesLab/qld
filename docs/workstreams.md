@@ -61,7 +61,7 @@ can work at the same time without colliding.
 | W20 | AArch64 ELF (M4) | `src/elf/arch/**`, `src/arch/**`, thunk/relaxation hooks in `src/elf/{layout,write,scan,synth}.rs`, `tests/aarch64*` | W16 | merged |
 | W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | merged |
 | W23 | Write-based (`pwrite`) output backend | `src/output/**`, writer call sites in `src/elf/` and `src/coff/` | W5 | merged (default) |
-| W24 | Benchmarks and performance (M5) | `benches/**`, `tests/projects/bench*`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**`, `src/input/**`, `src/debug/**` | W23 | in progress |
+| W24 | Benchmarks and performance (M5) | `benches/**`, `tests/projects/bench*`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**`, `src/input/**`, `src/debug/**` | W23 | merged |
 | W25 | Mach-O linking (M8) | `src/macho/**`, the ld64 front end in `src/args/`, `tests/macho_link*` | W15 | merged |
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
@@ -437,6 +437,15 @@ higher than lld's, identical output across thread counts.
 **Owns:** `benches/**`, benchmark scripts under `tests/projects/`, and
 performance changes in the link pipeline modules.
 
+**Merged:** the capture/replay suite and 16 measured speedups (16–22% at
+default threads, byte-identical output). Results in
+`tests/projects/bench.md`; M5's exit criterion is not met. Open:
+- run the link in a child process and exit the parent once the output is
+  written, as mold and wild do (`src/main.rs`, frozen; no `unsafe` needed);
+- idle rayon workers and system time past 16 threads;
+- symbol resolution (clang: 49 ms, wild ~15 ms); single-threaded speed;
+- corpus gaps: chromium, gold, `librustc_driver`; per-commit publishing.
+
 ---
 
 ## W25: Mach-O linking (M8)
@@ -454,7 +463,7 @@ ld64 flavor parser in `src/args/`, `tests/macho_link.rs`, new fixtures.
 ## Integration follow-ups
 
 - **W25:** `link()` dispatch for Mach-O and the `macho-macos` CI job are done.
-  Open: move `src/macho/sha256.rs` into `src/output/hash` (after W24 merges);
+  Open: move `src/macho/sha256.rs` into `src/output/hash`;
   `-r`, `-bundle_loader`, `-init`, `-alias`, `-flat_namespace`, arm64e and
   LTO are rejected by name; cstring deduplication and ObjC relative method
   lists are missing; legacy (pre-chained-fixups) output binds everything at

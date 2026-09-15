@@ -177,7 +177,8 @@ succeed. The error message names the missing search path.
 - **Threads.** Parallel by default. `--threads=N`, `--no-threads` and
   `--thread-count=N` (gold) are honored. Without them, inputs are mapped
   with at most 16 threads and the rest of the link uses one thread per 4 MiB
-  of input, at most 16, because small links run faster on few threads. A
+  of input (counting compressed debug sections at their inflated size), at
+  most 16, because small links run faster on few threads. A
   library caller's own rayon pool is respected. Output never depends on the
   thread count.
 - **TLS relaxation in executables.** Initial-exec accesses to thread-local

@@ -205,17 +205,22 @@ its linker.
 
 ## M5: Performance and optimization
 
-- [ ] Benchmark suite and dashboard: clang, chromium, rustc, the Linux kernel,
+- [~] Benchmark suite and dashboard: clang, chromium, rustc, the Linux kernel,
       and a large debug-info-heavy Rust binary. Compared against GNU ld, gold,
       lld, mold and wild on wall time, CPU time, peak RSS and output size.
-- [ ] Profiling passes on every pipeline stage. Thread scaling from 1 to 64+ cores.
-- [ ] Identical code folding: `--icf=safe` (using `.llvm_addrsig`) and `--icf=all`
-- [ ] String tail merging (`-O2`)
+      Capture/replay suite and results in
+      [tests/projects/bench.md](tests/projects/bench.md) (clang, clang with
+      debug info, `libclang-cpp.so`, `vmlinux`, a Rust debug binary). Missing:
+      chromium, gold, `librustc_driver`, per-commit publishing.
+- [~] Profiling passes on every pipeline stage (done, 16 speedups merged).
+      Thread scaling from 1 to 64+ cores: qld stops scaling at 12–16 threads.
+- [x] Identical code folding: `--icf=safe` (using `.llvm_addrsig`) and `--icf=all`
+- [x] String tail merging (`-O2`)
 - [ ] Section ordering: `--symbol-ordering-file`, `--call-graph-profile-sort`
 - [x] Compressed debug sections: read and write zlib and zstd
       (`--compress-debug-sections`), in-crate codecs, parallel
 - [ ] `--gdb-index` and `--debug-names` generation
-- [ ] Unlinking a large old output file in the background
+- [x] Unlinking a large old output file in the background
 - [ ] Optional separate-debug output (`--separate-debug-file`) with
       `.gnu_debuglink`
 
@@ -223,6 +228,15 @@ its linker.
 mold's and wild's on x86-64, on both 8-core and 64-core machines, with peak
 RSS no higher than lld's. Output is identical across 1, 2 and N threads for
 every benchmark.
+
+**Status (W24, 2026-09-15, 32-core Threadripper):** not met. qld beats GNU ld
+and lld at default threads on every large link, and mold on clang-debug
+(824 vs 1120 ms) and at default/64 threads on its own debug binary. wild is
+faster everywhere (clang: 102 vs 200 ms) and mold is faster at 8 threads.
+Peak RSS is below lld's on every benchmark, and output is identical across 1,
+2, 8 and 64 threads. Next: forking so the parent exits once the output is
+written (~30–150 ms of unmapping), scaling past 16 threads, faster symbol
+resolution, and single-threaded speed.
 
 ---
 
