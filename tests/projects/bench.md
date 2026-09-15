@@ -7,35 +7,36 @@ the method, the corpus and the results.
 ## Standing, stated plainly
 
 Measured on 2026-09-15 on a shared 32-core / 64-thread machine, at a load
-average of 1–20 (per row in the tables below). "Default" is each linker's
+average of 2–17 (per row in the tables below). "Default" is each linker's
 own thread count (qld: one thread per 4 MiB of input, at most 16). Minimum
 wall times:
 
 - **wild is faster than qld on every benchmark it can link, at every
-  thread count.** At default threads: clang 102 ms against qld's 213,
-  libclang-cpp 77 against 140, qld's own debug binary 136 against 217,
-  clang with debug info 660 against 836.
-- **mold is faster than qld at 8 threads on every benchmark** (clang 149
-  against 200 ms, clang-debug 598 against 921), and at default threads on
-  clang (184 against 213) and libclang-cpp (125 against 140). qld is ahead
-  of mold on clang-debug at default and 64 threads (836 against 1113, 896
-  against 1288), and level with it on qld's debug binary (217 against 214
-  at default, 236 against 238 at 64).
-- **qld is faster than lld** at default and 8 threads on every benchmark
-  except qld's debug binary at 8 threads (233 against 187 ms) and the small
-  link (10 against 9 ms), including `vmlinux` (147 against 180 ms), which
-  neither mold nor wild can link. On one thread, lld and mold are faster
-  than qld on every large link (clang: lld 429, mold 504, qld 644 ms).
+  thread count.** At default threads: clang 101 ms against qld's 197,
+  libclang-cpp 76 against 134, qld's own debug binary 129 against 202,
+  clang with debug info 670 against 837.
+- **mold is faster than qld at 8 threads on every benchmark** (clang 114
+  against 198 ms, clang-debug 543 against 946), and at default and 64
+  threads on clang (177 against 197, 205 against 232) and libclang-cpp
+  (125 against 134, 157 against 198). qld is faster than mold at default
+  and 64 threads on clang-debug (837 against 1121, 895 against 1250) and
+  qld's debug binary (202 against 208, 219 against 244).
+- **qld is faster than lld** at default, 8 and 64 threads on every
+  benchmark except qld's debug binary at 8 threads (217 against 199 ms) and
+  the small link (a tie), including `vmlinux` (148 against 153 ms at
+  default), which neither mold nor wild can link. On one thread, lld, mold
+  and wild are all faster than qld on every large link (clang: lld 418,
+  wild 460, mold 498, qld 627 ms).
 - **Peak RSS is below lld's on all six benchmarks** (clang-debug: qld
   3.8 GiB, lld 4.6, wild 4.4, mold 5.2).
 - **Output is byte-identical across 1, 2, 8 and 64 threads** on all six
   benchmarks, and identical to the output of the tree W24 started from.
 
 So the M5 exit criterion (wall time at or below mold's and wild's at 8 and
-64 cores) is **not met**. The W24 optimizations took 12–25% off qld's
-default-thread link times (clang 256 → 213 ms, clang-debug 1113 → 836 ms,
-libclang-cpp 160 → 140 ms, `vmlinux` 193 → 147 ms, qld's debug binary
-256 → 217 ms) and 14–24% off its single-threaded ones.
+64 cores) is **not met**. The W24 optimizations took 16–22% off qld's
+default-thread link times (clang 253 → 197 ms, clang-debug 1080 → 837 ms,
+libclang-cpp 160 → 134 ms, qld's debug binary 240 → 202 ms, `vmlinux`
+190 → 148 ms) and 16–25% off its single-threaded ones.
 
 ## Setup
 
@@ -129,115 +130,115 @@ Times are wall-clock; CPU is user+system.
 
 | linker | threads | wall min | wall median | CPU | peak RSS | output | load |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gnu | default | 2028 ms | 2100 ms | 2.10 s | 622 MiB | 131.2 MiB | 1–3 |
-| lld | default | 317 ms | 354 ms | 2.32 s | 739 MiB | 131.3 MiB | 1–2 |
-| lld | 1 | 429 ms | 434 ms | 0.43 s | 732 MiB | 131.3 MiB | 1–2 |
-| lld | 8 | 291 ms | 340 ms | 1.22 s | 740 MiB | 131.3 MiB | 1–2 |
-| lld | 64 | 371 ms | 377 ms | 5.07 s | 726 MiB | 131.3 MiB | 1–2 |
-| mold | default | 184 ms | 191 ms | 5.38 s | 842 MiB | 131.8 MiB | 1–2 |
-| mold | 1 | 504 ms | 505 ms | 0.50 s | 670 MiB | 131.8 MiB | 1–2 |
-| mold | 8 | 149 ms | 170 ms | 0.94 s | 722 MiB | 131.8 MiB | 1–2 |
-| mold | 64 | 210 ms | 222 ms | 11.40 s | 986 MiB | 131.8 MiB | 1–2 |
-| wild | default | 102 ms | 104 ms | 1.65 s | 497 MiB | 131.0 MiB | 1–2 |
-| wild | 1 | 465 ms | 467 ms | 0.48 s | 508 MiB | 131.0 MiB | 1–2 |
-| wild | 8 | 118 ms | 126 ms | 0.55 s | 506 MiB | 131.0 MiB | 1–2 |
-| wild | 64 | 100 ms | 103 ms | 1.64 s | 501 MiB | 131.0 MiB | 1–2 |
-| qld before | default | 256 ms | 265 ms | 1.51 s | 618 MiB | 131.3 MiB | 1–2 |
-| qld before | 1 | 755 ms | 759 ms | 0.76 s | 571 MiB | 131.3 MiB | 2–3 |
-| qld before | 8 | 264 ms | 269 ms | 1.04 s | 600 MiB | 131.3 MiB | 1–3 |
-| qld before | 64 | 299 ms | 304 ms | 4.66 s | 699 MiB | 131.3 MiB | 1–3 |
-| qld after | default | 213 ms | 217 ms | 1.56 s | 625 MiB | 131.3 MiB | 1–3 |
-| qld after | 1 | 644 ms | 650 ms | 0.65 s | 584 MiB | 131.3 MiB | 1–3 |
-| qld after | 8 | 200 ms | 211 ms | 0.93 s | 602 MiB | 131.3 MiB | 1–3 |
-| qld after | 64 | 247 ms | 254 ms | 4.78 s | 712 MiB | 131.3 MiB | 1–3 |
+| gnu | default | 2046 ms | 2065 ms | 2.06 s | 622 MiB | 131.2 MiB | 2–4 |
+| lld | default | 328 ms | 339 ms | 2.07 s | 739 MiB | 131.3 MiB | 2–4 |
+| lld | 1 | 418 ms | 429 ms | 0.43 s | 732 MiB | 131.3 MiB | 2–5 |
+| lld | 8 | 263 ms | 305 ms | 1.00 s | 740 MiB | 131.3 MiB | 2–5 |
+| lld | 64 | 370 ms | 376 ms | 5.08 s | 724 MiB | 131.3 MiB | 2–5 |
+| mold | default | 177 ms | 185 ms | 5.77 s | 854 MiB | 131.8 MiB | 2–5 |
+| mold | 1 | 498 ms | 506 ms | 0.50 s | 671 MiB | 131.8 MiB | 2–5 |
+| mold | 8 | 114 ms | 161 ms | 1.23 s | 725 MiB | 131.8 MiB | 2–5 |
+| mold | 64 | 205 ms | 219 ms | 12.04 s | 992 MiB | 131.8 MiB | 2–5 |
+| wild | default | 101 ms | 104 ms | 1.62 s | 498 MiB | 131.0 MiB | 2–5 |
+| wild | 1 | 460 ms | 463 ms | 0.48 s | 506 MiB | 131.0 MiB | 2–5 |
+| wild | 8 | 117 ms | 119 ms | 0.58 s | 508 MiB | 131.0 MiB | 2–5 |
+| wild | 64 | 100 ms | 102 ms | 1.75 s | 496 MiB | 131.0 MiB | 2–5 |
+| qld before | default | 253 ms | 254 ms | 1.55 s | 620 MiB | 131.3 MiB | 2–5 |
+| qld before | 1 | 744 ms | 758 ms | 0.76 s | 572 MiB | 131.3 MiB | 2–5 |
+| qld before | 8 | 248 ms | 259 ms | 1.02 s | 601 MiB | 131.3 MiB | 2–5 |
+| qld before | 64 | 282 ms | 289 ms | 4.52 s | 702 MiB | 131.3 MiB | 2–5 |
+| qld after | default | 197 ms | 199 ms | 1.58 s | 625 MiB | 131.3 MiB | 2–5 |
+| qld after | 1 | 627 ms | 631 ms | 0.63 s | 588 MiB | 131.3 MiB | 2–5 |
+| qld after | 8 | 198 ms | 202 ms | 0.91 s | 611 MiB | 131.3 MiB | 2–5 |
+| qld after | 64 | 232 ms | 240 ms | 5.47 s | 715 MiB | 131.3 MiB | 2–5 |
 
 ### libclang-cpp
 
 | linker | threads | wall min | wall median | CPU | peak RSS | output | load |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gnu | default | 1366 ms | 1387 ms | 1.38 s | 361 MiB | 77.5 MiB | 2–3 |
-| lld | default | 223 ms | 232 ms | 1.34 s | 398 MiB | 77.4 MiB | 2–3 |
-| lld | 1 | 290 ms | 302 ms | 0.30 s | 400 MiB | 77.4 MiB | 2–3 |
-| lld | 8 | 188 ms | 231 ms | 0.80 s | 406 MiB | 77.4 MiB | 2–3 |
-| lld | 64 | 242 ms | 247 ms | 2.49 s | 387 MiB | 77.4 MiB | 2–3 |
-| mold | default | 125 ms | 129 ms | 3.65 s | 573 MiB | 78.0 MiB | 2–3 |
-| mold | 1 | 324 ms | 326 ms | 0.32 s | 361 MiB | 78.0 MiB | 2–5 |
-| mold | 8 | 102 ms | 115 ms | 0.57 s | 412 MiB | 78.0 MiB | 2–5 |
-| mold | 64 | 161 ms | 165 ms | 8.39 s | 746 MiB | 78.0 MiB | 2–5 |
-| wild | default | 77 ms | 78 ms | 1.36 s | 291 MiB | 77.3 MiB | 2–5 |
-| wild | 1 | 286 ms | 289 ms | 0.30 s | 307 MiB | 77.3 MiB | 2–5 |
-| wild | 8 | 73 ms | 78 ms | 0.37 s | 308 MiB | 77.3 MiB | 2–5 |
-| wild | 64 | 76 ms | 102 ms | 1.33 s | 292 MiB | 77.3 MiB | 2–5 |
-| qld before | default | 160 ms | 167 ms | 1.09 s | 341 MiB | 77.5 MiB | 2–5 |
-| qld before | 1 | 494 ms | 498 ms | 0.50 s | 304 MiB | 77.5 MiB | 2–5 |
-| qld before | 8 | 163 ms | 170 ms | 0.69 s | 322 MiB | 77.5 MiB | 2–5 |
-| qld before | 64 | 219 ms | 228 ms | 3.03 s | 384 MiB | 77.5 MiB | 2–5 |
-| qld after | default | 140 ms | 146 ms | 1.01 s | 348 MiB | 77.5 MiB | 2–5 |
-| qld after | 1 | 425 ms | 429 ms | 0.43 s | 305 MiB | 77.5 MiB | 2–5 |
-| qld after | 8 | 136 ms | 142 ms | 0.63 s | 330 MiB | 77.5 MiB | 2–5 |
-| qld after | 64 | 207 ms | 223 ms | 3.24 s | 383 MiB | 77.5 MiB | 2–5 |
+| gnu | default | 1354 ms | 1377 ms | 1.37 s | 361 MiB | 77.5 MiB | 7–10 |
+| lld | default | 221 ms | 239 ms | 1.42 s | 401 MiB | 77.4 MiB | 6–10 |
+| lld | 1 | 293 ms | 307 ms | 0.31 s | 399 MiB | 77.4 MiB | 6–10 |
+| lld | 8 | 197 ms | 236 ms | 0.83 s | 402 MiB | 77.4 MiB | 6–10 |
+| lld | 64 | 239 ms | 242 ms | 2.26 s | 386 MiB | 77.4 MiB | 6–10 |
+| mold | default | 125 ms | 132 ms | 3.48 s | 574 MiB | 78.0 MiB | 6–10 |
+| mold | 1 | 321 ms | 324 ms | 0.33 s | 361 MiB | 78.0 MiB | 6–10 |
+| mold | 8 | 91 ms | 106 ms | 0.56 s | 414 MiB | 78.0 MiB | 6–10 |
+| mold | 64 | 157 ms | 164 ms | 8.25 s | 728 MiB | 78.0 MiB | 6–10 |
+| wild | default | 76 ms | 77 ms | 1.45 s | 292 MiB | 77.3 MiB | 6–10 |
+| wild | 1 | 289 ms | 290 ms | 0.30 s | 307 MiB | 77.3 MiB | 6–9 |
+| wild | 8 | 78 ms | 80 ms | 0.39 s | 308 MiB | 77.3 MiB | 6–9 |
+| wild | 64 | 77 ms | 103 ms | 1.33 s | 295 MiB | 77.3 MiB | 6–9 |
+| qld before | default | 160 ms | 166 ms | 1.05 s | 347 MiB | 77.5 MiB | 6–9 |
+| qld before | 1 | 501 ms | 504 ms | 0.50 s | 305 MiB | 77.5 MiB | 6–9 |
+| qld before | 8 | 160 ms | 179 ms | 0.72 s | 331 MiB | 77.5 MiB | 6–9 |
+| qld before | 64 | 228 ms | 241 ms | 3.06 s | 389 MiB | 77.5 MiB | 7–9 |
+| qld after | default | 134 ms | 137 ms | 1.00 s | 348 MiB | 77.5 MiB | 7–9 |
+| qld after | 1 | 422 ms | 428 ms | 0.43 s | 307 MiB | 77.5 MiB | 7–9 |
+| qld after | 8 | 132 ms | 147 ms | 0.68 s | 333 MiB | 77.5 MiB | 7–9 |
+| qld after | 64 | 198 ms | 207 ms | 3.21 s | 389 MiB | 77.5 MiB | 7–9 |
 
 ### small-count
 
 | linker | threads | wall min | wall median | CPU | peak RSS | output | load |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gnu | default | 27 ms | 30 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–6 |
-| lld | default | 9 ms | 10 ms | 0.02 s | 36 MiB | 0.0 MiB | 6–6 |
-| lld | 1 | 9 ms | 10 ms | 0.01 s | 39 MiB | 0.0 MiB | 6–6 |
-| lld | 8 | 8 ms | 9 ms | 0.01 s | 37 MiB | 0.0 MiB | 6–6 |
-| lld | 64 | 10 ms | 10 ms | 0.03 s | 38 MiB | 0.0 MiB | 6–6 |
-| mold | default | 12 ms | 12 ms | 0.26 s | 105 MiB | 0.0 MiB | 6–6 |
-| mold | 1 | 10 ms | 11 ms | 0.01 s | 37 MiB | 0.0 MiB | 6–6 |
-| mold | 8 | 10 ms | 11 ms | 0.05 s | 52 MiB | 0.0 MiB | 6–6 |
-| mold | 64 | 15 ms | 15 ms | 0.43 s | 148 MiB | 0.0 MiB | 6–6 |
-| wild | default | 9 ms | 9 ms | 0.20 s | 21 MiB | 0.0 MiB | 6–6 |
-| wild | 1 | 5 ms | 5 ms | 0.01 s | 21 MiB | 0.0 MiB | 6–6 |
-| wild | 8 | 5 ms | 5 ms | 0.02 s | 21 MiB | 0.0 MiB | 6–6 |
-| wild | 64 | 8 ms | 9 ms | 0.20 s | 21 MiB | 0.0 MiB | 6–6 |
-| qld before | default | 10 ms | 10 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–6 |
-| qld before | 1 | 8 ms | 9 ms | 0.01 s | 23 MiB | 0.0 MiB | 6–6 |
-| qld before | 8 | 9 ms | 9 ms | 0.03 s | 22 MiB | 0.0 MiB | 6–6 |
-| qld before | 64 | 16 ms | 17 ms | 0.50 s | 21 MiB | 0.0 MiB | 6–6 |
-| qld after | default | 10 ms | 10 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–6 |
-| qld after | 1 | 8 ms | 9 ms | 0.01 s | 24 MiB | 0.0 MiB | 6–6 |
-| qld after | 8 | 8 ms | 9 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–6 |
-| qld after | 64 | 16 ms | 16 ms | 0.50 s | 21 MiB | 0.0 MiB | 6–6 |
+| gnu | default | 28 ms | 28 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–7 |
+| lld | default | 9 ms | 10 ms | 0.02 s | 37 MiB | 0.0 MiB | 6–7 |
+| lld | 1 | 9 ms | 9 ms | 0.01 s | 38 MiB | 0.0 MiB | 6–7 |
+| lld | 8 | 8 ms | 8 ms | 0.01 s | 37 MiB | 0.0 MiB | 6–7 |
+| lld | 64 | 9 ms | 10 ms | 0.03 s | 37 MiB | 0.0 MiB | 6–7 |
+| mold | default | 12 ms | 13 ms | 0.18 s | 104 MiB | 0.0 MiB | 6–7 |
+| mold | 1 | 10 ms | 11 ms | 0.01 s | 37 MiB | 0.0 MiB | 6–7 |
+| mold | 8 | 10 ms | 11 ms | 0.04 s | 52 MiB | 0.0 MiB | 6–7 |
+| mold | 64 | 15 ms | 17 ms | 0.45 s | 140 MiB | 0.0 MiB | 6–7 |
+| wild | default | 9 ms | 10 ms | 0.20 s | 21 MiB | 0.0 MiB | 6–7 |
+| wild | 1 | 5 ms | 5 ms | 0.00 s | 21 MiB | 0.0 MiB | 6–7 |
+| wild | 8 | 5 ms | 5 ms | 0.02 s | 21 MiB | 0.0 MiB | 6–7 |
+| wild | 64 | 9 ms | 9 ms | 0.19 s | 21 MiB | 0.0 MiB | 6–7 |
+| qld before | default | 9 ms | 10 ms | 0.03 s | 22 MiB | 0.0 MiB | 6–7 |
+| qld before | 1 | 8 ms | 8 ms | 0.01 s | 23 MiB | 0.0 MiB | 6–7 |
+| qld before | 8 | 8 ms | 9 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–7 |
+| qld before | 64 | 17 ms | 17 ms | 0.51 s | 21 MiB | 0.0 MiB | 6–7 |
+| qld after | default | 9 ms | 10 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–7 |
+| qld after | 1 | 8 ms | 9 ms | 0.01 s | 24 MiB | 0.0 MiB | 6–7 |
+| qld after | 8 | 9 ms | 10 ms | 0.03 s | 21 MiB | 0.0 MiB | 6–7 |
+| qld after | 64 | 16 ms | 17 ms | 0.51 s | 21 MiB | 0.0 MiB | 6–7 |
 
 ### rust-qld-debug
 
 | linker | threads | wall min | wall median | CPU | peak RSS | output | load |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gnu | default | 1390 ms | 1391 ms | 1.39 s | 468 MiB | 162.3 MiB | 4–6 |
-| lld | default | 240 ms | 257 ms | 2.32 s | 613 MiB | 170.6 MiB | 4–6 |
-| lld | 1 | 386 ms | 396 ms | 0.40 s | 616 MiB | 170.6 MiB | 4–6 |
-| lld | 8 | 187 ms | 208 ms | 0.91 s | 614 MiB | 170.6 MiB | 4–6 |
-| lld | 64 | 276 ms | 282 ms | 7.05 s | 617 MiB | 170.6 MiB | 4–6 |
-| mold | default | 214 ms | 217 ms | 5.83 s | 793 MiB | 189.7 MiB | 4–6 |
-| mold | 1 | 395 ms | 409 ms | 0.41 s | 622 MiB | 189.7 MiB | 5–7 |
-| mold | 8 | 125 ms | 183 ms | 1.30 s | 685 MiB | 189.7 MiB | 5–7 |
-| mold | 64 | 238 ms | 251 ms | 12.59 s | 917 MiB | 189.7 MiB | 5–7 |
-| wild | default | 136 ms | 139 ms | 1.94 s | 581 MiB | 169.6 MiB | 5–7 |
-| wild | 1 | 395 ms | 405 ms | 0.42 s | 596 MiB | 169.6 MiB | 5–7 |
-| wild | 8 | 135 ms | 137 ms | 0.54 s | 595 MiB | 169.6 MiB | 5–7 |
-| wild | 64 | 133 ms | 138 ms | 1.96 s | 583 MiB | 169.6 MiB | 5–7 |
-| qld before | default | 256 ms | 261 ms | 1.68 s | 584 MiB | 169.6 MiB | 5–7 |
-| qld before | 1 | 982 ms | 1026 ms | 1.02 s | 524 MiB | 169.6 MiB | 5–6 |
-| qld before | 8 | 273 ms | 282 ms | 1.36 s | 574 MiB | 169.6 MiB | 5–6 |
-| qld before | 64 | 261 ms | 266 ms | 4.21 s | 621 MiB | 169.6 MiB | 5–6 |
-| qld after | default | 217 ms | 221 ms | 1.44 s | 583 MiB | 169.6 MiB | 5–6 |
-| qld after | 1 | 838 ms | 851 ms | 0.85 s | 521 MiB | 169.6 MiB | 5–6 |
-| qld after | 8 | 233 ms | 238 ms | 1.12 s | 567 MiB | 169.6 MiB | 4–6 |
-| qld after | 64 | 236 ms | 239 ms | 3.69 s | 617 MiB | 169.6 MiB | 4–6 |
+| gnu | default | 1347 ms | 1381 ms | 1.38 s | 469 MiB | 162.3 MiB | 5–10 |
+| lld | default | 231 ms | 253 ms | 2.32 s | 616 MiB | 170.6 MiB | 5–10 |
+| lld | 1 | 386 ms | 393 ms | 0.39 s | 616 MiB | 170.6 MiB | 5–10 |
+| lld | 8 | 199 ms | 226 ms | 1.07 s | 614 MiB | 170.6 MiB | 5–10 |
+| lld | 64 | 267 ms | 282 ms | 7.04 s | 616 MiB | 170.6 MiB | 5–10 |
+| mold | default | 208 ms | 215 ms | 5.98 s | 792 MiB | 189.7 MiB | 5–10 |
+| mold | 1 | 395 ms | 410 ms | 0.39 s | 622 MiB | 189.7 MiB | 5–10 |
+| mold | 8 | 111 ms | 192 ms | 1.19 s | 688 MiB | 189.7 MiB | 5–10 |
+| mold | 64 | 244 ms | 255 ms | 12.77 s | 924 MiB | 189.7 MiB | 5–10 |
+| wild | default | 129 ms | 133 ms | 1.93 s | 587 MiB | 169.6 MiB | 5–10 |
+| wild | 1 | 391 ms | 397 ms | 0.41 s | 597 MiB | 169.6 MiB | 5–10 |
+| wild | 8 | 132 ms | 134 ms | 0.55 s | 593 MiB | 169.6 MiB | 5–9 |
+| wild | 64 | 126 ms | 132 ms | 1.96 s | 584 MiB | 169.6 MiB | 5–9 |
+| qld before | default | 240 ms | 252 ms | 1.68 s | 583 MiB | 169.6 MiB | 5–9 |
+| qld before | 1 | 1016 ms | 1027 ms | 1.03 s | 523 MiB | 169.6 MiB | 5–9 |
+| qld before | 8 | 262 ms | 284 ms | 1.28 s | 573 MiB | 169.6 MiB | 5–9 |
+| qld before | 64 | 261 ms | 264 ms | 4.01 s | 623 MiB | 169.6 MiB | 5–9 |
+| qld after | default | 202 ms | 204 ms | 1.44 s | 577 MiB | 169.6 MiB | 6–10 |
+| qld after | 1 | 810 ms | 811 ms | 0.81 s | 521 MiB | 169.6 MiB | 6–10 |
+| qld after | 8 | 217 ms | 221 ms | 1.06 s | 568 MiB | 169.6 MiB | 5–10 |
+| qld after | 64 | 219 ms | 222 ms | 3.66 s | 622 MiB | 169.6 MiB | 5–10 |
 
 ### vmlinux
 
 | linker | threads | wall min | wall median | CPU | peak RSS | output | load |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gnu | default | 613 ms | 631 ms | 0.63 s | 197 MiB | 96.9 MiB | 4–5 |
-| lld | default | 180 ms | 205 ms | 0.76 s | 326 MiB | 98.6 MiB | 4–5 |
-| lld | 1 | 230 ms | 232 ms | 0.23 s | 331 MiB | 98.6 MiB | 4–5 |
-| lld | 8 | 176 ms | 194 ms | 0.54 s | 328 MiB | 98.6 MiB | 4–5 |
-| lld | 64 | 191 ms | 200 ms | 1.36 s | 321 MiB | 98.6 MiB | 4–5 |
+| gnu | default | 602 ms | 617 ms | 0.62 s | 197 MiB | 96.9 MiB | 5–7 |
+| lld | default | 153 ms | 200 ms | 0.71 s | 325 MiB | 98.6 MiB | 5–7 |
+| lld | 1 | 230 ms | 239 ms | 0.24 s | 331 MiB | 98.6 MiB | 5–7 |
+| lld | 8 | 176 ms | 186 ms | 0.48 s | 328 MiB | 98.6 MiB | 5–7 |
+| lld | 64 | 191 ms | 198 ms | 1.33 s | 323 MiB | 98.6 MiB | 5–7 |
 | mold | default | fails: link failed:                                               ^ unknown l | | | | | |
 | mold | 1 | fails: link failed:                                               ^ unknown l | | | | | |
 | mold | 8 | fails: link failed:                                               ^ unknown l | | | | | |
@@ -246,40 +247,40 @@ Times are wall-clock; CPU is user+system.
 | wild | 1 | fails: link failed: wild: error: unrecognized option(s): --emit-relocs | | | | | |
 | wild | 8 | fails: link failed: wild: error: unrecognized option(s): --emit-relocs | | | | | |
 | wild | 64 | fails: link failed: wild: error: unrecognized option(s): --emit-relocs | | | | | |
-| qld before | default | 193 ms | 202 ms | 1.01 s | 220 MiB | 98.6 MiB | 4–5 |
-| qld before | 1 | 586 ms | 587 ms | 0.59 s | 145 MiB | 98.6 MiB | 4–5 |
-| qld before | 8 | 197 ms | 204 ms | 0.74 s | 207 MiB | 98.6 MiB | 4–5 |
-| qld before | 64 | 206 ms | 214 ms | 2.30 s | 218 MiB | 98.6 MiB | 4–5 |
-| qld after | default | 147 ms | 148 ms | 0.72 s | 216 MiB | 98.6 MiB | 4–5 |
-| qld after | 1 | 440 ms | 446 ms | 0.44 s | 147 MiB | 98.6 MiB | 4–5 |
-| qld after | 8 | 150 ms | 152 ms | 0.56 s | 206 MiB | 98.6 MiB | 4–5 |
-| qld after | 64 | 163 ms | 165 ms | 1.48 s | 223 MiB | 98.6 MiB | 3–5 |
+| qld before | default | 190 ms | 199 ms | 1.03 s | 217 MiB | 98.6 MiB | 5–7 |
+| qld before | 1 | 586 ms | 588 ms | 0.59 s | 145 MiB | 98.6 MiB | 5–7 |
+| qld before | 8 | 201 ms | 204 ms | 0.76 s | 207 MiB | 98.6 MiB | 5–7 |
+| qld before | 64 | 210 ms | 212 ms | 2.26 s | 219 MiB | 98.6 MiB | 5–7 |
+| qld after | default | 148 ms | 149 ms | 0.70 s | 220 MiB | 98.6 MiB | 5–7 |
+| qld after | 1 | 440 ms | 444 ms | 0.44 s | 146 MiB | 98.6 MiB | 5–7 |
+| qld after | 8 | 152 ms | 157 ms | 0.57 s | 207 MiB | 98.6 MiB | 5–7 |
+| qld after | 64 | 159 ms | 161 ms | 1.49 s | 221 MiB | 98.6 MiB | 5–7 |
 
 ### clang-debug
 
 | linker | threads | wall min | wall median | CPU | peak RSS | output | load |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| gnu | default | 5953 ms | 6077 ms | 6.07 s | 1505 MiB | 1212.1 MiB | 3–19 |
-| lld | default | 1320 ms | 1331 ms | 15.77 s | 4621 MiB | 1213.7 MiB | 3–17 |
-| lld | 1 | 2658 ms | 2799 ms | 2.79 s | 4611 MiB | 1213.7 MiB | 5–9 |
-| lld | 8 | 1061 ms | 1150 ms | 6.52 s | 4619 MiB | 1213.7 MiB | 4–16 |
-| lld | 64 | 1617 ms | 1662 ms | 75.65 s | 4650 MiB | 1213.7 MiB | 4–16 |
-| mold | default | 1113 ms | 1172 ms | 35.43 s | 5165 MiB | 1214.2 MiB | 9–17 |
-| mold | 1 | 2143 ms | 2163 ms | 2.21 s | 4688 MiB | 1214.2 MiB | 5–8 |
-| mold | 8 | 598 ms | 620 ms | 4.40 s | 4792 MiB | 1214.2 MiB | 9–17 |
-| mold | 64 | 1288 ms | 1336 ms | 73.14 s | 5592 MiB | 1214.2 MiB | 9–16 |
-| wild | default | 660 ms | 677 ms | 11.22 s | 4398 MiB | 1213.4 MiB | 9–18 |
-| wild | 1 | 2499 ms | 2574 ms | 2.89 s | 4366 MiB | 1213.4 MiB | 5–7 |
-| wild | 8 | 817 ms | 823 ms | 3.77 s | 4385 MiB | 1213.4 MiB | 8–18 |
-| wild | 64 | 668 ms | 679 ms | 10.49 s | 4411 MiB | 1213.4 MiB | 8–18 |
-| qld before | default | 1113 ms | 1153 ms | 11.16 s | 3659 MiB | 1213.7 MiB | 8–17 |
-| qld before | 1 | 4427 ms | 4570 ms | 4.56 s | 3328 MiB | 1213.7 MiB | 4–7 |
-| qld before | 8 | 1206 ms | 1290 ms | 7.33 s | 3455 MiB | 1213.7 MiB | 8–17 |
-| qld before | 64 | 1151 ms | 1188 ms | 31.00 s | 3768 MiB | 1213.7 MiB | 8–17 |
-| qld after | default | 836 ms | 867 ms | 9.27 s | 3756 MiB | 1213.7 MiB | 11–20 |
-| qld after | 1 | 3829 ms | 3915 ms | 3.91 s | 3325 MiB | 1213.7 MiB | 4–7 |
-| qld after | 8 | 921 ms | 991 ms | 6.07 s | 3454 MiB | 1213.7 MiB | 11–20 |
-| qld after | 64 | 896 ms | 927 ms | 28.82 s | 3895 MiB | 1213.7 MiB | 11–20 |
+| gnu | default | 5981 ms | 6225 ms | 6.22 s | 1505 MiB | 1212.1 MiB | 5–14 |
+| lld | default | 1325 ms | 1366 ms | 16.32 s | 4616 MiB | 1213.7 MiB | 4–13 |
+| lld | 1 | 2484 ms | 2628 ms | 2.62 s | 4612 MiB | 1213.7 MiB | 5–8 |
+| lld | 8 | 1034 ms | 1064 ms | 6.02 s | 4612 MiB | 1213.7 MiB | 5–13 |
+| lld | 64 | 1668 ms | 1692 ms | 76.53 s | 4653 MiB | 1213.7 MiB | 5–13 |
+| mold | default | 1121 ms | 1161 ms | 33.81 s | 5180 MiB | 1214.2 MiB | 5–13 |
+| mold | 1 | 2080 ms | 2170 ms | 2.17 s | 4687 MiB | 1214.2 MiB | 5–7 |
+| mold | 8 | 543 ms | 578 ms | 3.80 s | 4816 MiB | 1214.2 MiB | 7–13 |
+| mold | 64 | 1250 ms | 1264 ms | 71.31 s | 5563 MiB | 1214.2 MiB | 7–13 |
+| wild | default | 670 ms | 672 ms | 10.78 s | 4398 MiB | 1213.4 MiB | 7–17 |
+| wild | 1 | 2526 ms | 2644 ms | 2.75 s | 4365 MiB | 1213.4 MiB | 4–7 |
+| wild | 8 | 774 ms | 836 ms | 3.51 s | 4378 MiB | 1213.4 MiB | 7–17 |
+| wild | 64 | 664 ms | 669 ms | 10.87 s | 4403 MiB | 1213.4 MiB | 7–17 |
+| qld before | default | 1080 ms | 1113 ms | 10.69 s | 3664 MiB | 1213.7 MiB | 7–16 |
+| qld before | 1 | 4417 ms | 4536 ms | 4.53 s | 3328 MiB | 1213.7 MiB | 4–7 |
+| qld before | 8 | 1212 ms | 1294 ms | 7.17 s | 3448 MiB | 1213.7 MiB | 7–16 |
+| qld before | 64 | 1144 ms | 1198 ms | 34.45 s | 3768 MiB | 1213.7 MiB | 7–15 |
+| qld after | default | 837 ms | 854 ms | 9.08 s | 3791 MiB | 1213.7 MiB | 7–15 |
+| qld after | 1 | 3532 ms | 3685 ms | 3.68 s | 3336 MiB | 1213.7 MiB | 4–6 |
+| qld after | 8 | 946 ms | 964 ms | 5.97 s | 3451 MiB | 1213.7 MiB | 7–15 |
+| qld after | 64 | 895 ms | 910 ms | 31.56 s | 3896 MiB | 1213.7 MiB | 7–14 |
 
 ## Determinism
 
@@ -303,66 +304,87 @@ same way before it was committed.
 ## Optimizations
 
 Each is one commit, with its measurements in the commit message (A/B runs
-of the previous and the new binary, interleaved).
+of the previous and the new binary, interleaved; stage laps from
+`QLD_TIMING=1`).
 
 | Commit | Change | Effect (min wall or stage lap) |
 | --- | --- | --- |
-| f1310bc | Lock-free merge-section deduplication (bucket pieces by shard, one task per shard); parallel offset assignment for groups without tail merging | clang-debug merge 425 → 195 ms; link 1212 → 946 ms |
-| d479fa1 | Relocation targets: section index without building an error `Result` | clang one thread 753 → 686 ms |
+| f1310bc | Lock-free merge-section deduplication (pieces bucketed by shard, one task per shard); parallel offset assignment for groups without tail merging | clang-debug merge 425 → 195 ms; link 1212 → 946 ms |
+| d479fa1 | Relocation targets: section index without building an error `Result` | clang, one thread: 753 → 686 ms |
 | 70743b2 | Archive symbol indexes read in parallel after the input walk | clang inputs 27 → 14 ms |
-| 6e963fa | Layout: members found and sized in parallel, bucketed ordering, early exit of the entry size scan | clang layout 20.5 → 9.4 ms |
+| 6e963fa | Layout: members found and sized in parallel, bucketed ordering, early exit of the entry-size scan | clang layout 20.5 → 9.4 ms |
 | 7dadc4e | `.dynstr` names added in bulk (parallel hash, dedup and copy); parallel GNU hash ordering and output emptiness | clang dynamic 23 → 16 ms |
 | 25d55ca | Output section flags folded per file in parallel | clang placement 17.7 → 11.4 ms |
-| 881a1f3 | Default thread count from uncompressed input size | W23's synthetic 320 MiB `--build-id` link 905 → 169 ms |
-| 99c944a | Faster portable SHA-1 (one loop per round function) | `vmlinux` one thread write 381 → 324 ms |
-| 31f03fa | Relocation lookups: `Target` always inlined (no store-forwarding stall), section kinds in a dense vector | clang one thread 677 → 624 ms |
-| 79778ea | Per-thread hint for the last merge piece found | clang-debug one thread 4322 → 3795 ms |
+| 881a1f3 | Default thread count from the uncompressed input size | W23's synthetic 320 MiB `--build-id` link 905 → 169 ms |
+| 99c944a | Faster portable SHA-1 (one loop per round function) | `vmlinux`, one thread: write 381 → 324 ms |
+| 31f03fa | Relocation lookups: `Target` always inlined (no store-forwarding stall), section kinds in a dense vector | clang, one thread: 677 → 624 ms |
+| 79778ea | Per-thread hint for the last merge piece found | clang-debug, one thread: 4322 → 3795 ms |
+| 59dd42a | Merge string ends found a word at a time | clang-debug resolution 121 → 103 ms |
+| 5a9ea23 | Symbol interning's linear steps parallel from 2^17 names | clang resolution 53 → 47 ms |
+| 37ae6aa | `--gc-sections` marks without building the section graph (unless `--why-live`) | libclang-cpp gc 12.2 → 8.5 ms |
+| 8b1de35 | COMDAT signatures hashed once, while parsing | clang, one thread: resolution 171 → 165 ms |
+| befd466 | Live merge sections found from the dense section vectors | clang merge 6.6 → 3.9 ms |
+| b50f406 | `.strtab` written in parallel from the plan's offsets | clang write, median 58 → 55 ms |
 
-Tried and not kept (no gain within noise): a lock-free symbol interning
-pass 1 (faster at 16 threads on clang's first round, slower on one
-thread), numbering new symbols by job order instead of sorting, building
-the write chunk list in parallel, a single writer thread fed by the
-rendering workers, reusing region buffers per thread, 1,024 merge shards
-instead of 256, and the mapped output backing at one thread.
+Tried and not kept (no gain beyond noise, or slower somewhere): a lock-free
+pass 1 for symbol interning (faster at 16 threads on clang's first round,
+slower on one thread), numbering new symbols by job order instead of
+sorting, building the write chunk list in parallel, a single writer
+thread fed by the rendering workers, reusing region buffers per thread,
+1,024 merge shards instead of 256, carrying piece hashes in the merge
+buckets, a further SHA-1 variant, and the mapped output backing at one
+thread.
 
 ## Where qld's time goes
 
-Stage laps (`QLD_TIMING=1`, approximate: single runs at low load) at
-default threads, after the optimizations:
+Stage laps (`QLD_TIMING=1`, two runs at load 3) at default threads, after
+the optimizations:
 
 | stage | clang | clang-debug |
 | --- | --- | --- |
-| inputs | 14 ms | 17 ms |
-| resolution | 52 ms | 120 ms |
-| placement | 12 ms | 14 ms |
-| scan | 8 ms | 10 ms |
-| merge | 7 ms | 195 ms |
-| dynamic | 15 ms | 11 ms |
-| layout | 10 ms | 10 ms |
-| write | 55 ms | 370 ms |
-| after the write (freeing, unmapping inputs, exit) | 25–30 ms | 120–130 ms |
+| inputs | 13 ms | 18 ms |
+| resolution | 49–51 ms | 98 ms |
+| placement | 12 ms | 13 ms |
+| scan | 8–10 ms | 9 ms |
+| merge | 4–5 ms | 186–192 ms |
+| dynamic | 15 ms | 12 ms |
+| layout | 11–13 ms | 9 ms |
+| write | 56–57 ms | 414–423 ms |
+| after the write: freeing, unmapping the inputs, exit | 29–34 ms | 150–157 ms |
+
+Threads doing work over time (perf samples, 5 ms buckets) show qld's
+default 16 threads mostly busy from input loading to the relocation scan;
+the gaps are the write (below), process start and exit, and short serial
+steps between stages. Beyond 12–16 threads little changes: clang 204 ms
+at 12 threads, 204 at 16 and 217 at 32; clang-debug 861, 829 and 818.
 
 - **Process teardown**: unmapping the inputs (2.5 GiB of mapped pages for
   clang-debug) takes about as long whether qld unmaps them or the kernel
-  does at exit. mold and wild avoid it by forking: the parent exits as soon
-  as the output is complete. qld could do the same by running the link in a
-  child process started from `main` (without `unsafe`: `std::process` to
-  start it, a Unix socket for the child to report that the output is
-  complete and with which status), which is a change to the frozen
-  `src/main.rs`; the gain is about the last row above.
-- **Resolution** (clang: 52 ms against wild's ~15 ms): interning 298,000
-  archive index names in the first round (20 ms: hash probes, then sorting
-  new names by first occurrence), loading and COMDAT claims in later rounds.
-  Deterministic dense symbol IDs by first occurrence are the costly part.
+  does at exit (measured both ways). mold and wild avoid the wait by
+  forking: the parent exits as soon as the output is complete. qld could do
+  the same by running the link in a child process started from `main`
+  (without `unsafe`: `std::process` to start it, a Unix socket for the
+  child to report that the output is complete and with which status),
+  which is a change to the frozen `src/main.rs`; the gain is about the last
+  row above.
 - **Write**: rendering is parallel, but buffered writes to one file are
-  serialized by the kernel; on clang-debug the 1.2 GiB copy into the page
-  cache is most of the 370 ms (wild spends 485 ms in its single flush).
+  serialized by the kernel: a test program writing 1 GiB in 1 MiB pieces
+  to this btrfs got 3.8 GiB/s from one thread and 3.6 GiB/s from 16, and a
+  mapped file was slower (2.1–2.7 GiB/s). The 1.2 GiB copy into the page
+  cache is most of clang-debug's write (wild spends 485 ms in its single
+  flush).
+- **Resolution** (clang: 49 ms against about 15 ms for wild's loading and
+  resolution): interning 298,000 archive index names in the first round
+  (hash probes under shard locks, then numbering new names by first
+  occurrence), loading and COMDAT claims in later rounds. Deterministic,
+  dense symbol IDs by first occurrence are the costly part.
 - **Merge** (clang-debug): 18.1 million `.debug_str` pieces; the shard
   tasks' hash-table work is 132 ms at 16 threads, dominated by cache misses
-  on piece bytes and tables.
+  on piece bytes and tables (wild's string merging takes 181 ms).
 - **64 threads**: qld's CPU time triples from 16 to 64 threads for the same
-  work (idle rayon workers spinning between parallel stages, and
-  page-fault and allocator contention: 5 s of system time on clang-debug at
+  work: at 64, a third of its samples are rayon workers looking for work
+  (`Stealer::steal`, epoch advancing) between parallel steps, and page
+  fault and allocator contention grows (clang-debug: 5 s of system time at
   16 threads, 13 s at 64), so wall time gets worse beyond 16 threads on
   this machine; the default stays capped at 16.
 
