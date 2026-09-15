@@ -191,21 +191,38 @@ fn link_arch(
 ) -> Result<Vec<u8>> {
     // Archive members extracted during resolution may ask for more
     // libraries with LC_LINKER_OPTION; link again with them.
+    // Selector stubs (`_objc_msgSend$sel`) left undefined are generated in
+    // an extra object; link again with it.
     let mut options = std::borrow::Cow::Borrowed(options);
+    let mut selectors: Vec<Vec<u8>> = Vec::new();
     for _ in 0..8 {
-        match link_arch_once(&options, arch, diagnostics)? {
+        let generated: Vec<(std::path::PathBuf, std::sync::Arc<[u8]>)> = if selectors.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                std::path::PathBuf::from("<objc selector stubs>"),
+                std::sync::Arc::from(super::objc_stubs::object(arch, &selectors)),
+            )]
+        };
+        match link_arch_once(&options, arch, diagnostics, &generated)? {
             Attempt::Done(bytes) => return Ok(bytes),
             Attempt::MoreInputs(more) => options.to_mut().darwin.inputs.extend(more),
+            Attempt::Selectors(more) => {
+                selectors.extend(more);
+                selectors.sort();
+                selectors.dedup();
+            }
         }
     }
     Err(Error::Internal(
-        "LC_LINKER_OPTION requests did not settle".into(),
+        "LC_LINKER_OPTION requests and selector stubs did not settle".into(),
     ))
 }
 
 enum Attempt {
     Done(Vec<u8>),
     MoreInputs(Vec<crate::args::darwin::DarwinInput>),
+    Selectors(Vec<Vec<u8>>),
 }
 
 /// One link attempt for `arch`.
@@ -214,10 +231,11 @@ fn link_arch_once(
     options: &LinkOptions,
     arch: Arch,
     diagnostics: &dyn DiagnosticSink,
+    generated: &[(std::path::PathBuf, std::sync::Arc<[u8]>)],
 ) -> Result<Attempt> {
     let config = Config::new(options, arch, infer_platform(options, arch))?;
     let table = FileTable::new();
-    let collected = inputs::collect(options, &config, &table, diagnostics)?;
+    let collected = inputs::collect(options, &config, &table, diagnostics, generated)?;
     let internal = InternalNames::new(options, &config);
     let mut files = collected.files(&internal)?;
 
@@ -228,6 +246,16 @@ fn link_arch_once(
     });
     if !more.is_empty() {
         return Ok(Attempt::MoreInputs(more));
+    }
+    let stubs: Vec<Vec<u8>> = resolution
+        .undefined()
+        .iter()
+        .filter_map(|u| u.name.bytes().strip_prefix(super::objc_stubs::PREFIX))
+        .filter(|selector| !selector.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    if !stubs.is_empty() {
+        return Ok(Attempt::Selectors(stubs));
     }
     let duplicates = report_duplicates(
         resolution.duplicates(),

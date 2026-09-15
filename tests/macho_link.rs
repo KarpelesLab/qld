@@ -24,9 +24,9 @@ use qld::args::{ParseOutcome, parse_darwin};
 use qld::diag::{Collect, DiagnosticSink};
 use qld::macho::read::consts::{
     LC_CODE_SIGNATURE, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_LOAD_DYLIB, LC_MAIN,
-    LC_UUID, MH_EXECUTE,
+    LC_SYMTAB, LC_UUID, MH_EXECUTE,
 };
-use qld::macho::read::{MachOFile, Source};
+use qld::macho::read::{ChainedFixups, MachOFile, Source};
 use qld::macho::sha256::Sha256;
 
 // ---------------------------------------------------------------------------
@@ -55,14 +55,16 @@ fn skip(test: &str, why: &str) {
     eprintln!("skipping {test}: {why}");
 }
 
-/// `llvm-<name>`, or `<name>` when only that exists (Xcode ships the LLVM
-/// tools without the prefix: `objdump`, `nm`, `lipo`, `dwarfdump`).
+/// `llvm-<name>`, or on macOS `<name>` when only that exists (Xcode ships
+/// the LLVM tools without the prefix: `objdump`, `lipo`, `dwarfdump`).
+/// Elsewhere an unprefixed tool is GNU binutils, which cannot read Mach-O
+/// the same way, so it is never used.
 fn tool(name: &str) -> String {
     let prefixed = format!("llvm-{name}");
     if Command::new(&prefixed).arg("--version").output().is_ok() {
         return prefixed;
     }
-    if Command::new(name).arg("--version").output().is_ok() {
+    if cfg!(target_os = "macos") && Command::new(name).arg("--version").output().is_ok() {
         return name.to_owned();
     }
     prefixed
@@ -262,6 +264,98 @@ fn check_signature(data: &[u8]) {
     }
 }
 
+/// A `nlist_64` record of `LC_SYMTAB`.
+#[derive(Debug)]
+struct Nlist {
+    name: String,
+    n_type: u8,
+    n_value: u64,
+}
+
+impl Nlist {
+    /// Defined in a section (and not a stab).
+    fn is_defined(&self) -> bool {
+        self.n_type & 0xe0 == 0 && self.n_type & 0x0e == 0x0e
+    }
+
+    fn is_external(&self) -> bool {
+        self.n_type & 0xe0 == 0 && self.n_type & 0x01 != 0
+    }
+}
+
+/// The symbol table of a 64-bit little-endian image, read with qld's reader
+/// (not `nm`, whose output differs between LLVM, Xcode and GNU binutils).
+fn symbols(data: &[u8]) -> Vec<Nlist> {
+    let file = MachOFile::parse(data, Source::new(Path::new("out"))).unwrap();
+    let Some(command) = file.find_command(LC_SYMTAB).unwrap() else {
+        return Vec::new();
+    };
+    let symtab = command.symtab().unwrap();
+    let strtab = &data[symtab.stroff as usize..][..symtab.strsize as usize];
+    (0..symtab.nsyms as usize)
+        .map(|i| {
+            let at = symtab.symoff as usize + i * 16;
+            let strx = u32_le(data, at) as usize;
+            let name = strtab[strx..].split(|&b| b == 0).next().unwrap();
+            Nlist {
+                name: String::from_utf8_lossy(name).into_owned(),
+                n_type: data[at + 4],
+                n_value: u64::from_le_bytes(data[at + 8..at + 16].try_into().unwrap()),
+            }
+        })
+        .collect()
+}
+
+/// The address of the defined symbol `name`.
+fn symbol_address(data: &[u8], name: &str) -> Option<u64> {
+    symbols(data)
+        .into_iter()
+        .find(|s| s.is_defined() && s.name == name)
+        .map(|s| s.n_value)
+}
+
+/// An import of `LC_DYLD_CHAINED_FIXUPS`.
+#[derive(Debug)]
+struct Import {
+    name: String,
+    lib_ordinal: i32,
+    weak: bool,
+}
+
+/// The chained-fixup imports, read with qld's reader (Xcode's `objdump`
+/// prints neither the names nor the weak-lookup binds).
+fn chained_imports(data: &[u8]) -> Vec<Import> {
+    let source = Source::new(Path::new("out"));
+    let file = MachOFile::parse(data, source).unwrap();
+    let command = file
+        .find_command(LC_DYLD_CHAINED_FIXUPS)
+        .unwrap()
+        .expect("LC_DYLD_CHAINED_FIXUPS");
+    let blob = command.linkedit_data().unwrap();
+    let bytes = &data[blob.dataoff as usize..][..blob.datasize as usize];
+    let fixups =
+        ChainedFixups::parse(bytes, u64::from(blob.dataoff), file.endian(), source).unwrap();
+    fixups
+        .imports()
+        .map(|import| {
+            let import = import.unwrap();
+            Import {
+                name: String::from_utf8_lossy(import.name).into_owned(),
+                lib_ordinal: import.lib_ordinal,
+                weak: import.weak_import,
+            }
+        })
+        .collect()
+}
+
+/// The import named `name`, which must exist.
+fn import<'a>(imports: &'a [Import], name: &str) -> &'a Import {
+    imports
+        .iter()
+        .find(|i| i.name == name)
+        .unwrap_or_else(|| panic!("no import {name}: {imports:?}"))
+}
+
 fn objdump(args: &[&str], file: &Path) -> Option<String> {
     let output = Command::new(tool("objdump"))
         .args(args)
@@ -428,9 +522,10 @@ fn hello_executables() {
                 "{arch}: {disassembly}"
             );
         }
-        if let Some(fixups) = objdump(&["--macho", "--chained-fixups"], &output) {
-            assert!(fixups.contains("(_printf)"), "{arch}: {fixups}");
-        }
+        let imports = chained_imports(&bytes);
+        let printf = import(&imports, "_printf");
+        assert_eq!(printf.lib_ordinal, 1, "{arch}: {imports:?}");
+        assert!(!printf.weak, "{arch}: {imports:?}");
 
         // Same inputs through ld64.lld: the same sections, exports, imports
         // and dylibs.
@@ -589,13 +684,15 @@ fn dylib_and_client() {
                 "{arch}: hidden symbol exported"
             );
         }
-        if let Some(info) = objdump(&["--macho", "--dyld-info"], &lib) {
-            assert!(
-                info.lines()
-                    .any(|l| l.contains("weak") && l.contains("_greet_weak")),
-                "{arch}: weak definition not bound through weak lookup:\n{info}"
-            );
-        }
+        // References to an exported weak definition bind through weak
+        // lookup (BIND_SPECIAL_DYLIB_WEAK_LOOKUP), so a strong definition
+        // elsewhere can override it.
+        let imports = chained_imports(&bytes);
+        assert_eq!(
+            import(&imports, "_greet_weak").lib_ordinal,
+            -3,
+            "{arch}: weak definition not bound through weak lookup: {imports:?}"
+        );
 
         let mut args = base_args(arch);
         args.extend(strings(&[
@@ -609,14 +706,25 @@ fn dylib_and_client() {
             "-lSystem",
         ]));
         let exe = lib_dir.join("use_greet");
-        link_and_compare(&args, &exe);
-        if let Some(info) = objdump(&["--macho", "--dyld-info"], &exe) {
-            assert!(
-                info.contains("_missing_weak (weak import)"),
-                "{arch}:\n{info}"
-            );
-            assert!(info.contains("libgreet"), "{arch}:\n{info}");
-        }
+        let bytes = link_and_compare(&args, &exe);
+        let imports = chained_imports(&bytes);
+        assert!(
+            import(&imports, "_missing_weak").weak,
+            "{arch}: {imports:?}"
+        );
+        // libgreet is the first dylib on the command line.
+        assert_eq!(
+            import(&imports, "_greet").lib_ordinal,
+            1,
+            "{arch}: {imports:?}"
+        );
+        let file = MachOFile::parse(&bytes, Source::new(&exe)).unwrap();
+        let first = file
+            .load_commands()
+            .map(Result::unwrap)
+            .find(|c| c.cmd == LC_LOAD_DYLIB)
+            .unwrap();
+        assert_eq!(first.dylib().unwrap().name, b"@rpath/libgreet.dylib");
         if host_can_run(arch) {
             let stdout = run(&exe).unwrap();
             assert!(stdout.contains("hello, dylib"), "{stdout}");
@@ -689,20 +797,6 @@ fn cxx_exceptions() {
 }
 
 /// The address of symbol `name` in `file`, from `llvm-nm`.
-fn nm_address(file: &Path, name: &str) -> Option<u64> {
-    let output = Command::new(tool("nm")).arg(file).output().ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|l| {
-            let mut parts = l.split_whitespace();
-            let address = parts.next()?;
-            let _kind = parts.next()?;
-            (parts.next()? == name)
-                .then(|| u64::from_str_radix(address, 16).ok())
-                .flatten()
-        })
-}
-
 #[test]
 fn dwarf_unwind_information() {
     for arch in ["arm64", "x86_64"] {
@@ -723,15 +817,15 @@ fn dwarf_unwind_information() {
             "-lSystem",
         ]));
         let exe = scratch("dwarf").join(format!("dwarf-{arch}"));
-        link_and_compare(&args, &exe);
+        let bytes = link_and_compare(&args, &exe);
+        let function = symbol_address(&bytes, "_call_through").unwrap();
         // The FDE in __eh_frame covers call_through.
-        if let (Ok(frames), Some(function)) = (
-            Command::new(tool("dwarfdump"))
-                .arg("--eh-frame")
-                .arg(&exe)
-                .output(),
-            nm_address(&exe, "_call_through"),
-        ) {
+        if let Ok(frames) = Command::new(tool("dwarfdump"))
+            .arg("--eh-frame")
+            .arg(&exe)
+            .output()
+            && frames.status.success()
+        {
             let frames = String::from_utf8_lossy(&frames.stdout);
             let wanted = format!("pc={function:08x}...");
             assert!(
@@ -763,7 +857,7 @@ fn dead_stripping() {
             "-lSystem",
         ]));
         let exe = scratch("dead_strip").join(format!("dead_strip-{arch}"));
-        link_and_compare(&args, &exe);
+        let bytes = link_and_compare(&args, &exe);
         for (name, kept) in [
             ("_main", true),
             ("_used_data", true),
@@ -772,14 +866,12 @@ fn dead_stripping() {
             ("_unused_caller", false),
             ("_unused_data", false),
         ] {
-            if tool_works(&tool("nm"), &["--version"]) {
-                assert_eq!(
-                    nm_address(&exe, name).is_some(),
-                    kept,
-                    "{arch}: {name} should {}be kept",
-                    if kept { "" } else { "not " }
-                );
-            }
+            assert_eq!(
+                symbol_address(&bytes, name).is_some(),
+                kept,
+                "{arch}: {name} should {}be kept",
+                if kept { "" } else { "not " }
+            );
         }
         if host_can_run(arch) {
             assert_eq!(run(&exe).unwrap(), "stripped 42\n");
@@ -998,9 +1090,9 @@ fn range_extension_thunks() {
     // main's calls go through thunks (adrp, add, br x16) that reach their
     // targets.
     // (Decoded here: llvm-objdump is slow on 130 MiB of code.)
-    if let (Some(main_address), Some(far_address)) =
-        (nm_address(&exe, "_main"), nm_address(&exe, "_far_function"))
     {
+        let main_address = symbol_address(&bytes, "_main").unwrap();
+        let far_address = symbol_address(&bytes, "_far_function").unwrap();
         assert!(far_address - main_address > 128 << 20);
         // __TEXT starts at file offset 0.
         let text = 0x1_0000_0000u64;
@@ -1128,20 +1220,19 @@ fn bundles_and_export_lists() {
         assert!(!trie.contains("_greet_count"), "{trie}");
         assert!(!trie.contains("_greet_weak"), "{trie}");
     }
-    if let Some(symbols) = Command::new(tool("nm"))
-        .arg("-m")
-        .arg(&bundle)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    {
-        assert!(
-            symbols
-                .lines()
-                .any(|l| l.contains("_greet_count") && l.contains("non-external")),
-            "{symbols}"
-        );
-    }
+    // Symbols left out of the export list stay in the symbol table, but not
+    // as externals.
+    let table = symbols(&bytes);
+    let count = table
+        .iter()
+        .find(|s| s.is_defined() && s.name == "_greet_count")
+        .unwrap_or_else(|| panic!("_greet_count missing: {table:?}"));
+    assert!(!count.is_external(), "{count:?}");
+    let greet = table
+        .iter()
+        .find(|s| s.is_defined() && s.name == "_greet")
+        .unwrap_or_else(|| panic!("_greet missing: {table:?}"));
+    assert!(greet.is_external(), "{greet:?}");
 }
 
 #[test]
@@ -1170,6 +1261,78 @@ fn objective_c() {
             }
             if host_can_run(arch) {
                 assert_eq!(run(&exe).unwrap(), "objc 42\n");
+            }
+        }
+    }
+}
+
+/// `_objc_msgSend$<selector>` calls (Apple clang's selector stubs, which
+/// upstream clang does not emit, hence the assembly) get stubs, selector
+/// references and method names synthesized by the linker.
+#[test]
+fn objective_c_selector_stubs() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "objective_c_selector_stubs",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile(
+            "selector_stubs",
+            &format!("selector_stubs-{arch}.s"),
+            arch,
+            &[],
+        );
+        for dead_strip in [false, true] {
+            let mut args = base_args(arch);
+            args.extend(strings(&[object.to_str().unwrap(), "-lobjc", "-lSystem"]));
+            if dead_strip {
+                args.push("-dead_strip".to_owned());
+            }
+            let exe = scratch("selector_stubs").join(format!("stubs-{arch}-{dead_strip}"));
+            let bytes = link_and_compare(&args, &exe);
+            let file = MachOFile::parse(&bytes, Source::new(&exe)).unwrap();
+            let mut sections = BTreeSet::new();
+            for command in file.load_commands() {
+                if let Ok(segment) = command.unwrap().segment() {
+                    for section in segment.sections.iter() {
+                        sections.insert((
+                            String::from_utf8_lossy(section.segname).into_owned(),
+                            String::from_utf8_lossy(section.sectname).into_owned(),
+                            section.size,
+                        ));
+                    }
+                }
+            }
+            let stub_size = if arch == "arm64" { 32 } else { 13 };
+            for wanted in [
+                ("__TEXT", "__objc_stubs", 2 * stub_size),
+                ("__DATA", "__objc_selrefs", 16),
+                ("__TEXT", "__objc_methname", 27),
+            ] {
+                let wanted = (wanted.0.to_owned(), wanted.1.to_owned(), wanted.2);
+                assert!(
+                    sections.contains(&wanted),
+                    "{arch}: {wanted:?} in {sections:?}"
+                );
+            }
+            let table = symbols(&bytes);
+            for stub in ["_objc_msgSend$description", "_objc_msgSend$initWithCount:"] {
+                let symbol = table
+                    .iter()
+                    .find(|s| s.is_defined() && s.name == stub)
+                    .unwrap_or_else(|| panic!("{arch}: {stub} missing: {table:?}"));
+                assert!(!symbol.is_external(), "{arch}: {symbol:?}");
+            }
+            let imports = chained_imports(&bytes);
+            assert!(
+                imports.iter().any(|i| i.name == "_objc_msgSend"),
+                "{arch}: {imports:?}"
+            );
+            if host_can_run(arch) {
+                run(&exe).unwrap();
             }
         }
     }
@@ -1296,12 +1459,11 @@ fn order_file() {
         "-lSystem",
     ]));
     let exe = dir.join("ordered");
-    link_and_compare(&args, &exe);
-    if let (Some(caller), Some(main), Some(function)) = (
-        nm_address(&exe, "_unused_caller"),
-        nm_address(&exe, "_main"),
-        nm_address(&exe, "_unused_function"),
-    ) {
+    let bytes = link_and_compare(&args, &exe);
+    {
+        let caller = symbol_address(&bytes, "_unused_caller").unwrap();
+        let main = symbol_address(&bytes, "_main").unwrap();
+        let function = symbol_address(&bytes, "_unused_function").unwrap();
         assert!(
             caller < main && main < function,
             "{caller:#x} {main:#x} {function:#x}"
@@ -1353,9 +1515,9 @@ fn undefined_symbols_are_reported() {
     let (bytes, _) = link_bytes(&lookup).unwrap();
     let path = dir.join("lookup");
     std::fs::write(&path, &bytes).unwrap();
-    if let Some(fixups) = objdump(&["--macho", "--chained-fixups"], &path) {
-        assert!(fixups.contains("flat-namespace"), "{fixups}");
-    }
+    // BIND_SPECIAL_DYLIB_FLAT_LOOKUP.
+    let imports = chained_imports(&bytes);
+    assert_eq!(import(&imports, "_missing").lib_ordinal, -2, "{imports:?}");
 }
 
 /// Runs the link in `W25_ARGS` (whitespace-separated), for development.

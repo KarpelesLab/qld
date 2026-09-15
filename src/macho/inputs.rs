@@ -499,6 +499,7 @@ pub fn collect<'t>(
     config: &Config,
     table: &'t FileTable,
     diagnostics: &dyn DiagnosticSink,
+    generated: &[(PathBuf, Arc<[u8]>)],
 ) -> Result<Collected<'t>> {
     let search = SearchPaths::new(options);
     let mut specs: Vec<DarwinInput> = Vec::new();
@@ -539,6 +540,19 @@ pub fn collect<'t>(
     };
     let pending = resolve_specs(&search, &specs)?;
     walker.walk(&pending)?;
+    // Objects the linker generates (Objective-C selector stubs) follow the
+    // command line.
+    for (name, data) in generated {
+        let id = table.add_bytes(name.clone(), Arc::clone(data))?;
+        walker.add(
+            id,
+            &DarwinInput {
+                kind: DarwinInputKind::File(name.clone()),
+                mode: LoadMode::Normal,
+                force_load: false,
+            },
+        )?;
+    }
 
     // Libraries and frameworks requested by `LC_LINKER_OPTION` in the
     // objects, searched after everything on the command line. Missing ones
