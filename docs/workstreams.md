@@ -60,6 +60,7 @@ can work at the same time without colliding.
 | W19 | Linker-script layout and raw outputs (M3) | `src/elf/{rules,place,layout,write,defined,script_layout,rawout}*`, `tests/script_link*` | W3, W16 | merged (M3) |
 | W20 | AArch64 ELF (M4) | `src/elf/arch/**`, `src/arch/**`, thunk/relaxation hooks in `src/elf/{layout,write,scan,synth}.rs`, `tests/aarch64*` | W16 | merged |
 | W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | merged |
+| W23 | Write-based (`pwrite`) output backend | `src/output/**`, writer call sites in `src/elf/` and `src/coff/` | W5 | in progress |
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -473,7 +474,7 @@ that cross workstream boundaries. The integrator does these between merges.
 | W10 | Fill `Location::source` for undefined-symbol diagnostics with `debug::dwarf::LineLookup` | done (W11) |
 | W8 | `ifunc-static` fixture prints "same address: no" when built with clang, under GNU ld too: fixture/toolchain issue | open |
 | W7 | `elf_read::basic_object_matches_readelf` failed once under the full parallel test run, passed on reruns: possible flake | done: two tests raced on the shared `basic.o`; it is now built once |
-| W5 | Pre-allocate output with `fallocate`: filling a fresh 1 GiB mapped file costs ~900 ms of page-fault block allocation on btrfs. Needs a syscall crate (`rustix` is pure Rust) — dependency decision | open |
+| W5 | Pre-allocate output with `fallocate` | dropped: measured on btrfs, `posix_fallocate` changes a 1 GiB mapped write by 0–15%; the cost is page-fault contention, which grows with threads (400 ms at 1 thread, ~860 ms at 16), while `pwrite` stays at ~260–370 ms. No crate would be needed anyway (a hand-declared `posix_fallocate`, like the plugin host's `dlopen`). Replaced by W23 |
 
 ## Launching an agent
 
