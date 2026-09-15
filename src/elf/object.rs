@@ -84,6 +84,9 @@ impl InputSection<'_> {
 pub struct ComdatGroup<'a> {
     /// The group signature.
     pub signature: &'a [u8],
+    /// The signature as a claim key, hashed once while the object is
+    /// parsed (resolution looks each group up twice).
+    pub key: SymbolName<'a>,
     /// Member section indices.
     pub members: Vec<u32>,
 }
@@ -464,7 +467,11 @@ impl<'a> ObjectInput<'a> {
                 section.group = group_number;
                 members.push(member);
             }
-            groups.push(ComdatGroup { signature, members });
+            groups.push(ComdatGroup {
+                signature,
+                key: SymbolName::new(signature),
+                members,
+            });
         }
 
         // Split mergeable sections into pieces now, while the file is hot.

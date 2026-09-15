@@ -156,7 +156,7 @@ impl<'a> SymbolIndex<'a> {
         if rest.is_empty() {
             return Err(error());
         }
-        let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let len = crate::elf::read::strtab::find_nul(rest).unwrap_or(rest.len());
         let name = rest.get(..len).ok_or_else(error)?;
         let next = start.saturating_add(len).saturating_add(1);
         Ok((name, next))

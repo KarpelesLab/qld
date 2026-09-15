@@ -593,11 +593,18 @@ pub fn collect<'a>(
             crate::args::OutputKind::StaticExecutable | crate::args::OutputKind::StaticPie
         ),
         lto: LtoMode::for_options(options),
+        deferred: Vec::new(),
     };
     for (entry, id) in pending.iter().zip(loaded) {
-        let id = id?;
-        walker.add(id, entry.attrs, &entry.what, &entry.found_as)?;
+        // An archive index read later still reports its error before this
+        // input's.
+        let added = id.and_then(|id| walker.add(id, entry.attrs, &entry.what, &entry.found_as));
+        if let Err(error) = added {
+            walker.finish()?;
+            return Err(error);
+        }
     }
+    walker.finish()?;
     let target = walker.target.unwrap_or(Target::X86_64_LINUX);
     if !matches!(target.arch, Architecture::X86_64 | Architecture::Aarch64) {
         return Err(Error::Unimplemented(format!(
@@ -625,9 +632,55 @@ struct Walker<'a, 's> {
     static_output: bool,
     /// How new inputs treat IR.
     lto: LtoMode,
+    /// Archives whose symbol index is read by [`Walker::finish`].
+    deferred: Vec<DeferredIndex<'a>>,
+}
+
+/// An indexed archive whose symbol index is read after the walk, in
+/// parallel with the other archives' ([`Walker::finish`]).
+struct DeferredIndex<'a> {
+    file: &'a InputFile,
+    /// Index in `files` of the archive's first member.
+    first: usize,
+    /// Member header offset and index in `files`, for every member, sorted.
+    by_offset: Vec<(u64, usize)>,
 }
 
 impl<'a> Walker<'a, '_> {
+    /// Reads the symbol indexes of the archives added so far, in parallel:
+    /// each gives its members their lazy names (and, with a plugin, marks
+    /// the IR members the index does not describe). On failure, returns the
+    /// error of the first such archive in input order.
+    fn finish(&mut self) -> Result<()> {
+        let deferred = std::mem::take(&mut self.deferred);
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        let mut slices: Vec<&mut [ElfInput<'a>]> = Vec::with_capacity(deferred.len());
+        let mut rest: &mut [ElfInput<'a>] = &mut self.files;
+        let mut consumed = 0usize;
+        let layout = || Error::Internal("archive members out of order".into());
+        for archive in &deferred {
+            let skip = archive.first.checked_sub(consumed).ok_or_else(layout)?;
+            let count = archive.by_offset.len();
+            if skip.checked_add(count).is_none_or(|end| end > rest.len()) {
+                return Err(layout());
+            }
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(skip);
+            let (members, tail) = tail.split_at_mut(count);
+            slices.push(members);
+            rest = tail;
+            consumed = archive.first.saturating_add(count);
+        }
+        let lto = self.lto;
+        let results: Vec<Result<()>> = deferred
+            .par_iter()
+            .zip(slices)
+            .map(|(archive, members)| read_symbol_index(archive, members, lto))
+            .collect();
+        results.into_iter().collect()
+    }
+
     fn next_position(&mut self) -> Result<u32> {
         self.ordinal = self
             .ordinal
@@ -800,26 +853,14 @@ impl<'a> Walker<'a, '_> {
             return Ok(());
         }
         match archive.symbol_index() {
-            Some(index) => {
+            Some(_) => {
                 by_offset.sort_unstable();
-                for symbol in index.iter() {
-                    let symbol = symbol?;
-                    let found = by_offset
-                        .binary_search_by_key(&symbol.member_offset, |&(offset, _)| offset)
-                        .ok()
-                        .and_then(|at| by_offset.get(at))
-                        .and_then(|&(_, slot)| self.files.get_mut(slot));
-                    match found {
-                        Some(input) => input.lazy_names.push(SymbolName::new(symbol.name)),
-                        None => {
-                            return Err(Error::malformed(
-                                file.path(),
-                                symbol.member_offset,
-                                "archive symbol index (member offset)",
-                            ));
-                        }
-                    }
-                }
+                self.deferred.push(DeferredIndex {
+                    file,
+                    first,
+                    by_offset,
+                });
+                Ok(())
             }
             None => {
                 // No index: learn what each member defines by reading it.
@@ -844,38 +885,9 @@ impl<'a> Walker<'a, '_> {
                     }
                     Ok(())
                 })?;
-                return Ok(());
+                Ok(())
             }
         }
-        if self.lto == LtoMode::Claim {
-            // IR members the index does not describe (an archive built
-            // without the plugin lists at most GCC's marker symbol) are
-            // claimed before resolution to learn their symbols.
-            let members = self.files.get_mut(first..).unwrap_or_default();
-            members.par_iter_mut().for_each(|input| {
-                let Some(member_file) = input.file else {
-                    return;
-                };
-                let undescribed = input.lazy_names.iter().all(|name| {
-                    name.bytes() == super::object::GCC_LTO_SLIM_MARKER
-                        || name.bytes() == b"__gnu_lto_v1"
-                });
-                if !undescribed {
-                    return;
-                }
-                let ir = match member_file.format() {
-                    FileFormat::Elf(i) if i.is_relocatable() => {
-                        defined_names(member_file).is_ok_and(|(_, gcc_lto)| gcc_lto)
-                    }
-                    format => format.is_ir(),
-                };
-                if ir {
-                    input.needs_claim = true;
-                    input.lazy_names = Vec::new();
-                }
-            });
-        }
-        Ok(())
     }
 
     fn add_script(&mut self, file: &'a InputFile, attrs: InputAttrs, what: &str) -> Result<()> {
@@ -1074,6 +1086,7 @@ pub fn add_after_lto<'a>(
         depth: 0,
         static_output,
         lto: LtoMode::AfterLto,
+        deferred: Vec::new(),
     };
     let result = (|| -> Result<()> {
         for &id in objects {
@@ -1104,8 +1117,71 @@ pub fn add_after_lto<'a>(
         }
         Ok(())
     })();
+    // The archives added before a failure still report their errors first.
+    let result = walker.finish().and(result);
     *files = walker.files;
     result
+}
+
+/// Reads one deferred archive symbol index into its `members` (the
+/// archive's entries of `files`, in member order); see [`Walker::finish`].
+fn read_symbol_index<'a>(
+    archive: &DeferredIndex<'a>,
+    members: &mut [ElfInput<'a>],
+    lto: LtoMode,
+) -> Result<()> {
+    let file = archive.file;
+    let parsed = file.archive()?;
+    let Some(index) = parsed.symbol_index() else {
+        return Ok(());
+    };
+    let by_offset = &archive.by_offset;
+    for symbol in index.iter() {
+        let symbol = symbol?;
+        let found = by_offset
+            .binary_search_by_key(&symbol.member_offset, |&(offset, _)| offset)
+            .ok()
+            .and_then(|at| by_offset.get(at))
+            .and_then(|&(_, slot)| members.get_mut(slot.checked_sub(archive.first)?));
+        match found {
+            Some(input) => input.lazy_names.push(SymbolName::new(symbol.name)),
+            None => {
+                return Err(Error::malformed(
+                    file.path(),
+                    symbol.member_offset,
+                    "archive symbol index (member offset)",
+                ));
+            }
+        }
+    }
+    if lto == LtoMode::Claim {
+        // IR members the index does not describe (an archive built
+        // without the plugin lists at most GCC's marker symbol) are
+        // claimed before resolution to learn their symbols.
+        members.par_iter_mut().for_each(|input| {
+            let Some(member_file) = input.file else {
+                return;
+            };
+            let undescribed = input.lazy_names.iter().all(|name| {
+                name.bytes() == super::object::GCC_LTO_SLIM_MARKER
+                    || name.bytes() == b"__gnu_lto_v1"
+            });
+            if !undescribed {
+                return;
+            }
+            let ir = match member_file.format() {
+                FileFormat::Elf(i) if i.is_relocatable() => {
+                    defined_names(member_file).is_ok_and(|(_, gcc_lto)| gcc_lto)
+                }
+                format => format.is_ir(),
+            };
+            if ir {
+                input.needs_claim = true;
+                input.lazy_names = Vec::new();
+            }
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

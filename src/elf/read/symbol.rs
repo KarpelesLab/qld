@@ -349,6 +349,24 @@ impl<'a, F: ElfFormat> SymbolTable<'a, F> {
         })
     }
 
+    /// [`section`](Self::section) without the error: `None` if the symbol
+    /// uses `SHN_XINDEX` and the extended index table has no entry for it.
+    ///
+    /// For hot paths (relocation targets): building the error `Result` there
+    /// cost more than the lookup itself.
+    #[inline]
+    #[must_use]
+    pub fn section_of(&self, index: usize, raw: &RawSymbol) -> Option<SectionIndex> {
+        Some(match raw.st_shndx {
+            SHN_UNDEF => SectionIndex::Undefined,
+            SHN_ABS => SectionIndex::Absolute,
+            SHN_COMMON => SectionIndex::Common,
+            SHN_XINDEX => SectionIndex::Section(F::Endian::u32(*self.shndx.get(index)?)),
+            n if n >= SHN_LORESERVE => SectionIndex::Reserved(n),
+            n => SectionIndex::Section(u32::from(n)),
+        })
+    }
+
     /// Completes a raw symbol read from entry `index`.
     ///
     /// # Errors

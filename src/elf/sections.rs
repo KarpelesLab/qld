@@ -34,6 +34,11 @@ pub struct Sections {
     /// Whether each section is part of the output: not ignored, not in a
     /// discarded COMDAT group, not garbage collected, not folded by ICF.
     pub live: Vec<bool>,
+    /// The kind of each section: the same as its object's
+    /// [`InputSection::kind`](super::object::InputSection::kind), in a dense
+    /// vector that relocation processing reads without touching the
+    /// (much larger) section records.
+    pub kind: Vec<SectionKind>,
     /// For sections folded by ICF, the section they fold into ([`NONE`]
     /// otherwise). Empty when ICF did not run.
     pub fold_into: Vec<u32>,
@@ -71,27 +76,36 @@ impl Sections {
         let total = total as usize;
         let mut owner = vec![0u32; total];
         let mut live = vec![false; total];
+        let mut kind = vec![SectionKind::Ignored; total];
         {
             let owners = split_per_file(&count, &mut owner);
             let lives = split_per_file(&count, &mut live);
-            owners.into_par_iter().zip(lives).enumerate().for_each(
-                |(file_index, (owner_slice, live_slice))| {
+            let kinds = split_per_file(&count, &mut kind);
+            owners
+                .into_par_iter()
+                .zip(lives)
+                .zip(kinds)
+                .enumerate()
+                .for_each(|(file_index, ((owner_slice, live_slice), kind_slice))| {
                     let Some(object) = files.get(file_index).and_then(|f| f.object.as_ref()) else {
                         return;
                     };
                     let file_u32 = u32::try_from(file_index).unwrap_or(NONE);
                     owner_slice.fill(file_u32);
-                    for (slot, section) in live_slice.iter_mut().zip(&object.sections) {
+                    for ((slot, kind), section) in
+                        live_slice.iter_mut().zip(kind_slice).zip(&object.sections)
+                    {
                         *slot = section.kind != SectionKind::Ignored;
+                        *kind = section.kind;
                     }
-                },
-            );
+                });
         }
         Ok(Self {
             base,
             count,
             owner,
             live,
+            kind,
             fold_into: Vec::new(),
         })
     }
@@ -154,6 +168,13 @@ impl Sections {
         let file = *self.owner.get(id.index())?;
         let base = *self.base.get(file as usize)?;
         Some((file as usize, id.as_u32().checked_sub(base)?))
+    }
+
+    /// The kind of section `index` of `file`, if that section is numbered.
+    #[inline]
+    #[must_use]
+    pub fn kind_in(&self, file: usize, index: u32) -> Option<SectionKind> {
+        self.kind.get(self.id(file, index)?.index()).copied()
     }
 
     /// Whether `id` is live.

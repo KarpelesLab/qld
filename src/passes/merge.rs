@@ -23,22 +23,26 @@
 //! [`merge_split_sections`] as [`MergeInput`]s in input order, optionally
 //! with a per-piece liveness bitmap.
 //!
-//! 1. **Deduplicate** in parallel through a sharded hash table (hashbrown
-//!    behind per-shard locks), keyed by the precomputed piece hash mixed with
-//!    the group number, and confirmed by comparing bytes. Each distinct
-//!    content keeps the lowest piece number, so the *leader* of every piece
-//!    is its first live occurrence in input order no matter which thread
-//!    inserted first.
+//! 1. **Deduplicate** in parallel through a sharded hash table, keyed by the
+//!    precomputed piece hash mixed with the group number, and confirmed by
+//!    comparing bytes. There are no locks: runs of input sections bucket
+//!    their live pieces by shard in parallel, then each shard's table (a
+//!    plain hashbrown table) is filled by one task that walks its buckets in
+//!    piece order. Each distinct content keeps the lowest piece number, so
+//!    the *leader* of every piece is its first live occurrence in input
+//!    order.
 //! 2. **Tail merge** (optional, strings only, `-O2`): per group, sort the
 //!    leaders by reversed content, in parallel. A string that is a suffix of
 //!    the string before it in descending order shares that string's storage,
 //!    if the offset of the suffix is a multiple of the alignment. Cost:
 //!    `O(U log U)` comparisons for `U` distinct strings, each comparison
 //!    `O(common suffix length)`.
-//! 3. **Assign offsets** per group, sequentially in first-occurrence order:
-//!    every piece that owns storage starts at the next multiple of the
-//!    group's alignment. Tail-merged strings point into their owner. Every
-//!    other live piece takes its leader's offset (in parallel).
+//! 3. **Assign offsets** per group, in first-occurrence order: every piece
+//!    that owns storage starts at the next multiple of the group's
+//!    alignment. Without tail merging this runs in parallel over runs of
+//!    sections, each laid out from 0 and then shifted by its aligned start;
+//!    with it, sequentially, and tail-merged strings point into their owner.
+//!    Every other live piece takes its leader's offset (in parallel).
 //!
 //! The resulting [`MergedSections`] maps (section, piece) and
 //! (section, input offset) to an output offset, and writes each group's
@@ -58,26 +62,26 @@
 mod split;
 
 use std::fmt;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use rayon::prelude::*;
 
 use super::bitset::BitSet;
-use super::csr::{CsrBuilder, InputError, for_each_row_mut};
+use super::csr::{CsrBuilder, InputError};
 use split::MIN_PIECES_PER_TASK;
 pub use split::{MalformedMerge, MergeProblem, PieceRef, SplitSection, split_section};
 
 /// Number of dedup table shards. Does not affect results.
 const SHARDS: usize = 256;
 
+/// Pieces per run of input sections bucketed together by `deduplicate`.
+/// Does not affect results.
+const PIECES_PER_RUN: usize = 1 << 16;
+
 /// Output offset of a piece that is not live.
 const DEAD_OFFSET: u64 = u64::MAX;
-
-/// Dedup slot of a piece that is not live.
-const DEAD_SLOT: u64 = u64::MAX;
 
 /// Leader of a piece that is not live.
 const DEAD_LEADER: u32 = u32::MAX;
@@ -373,16 +377,25 @@ struct Leader<'a> {
 struct Unique<'a> {
     hash: u64,
     group: u32,
-    /// Index of this content's leader in [`Shard::leaders`].
-    slot: u32,
+    /// The lowest piece number with this content: its leader.
+    leader: u32,
     bytes: &'a [u8],
 }
 
-/// One shard of the dedup table.
-struct Shard<'a> {
-    table: HashTable<Unique<'a>>,
-    /// Lowest piece number seen for each distinct content, by slot.
-    leaders: Vec<u32>,
+/// The live pieces of a run of consecutive input sections, bucketed by
+/// shard: bucket `s` is `entries[starts[s]..starts[s + 1]]`, in piece order.
+struct Bucketed {
+    starts: Vec<u32>,
+    /// (input section, piece within the section).
+    entries: Vec<(u32, u32)>,
+}
+
+impl Bucketed {
+    fn bucket(&self, shard: usize) -> &[(u32, u32)] {
+        let start = self.starts[shard] as usize;
+        let end = self.starts[shard + 1] as usize;
+        &self.entries[start..end]
+    }
 }
 
 fn check_groups(groups: &[MergeGroup]) -> Result<(), InputError> {
@@ -634,104 +647,7 @@ fn lay_out(
     }
 
     // 1. Deduplicate: keep the lowest live piece number for each content.
-    // Each distinct content gets a slot in its shard's `leaders` vector; a
-    // piece records its (shard, slot) so that finding its leader afterwards
-    // needs no second hash probe.
-    let shards: Vec<Mutex<Shard<'_>>> = (0..SHARDS)
-        .map(|_| {
-            let capacity = total / SHARDS / 2;
-            Mutex::new(Shard {
-                table: HashTable::with_capacity(capacity),
-                leaders: Vec::with_capacity(capacity),
-            })
-        })
-        .collect();
-    let mut slot_of = vec![DEAD_SLOT; total];
-    let mut unit = vec![(); inputs.len()];
-    for_each_row_mut(
-        &piece_base,
-        &mut slot_of,
-        &mut unit,
-        &|section, slots, ()| {
-            let input = &inputs[section];
-            let split = input.split;
-            let group = input.group;
-            let hashes = split.hashes();
-            let base = piece_base[section];
-            let insert = |(local, slot_ref): (usize, &mut u64)| {
-                let index = base + local;
-                if live.is_some_and(|live| !live.get(index)) {
-                    return;
-                }
-                let bytes = split.bytes_of(local);
-                let hash = group_hash(hashes.get(local).copied().unwrap_or(0), group);
-                // `total` fits in u32, checked above.
-                let index = index as u32;
-                let shard_index = shard_of(hash);
-                let mut guard = shards[shard_index]
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                let shard = &mut *guard;
-                let entry = shard.table.entry(
-                    hash,
-                    |unique| unique.hash == hash && unique.group == group && unique.bytes == bytes,
-                    |unique| unique.hash,
-                );
-                let slot = match entry {
-                    Entry::Occupied(occupied) => {
-                        let slot = occupied.get().slot;
-                        let leader = &mut shard.leaders[slot as usize];
-                        *leader = (*leader).min(index);
-                        slot
-                    }
-                    Entry::Vacant(vacant) => {
-                        // Fewer slots than pieces, so this fits in u32.
-                        let slot = shard.leaders.len() as u32;
-                        vacant.insert(Unique {
-                            hash,
-                            group,
-                            slot,
-                            bytes,
-                        });
-                        shard.leaders.push(index);
-                        slot
-                    }
-                };
-                *slot_ref = ((shard_index as u64) << 32) | u64::from(slot);
-            };
-            if slots.len() <= MIN_PIECES_PER_TASK {
-                slots.iter_mut().enumerate().for_each(insert);
-            } else {
-                slots
-                    .par_iter_mut()
-                    .with_min_len(MIN_PIECES_PER_TASK)
-                    .enumerate()
-                    .for_each(insert);
-            }
-        },
-    );
-    let shard_leaders: Vec<Vec<u32>> = shards
-        .into_par_iter()
-        .map(|shard| {
-            shard
-                .into_inner()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .leaders
-        })
-        .collect();
-    let leader: Vec<u32> = slot_of
-        .par_iter()
-        .with_min_len(MIN_PIECES_PER_TASK)
-        .map(|&slot_ref| {
-            if slot_ref == DEAD_SLOT {
-                DEAD_LEADER
-            } else {
-                shard_leaders[(slot_ref >> 32) as usize][slot_ref as u32 as usize]
-            }
-        })
-        .collect();
-    drop(slot_of);
-    drop(shard_leaders);
+    let leader = deduplicate(inputs, &piece_base, total, live);
 
     // 2 and 3. Tail merge and lay out each group.
     let mut members = CsrBuilder::with_capacity(groups.len(), inputs.len());
@@ -775,10 +691,219 @@ fn lay_out(
     Ok(Layout {
         groups,
         piece_base,
-        output_offset: out_offset
-            .into_par_iter()
-            .map(AtomicU64::into_inner)
-            .collect(),
+        // In place: the same layout, so no copy.
+        output_offset: out_offset.into_iter().map(AtomicU64::into_inner).collect(),
+    })
+}
+
+/// Finds the leader of every live piece: the lowest live piece number with
+/// the same contents in the same group ([`DEAD_LEADER`] for dead pieces).
+///
+/// Lock-free: the input sections are cut into runs of about
+/// [`PIECES_PER_RUN`] pieces, and each run's live pieces are bucketed by
+/// shard, in parallel. Then every shard, in parallel, walks its buckets in
+/// run order, so it sees its pieces in increasing piece number and the first
+/// one inserted into its table is the leader.
+fn deduplicate(
+    inputs: &[MergeInput<'_, '_>],
+    piece_base: &[usize],
+    total: usize,
+    live: Option<&BitSet>,
+) -> Vec<u32> {
+    let mut runs = Vec::new();
+    let mut run_start = 0usize;
+    for section in 0..inputs.len() {
+        if piece_base[section + 1] - piece_base[run_start] >= PIECES_PER_RUN {
+            runs.push(run_start..section + 1);
+            run_start = section + 1;
+        }
+    }
+    if run_start < inputs.len() {
+        runs.push(run_start..inputs.len());
+    }
+    // Every live piece of a section, with its group-mixed hash.
+    let pieces = |section: usize| {
+        let input = &inputs[section];
+        let base = piece_base[section];
+        input
+            .split
+            .hashes()
+            .iter()
+            .enumerate()
+            .filter(move |&(local, _)| live.is_none_or(|live| live.get(base + local)))
+            .map(move |(local, &hash)| (local, group_hash(hash, input.group)))
+    };
+    let buckets: Vec<Bucketed> = runs
+        .par_iter()
+        .map(|run| {
+            let mut starts = vec![0u32; SHARDS + 1];
+            for section in run.clone() {
+                for (_, hash) in pieces(section) {
+                    starts[shard_of(hash) + 1] += 1;
+                }
+            }
+            for shard in 0..SHARDS {
+                starts[shard + 1] += starts[shard];
+            }
+            let mut cursor = starts.clone();
+            let mut entries = vec![(0u32, 0u32); starts[SHARDS] as usize];
+            for section in run.clone() {
+                for (local, hash) in pieces(section) {
+                    let at = &mut cursor[shard_of(hash)];
+                    // Section and piece counts fit in u32 (checked by the
+                    // caller).
+                    entries[*at as usize] = (section as u32, local as u32);
+                    *at += 1;
+                }
+            }
+            Bucketed { starts, entries }
+        })
+        .collect();
+
+    let leader: Vec<AtomicU32> = (0..total)
+        .into_par_iter()
+        .with_min_len(MIN_PIECES_PER_TASK)
+        .map(|_| AtomicU32::new(DEAD_LEADER))
+        .collect();
+    (0..SHARDS).into_par_iter().for_each(|shard| {
+        let count: usize = buckets.iter().map(|b| b.bucket(shard).len()).sum();
+        let mut table: HashTable<Unique<'_>> = HashTable::with_capacity(count / 2);
+        for bucket in &buckets {
+            for &(section, local) in bucket.bucket(shard) {
+                let input = &inputs[section as usize];
+                let local = local as usize;
+                let hash = group_hash(input.split.hashes()[local], input.group);
+                let bytes = input.split.bytes_of(local);
+                let index = (piece_base[section as usize] + local) as u32;
+                let group = input.group;
+                let entry = table.entry(
+                    hash,
+                    |unique| unique.hash == hash && unique.group == group && unique.bytes == bytes,
+                    |unique| unique.hash,
+                );
+                let lead = match entry {
+                    Entry::Occupied(occupied) => occupied.get().leader,
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(Unique {
+                            hash,
+                            group,
+                            leader: index,
+                            bytes,
+                        });
+                        index
+                    }
+                };
+                leader[index as usize].store(lead, Ordering::Relaxed);
+            }
+        }
+    });
+    leader.into_iter().map(AtomicU32::into_inner).collect()
+}
+
+/// The storage-owning pieces of a run of member sections, with offsets from
+/// the run's start, and their global piece numbers.
+struct RunLayout {
+    pieces: Vec<OutputPiece>,
+    numbers: Vec<u32>,
+    /// End of the last piece, from the run's start.
+    span: u64,
+}
+
+/// Lays out a group without tail merging, in parallel.
+///
+/// Every leader owns storage, at the next multiple of the alignment. The
+/// member sections are cut into runs, and each run is laid out from offset 0
+/// in parallel. A run that starts at an aligned offset `base` then only
+/// shifts by `base` (`align(base + x) = base + align(x)`), so a sequential
+/// pass over the runs' spans gives each run its base, and the result is the
+/// same as a single sequential pass.
+fn layout_group_in_runs(
+    group: &MergeGroup,
+    members: &[usize],
+    inputs: &[MergeInput<'_, '_>],
+    piece_base: &[usize],
+    leader: &[u32],
+    out_offset: &[AtomicU64],
+) -> Result<MergedGroup, InputError> {
+    let alignment = group.alignment;
+    let too_large = InputError::TooLarge("merged section size");
+    let mut runs = Vec::new();
+    let mut run_start = 0usize;
+    let mut run_pieces = 0usize;
+    for (position, &section) in members.iter().enumerate() {
+        run_pieces += piece_base[section + 1] - piece_base[section];
+        if run_pieces >= PIECES_PER_RUN {
+            runs.push(run_start..position + 1);
+            run_start = position + 1;
+            run_pieces = 0;
+        }
+    }
+    if run_start < members.len() {
+        runs.push(run_start..members.len());
+    }
+    let local: Vec<Option<RunLayout>> = runs
+        .par_iter()
+        .map(|run| {
+            let mut layout = RunLayout {
+                pieces: Vec::new(),
+                numbers: Vec::new(),
+                span: 0,
+            };
+            for &section in &members[run.clone()] {
+                let split = inputs[section].split;
+                let base = piece_base[section];
+                let row = &leader[base..piece_base[section + 1]];
+                for (local, &lead) in row.iter().enumerate() {
+                    let index = base + local;
+                    if lead as usize != index {
+                        continue;
+                    }
+                    let (start, _) = split.bounds(local);
+                    let len = split.bytes_of(local).len() as u64;
+                    let offset = align_to(layout.span, alignment)?;
+                    layout.span = offset.checked_add(len)?;
+                    layout.pieces.push(OutputPiece {
+                        output_offset: offset,
+                        section: section as u32,
+                        input_offset: start as u64,
+                        len,
+                    });
+                    layout.numbers.push(index as u32);
+                }
+            }
+            Some(layout)
+        })
+        .collect();
+    let mut local = local
+        .into_iter()
+        .collect::<Option<Vec<RunLayout>>>()
+        .ok_or(too_large.clone())?;
+    let mut bases = Vec::with_capacity(local.len());
+    let mut next = 0u64;
+    let mut size = 0u64;
+    for run in &local {
+        bases.push(next);
+        if !run.pieces.is_empty() {
+            size = next.checked_add(run.span).ok_or(too_large.clone())?;
+            next = align_to(size, alignment).ok_or(too_large.clone())?;
+        }
+    }
+    // Offsets within a run are at most its span, so these sums are at most
+    // `size`, checked above.
+    local.par_iter_mut().zip(&bases).for_each(|(run, &base)| {
+        for (piece, &number) in run.pieces.iter_mut().zip(&run.numbers) {
+            piece.output_offset += base;
+            out_offset[number as usize].store(piece.output_offset, Ordering::Relaxed);
+        }
+    });
+    let pieces = local
+        .into_par_iter()
+        .flat_map_iter(|run| run.pieces)
+        .collect();
+    Ok(MergedGroup {
+        size,
+        alignment,
+        pieces,
     })
 }
 
@@ -792,6 +917,9 @@ fn layout_group(
     leader: &[u32],
     out_offset: &[AtomicU64],
 ) -> Result<MergedGroup, InputError> {
+    if !(group.tail_merge && matches!(group.kind, MergeKind::Strings { .. })) {
+        return layout_group_in_runs(group, members, inputs, piece_base, leader, out_offset);
+    }
     // Leaders of this group, in input order.
     let mut leaders: Vec<Leader<'_>> = Vec::new();
     for &section in members {

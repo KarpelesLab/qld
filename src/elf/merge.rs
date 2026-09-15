@@ -9,6 +9,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use hashbrown::HashMap;
+use rayon::prelude::*;
 
 use crate::error::Result;
 use crate::ids::SectionId;
@@ -79,47 +80,53 @@ pub fn merge<'s, 'a>(
     let mut inputs: Vec<MergeInput<'s, 'a>> = Vec::new();
     let mut input_of = vec![NONE; sections.len()];
 
-    for (file_index, file) in files.iter().enumerate() {
-        let Some(object) = &file.object else {
+    // The live merge sections, found in parallel from the dense kind and
+    // liveness vectors (in section ID order, which is input order).
+    let merge_ids: Vec<SectionId> = sections
+        .kind
+        .par_iter()
+        .zip(sections.live.par_iter())
+        .enumerate()
+        .with_min_len(1 << 16)
+        .filter(|&(_, (&kind, &live))| kind == SectionKind::Merge && live)
+        .map(|(index, _)| SectionId::new(index))
+        .collect();
+    for id in merge_ids {
+        let Some((file_index, index)) = sections.locate(id) else {
             continue;
         };
-        for (index, section) in object.sections.iter().enumerate() {
-            if section.kind != SectionKind::Merge {
-                continue;
-            }
-            let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(NONE)) else {
-                continue;
-            };
-            if !sections.is_live(id) {
-                continue;
-            }
-            let Some(output) = placement.output_of(id) else {
-                continue;
-            };
-            let Some(split) = object.splits.get(section.split as usize) else {
-                continue;
-            };
-            let (tag, unit) = match split.kind() {
-                MergeKind::Strings { char_size } => (0u8, u64::from(char_size)),
-                MergeKind::Fixed { entry_size } => (1u8, entry_size),
-            };
-            let key = (output, tag, unit, split.alignment());
-            let next = u32::try_from(groups.len()).unwrap_or(NONE);
-            let group = *keys.entry(key).or_insert_with(|| {
-                groups.push(MergeGroup {
-                    kind: split.kind(),
-                    alignment: split.alignment(),
-                    tail_merge,
-                });
-                group_output.push(output);
-                group_first.push(id);
-                next
+        let Some(object) = files.get(file_index).and_then(|f| f.object.as_ref()) else {
+            continue;
+        };
+        let Some(section) = object.section(index) else {
+            continue;
+        };
+        let Some(output) = placement.output_of(id) else {
+            continue;
+        };
+        let Some(split) = object.splits.get(section.split as usize) else {
+            continue;
+        };
+        let (tag, unit) = match split.kind() {
+            MergeKind::Strings { char_size } => (0u8, u64::from(char_size)),
+            MergeKind::Fixed { entry_size } => (1u8, entry_size),
+        };
+        let key = (output, tag, unit, split.alignment());
+        let next = u32::try_from(groups.len()).unwrap_or(NONE);
+        let group = *keys.entry(key).or_insert_with(|| {
+            groups.push(MergeGroup {
+                kind: split.kind(),
+                alignment: split.alignment(),
+                tail_merge,
             });
-            if let Some(slot) = input_of.get_mut(id.index()) {
-                *slot = u32::try_from(inputs.len()).unwrap_or(NONE);
-            }
-            inputs.push(MergeInput { group, split });
+            group_output.push(output);
+            group_first.push(id);
+            next
+        });
+        if let Some(slot) = input_of.get_mut(id.index()) {
+            *slot = u32::try_from(inputs.len()).unwrap_or(NONE);
         }
+        inputs.push(MergeInput { group, split });
     }
     let merged = merge_split_sections(&groups, &inputs, None)?;
     Ok(Merged {

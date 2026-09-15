@@ -27,7 +27,7 @@ use crate::elf::read::Relocations;
 use crate::elf::read::consts::{SHF_ALLOC, SHF_LINK_ORDER, SHT_NOTE};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
-use crate::passes::{SectionGraph, collect_garbage};
+use crate::passes::{SectionGraph, collect_garbage, mark_reachable};
 use crate::symbols::SymbolName;
 
 use super::defined::LinkerSymbols;
@@ -38,7 +38,13 @@ use super::place::Placement;
 use super::refs::{Def, Refs};
 
 /// Runs garbage collection. Returns the sections it removes, in input
-/// order; the caller clears their live bits.
+/// order (the caller clears their live bits), and, when `want_graph` (for
+/// `--why-live`), the section graph.
+///
+/// Without the graph, the mark enumerates the edges of the sections it
+/// reaches as it goes, so the relocations of unreachable sections are never
+/// read, and nothing is counted or stored twice. Both ways mark the same
+/// sections.
 ///
 /// # Errors
 ///
@@ -49,7 +55,8 @@ pub fn collect(
     eh_frames: &EhFrames<'_>,
     linker: &LinkerSymbols,
     internal: &InternalNames,
-) -> Result<(Vec<SectionId>, SectionGraph)> {
+    want_graph: bool,
+) -> Result<(Vec<SectionId>, Option<SectionGraph>)> {
     let total = refs.sections.len();
 
     // Extra edges: eh_frame, link order, groups.
@@ -146,20 +153,8 @@ pub fn collect(
         }));
     }
 
-    let edge_count = |section: SectionId| -> usize {
-        let base = relocation_count(refs, section);
-        let from = extra.partition_point(|(f, _)| *f < section);
-        let to = extra.partition_point(|(f, _)| *f <= section);
-        base.saturating_add(to.saturating_sub(from))
-    };
-    let fill = |section: SectionId, slot: &mut [SectionId]| -> usize {
-        let mut written = 0usize;
-        let mut push = |target: SectionId, slot: &mut [SectionId]| {
-            if let Some(entry) = slot.get_mut(written) {
-                *entry = target;
-                written = written.saturating_add(1);
-            }
-        };
+    // Calls `push` with every edge target of `section`.
+    let for_each_edge = |section: SectionId, push: &mut dyn FnMut(SectionId)| {
         if let Some((file_index, index)) = refs.sections.locate(section)
             && let Some(object) = refs.files.get(file_index).and_then(|f| f.object.as_ref())
             && let Some(input) = object.section(index)
@@ -178,20 +173,43 @@ pub fn collect(
                 if let Def::Section { .. } = target.def
                     && let Some(to) = refs.target_section(&target)
                 {
-                    push(to, slot);
+                    push(to);
                 }
             }
         }
         let from = extra.partition_point(|(f, _)| *f < section);
         let to = extra.partition_point(|(f, _)| *f <= section);
         for &(_, target) in extra.get(from..to).unwrap_or_default() {
-            push(target, slot);
+            push(target);
         }
-        written
     };
-    let graph = SectionGraph::build_parallel(total, edge_count, fill, roots)
-        .map_err(|e| Error::Internal(format!("section graph: {e}")))?;
-    let live = collect_garbage(&graph);
+
+    let (live, graph) = if want_graph {
+        let edge_count = |section: SectionId| -> usize {
+            let base = relocation_count(refs, section);
+            let from = extra.partition_point(|(f, _)| *f < section);
+            let to = extra.partition_point(|(f, _)| *f <= section);
+            base.saturating_add(to.saturating_sub(from))
+        };
+        let fill = |section: SectionId, slot: &mut [SectionId]| -> usize {
+            let mut written = 0usize;
+            for_each_edge(section, &mut |target| {
+                if let Some(entry) = slot.get_mut(written) {
+                    *entry = target;
+                    written = written.saturating_add(1);
+                }
+            });
+            written
+        };
+        let graph = SectionGraph::build_parallel(total, edge_count, fill, roots)
+            .map_err(|e| Error::Internal(format!("section graph: {e}")))?;
+        (collect_garbage(&graph), Some(graph))
+    } else {
+        let edges = |section: SectionId, targets: &mut Vec<SectionId>| {
+            for_each_edge(section, &mut |target| targets.push(target));
+        };
+        (mark_reachable(total, &roots, &edges), None)
+    };
 
     let removed: Vec<SectionId> = refs
         .sections

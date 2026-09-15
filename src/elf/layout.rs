@@ -385,6 +385,9 @@ pub(crate) fn add(a: u64, b: u64) -> Result<u64> {
 }
 
 /// Sort key of an input member within its output section.
+/// Members whose sizes one parallel task looks up, in [`layout_once`].
+const MIN_SIZES_PER_TASK: usize = 4096;
+
 #[derive(Clone, Copy, Debug)]
 struct Key {
     sub: u16,
@@ -436,52 +439,73 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
     let files = input.files;
     let output_count = placement.outputs.len();
 
-    // 1. Members, grouped by output section in section ID order.
-    let mut members: Vec<Vec<Key>> = (0..output_count).map(|_| Vec::new()).collect();
-    for (file_index, file) in files.iter().enumerate() {
-        let Some(object) = &file.object else {
-            continue;
-        };
-        for (index, section) in object.sections.iter().enumerate() {
-            let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(NONE)) else {
-                continue;
+    // 1. Members, grouped by output section in section ID order: found per
+    // file in parallel, then gathered in file order.
+    let per_file: Vec<Vec<(u32, Key)>> = files
+        .par_iter()
+        .enumerate()
+        .map(|(file_index, file)| {
+            let mut found = Vec::new();
+            let Some(object) = &file.object else {
+                return found;
             };
-            if !sections.is_live(id) {
-                continue;
-            }
-            let Some(output) = placement.output_of(id) else {
-                continue;
-            };
-            let member = if section.kind == SectionKind::Merge {
-                match input.merged.group_of(id) {
-                    Some(group) if input.merged.group_first.get(group as usize) == Some(&id) => {
-                        Member::Merge(group)
-                    }
-                    Some(_) => continue,
-                    None => Member::Input(id),
+            for (index, section) in object.sections.iter().enumerate() {
+                let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(NONE)) else {
+                    continue;
+                };
+                if !sections.is_live(id) {
+                    continue;
                 }
-            } else {
-                Member::Input(id)
-            };
-            let sub = placement.sub.get(id.index()).copied().unwrap_or(0);
-            let sort = placement
-                .outputs
-                .get(output as usize)
-                .and_then(|o| input.rules.outputs.get(usize::from(o.rule)))
-                .and_then(|r| r.inputs.get(usize::from(sub)))
-                .map_or(SortMode::None, |i| i.sort);
-            let priority = match sort {
-                SortMode::InitPriority => priority(section.name),
-                _ => 0,
-            };
-            if let Some(list) = members.get_mut(output as usize) {
-                list.push(Key {
-                    sub,
-                    priority,
-                    id,
-                    member,
-                });
+                let Some(output) = placement.output_of(id) else {
+                    continue;
+                };
+                let member = if section.kind == SectionKind::Merge {
+                    match input.merged.group_of(id) {
+                        Some(group)
+                            if input.merged.group_first.get(group as usize) == Some(&id) =>
+                        {
+                            Member::Merge(group)
+                        }
+                        Some(_) => continue,
+                        None => Member::Input(id),
+                    }
+                } else {
+                    Member::Input(id)
+                };
+                let sub = placement.sub.get(id.index()).copied().unwrap_or(0);
+                let sort = placement
+                    .outputs
+                    .get(output as usize)
+                    .and_then(|o| input.rules.outputs.get(usize::from(o.rule)))
+                    .and_then(|r| r.inputs.get(usize::from(sub)))
+                    .map_or(SortMode::None, |i| i.sort);
+                let priority = match sort {
+                    SortMode::InitPriority => priority(section.name),
+                    _ => 0,
+                };
+                found.push((
+                    output,
+                    Key {
+                        sub,
+                        priority,
+                        id,
+                        member,
+                    },
+                ));
             }
+            found
+        })
+        .collect();
+    let mut counts = vec![0usize; output_count];
+    for &(output, _) in per_file.iter().flatten() {
+        if let Some(count) = counts.get_mut(output as usize) {
+            *count = count.saturating_add(1);
+        }
+    }
+    let mut members: Vec<Vec<Key>> = counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+    for (output, key) in per_file.into_iter().flatten() {
+        if let Some(list) = members.get_mut(output as usize) {
+            list.push(key);
         }
     }
 
@@ -506,22 +530,46 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
             let output = placement.outputs.get(output_index);
             let rule = output.and_then(|o| input.rules.outputs.get(usize::from(o.rule)));
             let by_name = rule.is_some_and(|r| r.inputs.iter().any(|i| i.sort == SortMode::Name));
-            keys.sort_by(|a, b| {
-                a.sub.cmp(&b.sub).then_with(|| {
-                    let named = by_name
-                        && rule
-                            .and_then(|r| r.inputs.get(usize::from(a.sub)))
-                            .is_some_and(|i| i.sort == SortMode::Name);
-                    let by_name = if named {
-                        name_of(a.id).cmp(name_of(b.id))
-                    } else {
-                        core::cmp::Ordering::Equal
-                    };
-                    by_name
-                        .then(a.priority.cmp(&b.priority))
-                        .then(a.id.cmp(&b.id))
-                })
-            });
+            // The order is (sub, name for subs sorted by name, priority, id).
+            // Sorting by (sub, priority, id) first, then each name-sorted
+            // sub's run on its own, gives the same order, and the keys
+            // usually come sorted by that tuple already: checking is much
+            // cheaper than the general comparison. IDs are unique, so
+            // unstable sorts give the same order as stable ones.
+            if !keys.is_sorted_by_key(|k| (k.sub, k.priority, k.id)) {
+                // Keys arrive by section ID, with few distinct subs: a stable
+                // bucketing by sub, then sorting each run by (priority, id)
+                // where it is not already, is linear in the common case.
+                let subs = keys.iter().map(|k| usize::from(k.sub)).max().unwrap_or(0);
+                let mut buckets: Vec<Vec<Key>> = vec![Vec::new(); subs.saturating_add(1)];
+                for key in keys.drain(..) {
+                    if let Some(bucket) = buckets.get_mut(usize::from(key.sub)) {
+                        bucket.push(key);
+                    }
+                }
+                for mut bucket in buckets {
+                    if !bucket.is_sorted_by_key(|k| (k.priority, k.id)) {
+                        bucket.sort_unstable_by_key(|k| (k.priority, k.id));
+                    }
+                    keys.append(&mut bucket);
+                }
+            }
+            if by_name {
+                let named = |sub: u16| {
+                    rule.and_then(|r| r.inputs.get(usize::from(sub)))
+                        .is_some_and(|i| i.sort == SortMode::Name)
+                };
+                for run in keys.chunk_by_mut(|a, b| a.sub == b.sub) {
+                    if run.first().is_some_and(|k| named(k.sub)) {
+                        run.sort_unstable_by(|a, b| {
+                            name_of(a.id)
+                                .cmp(name_of(b.id))
+                                .then(a.priority.cmp(&b.priority))
+                                .then(a.id.cmp(&b.id))
+                        });
+                    }
+                }
+            }
             let synthetic = output.map_or(Synthetic::None, |o| o.synthetic);
             let mut list: Vec<Member> = Vec::with_capacity(keys.len().saturating_add(2));
             // With `-z now` there is no lazy binding, and GNU ld puts
@@ -547,8 +595,19 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
             let mut offset = 0u64;
             let mut align = 1u64;
             let mut placed = Vec::with_capacity(list.len());
-            for member in list {
-                let (size, member_align) = member_size(input, member)?;
+            // Sizes in parallel (they read section headers all over the
+            // inputs); offsets in order.
+            // (An error is looked up again, so that the sizes stay small.)
+            let sizes: Vec<Option<(u64, u64)>> = list
+                .par_iter()
+                .with_min_len(MIN_SIZES_PER_TASK)
+                .map(|&member| member_size(input, member).ok())
+                .collect();
+            for (member, size) in list.into_iter().zip(sizes) {
+                let (size, member_align) = match size {
+                    Some(size) => size,
+                    None => member_size(input, member)?,
+                };
                 if size == 0 && matches!(member, Member::Synthetic(_)) {
                     continue;
                 }
@@ -1596,6 +1655,8 @@ pub(crate) fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[
             Member::Synthetic(_) => 0,
         };
         match entsize {
+            // A zero size gives 0 whatever follows (all zero, or a mismatch).
+            None if size == 0 => return 0,
             None => entsize = Some(size),
             Some(e) if e != size => return 0,
             Some(_) => {}

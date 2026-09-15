@@ -24,6 +24,8 @@
 
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
@@ -188,11 +190,24 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
     if options.threads.is_some() {
         return None;
     }
-    let bytes: u64 = table
-        .iter()
-        .filter(|(_, file)| file.parent().is_none())
+    let top_level = || table.iter().filter(|(_, file)| file.parent().is_none());
+    let mut bytes: u64 = top_level()
         .map(|(_, file)| u64::try_from(file.data().len()).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add);
+    // Compressed debug sections count at their uncompressed size: inflating
+    // them and writing them out is the work (256 objects whose 320 MiB of
+    // debug information compress to under a megabyte linked on one thread).
+    // Only links that would get fewer than the most threads look, and only
+    // at section headers.
+    let most = BYTES_PER_THREAD.saturating_mul(MAX_DEFAULT_THREADS as u64);
+    if bytes < most {
+        for (_, file) in top_level() {
+            bytes = bytes.saturating_add(compressed_growth(file));
+            if bytes >= most {
+                break;
+            }
+        }
+    }
     let wanted = usize::try_from(bytes.div_ceil(BYTES_PER_THREAD))
         .unwrap_or(usize::MAX)
         .clamp(1, MAX_DEFAULT_THREADS);
@@ -200,6 +215,30 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
         return Some(wanted.min(available_threads()));
     }
     (wanted < rayon::current_num_threads()).then_some(wanted)
+}
+
+/// How many bytes the compressed sections of a relocatable ELF input grow
+/// by when inflated (0 for anything else, and for malformed files, which
+/// parsing reports later).
+fn compressed_growth(file: &crate::input::InputFile) -> u64 {
+    use crate::elf::read::{Elf64Le, ObjectFile, Source};
+    use crate::input::FileFormat;
+    if !matches!(file.format(), FileFormat::Elf(ident) if ident.is_relocatable()) {
+        return 0;
+    }
+    let Ok(object) = ObjectFile::<Elf64Le>::parse(file.data(), Source::new(file.path())) else {
+        return 0;
+    };
+    object
+        .elf()
+        .sections()
+        .iter()
+        .filter(|header| header.is_compressed())
+        .filter_map(|header| {
+            let (chdr, _) = object.compressed_data(&header).ok()??;
+            Some(chdr.ch_size.saturating_sub(header.sh_size))
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// Everything after input collection, run in the link's thread pool.
@@ -313,12 +352,14 @@ fn link_inputs<'a>(
             resolution: &resolution,
             sections: &sections,
         };
-        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
+        let why_live = !options.why_live.is_empty();
+        let (removed, graph) =
+            gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live)?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
-        if !options.why_live.is_empty() {
-            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
+        if let Some(graph) = &graph {
+            gc::report_why_live(&refs, graph, &options.why_live, diagnostics);
         }
         for id in &removed {
             if let Some(slot) = sections.live.get_mut(id.index()) {
@@ -677,12 +718,14 @@ fn link_relocatable<'a>(
             sections: &sections,
         };
         let linker = defined::LinkerSymbols::default();
-        let (removed, graph) = gc::collect(&refs, &placement, &eh_frames, &linker, internal)?;
+        let why_live = !options.why_live.is_empty();
+        let (removed, graph) =
+            gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live)?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
-        if !options.why_live.is_empty() {
-            gc::report_why_live(&refs, &graph, &options.why_live, diagnostics);
+        if let Some(graph) = &graph {
+            gc::report_why_live(&refs, graph, &options.why_live, diagnostics);
         }
         for &id in &removed {
             // Sections only relocatable output copies (`.note.GNU-stack`,
@@ -720,23 +763,38 @@ fn nonempty_outputs(
     sections: &Sections,
     placement: &place::Placement<'_>,
 ) -> Vec<bool> {
-    let mut nonempty = vec![false; placement.outputs.len()];
-    for (file_index, file) in files.iter().enumerate() {
-        let Some(object) = &file.object else {
-            continue;
-        };
-        for (index, section) in object.sections.iter().enumerate() {
-            let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(u32::MAX)) else {
-                continue;
+    let outputs = placement.outputs.len();
+    // Per file in parallel (a bit set per file would be as large as the
+    // output list, so each file lists what it fills), then combined.
+    let filled: Vec<Vec<u32>> = files
+        .par_iter()
+        .enumerate()
+        .map(|(file_index, file)| {
+            let mut filled = Vec::new();
+            let Some(object) = &file.object else {
+                return filled;
             };
-            if section.header.sh_size == 0 || !sections.is_live(id) {
-                continue;
+            for (index, section) in object.sections.iter().enumerate() {
+                let Some(id) = sections.id(file_index, u32::try_from(index).unwrap_or(u32::MAX))
+                else {
+                    continue;
+                };
+                if section.header.sh_size == 0 || !sections.is_live(id) {
+                    continue;
+                }
+                if let Some(output) = placement.output_of(id)
+                    && filled.last() != Some(&output)
+                {
+                    filled.push(output);
+                }
             }
-            if let Some(output) = placement.output_of(id)
-                && let Some(slot) = nonempty.get_mut(output as usize)
-            {
-                *slot = true;
-            }
+            filled
+        })
+        .collect();
+    let mut nonempty = vec![false; outputs];
+    for output in filled.into_iter().flatten() {
+        if let Some(slot) = nonempty.get_mut(output as usize) {
+            *slot = true;
         }
     }
     nonempty

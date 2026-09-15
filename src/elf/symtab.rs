@@ -42,6 +42,10 @@ pub struct SymtabPlan {
     pub hidden: Vec<SymbolId>,
     /// Globals.
     pub globals: Vec<SymbolId>,
+    /// String table offset of each name of `hidden`.
+    hidden_offsets: Vec<usize>,
+    /// String table offset of each name of `globals`.
+    global_offsets: Vec<usize>,
     /// First entry index of each file's locals (after the null symbol).
     local_base: Vec<usize>,
     /// String table offset where each file's local names start.
@@ -250,6 +254,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
     for &(id, hidden, len) in &selected {
         if hidden {
             plan.hidden.push(id);
+            plan.hidden_offsets.push(offset);
             index = index.saturating_add(1);
             offset = offset.saturating_add(len);
         }
@@ -259,6 +264,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
     for &(id, hidden, len) in &selected {
         if !hidden {
             plan.globals.push(id);
+            plan.global_offsets.push(offset);
             index = index.saturating_add(1);
             offset = offset.saturating_add(len);
         }
@@ -570,79 +576,106 @@ pub fn write_symtab(
             );
         };
 
-    let mut offsets = Vec::with_capacity(plan.hidden.len());
-    let mut offset = plan.hidden_names;
-    for &id in &plan.hidden {
-        offsets.push(offset);
-        offset = offset
-            .saturating_add(global_name_len(refs, id))
-            .saturating_add(1);
-    }
+    // Name offsets were computed by the plan, from the same lengths.
     hidden
         .par_iter_mut()
         .zip(plan.hidden.par_iter())
-        .zip(offsets.par_iter())
+        .zip(plan.hidden_offsets.par_iter())
         .for_each(|((entry, &id), &name)| global_entry(id, true, name, entry));
-
-    let mut offsets = Vec::with_capacity(plan.globals.len());
-    let mut offset = plan.global_names;
-    for &id in &plan.globals {
-        offsets.push(offset);
-        offset = offset
-            .saturating_add(global_name_len(refs, id))
-            .saturating_add(1);
-    }
     globals
         .par_iter_mut()
         .zip(plan.globals.par_iter())
-        .zip(offsets.par_iter())
+        .zip(plan.global_offsets.par_iter())
         .for_each(|((entry, &id), &name)| global_entry(id, false, name, entry));
 }
 
-/// Writes `.strtab` into `out`.
+/// Writes `.strtab` into `out`: each file's local names, then the hidden
+/// and global names, from the offsets the plan computed, in parallel.
 pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
-    let mut cursor = 1usize;
-    for (file_index, kept) in plan.locals.iter().enumerate() {
-        let Some(object) = refs.files.get(file_index).and_then(|f| f.object.as_ref()) else {
-            continue;
-        };
-        let symbols = object.elf.symbols();
-        for &index in kept {
-            let name = symbols
-                .get_raw(index as usize)
-                .and_then(|raw| symbols.name(index as usize, &raw).ok())
-                .unwrap_or_default();
-            cursor = put_name(out, cursor, name);
-        }
+    /// Globals whose names one task writes.
+    const NAMES_PER_TASK: usize = 4096;
+    enum Task<'p> {
+        /// Local names of a file.
+        Locals(usize),
+        /// Consecutive hidden or global names.
+        Globals(&'p [SymbolId]),
     }
-    for &id in plan.hidden.iter().chain(&plan.globals) {
-        let name = refs.symbols.name(id);
-        match name.version() {
-            Some(version) => {
-                let end = cursor.saturating_add(name.bytes().len());
-                if let Some(dest) = out.get_mut(cursor..end) {
-                    dest.copy_from_slice(name.bytes());
-                }
-                if let Some(at) = out.get_mut(end) {
-                    *at = b'@';
-                }
-                cursor = put_name(out, end.saturating_add(1), version);
+    // Every task writes into its own slice of `out`, which starts at its
+    // first name's offset; the plan's offsets increase in this order.
+    let mut starts: Vec<(usize, Task<'_>)> = Vec::new();
+    for (file_index, &start) in plan.local_names.iter().enumerate() {
+        starts.push((start, Task::Locals(file_index)));
+    }
+    for (ids, offsets) in [
+        (&plan.hidden, &plan.hidden_offsets),
+        (&plan.globals, &plan.global_offsets),
+    ] {
+        for (chunk, chunk_offsets) in ids
+            .chunks(NAMES_PER_TASK)
+            .zip(offsets.chunks(NAMES_PER_TASK))
+        {
+            if let Some(&start) = chunk_offsets.first() {
+                starts.push((start, Task::Globals(chunk)));
             }
-            None => match import_suffix(refs, id) {
-                Some(version) => {
-                    let end = cursor.saturating_add(name.bytes().len());
-                    if let Some(dest) = out.get_mut(cursor..end) {
-                        dest.copy_from_slice(name.bytes());
-                    }
-                    if let Some(at) = out.get_mut(end) {
-                        *at = b'@';
-                    }
-                    cursor = put_name(out, end.saturating_add(1), version);
-                }
-                None => cursor = put_name(out, cursor, name.bytes()),
-            },
         }
     }
+    let mut tasks: Vec<(Task<'_>, &mut [u8])> = Vec::with_capacity(starts.len());
+    let mut rest: &mut [u8] = out;
+    let mut consumed = 0usize;
+    let mut starts = starts.into_iter().peekable();
+    while let Some((start, task)) = starts.next() {
+        let end = starts
+            .peek()
+            .map_or(consumed.saturating_add(rest.len()), |&(next, _)| next);
+        // Skip up to `start` (the null byte, or nothing), then take this
+        // task's bytes; out-of-range offsets give empty slices.
+        let skip = start.saturating_sub(consumed).min(rest.len());
+        let (_, tail) = std::mem::take(&mut rest).split_at_mut(skip);
+        let take = end.saturating_sub(start).min(tail.len());
+        let (slice, tail) = tail.split_at_mut(take);
+        tasks.push((task, slice));
+        rest = tail;
+        consumed = consumed.saturating_add(skip).saturating_add(take);
+    }
+    tasks.into_par_iter().for_each(|(task, slice)| match task {
+        Task::Locals(file_index) => {
+            let (Some(object), Some(kept)) = (
+                refs.files.get(file_index).and_then(|f| f.object.as_ref()),
+                plan.locals.get(file_index),
+            ) else {
+                return;
+            };
+            let symbols = object.elf.symbols();
+            let mut cursor = 0usize;
+            for &index in kept {
+                let name = symbols
+                    .get_raw(index as usize)
+                    .and_then(|raw| symbols.name(index as usize, &raw).ok())
+                    .unwrap_or_default();
+                cursor = put_name(slice, cursor, name);
+            }
+        }
+        Task::Globals(ids) => {
+            let mut cursor = 0usize;
+            for &id in ids {
+                let name = refs.symbols.name(id);
+                let version = name.version().or_else(|| import_suffix(refs, id));
+                cursor = match version {
+                    Some(version) => {
+                        let end = cursor.saturating_add(name.bytes().len());
+                        if let Some(dest) = slice.get_mut(cursor..end) {
+                            dest.copy_from_slice(name.bytes());
+                        }
+                        if let Some(at) = slice.get_mut(end) {
+                            *at = b'@';
+                        }
+                        put_name(slice, end.saturating_add(1), version)
+                    }
+                    None => put_name(slice, cursor, name.bytes()),
+                };
+            }
+        }
+    });
 }
 
 /// The binding of an undefined or imported symbol: weak when every

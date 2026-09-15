@@ -143,11 +143,7 @@ impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
                 if object.discarded_groups.get(index).copied().unwrap_or(false) {
                     continue;
                 }
-                round.offer(
-                    SymbolName::new(group.signature),
-                    file.position,
-                    round_file.id,
-                );
+                round.offer(group.key, file.position, round_file.id);
             }
         });
         files.par_iter_mut().for_each(|round_file| {
@@ -169,7 +165,7 @@ impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
             let discarded: Vec<bool> = object
                 .groups
                 .iter()
-                .map(|group| round.owner(&SymbolName::new(group.signature)) != Some(id))
+                .map(|group| round.owner(&group.key) != Some(id))
                 .collect();
             if discarded.contains(&true) {
                 object.discard_groups(discarded);

@@ -23,6 +23,11 @@ use crate::ids::SectionId;
 /// A task hands off half its stack once the stack is longer than this.
 const SPLIT_THRESHOLD: usize = 256;
 
+/// The same for [`mark_reachable`], whose steps read relocations and so
+/// cost far more than a graph's: splitting early keeps long chains of
+/// references from running on one thread.
+const LAZY_SPLIT_THRESHOLD: usize = 32;
+
 /// Marks live sections. Usable for more than one round of marking, for
 /// formats where marking discovers new roots (for example, lld's
 /// `-z start-stop-gc` handling, where a live reference to `__start_foo` makes
@@ -117,6 +122,69 @@ fn mark_task<'s>(
         if stack.len() > SPLIT_THRESHOLD {
             let half = stack.split_off(stack.len() / 2);
             scope.spawn(move |scope| mark_task(scope, graph, bits, half));
+        }
+    }
+}
+
+/// Marks `roots` and every section reachable from them, with the edges
+/// given by `edges(section, targets)` (which appends the section's targets
+/// to `targets`), and returns the live set of `sections` sections.
+///
+/// The same mark as [`collect_garbage`], without building a
+/// [`SectionGraph`]: only the sections that turn out reachable have their
+/// edges enumerated, once. Out-of-range roots and targets are ignored. The
+/// result is the reachable set, whatever the scheduling.
+pub fn mark_reachable<E>(sections: usize, roots: &[SectionId], edges: &E) -> LiveSet
+where
+    E: Fn(SectionId, &mut Vec<SectionId>) + Sync,
+{
+    let marks = AtomicBitSet::new(sections);
+    let bits = &marks;
+    if rayon::current_num_threads() <= 1 {
+        let mut stack: Vec<SectionId> = roots
+            .iter()
+            .copied()
+            .filter(|root| bits.set(root.index()))
+            .collect();
+        let mut targets = Vec::new();
+        while let Some(section) = stack.pop() {
+            edges(section, &mut targets);
+            stack.extend(targets.drain(..).filter(|target| bits.set(target.index())));
+        }
+    } else {
+        rayon::scope(|scope| {
+            for chunk in roots.chunks(LAZY_SPLIT_THRESHOLD) {
+                let stack: Vec<SectionId> = chunk
+                    .iter()
+                    .copied()
+                    .filter(|root| bits.set(root.index()))
+                    .collect();
+                if !stack.is_empty() {
+                    scope.spawn(move |scope| mark_lazy_task(scope, edges, bits, stack));
+                }
+            }
+        });
+    }
+    LiveSet {
+        bits: marks.into_bitset(),
+    }
+}
+
+fn mark_lazy_task<'s, E>(
+    scope: &Scope<'s>,
+    edges: &'s E,
+    bits: &'s AtomicBitSet,
+    mut stack: Vec<SectionId>,
+) where
+    E: Fn(SectionId, &mut Vec<SectionId>) + Sync,
+{
+    let mut targets = Vec::new();
+    while let Some(section) = stack.pop() {
+        edges(section, &mut targets);
+        stack.extend(targets.drain(..).filter(|target| bits.set(target.index())));
+        if stack.len() > LAZY_SPLIT_THRESHOLD {
+            let half = stack.split_off(stack.len() / 2);
+            scope.spawn(move |scope| mark_lazy_task(scope, edges, bits, half));
         }
     }
 }
@@ -301,6 +369,56 @@ mod tests {
         assert_eq!(why_live(&graph, id(5)), Some(vec![id(5)]));
         assert_eq!(why_live(&graph, id(3)), None);
         assert_eq!(why_live(&graph, id(99)), None);
+    }
+
+    #[test]
+    fn lazy_mark_matches_graph_mark() {
+        // A pseudo-random graph with long chains, cycles and unreachable
+        // parts, marked on pools of several sizes.
+        let sections = 20_000usize;
+        let mut builder = GraphBuilder::new(sections);
+        let mut adjacency: Vec<Vec<SectionId>> = vec![Vec::new(); sections];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (from, targets) in adjacency.iter_mut().enumerate() {
+            if from + 1 < sections && next() % 4 != 0 {
+                targets.push(id(from + 1));
+            }
+            for _ in 0..next() % 3 {
+                let to = (next() % sections as u64) as usize;
+                if next() % 2 == 0 {
+                    targets.push(id(to));
+                }
+            }
+        }
+        for (from, targets) in adjacency.iter().enumerate() {
+            for &to in targets {
+                builder.add_edge(id(from), to);
+            }
+        }
+        let roots: Vec<SectionId> = (0..sections).step_by(997).map(id).collect();
+        for &root in &roots {
+            builder.add_root(root);
+        }
+        let graph = builder.build().unwrap();
+        let expected = collect_garbage(&graph);
+        for threads in [1, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let lazy = pool.install(|| {
+                mark_reachable(sections, &roots, &|section, targets| {
+                    targets.extend_from_slice(&adjacency[section.index()]);
+                })
+            });
+            assert_eq!(lazy, expected, "{threads} threads");
+        }
     }
 
     #[test]
