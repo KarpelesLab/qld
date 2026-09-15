@@ -65,6 +65,9 @@ pub struct LoadedDylib {
     /// Exported symbols, including those of re-exported libraries, sorted by
     /// name.
     pub exports: Vec<DylibExport>,
+    /// Linked implicitly, as a public re-export of another library: its load
+    /// command is written only if the output uses it.
+    pub implicit: bool,
 }
 
 /// What an input is.
@@ -816,13 +819,13 @@ impl<'t> Walker<'_, 't> {
             return Ok(());
         }
         let mut exports = Vec::new();
-        let mut visited = HashSet::new();
+        let mut gather = Gather::default();
         self.stub_exports(
             stub,
             main.install_name.as_bytes(),
             &target,
             &mut exports,
-            &mut visited,
+            &mut gather,
             0,
         )?;
         exports.sort();
@@ -834,30 +837,38 @@ impl<'t> Walker<'_, 't> {
             compatibility_version: main.compatibility_version,
             mode,
             exports,
-        })
+            implicit: false,
+        })?;
+        // Implicitly linked re-exports follow their parent, as lld loads
+        // them.
+        for dylib in gather.implicit {
+            self.push_dylib(dylib)?;
+        }
+        Ok(())
     }
 
     /// Collects the exports of `install_name` (inlined in `stub`, or found
-    /// under the roots) and of the libraries it re-exports. `visited` holds
-    /// the install names already collected, so cycles end.
+    /// under the roots) and of the libraries it re-exports. `gather.visited`
+    /// holds the install names already collected, so cycles end. Returns
+    /// the library's current and compatibility versions, when found.
     fn stub_exports(
         &self,
         stub: &TextStub,
         install_name: &[u8],
         target: &StubTarget,
         out: &mut Vec<DylibExport>,
-        visited: &mut HashSet<Vec<u8>>,
+        gather: &mut Gather,
         depth: usize,
-    ) -> Result<()> {
-        if depth > 32 || !visited.insert(install_name.to_vec()) {
-            return Ok(());
+    ) -> Result<Option<(PackedVersion, PackedVersion)>> {
+        if depth > 32 || !gather.visited.insert(install_name.to_vec()) {
+            return Ok(None);
         }
         let name = String::from_utf8_lossy(install_name);
         let Some(library) = stub.library(&name) else {
-            return self.external_exports(install_name, out, visited, depth);
+            return self.external_exports(install_name, out, gather, depth);
         };
         let Some(selected) = library.select_target(target) else {
-            return Ok(());
+            return Ok(None);
         };
         let selected = selected.clone();
         for symbol in library.exports_for(&selected) {
@@ -873,14 +884,60 @@ impl<'t> Walker<'_, 't> {
             .map(str::to_owned)
             .collect();
         for reexport in reexports {
-            self.stub_exports(
-                stub,
+            self.reexport(
+                Some(stub),
                 reexport.as_bytes(),
-                target,
                 out,
-                visited,
+                gather,
                 depth.saturating_add(1),
             )?;
+        }
+        Ok(Some((
+            library.current_version,
+            library.compatibility_version,
+        )))
+    }
+
+    /// Follows a re-exported library. Libraries in public locations
+    /// (`/usr/lib`, `/System/Library/Frameworks`) are linked implicitly, as
+    /// ld64 and lld do: their symbols bind to their own load command, added
+    /// when something uses them. Others' exports count as the parent's.
+    fn reexport(
+        &self,
+        stub: Option<&TextStub>,
+        install_name: &[u8],
+        out: &mut Vec<DylibExport>,
+        gather: &mut Gather,
+        depth: usize,
+    ) -> Result<()> {
+        if gather.visited.contains(install_name) {
+            return Ok(());
+        }
+        let target = self.stub_target();
+        let mut own = Vec::new();
+        let implicit = is_implicitly_linked(install_name);
+        let destination = if implicit { &mut own } else { &mut *out };
+        let versions = match stub {
+            Some(stub) => {
+                self.stub_exports(stub, install_name, &target, destination, gather, depth)?
+            }
+            None => {
+                gather.visited.insert(install_name.to_vec());
+                self.external_exports(install_name, destination, gather, depth)?
+            }
+        };
+        if implicit && let Some((current_version, compatibility_version)) = versions {
+            own.sort();
+            own.dedup_by(|a, b| a.name == b.name);
+            gather.implicit.push(LoadedDylib {
+                path: PathBuf::from(String::from_utf8_lossy(install_name).into_owned()),
+                install_name: install_name.to_vec(),
+                current_version,
+                compatibility_version,
+                mode: LoadMode::Normal,
+                exports: own,
+                implicit: true,
+            });
         }
         Ok(())
     }
@@ -892,15 +949,15 @@ impl<'t> Walker<'_, 't> {
         &self,
         install_name: &[u8],
         out: &mut Vec<DylibExport>,
-        visited: &mut HashSet<Vec<u8>>,
+        gather: &mut Gather,
         depth: usize,
-    ) -> Result<()> {
+    ) -> Result<Option<(PackedVersion, PackedVersion)>> {
         let Some(path) = self.search.find_install_name(install_name) else {
             self.diagnostics.emit(Diagnostic::warning(format!(
                 "unable to locate re-exported library {}",
                 String::from_utf8_lossy(install_name)
             )));
-            return Ok(());
+            return Ok(None);
         };
         let data = std::fs::read(&path).map_err(|error| Error::io(&path, error))?;
         let source = MachSource::new(&path);
@@ -917,21 +974,21 @@ impl<'t> Walker<'_, 't> {
                 let target = self.stub_target();
                 // The file describes `install_name` itself: collect it
                 // without the visited check that already passed.
-                visited.remove(install_name);
+                gather.visited.remove(install_name);
                 self.stub_exports(
                     &stub,
                     install_name,
                     &target,
                     out,
-                    visited,
+                    gather,
                     depth.saturating_add(1),
                 )
             }
             FileFormat::MachO(_) => {
                 let dylib = Dylib::parse(&data, source)?;
-                self.binary_exports(&dylib, out, visited, depth.saturating_add(1))
+                self.binary_exports(&dylib, out, gather, depth.saturating_add(1))
             }
-            _ => Ok(()),
+            _ => Ok(None),
         }
     }
 
@@ -939,9 +996,13 @@ impl<'t> Walker<'_, 't> {
         &self,
         dylib: &Dylib<'_>,
         out: &mut Vec<DylibExport>,
-        visited: &mut HashSet<Vec<u8>>,
+        gather: &mut Gather,
         depth: usize,
-    ) -> Result<()> {
+    ) -> Result<Option<(PackedVersion, PackedVersion)>> {
+        let versions = dylib.id().map_or(
+            (PackedVersion::new(1, 0, 0), PackedVersion::new(1, 0, 0)),
+            |id| (id.current_version, id.compatibility_version),
+        );
         if dylib.exports_trie().is_empty() {
             for symbol in dylib.symbols().iter() {
                 let symbol = symbol?;
@@ -964,22 +1025,20 @@ impl<'t> Walker<'_, 't> {
             }
         }
         if depth > 32 {
-            return Ok(());
+            return Ok(Some(versions));
         }
         let reexports: Vec<Vec<u8>> = dylib.reexports().map(|d| d.name.to_vec()).collect();
         for name in reexports {
-            if visited.insert(name.clone()) {
-                self.external_exports(&name, out, visited, depth.saturating_add(1))?;
-            }
+            self.reexport(None, &name, out, gather, depth.saturating_add(1))?;
         }
-        Ok(())
+        Ok(Some(versions))
     }
 
     fn add_binary_dylib(&mut self, dylib: &Dylib<'_>, path: PathBuf, mode: LoadMode) -> Result<()> {
         let mut exports = Vec::new();
-        let mut visited = HashSet::new();
-        visited.insert(dylib.install_name().to_vec());
-        self.binary_exports(dylib, &mut exports, &mut visited, 0)?;
+        let mut gather = Gather::default();
+        gather.visited.insert(dylib.install_name().to_vec());
+        self.binary_exports(dylib, &mut exports, &mut gather, 0)?;
         exports.sort();
         exports.dedup_by(|a, b| a.name == b.name);
         let (current_version, compatibility_version) = dylib.id().map_or(
@@ -998,8 +1057,41 @@ impl<'t> Walker<'_, 't> {
             compatibility_version,
             mode,
             exports,
-        })
+            implicit: false,
+        })?;
+        // Implicitly linked re-exports follow their parent, as lld loads
+        // them.
+        for dylib in gather.implicit {
+            self.push_dylib(dylib)?;
+        }
+        Ok(())
     }
+}
+
+/// State shared while following re-exports.
+#[derive(Default)]
+struct Gather {
+    visited: HashSet<Vec<u8>>,
+    implicit: Vec<LoadedDylib>,
+}
+
+/// Whether a re-exported library is linked implicitly: its install name is
+/// directly in `/usr/lib`, or is a framework's binary in
+/// `/System/Library/Frameworks` (lld's rule).
+#[must_use]
+pub fn is_implicitly_linked(install_name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(install_name) else {
+        return false;
+    };
+    let path = Path::new(name);
+    if path.parent() == Some(Path::new("/usr/lib")) {
+        return true;
+    }
+    if let Some(rest) = name.strip_prefix("/System/Library/Frameworks/") {
+        let framework = rest.split('.').next().unwrap_or("");
+        return path.file_name().and_then(|f| f.to_str()) == Some(framework);
+    }
+    false
 }
 
 /// Whether an archive member defines an Objective-C class or category, for

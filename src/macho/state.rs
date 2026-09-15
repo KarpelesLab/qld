@@ -9,10 +9,10 @@ use crate::args::darwin::{LoadMode, UndefinedTreatment};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
+use crate::macho::read::AtomKind;
 use crate::macho::read::consts::{
     N_ABS, N_SECT, S_MOD_INIT_FUNC_POINTERS, S_MOD_TERM_FUNC_POINTERS,
 };
-use crate::macho::read::{AtomKind, RelocationTarget};
 use crate::symbols::{DefinitionKind, Resolution, SymbolTable, SymbolUse};
 
 use super::config::Config;
@@ -532,35 +532,6 @@ impl<'a> Link<'a> {
         }
     }
 
-    /// The atom of `file` a relocation target points into, if any.
-    fn target_atom(
-        &self,
-        file: usize,
-        object: &LinkObject<'_>,
-        target: RelocationTarget,
-        value: u64,
-    ) -> Option<usize> {
-        match target {
-            RelocationTarget::Symbol(symbol) => {
-                let global = *object.global_of_symbol.get(usize::try_from(symbol).ok()?)?;
-                if global != NOT_GLOBAL {
-                    let id = self.global_id(file, global)?;
-                    return self.symbol_atom(id);
-                }
-                let atom = object.atoms.symbol_atom(symbol)?;
-                Some(self.atom_id(file, atom))
-            }
-            RelocationTarget::Section(ordinal) => {
-                let section = usize::try_from(ordinal).ok()?.checked_sub(1)?;
-                let header = object.file.sections().get(section)?;
-                let offset = value.checked_sub(header.addr)?;
-                let atom = atom_containing(object, section, offset)?;
-                Some(self.atom_id(file, atom))
-            }
-            RelocationTarget::Scattered(_) => None,
-        }
-    }
-
     /// Reference edges between atoms, including the reverse edges that keep
     /// live-support atoms (compact unwind records, `S_ATTR_LIVE_SUPPORT`)
     /// alive with what they describe.
@@ -572,17 +543,29 @@ impl<'a> Link<'a> {
                 let Some(object) = self.object(file) else {
                     return Ok(edges);
                 };
+                let atom_of = |place: super::reloc::Place| match place {
+                    super::reloc::Place::Atom { atom, .. } => Some(atom),
+                    _ => None,
+                };
                 for (section_index, relocations) in object.relocations.iter().enumerate() {
                     let Some(section) = object.file.sections().get(section_index) else {
                         continue;
                     };
-                    let reverse = section.is_live_support()
-                        || section.is(b"__LD", b"__compact_unwind")
-                        || section.is(b"__TEXT", b"__eh_frame");
+                    if section.is(b"__TEXT", b"__eh_frame") {
+                        continue;
+                    }
+                    let reverse =
+                        section.is_live_support() || section.is(b"__LD", b"__compact_unwind");
                     let data = object.file.section_data(section_index)?;
                     for relocation in relocations {
-                        let reloc = relocation.relocation.relocation;
-                        let value = embedded_address(data, &reloc, section.addr);
+                        let decoded = super::reloc::decode(
+                            self,
+                            file,
+                            object,
+                            section_index,
+                            data,
+                            &relocation.relocation,
+                        )?;
                         let from = self.atom_id(file, relocation.atom);
                         let mut push = |target: Option<usize>| {
                             if let Some(to) = target {
@@ -592,9 +575,44 @@ impl<'a> Link<'a> {
                                 edges.push((from, to));
                             }
                         };
-                        push(self.target_atom(file, object, reloc.target, value));
-                        if let Some(subtractor) = relocation.relocation.subtractor {
-                            push(self.target_atom(file, object, subtractor.target, 0));
+                        let target = super::reloc::place(
+                            self,
+                            file,
+                            object,
+                            decoded.referent,
+                            decoded.addend,
+                        )
+                        .ok()
+                        .and_then(atom_of);
+                        push(target);
+                        if let Some(subtrahend) = decoded.subtrahend {
+                            push(
+                                super::reloc::place(self, file, object, subtrahend, 0)
+                                    .ok()
+                                    .and_then(atom_of),
+                            );
+                        }
+                    }
+                }
+                // An FDE keeps its function's LSDA alive.
+                if let Some((section, frame)) = super::eh_frame::parse(object)? {
+                    let data = object.file.section_data(section)?;
+                    for record in &frame.records {
+                        let crate::macho::read::EhFrameKind::Fde(fde) = record.kind else {
+                            continue;
+                        };
+                        let Some(lsda) = &fde.lsda else {
+                            continue;
+                        };
+                        let target = |pointer| match super::eh_frame::pointer_target(
+                            self, file, object, section, data, pointer,
+                        ) {
+                            Ok(Some(super::eh_frame::Target::Place(place))) => atom_of(place),
+                            _ => None,
+                        };
+                        if let (Some(function), Some(lsda)) = (target(&fde.pc_begin), target(lsda))
+                        {
+                            edges.push((function, lsda));
                         }
                     }
                 }
@@ -681,24 +699,6 @@ impl<'a> Link<'a> {
             let _ = AtomKind::Regular;
         }
         roots
-    }
-}
-
-/// The object address an `UNSIGNED` relocation's contents hold, used to
-/// find the target of section-relative relocations. Zero for other types.
-fn embedded_address(
-    data: &[u8],
-    reloc: &crate::macho::read::Relocation,
-    _section_addr: u64,
-) -> u64 {
-    if reloc.pcrel || !matches!(reloc.target, RelocationTarget::Section(_)) {
-        return 0;
-    }
-    let at = usize::try_from(reloc.address).unwrap_or(usize::MAX);
-    match reloc.length {
-        3 => super::buf::get64(data, at).unwrap_or(0),
-        2 => u64::from(super::buf::get32(data, at).unwrap_or(0)),
-        _ => 0,
     }
 }
 

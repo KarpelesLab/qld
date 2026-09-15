@@ -188,6 +188,50 @@ pub fn output_names<'s>(
     }
 }
 
+/// An atom placed in an output section: its sort key (order file position,
+/// cold), file and atom index.
+type Member = ((usize, bool), usize, usize);
+
+/// Reads an `-order_file`: one symbol per line, optionally prefixed with an
+/// architecture (`arm64:`) and an object file (`foo.o:`); `#` starts a
+/// comment. Returns each symbol's position.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file cannot be read.
+pub fn read_order_file(path: &std::path::Path, arch: &str) -> Result<HashMap<Vec<u8>, usize>> {
+    let text = std::fs::read(path).map_err(|error| Error::io(path, error))?;
+    let mut order = HashMap::new();
+    for line in text.split(|&b| b == b'\n') {
+        let line = match line.iter().position(|&b| b == b'#') {
+            Some(hash) => line.get(..hash).unwrap_or(&[]),
+            None => line,
+        };
+        let mut symbol = line.trim_ascii();
+        for known in [b"arm64:".as_slice(), b"x86_64:", b"arm64e:", b"x86_64h:"] {
+            if let Some(rest) = symbol.strip_prefix(known) {
+                if !known.starts_with(arch.as_bytes())
+                    || known.len() != arch.len().saturating_add(1)
+                {
+                    symbol = b"";
+                } else {
+                    symbol = rest;
+                }
+                break;
+            }
+        }
+        if let Some(position) = symbol.windows(3).position(|w| w == b".o:") {
+            symbol = symbol.get(position.saturating_add(3)..).unwrap_or(&[]);
+        }
+        if symbol.is_empty() {
+            continue;
+        }
+        let next = order.len();
+        order.entry(symbol.to_vec()).or_insert(next);
+    }
+    Ok(order)
+}
+
 /// Whether an input section is consumed by the linker rather than copied.
 #[must_use]
 pub fn is_consumed(segname: &[u8], sectname: &[u8], flags: u32) -> bool {
@@ -311,6 +355,7 @@ pub fn plan(
     synthetic: &SyntheticSizes,
     commons: &[(u64, u32)],
     sectcreate: &[(Vec<u8>, Vec<u8>, u64)],
+    order: &HashMap<Vec<u8>, usize>,
 ) -> Result<Layout> {
     let config = link.config;
     let mut builder = Builder {
@@ -321,6 +366,10 @@ pub fn plan(
     let mut atom_offset = vec![0u64; link.atom_count];
     let data_const = config.data_const;
 
+    // Atoms of each output section, with their sort keys: symbols listed in
+    // the order file first (in its order), then everything else in input
+    // order, with cold functions (`N_COLD_FUNC`) last, as ld64 and lld do.
+    let mut members: Vec<Vec<Member>> = Vec::new();
     for (file_index, _) in link.files.iter().enumerate() {
         let Some(object) = link.object(file_index) else {
             continue;
@@ -351,23 +400,57 @@ pub fn plan(
                 u32::try_from(file_index).unwrap_or(NONE),
                 u32::try_from(section_index).unwrap_or(NONE),
             ));
+            if members.len() <= out {
+                members.resize_with(out.saturating_add(1), Vec::new);
+            }
+            let Some(list) = members.get_mut(out) else {
+                continue;
+            };
             for atom in atoms {
-                let Some(info) = object.atoms.atoms().get(atom) else {
-                    continue;
+                let mut listed = usize::MAX;
+                let mut cold = false;
+                for &symbol in object.atoms.atom_symbols(atom) {
+                    let Ok(entry) = object.file.symbols().get(symbol) else {
+                        continue;
+                    };
+                    cold |= entry.is_cold_func();
+                    if let Some(&position) = order.get(entry.name) {
+                        listed = listed.min(position);
+                    }
+                }
+                let key = if listed == usize::MAX {
+                    (usize::MAX, cold)
+                } else {
+                    (listed, false)
                 };
-                out_section.align = out_section.align.max(info.align);
-                let alignment = 1u64.checked_shl(info.align).unwrap_or(1);
-                let offset = align_up(out_section.size, alignment);
-                out_section.size = offset
-                    .checked_add(info.size)
-                    .ok_or_else(|| Error::Limit("output section larger than 2^64".into()))?;
-                let id = link.atom_id(file_index, atom);
-                if let Some(slot) = atom_section.get_mut(id) {
-                    *slot = u32::try_from(out).unwrap_or(NONE);
-                }
-                if let Some(slot) = atom_offset.get_mut(id) {
-                    *slot = offset;
-                }
+                list.push((key, file_index, atom));
+            }
+        }
+    }
+    for (out, list) in members.iter_mut().enumerate() {
+        list.sort_by_key(|&(key, _, _)| key);
+        let Some(out_section) = builder.sections.get_mut(out) else {
+            continue;
+        };
+        for &(_, file_index, atom) in list.iter() {
+            let Some(info) = link
+                .object(file_index)
+                .and_then(|object| object.atoms.atoms().get(atom))
+            else {
+                continue;
+            };
+            out_section.align = out_section.align.max(info.align);
+            let alignment = 1u64.checked_shl(info.align).unwrap_or(1);
+            let offset = align_up(out_section.size, alignment);
+            out_section.size = offset
+                .checked_add(info.size)
+                .ok_or_else(|| Error::Limit("output section larger than 2^64".into()))?;
+            let id = link.atom_id(file_index, atom);
+            if let Some(slot) = atom_section.get_mut(id) {
+                *slot = u32::try_from(out).unwrap_or(NONE);
+            }
+            if let Some(slot) = atom_offset.get_mut(id) {
+                *slot = offset;
             }
         }
     }

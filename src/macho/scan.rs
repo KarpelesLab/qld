@@ -94,10 +94,36 @@ pub fn scan(
                 let Some(section) = object.file.sections().get(section_index) else {
                     continue;
                 };
+                let data = object.file.section_data(section_index)?;
+                if section.is(b"__TEXT", b"__eh_frame") {
+                    // CIE personalities are reached through `__got`.
+                    for relocation in relocations {
+                        let decoded = reloc::decode(
+                            link,
+                            file,
+                            object,
+                            section_index,
+                            data,
+                            &relocation.relocation,
+                        )?;
+                        if let Referent::Global(id) = decoded.referent
+                            && reloc::needs(arm64, decoded.r_type).pointer
+                        {
+                            out.push((
+                                id,
+                                Wants {
+                                    got: true,
+                                    used: true,
+                                    ..Wants::default()
+                                },
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 if is_consumed(section.segname, section.sectname, section.flags) {
                     continue;
                 }
-                let data = object.file.section_data(section_index)?;
                 for relocation in relocations {
                     if !link.is_live(file, relocation.atom) {
                         continue;
@@ -243,7 +269,7 @@ pub fn scan(
     for (index, dylib) in link.dylibs.iter().enumerate() {
         let keep = dylib.mode == LoadMode::Needed
             || used.get(index).copied().unwrap_or(false)
-            || !options.darwin.dead_strip_dylibs;
+            || (!options.darwin.dead_strip_dylibs && !dylib.implicit);
         if !keep {
             continue;
         }

@@ -263,6 +263,8 @@ struct Summary {
     exports: BTreeSet<String>,
     imports: BTreeSet<String>,
     dylibs: Vec<String>,
+    /// The `__unwind_info` encodings, in function order, without addresses.
+    unwind: Vec<String>,
 }
 
 fn summarize(file: &Path) -> Option<Summary> {
@@ -294,11 +296,34 @@ fn summarize(file: &Path) -> Option<Summary> {
         .skip(1)
         .map(|l| l.split_whitespace().next().unwrap_or("").to_owned())
         .collect();
+    // DWARF encodings hold an `__eh_frame` offset, which depends on which
+    // CIEs a linker keeps.
+    let data = std::fs::read(file).ok()?;
+    let arm64 = MachOFile::parse(&data, Source::new(file))
+        .ok()?
+        .header()
+        .cpu_type
+        == qld::macho::read::consts::CPU_TYPE_ARM64;
+    let dwarf_mode = if arm64 { 0x0300_0000 } else { 0x0400_0000 };
+    let unwind = objdump(&["--macho", "--unwind-info"], file)?
+        .lines()
+        .filter_map(|l| {
+            let (_, encoding) = l.split_once("encoding[")?;
+            let text = encoding.split_once('=')?.1.trim();
+            let value = u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()?;
+            Some(if value & 0x0f00_0000 == dwarf_mode {
+                "dwarf".to_owned()
+            } else {
+                text.to_owned()
+            })
+        })
+        .collect();
     Some(Summary {
         sections,
         exports,
         imports,
         dylibs,
+        unwind,
     })
 }
 
@@ -591,6 +616,133 @@ fn thread_local_variables() {
         }
         if host_can_run(arch) {
             assert_eq!(run(&exe).unwrap(), "42 3 tls 6\n");
+        }
+    }
+}
+
+#[test]
+fn cxx_exceptions() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "cxx_exceptions",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("exceptions", "exceptions.cpp", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[object.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = scratch("exceptions").join(format!("exceptions-{arch}"));
+        link_and_compare(&args, &exe);
+        if let Some(unwind) = objdump(&["--macho", "--unwind-info"], &exe) {
+            assert!(
+                unwind.contains("Personality functions: (count = 1)"),
+                "{unwind}"
+            );
+            assert!(unwind.contains("LSDA descriptors:"), "{unwind}");
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "caught 84 after 10 cleanups\n");
+        }
+    }
+}
+
+/// The address of symbol `name` in `file`, from `llvm-nm`.
+fn nm_address(file: &Path, name: &str) -> Option<u64> {
+    let output = Command::new("llvm-nm").arg(file).output().ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|l| {
+            let mut parts = l.split_whitespace();
+            let address = parts.next()?;
+            let _kind = parts.next()?;
+            (parts.next()? == name)
+                .then(|| u64::from_str_radix(address, 16).ok())
+                .flatten()
+        })
+}
+
+#[test]
+fn dwarf_unwind_information() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "dwarf_unwind_information",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let main = compile("dwarf", "dwarf_unwind.cpp", arch, &[]);
+        let asm = compile("dwarf", &format!("dwarf-{arch}.s"), arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            main.to_str().unwrap(),
+            asm.to_str().unwrap(),
+            "-lc++",
+            "-lSystem",
+        ]));
+        let exe = scratch("dwarf").join(format!("dwarf-{arch}"));
+        link_and_compare(&args, &exe);
+        // The FDE in __eh_frame covers call_through.
+        if let (Ok(frames), Some(function)) = (
+            Command::new("llvm-dwarfdump")
+                .arg("--eh-frame")
+                .arg(&exe)
+                .output(),
+            nm_address(&exe, "_call_through"),
+        ) {
+            let frames = String::from_utf8_lossy(&frames.stdout);
+            let wanted = format!("pc={function:08x}...");
+            assert!(
+                frames.contains(&wanted),
+                "{arch}: no FDE for {wanted}:\n{frames}"
+            );
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "dwarf 7\n");
+        }
+    }
+}
+
+#[test]
+fn dead_stripping() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "dead_stripping",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("dead_strip", "dead_strip.c", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            object.to_str().unwrap(),
+            "-dead_strip",
+            "-lSystem",
+        ]));
+        let exe = scratch("dead_strip").join(format!("dead_strip-{arch}"));
+        link_and_compare(&args, &exe);
+        for (name, kept) in [
+            ("_main", true),
+            ("_used_data", true),
+            ("_kept_by_attribute", true),
+            ("_unused_function", false),
+            ("_unused_caller", false),
+            ("_unused_data", false),
+        ] {
+            if tool_works("llvm-nm", &["--version"]) {
+                assert_eq!(
+                    nm_address(&exe, name).is_some(),
+                    kept,
+                    "{arch}: {name} should {}be kept",
+                    if kept { "" } else { "not " }
+                );
+            }
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "stripped 42\n");
         }
     }
 }

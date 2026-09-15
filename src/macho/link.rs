@@ -240,8 +240,9 @@ fn link_arch(
         }
     }
 
-    let unwind_plan = super::unwind::plan(&link, &synthetic)?;
-    let eh_frame_plan = super::eh_frame::plan(&link)?;
+    let mut unwind_entries = super::unwind::collect(&link)?;
+    let eh_frame_plan = super::eh_frame::plan(&link, &mut unwind_entries)?;
+    let unwind_plan = super::unwind::plan(&link, unwind_entries);
     let sizes = SyntheticSizes {
         stubs: to_u64(synthetic.stubs.len()),
         got: to_u64(synthetic.got.len()),
@@ -268,7 +269,11 @@ fn link_arch(
         ));
         sectcreate_data.push(data);
     }
-    let mut layout = layout::plan(&link, &sizes, &commons, &sectcreate)?;
+    let order = match &options.darwin.order_file {
+        Some(path) => layout::read_order_file(path, arch.name().unwrap_or(""))?,
+        None => hashbrown::HashMap::new(),
+    };
+    let mut layout = layout::plan(&link, &sizes, &commons, &sectcreate, &order)?;
 
     // Load commands.
     let mut commands = Commands {
@@ -311,6 +316,37 @@ fn link_arch(
     let thunks = Thunks::default();
     fill_section_indices(&mut layout, &synthetic);
 
+    // `__unwind_info` was sized with an upper bound; its exact size is known
+    // once the code has addresses (which it does not change: it follows all
+    // code), so shrink it and lay out the rest again.
+    let mut unwind_info = Vec::new();
+    if unwind_plan.size() > 0 {
+        for _ in 0..2 {
+            unwind_info = super::unwind::build(
+                &Addresses {
+                    link: &link,
+                    layout: &layout,
+                    synthetic: &synthetic,
+                    thunks: &thunks,
+                },
+                &unwind_plan,
+            )?;
+            let exact = to_u64(unwind_info.len());
+            let Some(section) = layout
+                .sections
+                .iter_mut()
+                .find(|s| s.kind == layout::SectionKind::UnwindInfo)
+            else {
+                break;
+            };
+            if section.size == exact {
+                break;
+            }
+            section.size = exact;
+            layout.assign_addresses(&link, header_size)?;
+        }
+    }
+
     let addresses = Addresses {
         link: &link,
         layout: &layout,
@@ -325,8 +361,8 @@ fn link_arch(
 
     let linkedit_start = layout.segment(b"__LINKEDIT").map_or(0, |s| s.fileoff);
     let mut image = vec![0u8; to_usize(linkedit_start)];
-    let mut pointer_fixups = sections::write(&addresses, &sectcreate_data, &mut image)?;
-    super::unwind::write(&addresses, &unwind_plan, &mut image, &mut pointer_fixups)?;
+    let pointer_fixups = sections::write(&addresses, &sectcreate_data, &mut image)?;
+    super::unwind::write(&layout, &unwind_info, &mut image)?;
     super::eh_frame::write(&addresses, &eh_frame_plan, &mut image)?;
 
     // __LINKEDIT.
