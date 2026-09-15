@@ -62,7 +62,7 @@ can work at the same time without colliding.
 | W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | merged |
 | W23 | Write-based (`pwrite`) output backend | `src/output/**`, writer call sites in `src/elf/` and `src/coff/` | W5 | merged (default) |
 | W24 | Benchmarks and performance (M5) | `benches/**`, `tests/projects/bench*`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**`, `src/input/**`, `src/debug/**` | W23 | in progress |
-| W25 | Mach-O linking (M8) | `src/macho/**`, the ld64 front end in `src/args/`, `tests/macho_link*` | W15 | in progress |
+| W25 | Mach-O linking (M8) | `src/macho/**`, the ld64 front end in `src/args/`, `tests/macho_link*` | W15 | merged |
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -452,6 +452,13 @@ ld64 flavor parser in `src/args/`, `tests/macho_link.rs`, new fixtures.
 ---
 
 ## Integration follow-ups
+
+- **W25:** `link()` dispatch for Mach-O and the `macho-macos` CI job are done.
+  Open: move `src/macho/sha256.rs` into `src/output/hash` (after W24 merges);
+  `-r`, `-bundle_loader`, `-init`, `-alias`, `-flat_namespace`, arm64e and
+  LTO are rejected by name; cstring deduplication and ObjC relative method
+  lists are missing; legacy (pre-chained-fixups) output binds everything at
+  load time; `-v` with inputs prints a note instead of the version on stdout.
 
 Changes requested by merged workstreams that need a frozen shared file, or
 that cross workstream boundaries. The integrator does these between merges.

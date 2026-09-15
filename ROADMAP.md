@@ -284,17 +284,18 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 
 ## M8: Mach-O (ld64 flavor)
 
-- [ ] ld64 argv flavor: `-arch`, `-platform_version`, `-syslibroot`,
+- [x] ld64 argv flavor: `-arch`, `-platform_version`, `-syslibroot`,
       `-framework`, `-dylib`, `-bundle`, `-dead_strip`, `-undefined`, `-exported_symbols_list`
 - [x] Mach-O object parsing including `.subsections_via_symbols` atomization (reader)
-- [~] `.tbd` text stubs (v1–v5) and dylib inputs read; two-level namespace and re-export resolution pending
-- [ ] arm64 and x86_64: stubs, GOT, thunks (arm64), TLV
-- [ ] `LC_DYLD_CHAINED_FIXUPS` and legacy `LC_DYLD_INFO_ONLY` output
-- [ ] Compact unwind (`__unwind_info`) synthesis, `__eh_frame`
-- [ ] Ad-hoc code signature (`LC_CODE_SIGNATURE`), which arm64 macOS requires
-- [ ] STABS debug map (`N_OSO`) so `dsymutil` can find DWARF in object files
-- [ ] Objective-C / Swift sections handled correctly (category merging later)
-- [ ] **Universal (fat) binaries**: link each slice in parallel from multiple
+- [x] `.tbd` text stubs (v1–v5) and dylib inputs; two-level namespace and re-export resolution, including implicit public re-exports
+- [x] arm64 and x86_64: stubs, GOT, thunks (arm64), TLV
+- [x] `LC_DYLD_CHAINED_FIXUPS` and legacy `LC_DYLD_INFO_ONLY` output
+- [x] Compact unwind (`__unwind_info`) synthesis, `__eh_frame`
+- [x] Ad-hoc code signature (`LC_CODE_SIGNATURE`), which arm64 macOS requires
+- [x] STABS debug map (`N_OSO`) so `dsymutil` can find DWARF in object files
+- [~] Objective-C / Swift sections handled correctly (basic handling done; category merging and relative method lists later)
+- [ ] `-r`, arm64e, LTO through `libLTO`
+- [x] **Universal (fat) binaries**: link each slice in parallel from multiple
       `-arch` values and write the `fat_header`; accept fat objects, archives
       and dylibs as inputs by selecting the matching slice
 
@@ -302,6 +303,11 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 test suite on arm64 and x86_64 CI runners with `-fuse-ld=qld`. A Rust
 `aarch64-apple-darwin` binary runs. A universal binary passes `lipo -info`
 and runs natively on both architectures.
+
+**Status:** everything above except `-r`, arm64e and LTO is implemented and
+validated structurally against `ld64.lld` on Linux (`tests/macho_link.rs`).
+The `macho-macos` CI job links against the real SDK and runs the outputs; the
+exit criteria are not claimed until that job is green.
 
 ---
 

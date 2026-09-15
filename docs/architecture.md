@@ -244,6 +244,27 @@ The final file size is known before any byte is written. The writer then:
 Removing a large old output file can run on a background thread so that it
 doesn't hold up the link.
 
+### Mach-O pipeline
+
+`macho::link` follows the same stages with Mach-O semantics. Each `-arch`
+value is an independent link; several run in parallel and `fat.rs` joins
+them into a universal binary. Per architecture:
+
+1. `inputs`: search paths, objects, archives, dylibs, `.tbd` stubs and
+   frameworks, selecting universal slices;
+2. symbol resolution with Mach-O precedence rules;
+3. relocations loaded in parallel, undefined symbols reported, `-undefined`
+   applied;
+4. weak definition coalescing and `-dead_strip` over
+   `.subsections_via_symbols` atoms;
+5. `scan`: stubs, `__got`, `__thread_ptrs`, imports and dylib ordinals;
+6. layout in lld's section order (`-order_file`, arm64 thunk islands), with
+   `__unwind_info` sized before addresses are assigned and built after;
+7. section contents and relocations, collecting pointer fixups;
+8. `__LINKEDIT` (chained fixups or rebase/bind opcodes, export trie, symbol
+   tables, STABS debug map), then the header, `LC_UUID` and the ad-hoc code
+   signature.
+
 ## Module layout
 
 qld is a **single crate**. It builds as one library plus one binary, and the

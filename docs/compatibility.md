@@ -366,5 +366,20 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   reproduced (clang does not put those labels in the symbol table).
 - Selecting `x86_64` from a universal input also accepts a lone `x86_64h`
   slice.
+- `@file` arguments stay literal when no such file exists, so `@rpath/...`
+  and `@executable_path/...` pass through.
+- References to exported weak definitions bind through weak lookup, as ld64
+  does. Implicit re-exports (a public sub-library such as `libc++abi` under
+  `libc++`) are followed.
+- `ZERO_AR_DATE` in the environment zeroes the debug-map (`N_OSO`)
+  timestamps.
+- `-order_file` accepts ld64's syntax: one symbol per line, optional
+  `arch:` and `object.o:` prefixes, `#` comments.
+- Known differences: no cstring deduplication; no Objective-C relative
+  method lists; unused CIEs in `__eh_frame` are dropped; legacy
+  (`LC_DYLD_INFO_ONLY`) output binds every import at load time and does not
+  use weak binding.
+- Not supported yet, rejected with an error: `-r`, `-alias`,
+  `-bundle_loader`, `-init`, `-flat_namespace`, arm64e, and LTO/bitcode.
 - `-lto_library` is accepted. Mach-O LTO uses `libLTO` through the plugin
   layer, not the GNU plugin API. See [optimizations.md](optimizations.md#lto).

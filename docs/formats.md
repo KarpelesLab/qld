@@ -137,6 +137,20 @@ every output format:
 | Platform | `LC_BUILD_VERSION` from `-platform_version` |
 | ObjC/Swift | correct section handling. `__objc_imageinfo` merging. |
 
+### Implementation notes
+
+- **Dynamic info:** chained fixups (pointer format `DYLD_CHAINED_PTR_64`)
+  are used when the deployment target is at least macOS 12, iOS/tvOS 15 or
+  watchOS 8, as ld64 does; older targets get `LC_DYLD_INFO_ONLY`.
+  `-fixup_chains` and `-no_fixup_chains` override the choice.
+- **arm64 thunks:** a code section larger than 120 MiB gets islands every
+  100 MiB. A branch beyond `bl` range (±128 MiB) goes through an
+  `adrp`/`add`/`br x16` thunk in the island nearest its caller, one thunk
+  per far target per island. Layout repeats until the thunk sets stop
+  growing.
+- **Determinism:** `LC_UUID` is an MD5 of the output (version-3 UUID). The
+  ad-hoc code signature is computed last, over the finished image.
+
 ### Universal (fat) binaries
 
 - **Output:** each `-arch` value produces a complete, independent link. The
