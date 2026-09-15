@@ -61,6 +61,8 @@ can work at the same time without colliding.
 | W20 | AArch64 ELF (M4) | `src/elf/arch/**`, `src/arch/**`, thunk/relaxation hooks in `src/elf/{layout,write,scan,synth}.rs`, `tests/aarch64*` | W16 | merged |
 | W21 | PE/COFF linking (M7) | `src/coff/**` (beyond `read/`), `tests/coff_link*` | W14 | merged |
 | W23 | Write-based (`pwrite`) output backend | `src/output/**`, writer call sites in `src/elf/` and `src/coff/` | W5 | merged (default) |
+| W24 | Benchmarks and performance (M5) | `benches/**`, `tests/projects/bench*`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**`, `src/input/**`, `src/debug/**` | W23 | in progress |
+| W25 | Mach-O linking (M8) | `src/macho/**`, the ld64 front end in `src/args/`, `tests/macho_link*` | W15 | in progress |
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -421,6 +423,31 @@ MinGW flavor: symbol resolution, layout, imports and exports, base
 relocations, SEH, and `--out-implib`. The readers are merged (W14).
 
 **Owns:** `src/coff/**` outside `read/`, `tests/coff_link.rs`, new fixtures.
+
+---
+
+## W24: Benchmarks and performance (M5)
+
+**Goal:** a reproducible benchmark suite comparing qld with GNU ld, lld, mold
+and wild on real links (clang, rustc's `librustc_driver`, the Linux kernel,
+large debug-info binaries), then profiling-driven work toward M5's exit
+criterion: wall time at or below mold and wild at 8 and 64 cores, peak RSS no
+higher than lld's, identical output across thread counts.
+
+**Owns:** `benches/**`, benchmark scripts under `tests/projects/`, and
+performance changes in the link pipeline modules.
+
+---
+
+## W25: Mach-O linking (M8)
+
+**Goal:** qld links arm64 and x86_64 macOS executables and dylibs through an
+ld64-compatible command line, including chained fixups, `__unwind_info`, the
+ad-hoc code signature and universal binaries; the macOS CI runner executes
+the results. The readers are merged (W15).
+
+**Owns:** `src/macho/**` outside `read/` (extending `read/` as needed), the
+ld64 flavor parser in `src/args/`, `tests/macho_link.rs`, new fixtures.
 
 ---
 
