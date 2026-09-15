@@ -1265,6 +1265,42 @@ fn linker_options_from_archive_members() {
 }
 
 #[test]
+fn order_file() {
+    let arch = "arm64";
+    if !clang_for(arch) {
+        skip("order_file", "clang cannot target arm64-apple-macos");
+        return;
+    }
+    let dir = scratch("order");
+    let object = compile("order", "dead_strip.c", arch, &[]);
+    let order = dir.join("order.txt");
+    std::fs::write(
+        &order,
+        "# callers first\narm64:_unused_caller\n_main\nx86_64:_unused_function\n",
+    )
+    .unwrap();
+    let mut args = base_args(arch);
+    args.extend(strings(&[
+        object.to_str().unwrap(),
+        "-order_file",
+        order.to_str().unwrap(),
+        "-lSystem",
+    ]));
+    let exe = dir.join("ordered");
+    link_and_compare(&args, &exe);
+    if let (Some(caller), Some(main), Some(function)) = (
+        nm_address(&exe, "_unused_caller"),
+        nm_address(&exe, "_main"),
+        nm_address(&exe, "_unused_function"),
+    ) {
+        assert!(
+            caller < main && main < function,
+            "{caller:#x} {main:#x} {function:#x}"
+        );
+    }
+}
+
+#[test]
 fn undefined_symbols_are_reported() {
     if !clang_for("arm64") {
         skip(
