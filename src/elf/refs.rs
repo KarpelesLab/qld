@@ -214,7 +214,7 @@ fn local_def(
     raw: &RawSymbol,
     symbols: &crate::elf::read::SymbolTable<'_, crate::elf::read::Elf64Le>,
 ) -> Option<Def> {
-    Some(match symbols.section(index, raw).ok()? {
+    Some(match symbols.section_of(index, raw)? {
         SectionIndex::Section(section) => Def::Section {
             file,
             section,
