@@ -399,6 +399,16 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
                 loader.scripts.push((script, true));
             }
             InputKind::File(path) if spec.attrs.format == InputFormat::Binary => {
+                let kind = options
+                    .target
+                    .and_then(crate::elf::arch::Arch::from_target)
+                    .map(crate::elf::arch::Arch::kind);
+                if let Some(kind) = kind.filter(|&k| k != crate::elf::read::ElfKind::Elf64Le) {
+                    // `binary_input` writes 64-bit little-endian objects.
+                    return Err(Error::Unimplemented(format!(
+                        "-b binary inputs for {kind:?} (roadmap M4: more ELF architectures)"
+                    )));
+                }
                 let data = read_file(&provider, path)?;
                 let name = path.as_os_str().as_encoded_bytes().to_vec();
                 let object = crate::elf::binary_input::convert(&name, &data)?;

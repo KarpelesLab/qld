@@ -124,7 +124,10 @@ fn input_kind(options: &LinkOptions) -> ElfKind {
 /// an archive.
 fn sniff_bytes(data: &[u8]) -> Option<ElfKind> {
     let one = |data: &[u8]| {
-        ElfKind::identify(data).or_else(|| {
+        // `EM_NONE` objects (`-b binary` inputs) name no target.
+        let neutral = data.get(18..20) == Some(&[0, 0]);
+        let elf = ElfKind::identify(data).filter(|_| !neutral);
+        elf.or_else(|| {
             super::target::of_bitcode(data)
                 .and_then(super::arch::Arch::from_target)
                 .map(super::arch::Arch::kind)

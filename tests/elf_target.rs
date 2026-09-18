@@ -269,3 +269,34 @@ fn bitcode_names_the_target() {
     );
     assert_incompatible(&output, "Aarch64");
 }
+
+/// `-b binary` inputs are machine-neutral: they link into any 64-bit
+/// little-endian target, and the output's machine is the target's (`-m`),
+/// not x86-64. Needs no tools.
+#[test]
+fn binary_inputs_take_the_target() {
+    let dir = scratch("binary");
+    fs::write(dir.join("blob.bin"), b"hello").unwrap();
+    for (emulation, machine) in [("aarch64linux", 183), ("elf_x86_64", 62)] {
+        let args = [
+            "-m", emulation, "-r", "-b", "binary", "blob.bin", "-o", "blob.o",
+        ];
+        let output = qld(&dir, &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(class_and_machine(&dir.join("blob.o")), (2, machine));
+    }
+    // ELF32 targets are refused cleanly: the objects are 64-bit.
+    let output = qld(
+        &dir,
+        &["-m", "elf_i386", "-b", "binary", "blob.bin", "-o", "out"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("-b binary inputs for Elf32Le"),
+        "{stderr}"
+    );
+}

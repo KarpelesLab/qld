@@ -796,6 +796,10 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
         else {
             return Ok(());
         };
+        if ident.machine == crate::elf::read::consts::EM_NONE {
+            // Machine-neutral: `-b binary` inputs (`binary_input`).
+            return Ok(());
+        }
         let found = ident.architecture();
         if found == Some(target.arch) && ident.endian == target.endian {
             return Ok(());

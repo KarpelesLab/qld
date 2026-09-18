@@ -483,8 +483,10 @@ impl Arch {
         if self != Self::RiscV64 {
             return None;
         }
+        // RISC-V objects only: not `-b binary` inputs, which are `EM_NONE`.
         let flags = |f: &super::inputs::ElfInput<'_, F>| {
-            f.object.as_ref().map(|o| o.elf.elf().header().e_flags)
+            let header = f.object.as_ref()?.elf.elf().header();
+            (header.e_machine == crate::elf::read::consts::EM_RISCV).then_some(header.e_flags)
         };
         let (first_index, first) = files
             .iter()

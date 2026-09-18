@@ -15,7 +15,8 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::elf::read::consts::{
-    SHF_ALLOC, SHF_WRITE, SHN_ABS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STT_NOTYPE,
+    EM_NONE, SHF_ALLOC, SHF_WRITE, SHN_ABS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL,
+    STT_NOTYPE,
 };
 use crate::error::{Error, Result};
 
@@ -60,8 +61,10 @@ fn pad_to(out: &mut Vec<u8>, align: usize) {
     }
 }
 
-/// Wraps `data` in an x86-64 ELF relocatable object as GNU ld's binary
-/// input format would present it. `name` is the input path as given on the
+/// Wraps `data` in an ELF relocatable object as GNU ld's binary input
+/// format would present it. The object is 64-bit little-endian and
+/// machine-neutral (`EM_NONE`): it has no code and no relocations, so it
+/// links into any 64-bit little-endian target, and names none. `name` is the input path as given on the
 /// command line.
 ///
 /// # Errors
@@ -198,7 +201,7 @@ pub fn convert(name: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     ehdr[5] = 1; // ELFDATA2LSB
     ehdr[6] = 1; // EV_CURRENT
     ehdr[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
-    ehdr[18..20].copy_from_slice(&crate::elf::read::consts::EM_X86_64.to_le_bytes());
+    ehdr[18..20].copy_from_slice(&EM_NONE.to_le_bytes());
     ehdr[20..24].copy_from_slice(&1u32.to_le_bytes());
     ehdr[40..48].copy_from_slice(&u64_of(shoff)?.to_le_bytes());
     ehdr[52..54].copy_from_slice(&64u16.to_le_bytes());
