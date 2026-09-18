@@ -50,6 +50,9 @@ use crate::arch::aarch64::Field as A64Field;
 enum Chunk {
     Headers,
     Input(SectionId),
+    /// An input section followed by this many bytes of no-op padding, the
+    /// gap before the next member of a code section.
+    PaddedInput(SectionId, u32),
     Merge(u32),
     Synthetic(Synthetic),
     Symtab,
@@ -67,10 +70,14 @@ enum Chunk {
 }
 
 /// Adds no-op padding for the gaps of an executable section that nothing
-/// else fills, as BFD's x86 default fill does.
+/// else fills, as BFD's x86 default fill does. `members` is where the
+/// section's member chunks start in `chunks`: a gap right after an input
+/// section extends its chunk ([`Chunk::PaddedInput`]) rather than adding
+/// one, which halves the chunks of a large code section (clang: 147,000 of
+/// 323,000 chunks were padding).
 fn push_code_padding(
     section: &super::layout::OutSection<'_>,
-    _position: u32,
+    members: usize,
     chunks: &mut Vec<(ChunkRange, Chunk)>,
 ) {
     let mut covered: Vec<(u64, u64)> = section
@@ -87,17 +94,28 @@ fn push_code_padding(
         )
         .collect();
     covered.sort_unstable();
+    let end_of = |(range, _): &(ChunkRange, Chunk)| range.offset.saturating_add(range.size);
     let mut cursor = 0u64;
     for (offset, size) in covered.into_iter().chain([(section.size, 0)]) {
         if offset > cursor && cursor < section.size {
             let end = offset.min(section.size);
-            chunks.push((
-                ChunkRange::new(
-                    section.offset.saturating_add(cursor),
-                    end.saturating_sub(cursor),
-                ),
-                Chunk::Nop,
-            ));
+            let start = section.offset.saturating_add(cursor);
+            let gap = end.saturating_sub(cursor);
+            // The member chunks are in offset order: find the one that ends
+            // where the gap starts.
+            let tail = chunks.get_mut(members..).unwrap_or_default();
+            let at = tail.partition_point(|chunk| end_of(chunk) < start);
+            match (tail.get_mut(at), u32::try_from(gap)) {
+                (Some((range, chunk @ Chunk::Input(_))), Ok(pad))
+                    if end_of(&(*range, *chunk)) == start =>
+                {
+                    if let Chunk::Input(id) = *chunk {
+                        *chunk = Chunk::PaddedInput(id, pad);
+                        range.size = range.size.saturating_add(gap);
+                    }
+                }
+                _ => chunks.push((ChunkRange::new(start, gap), Chunk::Nop)),
+            }
         }
         cursor = cursor.max(offset.saturating_add(size));
     }
@@ -220,6 +238,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                         ));
                     }
                 }
+                let members = chunks.len();
                 for placed in &section.members {
                     if placed.size == 0 {
                         continue;
@@ -235,7 +254,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                     chunks.push((range, chunk));
                 }
                 if section.flags & SHF_EXECINSTR != 0 {
-                    push_code_padding(section, position32, &mut chunks);
+                    push_code_padding(section, members, &mut chunks);
                 }
             }
         }
@@ -452,6 +471,12 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             Ok(())
         }
         Chunk::Input(id) => write_input(input, id, out),
+        Chunk::PaddedInput(id, pad) => {
+            let content = out.len().saturating_sub(pad as usize);
+            let (section, padding) = out.split_at_mut(content);
+            input.context.arch.write_nops(padding);
+            write_input(input, id, section)
+        }
         Chunk::Fill(position, index) => {
             let pattern = layout
                 .sections
