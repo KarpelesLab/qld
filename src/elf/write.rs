@@ -1529,6 +1529,15 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                     target: sa,
                     st_other: target.raw.map_or(0, |raw| raw.st_other),
                     via_stub,
+                    slot: via_stub
+                        .then(|| {
+                            super::values::plt_slot_address(
+                                addresses.synth,
+                                addresses.layout,
+                                owner,
+                            )
+                        })
+                        .flatten(),
                 };
                 let mut sa = arch.branch_destination(branch);
                 if let Some(destination) = arch.branch_thunk(branch)

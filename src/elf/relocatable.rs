@@ -1571,6 +1571,8 @@ fn write_header(plan: &Plan<'_>, out: &mut [u8]) {
     header[18..20].copy_from_slice(&plan.machine.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[40..48].copy_from_slice(&plan.shoff.to_le_bytes());
+    let e_flags = crate::elf::arch::Arch::from_machine(plan.machine).map_or(0, |a| a.e_flags());
+    header[48..52].copy_from_slice(&e_flags.to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());
     header[58..60].copy_from_slice(&64u16.to_le_bytes());
     let (shnum, shstrndx) = if plan.section_count >= u32::from(SHN_LORESERVE) {

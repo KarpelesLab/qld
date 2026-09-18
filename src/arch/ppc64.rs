@@ -598,35 +598,73 @@ pub fn plt_call_stub(toc_offset: i64) -> Result<[u32; 5], EncodeError> {
 pub const PLT_CALL_STUB_SIZE: u64 = 20;
 
 /// Number of bytes a range-extension thunk occupies.
-pub const THUNK_SIZE: u64 = 32;
+pub const THUNK_SIZE: u64 = 36;
 
-/// The instructions of a range-extension thunk at `thunk` that branches to
-/// `target`. The address is computed from the thunk's own (`bcl` reads the
-/// program counter), not from the TOC pointer, so the thunk serves callers
-/// that do not maintain `r2` as well, and it leaves `r12` holding the
-/// target, as a global entry point expects. It clobbers `r0`, `r11` and
-/// `r12`, which the ABI lets call linkage code use. This is GNU ld's
-/// `long_branch_notoc` stub.
+/// A thunk key with this bit set names a GOT or PLT word (8-aligned)
+/// rather than a destination: the thunk jumps to the address stored there
+/// (a PLT call from code without a TOC pointer).
+pub const THUNK_VIA_SLOT: u64 = 1;
+/// A thunk key with this bit set saves `r2` before branching to the
+/// destination: a call from code with a TOC pointer to a function that
+/// clobbers it (`st_other` value 1).
+pub const THUNK_SAVE_TOC: u64 = 2;
+
+/// `trap`, which pads a thunk.
+const TRAP: u32 = 0x7fe0_0008;
+
+/// The instructions of the range-extension thunk at `thunk` for thunk
+/// `key`: a destination address, possibly with [`THUNK_VIA_SLOT`] or
+/// [`THUNK_SAVE_TOC`] set.
+///
+/// Addresses are computed from the thunk's own (`bcl` reads the program
+/// counter), not from the TOC pointer, so a thunk serves callers that do
+/// not maintain `r2` as well, and it leaves `r12` holding the destination,
+/// as a global entry point expects. It clobbers `r0`, `r11` and `r12`,
+/// which the ABI lets call linkage code use. These are GNU ld's
+/// `long_branch_notoc` and `plt_call_notoc` stubs; the TOC-saving form
+/// starts with `std r2, 24(r1)`, and the caller's `nop` after its `bl`
+/// restores it.
 ///
 /// # Errors
 ///
-/// [`EncodeError::Overflow`] when the target is more than 2 GiB away.
-pub fn thunk(thunk: u64, target: u64) -> Result<[u32; 8], EncodeError> {
-    let offset = (target as i64).wrapping_sub(thunk.wrapping_add(8) as i64);
+/// [`EncodeError::Overflow`] when the destination or word is more than
+/// 2 GiB away.
+pub fn thunk(thunk: u64, key: u64) -> Result<[u32; 9], EncodeError> {
+    let target = key & !3;
+    let save = key & THUNK_SAVE_TOC != 0;
+    let start = if save { thunk.wrapping_add(4) } else { thunk };
+    let offset = (target as i64).wrapping_sub(start.wrapping_add(8) as i64);
     if !fits_signed(offset.wrapping_add(0x8000), 32) {
         return Err(EncodeError::Overflow);
     }
     let v = offset as u64;
-    Ok([
+    let low = if key & THUNK_VIA_SLOT != 0 {
+        if v & 3 != 0 {
+            return Err(EncodeError::Overflow);
+        }
+        0xe98c_0000 | lo(v) // ld r12, #lo(r12)
+    } else {
+        0x398c_0000 | lo(v) // addi r12, r12, #lo
+    };
+    let body = [
         0x7d88_02a6,         // mflr r12
         0x429f_0005,         // bcl 20, 31, .+4
         0x7d68_02a6,         // mflr r11
         0x7d88_03a6,         // mtlr r12
         0x3d8b_0000 | ha(v), // addis r12, r11, #ha
-        0x398c_0000 | lo(v), // addi r12, r12, #lo
+        low,
         MTCTR_R12,
         BCTR,
-    ])
+    ];
+    let mut words = [TRAP; 9];
+    let (first, rest) = words.split_at_mut(usize::from(save));
+    if let Some(slot) = first.first_mut() {
+        *slot = STD_R2_24_R1;
+    }
+    for (slot, word) in rest.iter_mut().zip(body) {
+        *slot = word;
+    }
+    Ok(words)
 }
 
 /// Writes the words of [`thunk`] into `out` at `at`.

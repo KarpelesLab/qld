@@ -428,6 +428,23 @@ pub fn plt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u
     lazy_plt_address(synth, layout, index)
 }
 
+/// The address of the GOT word `owner`'s PLT entry (or IFUNC stub) jumps
+/// through: its `.got.plt` slot, or its GOT entry for `.plt.got`.
+#[must_use]
+pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
+    if synth.plt_got.index(owner).is_some() {
+        let (base, ..) = layout.synthetic(Synthetic::Got)?;
+        return base.checked_add(synth.got_word(owner, GotKind::Address)?.checked_mul(8)?);
+    }
+    let index = if synth.dynamic() {
+        synth.plt_index(owner)?
+    } else {
+        u64::try_from(synth.iplt.index(owner)?).ok()?
+    };
+    let (base, ..) = layout.synthetic(Synthetic::GotPlt)?;
+    base.checked_add(index.checked_add(synth.got_plt_reserved)?.checked_mul(8)?)
+}
+
 /// The address of lazy `.plt` entry `index`, after the header.
 #[must_use]
 pub fn lazy_plt_address(synth: &Synth, layout: &Layout<'_>, index: u64) -> Option<u64> {

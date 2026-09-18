@@ -244,10 +244,12 @@ impl Synth {
                 .collect()
         };
         let dynamic = mode.dynamic;
+        let uses_plt_got = self.arch.uses_plt_got();
         // A preemptible function with both a GOT entry and calls goes
         // through `.plt.got`, unless its PLT entry is its canonical address.
         let plt_got = move |f: SymbolFlags| {
             dynamic
+                && uses_plt_got
                 && f.contains(SymbolFlags::NEEDS_PLT | SymbolFlags::NEEDS_GOT)
                 && !f.contains(SymbolFlags::NEEDS_CANONICAL_PLT)
         };

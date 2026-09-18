@@ -149,16 +149,22 @@ fn plt_address(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, owner: Owner) -
     crate::elf::values::plt_address(input.synth, layout, owner)
 }
 
+/// The GOT word `owner`'s stub jumps through (0 when there is none, which
+/// the writer reports).
+fn slot_of(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, owner: Owner) -> u64 {
+    crate::elf::values::plt_slot_address(input.synth, layout, owner).unwrap_or(0)
+}
+
 /// The address a `bl`/`b` against `symbol` of `file` ends up branching to,
-/// as the writer will compute it, whether that is a stub, and the callee's
-/// `st_other`.
+/// as the writer will compute it, whether that is a stub (and the GOT word
+/// it jumps through), and the callee's `st_other`.
 fn branch_target(
     input: &LayoutInput<'_, '_>,
     layout: &Layout<'_>,
     file: usize,
     symbol: u32,
     addend: i64,
-) -> Option<(u64, bool, u8)> {
+) -> Option<(u64, Option<u64>, u8)> {
     let refs = &input.refs;
     let target = refs.target(file, symbol as usize)?;
     let owner = match target.global {
@@ -171,7 +177,7 @@ fn branch_target(
     if target.is_ifunc()
         && let Some(stub) = crate::elf::values::iplt_address(input.synth, layout, owner)
     {
-        return Some((stub, true, 0));
+        return Some((stub, Some(slot_of(input, layout, owner)), 0));
     }
     let flags = target
         .global
@@ -179,7 +185,7 @@ fn branch_target(
     if flags.contains(SymbolFlags::NEEDS_PLT | crate::elf::export::PREEMPTIBLE)
         && let Some(plt) = plt_address(input, layout, owner)
     {
-        return Some((plt, true, 0));
+        return Some((plt, Some(slot_of(input, layout, owner)), 0));
     }
     let st_other = target.raw.map_or(0, |raw| raw.st_other);
     let address = match target.def {
@@ -199,12 +205,15 @@ fn branch_target(
                 .wrapping_add(value)
         }
         Def::Absolute(value) => value,
+        // Symbol 0: the addend is an absolute address (what an assembler
+        // makes of a branch to an absolute symbol it resolved itself).
+        Def::Undefined { .. } if symbol == 0 => 0,
         // Common, linker-defined and shared-library symbols are not branch
         // targets in code qld links; anything left is resolved to zero and
         // reported by the writer if it really is out of range.
         _ => return None,
     };
-    Some((address.wrapping_add_signed(addend), false, st_other))
+    Some((address.wrapping_add_signed(addend), None, st_other))
 }
 
 /// Plans the thunks the layout in `layout` needs, given the ones `previous`
@@ -257,7 +266,7 @@ pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks)
                     continue;
                 }
                 let place = base.wrapping_add(rel.offset);
-                let Some((target, via_stub, st_other)) =
+                let Some((target, stub_slot, st_other)) =
                     branch_target(input, layout, file_index, rel.symbol, rel.addend)
                 else {
                     continue;
@@ -267,7 +276,8 @@ pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks)
                     place,
                     target,
                     st_other,
-                    via_stub,
+                    via_stub: stub_slot.is_some(),
+                    slot: stub_slot,
                 };
                 if let Some(destination) = arch.branch_thunk(branch) {
                     needed.push((output, destination));

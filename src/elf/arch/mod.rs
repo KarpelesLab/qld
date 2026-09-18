@@ -348,6 +348,9 @@ pub struct Branch {
     pub st_other: u8,
     /// The branch goes to a PLT or IFUNC stub.
     pub via_stub: bool,
+    /// The GOT word that stub jumps through, for calls that need a stub of
+    /// their own (PowerPC64 code without a TOC pointer).
+    pub slot: Option<u64>,
 }
 
 /// Options that change the shape of PLT entries.
@@ -829,6 +832,14 @@ impl Arch {
             Self::AArch64 => false,
             Self::Ppc64 => true,
         }
+    }
+
+    /// Whether a preemptible function that also has a GOT entry is called
+    /// through `.plt.got` (jumping through that entry) rather than getting
+    /// a PLT slot. PowerPC64 linkers give every called function a slot.
+    #[must_use]
+    pub fn uses_plt_got(self) -> bool {
+        self != Self::Ppc64
     }
 
     /// Size of one `.plt.sec` entry.

@@ -501,25 +501,34 @@ pub fn is_thunk_branch(r_type: u32) -> bool {
     matches!(r_type, R_PPC64_REL24 | R_PPC64_REL24_NOTOC)
 }
 
-/// The destination of the thunk a branch needs, if it needs one: a branch
-/// out of range, or a call from code without a TOC pointer to a function
-/// that needs one, which the thunk enters at its global entry point with
-/// `r12` set.
+/// The key of the thunk a branch needs, if it needs one
+/// ([`crate::arch::ppc64::thunk`]): a branch out of range; a call from
+/// code without a TOC pointer to a function that needs one, which the
+/// thunk enters at its global entry point with `r12` set, or through the
+/// PLT, which it reaches by loading the PLT word PC-relatively; or a call
+/// from code with a TOC pointer to a function that clobbers it, which the
+/// thunk saves first.
 #[must_use]
 pub fn branch_thunk(branch: Branch) -> Option<u64> {
     if !is_thunk_branch(branch.r_type) {
         return None;
     }
+    let notoc = branch.r_type == R_PPC64_REL24_NOTOC;
+    if notoc && branch.via_stub {
+        return branch.slot.map(|slot| slot | insn::THUNK_VIA_SLOT);
+    }
     let destination = branch_destination(branch);
-    let needs_toc = branch.r_type == R_PPC64_REL24_NOTOC
-        && !branch.via_stub
-        && insn::local_entry_offset(branch.st_other) != 0;
+    if !notoc && !branch.via_stub && insn::clobbers_toc(branch.st_other) {
+        return Some(destination | insn::THUNK_SAVE_TOC);
+    }
+    let needs_toc = notoc && !branch.via_stub && insn::local_entry_offset(branch.st_other) != 0;
     (needs_toc || !insn::branch24_in_range(branch.place, destination)).then_some(destination)
 }
 
-/// Finishes a direct call written at `offset`: a call through a PLT or
-/// IFUNC stub, which saves the TOC pointer, gets the `nop` after it turned
-/// into the `ld r2, 24(r1)` that restores it.
+/// Finishes a direct call written at `offset`: a call through a stub that
+/// saves the TOC pointer (a PLT or IFUNC stub, or the thunk of a call to a
+/// function that clobbers `r2`) gets the `nop` after it turned into the
+/// `ld r2, 24(r1)` that restores it.
 ///
 /// A recursive call without the `nop` is accepted, as GCC once emitted
 /// those and the function is not really preempted in practice (lld does
@@ -527,20 +536,20 @@ pub fn branch_thunk(branch: Branch) -> Option<u64> {
 ///
 /// # Errors
 ///
-/// [`ApplyError::BadInstruction`] for the calls qld does not have stubs
-/// for yet: through the PLT from code without a TOC pointer, and to a
-/// function that clobbers the TOC pointer from code that keeps it.
+/// [`ApplyError::BadInstruction`] for a PLT call from code without a TOC
+/// pointer whose PLT word is unknown.
 pub fn finish_call(out: &mut [u8], offset: u64, branch: Branch) -> Result<(), ApplyError> {
     match branch.r_type {
-        R_PPC64_REL24 if branch.via_stub => {
+        R_PPC64_REL24 if branch.via_stub || insn::clobbers_toc(branch.st_other) => {
             let next = offset.wrapping_add(4);
             if get(out, next).ok() == Some(NOP) {
                 put(out, next, LD_R2_24_R1)?;
             }
             Ok(())
         }
-        R_PPC64_REL24 if insn::clobbers_toc(branch.st_other) => Err(ApplyError::BadInstruction),
-        R_PPC64_REL24_NOTOC if branch.via_stub => Err(ApplyError::BadInstruction),
+        R_PPC64_REL24_NOTOC if branch.via_stub && branch.slot.is_none() => {
+            Err(ApplyError::BadInstruction)
+        }
         _ => Ok(()),
     }
 }
@@ -884,6 +893,7 @@ mod tests {
             target: 0x1000_0100,
             st_other: 3 << 5,
             via_stub: false,
+            slot: None,
         };
         assert_eq!(branch_destination(call), 0x1000_0108);
         assert_eq!(branch_thunk(call), None);
@@ -906,6 +916,36 @@ mod tests {
         let mut code = bytes(&[0x4800_0001, NOP]);
         finish_call(&mut code, 0, stub).unwrap();
         assert_eq!(words(&code), [0x4800_0001, LD_R2_24_R1]);
+
+        // PC-relative code calls through the PLT with a stub of its own
+        // that loads the PLT word.
+        let pcrel_plt = Branch {
+            r_type: R_PPC64_REL24_NOTOC,
+            via_stub: true,
+            slot: Some(0x1002_0010),
+            ..call
+        };
+        assert_eq!(
+            branch_thunk(pcrel_plt),
+            Some(0x1002_0010 | insn::THUNK_VIA_SLOT)
+        );
+        // A callee that clobbers r2 is called through a thunk saving it,
+        // and the caller's nop restores it.
+        let clobbers = Branch {
+            st_other: 1 << 5,
+            ..call
+        };
+        assert_eq!(
+            branch_thunk(clobbers),
+            Some(0x1000_0100 | insn::THUNK_SAVE_TOC)
+        );
+        let mut code = bytes(&[0x4800_0001, NOP]);
+        finish_call(&mut code, 0, clobbers).unwrap();
+        assert_eq!(words(&code), [0x4800_0001, LD_R2_24_R1]);
+        let thunk = insn::thunk(0x1000_0200, 0x1000_0100 | insn::THUNK_SAVE_TOC).unwrap();
+        assert_eq!(thunk[0], insn::STD_R2_24_R1);
+        let thunk = insn::thunk(0x1000_0200, 0x1002_0010 | insn::THUNK_VIA_SLOT).unwrap();
+        assert_eq!(thunk[5] >> 16, 0xe98c, "ld r12, lo(r12)");
     }
 
     /// The `.glink` lld 23 writes for a PIE whose `.glink` is at 0x10310
