@@ -225,6 +225,13 @@ pub struct DarwinArgs {
     /// `-force_flat_namespace`: an executable that makes dyld bind every
     /// image it loads with flat lookup (`MH_FORCE_FLAT`).
     pub force_flat_namespace: bool,
+    /// `-objc_relative_method_lists` (`Some(true)`) /
+    /// `-no_objc_relative_method_lists` (`Some(false)`). `None` chooses from
+    /// the deployment target.
+    pub objc_relative_method_lists: Option<bool>,
+    /// `-objc_category_merging` (`-no_objc_category_merging` turns it off
+    /// again).
+    pub objc_category_merging: bool,
 }
 
 impl Default for DarwinArgs {
@@ -272,6 +279,8 @@ impl Default for DarwinArgs {
             keep_private_externs: false,
             flat_namespace: false,
             force_flat_namespace: false,
+            objc_relative_method_lists: None,
+            objc_category_merging: false,
         }
     }
 }
@@ -359,6 +368,8 @@ enum Act {
     Sectcreate,
     Alias,
     AliasList,
+    RelativeMethodLists(bool),
+    CategoryMerging(bool),
     ForceFlat,
     Init,
     DeadStrippableDylib,
@@ -927,8 +938,30 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     ignored("deduplicate", Flag),
     ignored("bind_at_load", Flag),
     ignored("no_implicit_dylibs", Flag),
-    ignored("no_objc_category_merging", Flag),
-    ignored("objc_category_merging", Flag),
+    opt(
+        "objc_category_merging",
+        Flag,
+        Act::CategoryMerging(true),
+        "Merge Objective-C categories into their classes",
+    ),
+    opt(
+        "no_objc_category_merging",
+        Flag,
+        Act::CategoryMerging(false),
+        "Do not merge Objective-C categories (the default)",
+    ),
+    opt(
+        "objc_relative_method_lists",
+        Flag,
+        Act::RelativeMethodLists(true),
+        "Objective-C method lists with 32-bit offsets",
+    ),
+    opt(
+        "no_objc_relative_method_lists",
+        Flag,
+        Act::RelativeMethodLists(false),
+        "Objective-C method lists with pointers",
+    ),
     ignored("objc_abi_version", V1),
     ignored("ld_classic", Flag),
     // Obsolete options ld64 accepts and ignores.
@@ -1401,6 +1434,8 @@ impl Parser<'_> {
                 darwin.force_flat_namespace = true;
             }
             Act::AliasList => self.alias_list(first)?,
+            Act::RelativeMethodLists(on) => darwin.objc_relative_method_lists = Some(on),
+            Act::CategoryMerging(on) => darwin.objc_category_merging = on,
             Act::DeadStrippableDylib => darwin.mark_dead_strippable_dylib = true,
             Act::OsoPrefix => darwin.oso_prefix = Some(PathBuf::from(first)),
             Act::FunctionStarts(on) => darwin.function_starts = on,

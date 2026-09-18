@@ -104,6 +104,8 @@ pub struct Link<'a> {
     /// With `-dead_strip`, undefined symbols whose report waits for dead
     /// stripping: only those live code reaches are errors, as in ld64.
     pub pending_undefined: Vec<SymbolId>,
+    /// Objective-C metadata the writer rewrites ([`super::objc`]).
+    pub objc: super::objc::Plan,
 }
 
 impl std::fmt::Debug for Link<'_> {
@@ -191,6 +193,7 @@ impl<'a> Link<'a> {
             atom_count: usize::try_from(count).unwrap_or(usize::MAX),
             live: Vec::new(),
             pending_undefined: Vec::new(),
+            objc: super::objc::Plan::default(),
         };
         link.classify(options, diagnostics)?;
         Ok(link)

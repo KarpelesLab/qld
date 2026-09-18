@@ -133,6 +133,14 @@ fn write_input(
                 continue;
             };
             let offset = to_usize(layout.atom_offset.get(id).copied().unwrap_or(0));
+            if let Some(rewrite) = link.objc.rewrite(id) {
+                if let Some(slot) = out.get_mut(offset..offset.saturating_add(rewrite.bytes.len()))
+                {
+                    slot.copy_from_slice(&rewrite.bytes);
+                }
+                fixups.extend(write_fields(addresses, section, rewrite, offset, out)?);
+                continue;
+            }
             let source = data
                 .get(to_usize(info.offset)..to_usize(info.offset.saturating_add(info.size)))
                 .unwrap_or(&[]);
@@ -145,7 +153,7 @@ fn write_input(
         };
         for relocation in relocations {
             let id = link.atom_id(file, relocation.atom);
-            if layout.atom_section.get(id) != Some(&index32) {
+            if layout.atom_section.get(id) != Some(&index32) || link.objc.rewrite(id).is_some() {
                 continue;
             }
             let decoded = reloc::decode(link, file, object, input, data, &relocation.relocation)?;
@@ -186,6 +194,55 @@ fn write_input(
                 other => other,
             })?;
             fixups.extend(fixup);
+        }
+    }
+    Ok(fixups)
+}
+
+/// Fills the pointers and offsets of an Objective-C metadata atom the
+/// linker rewrote ([`super::objc`]), at `offset` in the section.
+fn write_fields(
+    addresses: &Addresses<'_, '_>,
+    section: &OutSection,
+    rewrite: &super::objc::Rewrite,
+    offset: usize,
+    out: &mut [u8],
+) -> Result<Vec<Fixup>> {
+    let mut fixups = Vec::new();
+    for field in &rewrite.fields {
+        let at = offset.saturating_add(to_usize(field.offset));
+        let place = section.addr.saturating_add(at as u64);
+        let value = addresses.value(field.target.place, field.target.addend)?;
+        match field.kind {
+            super::objc::FieldKind::Pointer => {
+                let (written, kind) = match value {
+                    Value::Address(target) => (target, Some(FixupKind::Rebase(target))),
+                    Value::Absolute(value) => (value, None),
+                    Value::Import(import, addend) => (0, Some(FixupKind::Bind { import, addend })),
+                };
+                put64(out, at, written)
+                    .ok_or_else(|| Error::Internal("pointer outside its section".into()))?;
+                if let Some(kind) = kind {
+                    fixups.push(Fixup {
+                        address: place,
+                        kind,
+                    });
+                }
+            }
+            super::objc::FieldKind::Relative => {
+                let (Value::Address(target) | Value::Absolute(target)) = value else {
+                    return Err(Error::Internal(format!(
+                        "relative method list entry at {place:#x} refers to an import"
+                    )));
+                };
+                let delta = i32::try_from(target.wrapping_sub(place) as i64).map_err(|_| {
+                    Error::Limit(format!(
+                        "relative method list entry at {place:#x} out of range of {target:#x}"
+                    ))
+                })?;
+                super::buf::put32(out, at, delta as u32)
+                    .ok_or_else(|| Error::Internal("offset outside its section".into()))?;
+            }
         }
     }
     Ok(fixups)

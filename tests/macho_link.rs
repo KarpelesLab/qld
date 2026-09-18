@@ -43,6 +43,8 @@ use qld::output::hash::Sha256;
 mod library;
 #[path = "macho_link/namespace.rs"]
 mod namespace;
+#[path = "macho_link/objc.rs"]
+mod objc;
 #[path = "macho_link/search_paths.rs"]
 mod search_paths;
 #[path = "macho_link/suite.rs"]
@@ -435,8 +437,12 @@ fn summarize(file: &Path) -> Option<Summary> {
             }
             // lld merges the literal sections into one `__literals`; ld64
             // and qld keep `__literal4`, `__literal8` and `__literal16`.
+            // lld also merges Objective-C class names and method types into
+            // `__cstring`.
             Some(if name.starts_with("__literal") {
                 "__literals".to_owned()
+            } else if matches!(name, "__objc_classname" | "__objc_methtype") {
+                "__cstring".to_owned()
             } else {
                 name.to_owned()
             })
@@ -647,14 +653,7 @@ fn link_and_compare(args: &[String], output: &Path) -> Vec<u8> {
             .status()
             .unwrap();
         assert!(status.success(), "ld64.lld failed on {args:?}");
-        if let (Some(mut ours), Some(mut theirs)) = (summarize(output), summarize(&reference)) {
-            // lld rewrites Objective-C metadata (relative method lists,
-            // class names and method types merged into __cstring), which
-            // qld does not.
-            if args.iter().any(|a| a == "-lobjc") {
-                ours.sections.clear();
-                theirs.sections.clear();
-            }
+        if let (Some(ours), Some(theirs)) = (summarize(output), summarize(&reference)) {
             assert_eq!(ours, theirs, "{}: qld vs ld64.lld", output.display());
         }
     }

@@ -16,9 +16,11 @@ Sources in `tests/data/macho_link/suite/`, driver in
 | `cxx_suite` | executable, `libsuite_cxx.dylib` | exceptions thrown across the dylib boundary both ways, `exception_ptr`, nested exceptions, `bad_variant_access`/`bad_any_cast`, `dynamic_cast`/`typeid` across images, virtual inheritance, one copy of an inline function's static local, iostreams, `<regex>`, `<filesystem>`, threads, `thread_local` with destructors (`_tlv_atexit`), static initialization order |
 | `objc_suite` | executable (with Objective-C++), `libsuite_objc.dylib`, `libsuite_category.a` (`-ObjC`) | a subclass of a dylib's class, categories from the executable, the dylib and an archive member nothing references, `+load` in classes and categories, protocols, category properties, KVC, blocks, GCD, `@try`/`@finally` across images, ARC weak references, notifications, `@synchronized`, C++ ivars (`.cxx_construct`/`.cxx_destruct`), C++ exceptions through methods and `NSException` caught by C++ |
 
-Each is built for arm64 and x86_64 (run under Rosetta), three ways:
-default (chained fixups), `-Wl,-dead_strip`, and `-mmacosx-version-min=11.0`
-(legacy `LC_DYLD_INFO_ONLY`).
+Each is built for arm64 and x86_64 (run under Rosetta), four ways:
+default (chained fixups), `-Wl,-dead_strip`, `-mmacosx-version-min=11.0`
+(legacy `LC_DYLD_INFO_ONLY`), and `-Wl,-objc_category_merging
+-Wl,-dead_strip`. Objective-C method lists are relative (the default from
+macOS 11) in every variant.
 
 ## Downloaded projects: `tests/projects/macos-suite.sh`
 

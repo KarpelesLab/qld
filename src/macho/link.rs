@@ -195,26 +195,39 @@ fn link_arch(
 ) -> Result<Vec<u8>> {
     // Archive members extracted during resolution may ask for more
     // libraries with LC_LINKER_OPTION; link again with them.
-    // Selector stubs (`_objc_msgSend$sel`) left undefined are generated in
-    // an extra object; link again with it.
+    // Selector stubs (`_objc_msgSend$sel`) left undefined, and selector
+    // references relative method lists need, are generated in an extra
+    // object; link again with it.
     let mut options = std::borrow::Cow::Borrowed(options);
     let mut selectors: Vec<Vec<u8>> = Vec::new();
+    let mut selrefs: Vec<Vec<u8>> = Vec::new();
     for _ in 0..8 {
-        let generated: Vec<(std::path::PathBuf, std::sync::Arc<[u8]>)> = if selectors.is_empty() {
-            Vec::new()
-        } else {
-            vec![(
-                std::path::PathBuf::from("<objc selector stubs>"),
-                std::sync::Arc::from(super::objc_stubs::object(arch, &selectors)),
-            )]
-        };
-        match link_arch_once(&options, arch, diagnostics, &generated)? {
+        let generated: Vec<(std::path::PathBuf, std::sync::Arc<[u8]>)> =
+            if selectors.is_empty() && selrefs.is_empty() {
+                Vec::new()
+            } else {
+                let only: Vec<Vec<u8>> = selrefs
+                    .iter()
+                    .filter(|name| selectors.binary_search(name).is_err())
+                    .cloned()
+                    .collect();
+                vec![(
+                    std::path::PathBuf::from("<objc selector stubs>"),
+                    std::sync::Arc::from(super::objc_stubs::object(arch, &selectors, &only)),
+                )]
+            };
+        match link_arch_once(&options, arch, diagnostics, &generated, &selrefs)? {
             Attempt::Done(bytes) => return Ok(bytes),
             Attempt::MoreInputs(more) => options.to_mut().darwin.inputs.extend(more),
             Attempt::Selectors(more) => {
                 selectors.extend(more);
                 selectors.sort();
                 selectors.dedup();
+            }
+            Attempt::SelRefs(more) => {
+                selrefs.extend(more);
+                selrefs.sort();
+                selrefs.dedup();
             }
         }
     }
@@ -227,6 +240,7 @@ enum Attempt {
     Done(Vec<u8>),
     MoreInputs(Vec<crate::args::darwin::DarwinInput>),
     Selectors(Vec<Vec<u8>>),
+    SelRefs(Vec<Vec<u8>>),
 }
 
 /// One link attempt for `arch`.
@@ -236,6 +250,7 @@ fn link_arch_once(
     arch: Arch,
     diagnostics: &dyn DiagnosticSink,
     generated: &[(std::path::PathBuf, std::sync::Arc<[u8]>)],
+    requested_selrefs: &[Vec<u8>],
 ) -> Result<Attempt> {
     let config = Config::new(options, arch, infer_platform(options, arch))?;
     let table = FileTable::for_link(options);
@@ -296,8 +311,18 @@ fn link_arch_once(
         &internal,
         diagnostics,
     )?;
+    if !config.is_relocatable() {
+        let missing: Vec<Vec<u8>> = super::objc::missing_selrefs(&link)?
+            .into_iter()
+            .filter(|name| requested_selrefs.binary_search(name).is_err())
+            .collect();
+        if !missing.is_empty() {
+            return Ok(Attempt::SelRefs(missing));
+        }
+    }
     link.mark_live(options)?;
     link.report_live_undefined(options, diagnostics)?;
+    super::objc::plan(&mut link)?;
     options.check_cancelled()?;
     if config.is_relocatable() {
         return super::relocatable::write(&link, options, diagnostics).map(Attempt::Done);
