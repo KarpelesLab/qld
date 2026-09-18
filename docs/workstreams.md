@@ -66,6 +66,18 @@ can work at the same time without colliding.
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | merged |
 | W26 | Performance round 2 (M5) | `src/main.rs` (fork on exit, agreed), `--fork`/`--no-fork` in `src/args/`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**` (except `hash/sha256.rs`), `src/input/**`, `src/debug/**`, `benches/**`, `tests/projects/bench*` | W24 | merged |
 | W27 | Mach-O follow-ups (M8) | `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs` (moved from `src/macho/`), `tests/macho_link*` | W25 | merged |
+| W28 | Symbol resolution redesign (M5) | `src/symbols/**`, `src/elf/{resolve,object}*.rs`, `benches/**`, `tests/projects/bench*` | W26 | in progress |
+| W29 | Debug and ordering outputs (M5) | new `src/debug/{gdb_index,debug_names}*`, new `src/elf/{ordering,separate_debug}*`, hooks in `src/elf/{layout,write,synth}.rs`, `tests/debug_index*`, `tests/ordering*` | W24 | in progress |
+| W30 | RISC-V 64 (M4) | `src/elf/arch/riscv*`, `src/arch/riscv*`, relaxation/shrinking hooks, `tests/riscv*`, `tests/fixtures/riscv64-*` | W20 | in progress |
+| W31 | PowerPC64 LE, ELFv2 (M4) | `src/elf/arch/ppc64*`, `src/arch/ppc64*`, `tests/ppc64*`, `tests/fixtures/ppc64-*` | W20 | in progress |
+| W32 | LoongArch64 (M4) | `src/elf/arch/loongarch*`, `src/arch/loongarch*`, `tests/loongarch*`, `tests/fixtures/loongarch64-*` | W20 | in progress |
+| W33 | PE i386 and ARM64 (M7) | `src/coff/**`, `tests/coff_link*` and its data | W21 | in progress |
+| W34 | Mach-O completeness (M8) | `src/macho/**` except `lto*`, `src/args/darwin.rs`, `tests/macho_link*` | W27 | in progress |
+| W35 | Mach-O LTO through libLTO (M8) | new `src/plugin/liblto*`, `src/macho/lto*`, one hook in `src/macho/link.rs`, `tests/macho_lto*` | W17, W27 | in progress |
+| W36 | Library API for 1.0 (M9) | `examples/**`, `tests/api*`, new `src/input/source*`, API-only changes in `src/args/options.rs`; proposals for `lib.rs` | — | in progress |
+| W37 | AArch64 completeness (M4) | `src/elf/arch/aarch64.rs`, `src/arch/aarch64.rs`, `tests/aarch64*`, `tests/fixtures/aarch64-*` | W20 | in progress |
+| W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | in progress |
+| W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -494,6 +506,58 @@ implementation into `src/output/hash`.
 
 **Owns:** `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs`,
 `tests/macho_link*` and its data.
+
+---
+
+## W28: Symbol resolution redesign (M5)
+
+**Goal:** resolution (currently 35–45 ms on clang; wild takes ~15 ms)
+reaches wild's speed, keeping symbol IDs, and so output, identical.
+
+## W29: Debug and ordering outputs (M5)
+
+**Goal:** `--gdb-index`, `--debug-names`, `--separate-debug-file` with
+`.gnu_debuglink`, `--symbol-ordering-file`, `--call-graph-profile-sort`.
+
+## W30–W32: RISC-V 64, PowerPC64 LE, LoongArch64 (M4)
+
+**Goal:** each architecture links the fixture suite, validated against
+ld.lld locally and run under qemu-user in CI. ELF32 and big-endian (i386,
+ARM, RV32, x32, ppc64 BE, s390x) wait for a generic ELF32/BE pass, which
+touches the whole ELF pipeline and is scheduled after this round.
+
+## W33: PE i386 and ARM64 (M7)
+
+**Goal:** PE32 (i386, with SafeSEH) and ARM64 PE32+ outputs, run in CI.
+
+## W34: Mach-O completeness (M8)
+
+**Goal:** the broader `-fuse-ld` suite (M8 exit criterion), ObjC category
+merging and relative method lists, arm64e.
+
+## W35: Mach-O LTO through libLTO (M8)
+
+**Goal:** `-flto` links on macOS through Apple's/LLVM's `libLTO` C API.
+
+## W36: Library API for 1.0 (M9)
+
+**Goal:** API review, in-memory inputs and outputs, cancellation, rustdoc
+examples; proposals for frozen files.
+
+## W37: AArch64 completeness (M4)
+
+**Goal:** ADRP relaxations, Cortex-A53 843419 workaround, `-z force-bti`,
+`-z pac-plt`, lazy TLSDESC decision.
+
+## W38: Scripts and M1/M3 leftovers
+
+**Goal:** `-r` with `-T`, `--defsym` with full expressions, musl C
+programs verified.
+
+## W39: Packaging and releases (M9)
+
+**Goal:** release workflow with prebuilt binaries, `ld.qld`/`ld64.qld`
+links, distribution package recipes.
 
 ---
 
