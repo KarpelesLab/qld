@@ -42,4 +42,17 @@ references) must be in that log.
 
 ## Results
 
-Pending the first CI run.
+CI run 35323375730 (`macos-latest`, Xcode 26.6, arm64 runner with Rosetta):
+
+| Part | arm64 | x86_64 |
+| --- | --- | --- |
+| `fuse_ld_suite` (C, C++, Objective-C; default, `-dead_strip`, macOS 11) | 9/9 | 9/9 |
+| zlib | PASS | PASS |
+| Lua | PASS | PASS |
+| SQLite | PASS | PASS |
+| {fmt} | not run: 11.0.2's tests do not compile with Xcode 26's libc++; now 12.2.0 | same |
+
+Fixed on the way: clang passes `-O<n>` to a linker given with
+`-fuse-ld=<path>`; relative `-L` paths were looked up under `-syslibroot`
+(`-L.` found the SDK's `libsqlite3.tbd`); legacy output did not write weak
+bindings.
