@@ -203,6 +203,18 @@ fn may_hold_bitcode(path: &Path) -> bool {
             || magic.starts_with(&[0xca, 0xfe, 0xba, 0xbf]))
 }
 
+/// Whether `data` is a little-endian Mach-O object for `arch`'s CPU type.
+fn is_object_for(data: &[u8], arch: Arch) -> bool {
+    let word = |at: usize| {
+        data.get(at..at.checked_add(4)?)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    matches!(word(0), Some(0xfeed_facf | 0xfeed_face))
+        && word(4) == Some(arch.cpu_type)
+        && word(12) == Some(crate::macho::read::consts::MH_OBJECT)
+}
+
 /// Finds the bitcode in `candidates`, loading the files that may hold some
 /// into `table`.
 fn scan<'t>(candidates: &'t [Candidate], table: &'t FileTable, arch: Arch) -> Result<Scan<'t>> {
@@ -261,13 +273,15 @@ fn scan<'t>(candidates: &'t [Candidate], table: &'t FileTable, arch: Arch) -> Re
                     date,
                     module: scan.modules.len().saturating_sub(1),
                 });
-            } else {
+            } else if is_object_for(bytes, arch) {
                 pieces.push(Piece::Native {
                     name: member.name,
                     date,
                     data: bytes,
                 });
             }
+            // Other members (the symbol table, objects for other
+            // architectures) are skipped by the link anyway.
         }
         scan.replaced.push(Replaced {
             candidate: index,
@@ -458,19 +472,19 @@ struct Decision {
 }
 
 /// Resolves symbols over `options` with the stand-ins in `generated`.
+/// Warnings go to `quiet`: the link that follows reports them.
 fn resolve(
     options: &LinkOptions,
     arch: Arch,
     generated: &Generated,
     module_count: usize,
+    quiet: &Collect,
 ) -> Result<Decision> {
     let mut options = Cow::Borrowed(options);
-    // Warnings are left to the real link.
-    let quiet = Collect::new();
     for _ in 0..8 {
         let config = Config::new(&options, arch, None)?;
         let table = FileTable::new();
-        let collected = inputs::collect(&options, &config, &table, &quiet, &generated.inputs)?;
+        let collected = inputs::collect(&options, &config, &table, quiet, &generated.inputs)?;
         let internal = InternalNames::new(&options, &config);
         let mut files = collected.files(&internal)?;
         let mut symbols = SymbolTable::new();
@@ -828,10 +842,21 @@ pub(super) fn prepare<'o>(
         .zip(&wrong_arch)
         .map(|(module, &wrong)| (!wrong).then(|| stand_in(module, arch)))
         .collect();
-    let decision = {
-        let generated = generate(&replaced, &candidates, Some(&stand_ins));
-        resolve(&without, arch, &generated, modules.len())?
+    let generated = generate(&replaced, &candidates, Some(&stand_ins));
+    let quiet = Collect::new();
+    let decision = match resolve(&without, arch, &generated, modules.len(), &quiet) {
+        Ok(decision) => decision,
+        Err(error) => {
+            // The errors that explain the failure: the link stops here.
+            for diagnostic in quiet.take_sorted() {
+                if diagnostic.severity == Severity::Error {
+                    diagnostics.emit(diagnostic);
+                }
+            }
+            return Err(error);
+        }
     };
+    drop(generated);
 
     let mut inputs = codegen(
         &mut lib.lock(),
