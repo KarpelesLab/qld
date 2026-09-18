@@ -43,6 +43,10 @@ pub struct Prepared {
     pub options: LinkOptions,
     /// The layout plan, when scripts or options call for the script engine.
     pub script: Option<LayoutScript>,
+    /// For a relocatable link without `-T`: [`Prepared::script`] with the
+    /// built-in x86-64 relocatable layout ([`super::defaults::relocatable_script`])
+    /// added, which the driver uses when the inputs are x86-64.
+    pub relocatable_default: Option<LayoutScript>,
 }
 
 impl Prepared {
@@ -521,9 +525,24 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
         }
         Some(builder.finish()?)
     };
+    let relocatable_default = if relocatable && loader.scripts.is_empty() {
+        let default = parse_script(
+            super::defaults::relocatable_script().as_bytes(),
+            Path::new("<default script>"),
+            &mut FsReader::default(),
+        )
+        .map_err(|e| Error::Internal(format!("built-in linker script: {e}")))?;
+        let mut builder = Builder::default();
+        builder.add(&defsyms)?;
+        builder.add(&default)?;
+        Some(builder.finish()?)
+    } else {
+        None
+    };
     Ok(Prepared {
         options: loader.out,
         script,
+        relocatable_default,
     })
 }
 

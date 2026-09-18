@@ -97,7 +97,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     let wrap = WrapTable::new(&options.wrap);
     let mut internal = InternalNames::new(options);
     prepared.add_internal_names(&mut internal.names);
-    let script = prepared.script.as_ref();
+    let mut script = prepared.script.as_ref();
     let table = FileTable::for_link(options);
     let config = ParseConfig {
         strip_debug: options.strip >= StripMode::Debug,
@@ -125,6 +125,12 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         narrow.run(|| inputs::collect(options, &table, &internal, config))?
     };
     lap("inputs");
+    // x86-64 relocatable output follows GNU ld's built-in `-r` layout.
+    if let Some(default) = &prepared.relocatable_default
+        && super::arch::Arch::of(options, &inputs.files) == super::arch::Arch::X86_64
+    {
+        script = Some(default);
+    }
     options.check_cancelled()?;
 
     let threads = input_sized_threads(options, &table, own_pools);
@@ -823,6 +829,9 @@ fn link_relocatable<'a>(
     // garbage collection, whose `KEEP` roots it gives.
     let script_placement =
         script.map(|s| super::script_layout::relocatable::place(s, files, &mut sections, options));
+    if script.is_some() {
+        lap("script placement");
+    }
     if options.gc_sections {
         if options.entry.is_none() && options.undefined.is_empty() {
             return Err(Error::Option(
@@ -883,6 +892,9 @@ fn link_relocatable<'a>(
         )?),
         _ => None,
     };
+    if script_layout.is_some() {
+        lap("script layout");
+    }
     relocatable::write(&relocatable::RelocatableInput {
         options,
         refs,

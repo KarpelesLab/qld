@@ -1039,6 +1039,9 @@ fn relocatable_sections(path: &Path) -> Vec<RelSection> {
         let (offset, size) = (word(h + 24, 8) as usize, word(h + 32, 8));
         let contents = if matches!(sh_type, 2 | 3 | 4 | 8 | 17) {
             Vec::new()
+        } else if name == ".note.gnu.build-id" {
+            // The note header; the hash is of different outputs.
+            data[offset..offset + 16].to_vec()
         } else {
             data[offset..offset + size as usize].to_vec()
         };
@@ -1251,6 +1254,9 @@ alias_off = fa + 1;
     )
     .unwrap();
     compare_relocatable(&dir, &["-T", "module.ld", "a.o", "b.o"]);
+    // Without a script, x86-64 relocatable output follows GNU ld's built-in
+    // `-r` layout, with `--build-id` first.
+    compare_relocatable(&dir, &["--build-id", "a.o", "b.o"]);
 }
 
 /// `-T` scripts and the scripts they `INCLUDE` are read through

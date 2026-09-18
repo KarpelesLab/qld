@@ -8,6 +8,12 @@
 //!
 //! # Sections
 //!
+//! A linker script (`-T`, or on x86-64 the built-in `-r` layout of
+//! [`crate::elf::script_layout::defaults::relocatable_script`]) decides the
+//! output sections it names, in its order
+//! ([`crate::elf::script_layout::relocatable`]); the rules below place the
+//! rest after them.
+//!
 //! Input sections with the same name, type class (`SHT_NOBITS` joins
 //! `SHT_PROGBITS`) and allocation are concatenated into one output section,
 //! in order of first appearance. Members of a kept COMDAT group stay in
@@ -540,6 +546,24 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         }
     }
 
+    // `--build-id`: GNU ld creates the note in the first input object, so
+    // under a script it follows that object's orphans; its default `-r`
+    // script puts it first.
+    let build_id = crate::elf::synth::plan_build_id(input.options);
+    let make_build_id = |size: u64| {
+        let mut note = OutSection::new(b".note.gnu.build-id", OutKind::BuildId, SHT_NOTE);
+        note.flags = SHF_ALLOC;
+        note.align = 4;
+        note.size = size.saturating_add(16);
+        note
+    };
+    let mut build_id_pending = build_id;
+    if input.script.is_none_or(|s| s.build_id_first)
+        && let Some(size) = build_id_pending.take()
+    {
+        outs.push(make_build_id(size));
+    }
+
     // A linker script's output sections come next, in statement order.
     let mut assign = vec![NONE; sections.len()];
     let mut script_outs: Vec<u32> = Vec::new();
@@ -639,24 +663,6 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
                 *slot = number;
             }
         }
-    }
-
-    // `--build-id`: GNU ld creates the note in the first input object, so
-    // under a script it follows that object's orphans; its default `-r`
-    // script puts it first.
-    let build_id = crate::elf::synth::plan_build_id(input.options);
-    let make_build_id = |size: u64| {
-        let mut note = OutSection::new(b".note.gnu.build-id", OutKind::BuildId, SHT_NOTE);
-        note.flags = SHF_ALLOC;
-        note.align = 4;
-        note.size = size.saturating_add(16);
-        note
-    };
-    let mut build_id_pending = build_id;
-    if input.script.is_none()
-        && let Some(size) = build_id_pending.take()
-    {
-        outs.push(make_build_id(size));
     }
 
     // Content sections, in order of first appearance.
@@ -775,8 +781,13 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             sh_type: SHT_PROGBITS,
             flags: SHF_ALLOC,
         };
-        let out_index = match keys.get(&key) {
-            Some(&out) => out,
+        // A linker script's `.bss` takes them.
+        let script_bss = outs
+            .iter()
+            .position(|o| o.script.is_some() && o.name == b".bss" && o.kind == OutKind::Content)
+            .and_then(|o| u32::try_from(o).ok());
+        let out_index = match script_bss.or_else(|| keys.get(&key).copied()) {
+            Some(out) => out,
             None => {
                 let out = index_u32(outs.len())?;
                 let mut bss = OutSection::new(b".bss", OutKind::Content, SHT_NOBITS);

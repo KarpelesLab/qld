@@ -350,6 +350,113 @@ PROVIDE (etext = .);
     s
 }
 
+/// The built-in layout of x86-64 relocatable output (`-r`), after GNU
+/// ld's `elf_x86_64.xr`: every output section at address 0, in its order,
+/// with `-r`'s narrower patterns (`.text.*` sections stay apart); what it
+/// does not name is an orphan, written after it in input order.
+#[must_use]
+pub fn relocatable_script() -> &'static str {
+    "SECTIONS
+{
+.note.gnu.build-id 0 : { *(.note.gnu.build-id) }
+.interp 0 : { *(.interp) }
+.hash 0 : { *(.hash) }
+.gnu.hash 0 : { *(.gnu.hash) }
+.dynsym 0 : { *(.dynsym) }
+.dynstr 0 : { *(.dynstr) }
+.gnu.version 0 : { *(.gnu.version) }
+.gnu.version_d 0 : { *(.gnu.version_d) }
+.gnu.version_r 0 : { *(.gnu.version_r) }
+.rela.init 0 : { *(.rela.init) }
+.rela.text 0 : { *(.rela.text) }
+.rela.fini 0 : { *(.rela.fini) }
+.rela.rodata 0 : { *(.rela.rodata) }
+.rela.data.rel.ro 0 : { *(.rela.data.rel.ro) }
+.rela.data 0 : { *(.rela.data) }
+.rela.tdata 0 : { *(.rela.tdata) }
+.rela.tbss 0 : { *(.rela.tbss) }
+.rela.ctors 0 : { *(.rela.ctors) }
+.rela.dtors 0 : { *(.rela.dtors) }
+.rela.got 0 : { *(.rela.got) }
+.rela.tls 0 : { *(.rela.tls) }
+.rela.bss 0 : { *(.rela.bss) }
+.rela.ldata 0 : { *(.rela.ldata) }
+.rela.lbss 0 : { *(.rela.lbss) }
+.rela.lrodata 0 : { *(.rela.lrodata) }
+.rela.ifunc 0 : { *(.rela.ifunc) }
+.rela.plt 0 : { *(.rela.plt) }
+.relr.dyn : { *(.relr.dyn) }
+.init 0 : { KEEP (*(SORT_NONE(.init))) }
+.plt 0 : { *(.plt) }
+.plt.got 0 : { *(.plt.got) }
+.plt.sec 0 : { *(.plt.sec) }
+.text 0 : { *(.text .stub) *(.gnu.warning) }
+.fini 0 : { KEEP (*(SORT_NONE(.fini))) }
+.rodata 0 : { *(.rodata) }
+.rodata1 0 : { *(.rodata1) }
+.eh_frame_hdr 0 : { *(.eh_frame_hdr) }
+.eh_frame 0 : ONLY_IF_RO { KEEP (*(.eh_frame)) }
+.sframe 0 : ONLY_IF_RO { KEEP (*(.sframe)) }
+.gcc_except_table 0 : ONLY_IF_RO { *(.gcc_except_table) }
+.gnu_extab 0 : ONLY_IF_RO { *(.gnu_extab*) }
+.exception_ranges 0 : ONLY_IF_RO { *(.exception_ranges) }
+.eh_frame 0 : ONLY_IF_RW { KEEP (*(.eh_frame)) }
+.sframe 0 : ONLY_IF_RW { KEEP (*(.sframe)) }
+.gnu_extab 0 : ONLY_IF_RW { *(.gnu_extab) }
+.gcc_except_table 0 : ONLY_IF_RW { *(.gcc_except_table) }
+.exception_ranges 0 : ONLY_IF_RW { *(.exception_ranges) }
+.tdata 0 : { *(.tdata) }
+.tbss 0 : { *(.tbss) }
+.jcr 0 : { KEEP (*(.jcr)) }
+.dynamic 0 : { *(.dynamic) }
+.got 0 : { *(.got) }
+.got.plt 0 : { *(.got.plt) }
+.data 0 : { *(.data) }
+.data1 0 : { *(.data1) }
+.bss 0 : { *(.bss) }
+.lbss 0 : { *(.lbss) }
+.lrodata 0 : { *(.lrodata) }
+.ldata 0 : { *(.ldata) }
+.stab 0 : { *(.stab) }
+.stabstr 0 : { *(.stabstr) }
+.stab.excl 0 : { *(.stab.excl) }
+.stab.exclstr 0 : { *(.stab.exclstr) }
+.stab.index 0 : { *(.stab.index) }
+.stab.indexstr 0 : { *(.stab.indexstr) }
+.comment 0 (INFO) : { *(.comment) }
+.gnu.build.attributes : { *(.gnu.build.attributes) }
+.debug 0 : { *(.debug) }
+.line 0 : { *(.line) }
+.debug_srcinfo 0 : { *(.debug_srcinfo) }
+.debug_sfnames 0 : { *(.debug_sfnames) }
+.debug_aranges 0 : { *(.debug_aranges) }
+.debug_pubnames 0 : { *(.debug_pubnames) }
+.debug_info 0 : { *(.debug_info) }
+.debug_abbrev 0 : { *(.debug_abbrev) }
+.debug_line 0 : { *(.debug_line) }
+.debug_frame 0 : { *(.debug_frame) }
+.debug_str 0 : { *(.debug_str) }
+.debug_loc 0 : { *(.debug_loc) }
+.debug_macinfo 0 : { *(.debug_macinfo) }
+.debug_weaknames 0 : { *(.debug_weaknames) }
+.debug_funcnames 0 : { *(.debug_funcnames) }
+.debug_typenames 0 : { *(.debug_typenames) }
+.debug_varnames 0 : { *(.debug_varnames) }
+.debug_pubtypes 0 : { *(.debug_pubtypes) }
+.debug_ranges 0 : { *(.debug_ranges) }
+.debug_addr 0 : { *(.debug_addr) }
+.debug_line_str 0 : { *(.debug_line_str) }
+.debug_loclists 0 : { *(.debug_loclists) }
+.debug_macro 0 : { *(.debug_macro) }
+.debug_names 0 : { *(.debug_names) }
+.debug_rnglists 0 : { *(.debug_rnglists) }
+.debug_str_offsets 0 : { *(.debug_str_offsets) }
+.debug_sup 0 : { *(.debug_sup) }
+.gnu.attributes 0 : { KEEP (*(.gnu.attributes)) }
+}
+"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +478,11 @@ mod tests {
                 }
             }
         }
+        parse_script(
+            relocatable_script().as_bytes(),
+            Path::new("default"),
+            &mut NoIncludes,
+        )
+        .unwrap();
     }
 }

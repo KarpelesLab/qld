@@ -125,6 +125,9 @@ pub struct RelocatableScript<'a> {
     pub assign: Vec<u32>,
     /// The symbols the script defines, by symbol ID.
     pub symbols: Vec<ScriptDefinition>,
+    /// Whether a statement names `.note.gnu.build-id`, which then comes
+    /// first (as in GNU ld's built-in `-r` layout).
+    pub build_id_first: bool,
 }
 
 impl RelocatableScript<'_> {
@@ -814,6 +817,7 @@ pub fn layout<'a>(
         outputs,
         assign: assign_out,
         symbols: definitions,
+        build_id_first: script.find_output(b".note.gnu.build-id").is_some(),
     })
 }
 
