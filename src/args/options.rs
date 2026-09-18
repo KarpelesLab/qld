@@ -45,6 +45,7 @@ pub enum OutputKind {
 }
 
 /// How much of the symbol table survives into the output.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StripMode {
     /// Keep everything (default).
@@ -57,6 +58,7 @@ pub enum StripMode {
 }
 
 /// Which local symbols are dropped from the output symbol table.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DiscardMode {
     /// The linker's default: drop compiler-generated temporary locals
@@ -91,6 +93,7 @@ pub enum BuildId {
 }
 
 /// Which symbol hash tables the dynamic output carries (`--hash-style`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HashStyle {
     /// `.hash` only.
@@ -104,6 +107,7 @@ pub enum HashStyle {
 
 /// `-Bsymbolic` and its variants: which default-visibility definitions in a
 /// shared library bind locally.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SymbolicMode {
     /// `-Bno-symbolic` (default): nothing binds locally.
@@ -121,6 +125,7 @@ pub enum SymbolicMode {
 }
 
 /// `--unresolved-symbols=<method>`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnresolvedSymbols {
     /// `ignore-all`: report nothing.
@@ -135,6 +140,7 @@ pub enum UnresolvedSymbols {
 }
 
 /// Colored diagnostics (`--color-diagnostics`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ColorChoice {
     /// Color when stderr is a terminal (default).
@@ -147,6 +153,7 @@ pub enum ColorChoice {
 }
 
 /// Page alignment mode (`-n`, `-N`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MagicMode {
     /// Normal demand-paged output (default).
@@ -159,6 +166,7 @@ pub enum MagicMode {
 }
 
 /// `-z separate-code` and related segment layout choices.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeparateCode {
     /// `-z noseparate-code`: code may share a segment with other read-only
@@ -173,6 +181,7 @@ pub enum SeparateCode {
 }
 
 /// `-z execstack` / `-z noexecstack` / `-z execstack-if-needed`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecStack {
     /// No option given: decided from the inputs' `.note.GNU-stack` sections
@@ -186,6 +195,7 @@ pub enum ExecStack {
 }
 
 /// Dynamic section flags set by `-z` keywords (`DT_FLAGS` / `DT_FLAGS_1`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DynamicFlags {
     /// `-z nodelete` (`DF_1_NODELETE`).
@@ -211,6 +221,7 @@ pub struct DynamicFlags {
 }
 
 /// x86 control-flow enforcement options (`-z ibt`, `-z shstk`, …).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Features {
     /// `-z ibt`: mark the output as IBT-compatible.
@@ -227,6 +238,7 @@ pub struct X86Features {
 }
 
 /// Severity for the `-z *-report=` keywords.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReportLevel {
     /// Report nothing (default).
@@ -239,6 +251,7 @@ pub enum ReportLevel {
 }
 
 /// How the inputs that follow `-b` / `--format` are interpreted.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InputFormat {
     /// Identify the format from the file contents (default).
@@ -340,6 +353,7 @@ pub struct InputSpec {
 /// [`PeOptions::from_link_options`](crate::coff::PeOptions::from_link_options);
 /// ELF and Mach-O links ignore them, which is why GNU ld's per-emulation
 /// options are accepted whatever the target is.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeArgs {
     /// `--subsystem NAME[,MAJOR[.MINOR]]`, as an `IMAGE_SUBSYSTEM_*` value.
