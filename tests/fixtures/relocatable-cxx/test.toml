@@ -31,3 +31,6 @@ expect.readelf_files."combined.o" = [
   "!Program Headers:",
 ]
 determinism = true
+# AArch64 GNU ld also gives the personality routine, which only `.eh_frame`
+# data references, a PLT slot that nothing calls; qld does not.
+diff.ignore_arch.aarch64 = ["JUMP_SLOT __gxx_personality_v0"]

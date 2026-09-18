@@ -34,12 +34,5 @@ targets = ["aarch64-linux-gnu"]
 determinism = true
 # qld binds TLS descriptors eagerly (.rela.dyn, as lld does); GNU ld puts
 # them in .rela.plt with a lazy TLSDESC trampoline, which glibc no longer
-# uses. GNU ld's AArch64 default script also defines __bss_start__,
-# _bss_end__, __bss_end__ and __end__, which qld does not (yet).
-diff.ignore = [
-  "TLSDESC",
-  "__bss_start__",
-  "_bss_end__",
-  "__bss_end__",
-  "__end__",
-]
+# uses.
+diff.ignore = ["TLSDESC"]

@@ -86,6 +86,10 @@ pub struct Fixture {
     pub gnu_ld: GnuLdExpectation,
     /// Differential runner: property lines to ignore (substring patterns).
     pub diff_ignore: Vec<String>,
+    /// Differential runner: more lines to ignore when the host is one
+    /// architecture (`diff.ignore_arch.aarch64 = [...]`), for differences
+    /// that only one architecture's GNU ld has.
+    pub diff_ignore_arch: Vec<(String, Vec<String>)>,
     /// Differential runner: skip this fixture, with a reason.
     pub diff_skip: Option<String>,
     /// Skip this fixture everywhere, with a reason.
@@ -104,6 +108,21 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// The differential runner's ignore patterns on architecture `arch`:
+    /// `diff.ignore` plus that architecture's `diff.ignore_arch`.
+    pub fn diff_ignores(&self, arch: &str) -> Vec<String> {
+        self.diff_ignore
+            .iter()
+            .chain(
+                self.diff_ignore_arch
+                    .iter()
+                    .filter(|(a, _)| a == arch)
+                    .flat_map(|(_, patterns)| patterns),
+            )
+            .cloned()
+            .collect()
+    }
+
     /// Loads and validates `dir/test.toml`.
     pub fn load(dir: &Path) -> Result<Self, String> {
         let name = dir
@@ -134,6 +153,7 @@ impl Fixture {
             determinism: false,
             gnu_ld: GnuLdExpectation::Pass,
             diff_ignore: Vec::new(),
+            diff_ignore_arch: Vec::new(),
             diff_skip: None,
             skip: None,
             requires_files: Vec::new(),
@@ -252,6 +272,9 @@ impl Fixture {
                     strings()?,
                 )),
                 ["diff", "ignore"] => fixture.diff_ignore = strings()?,
+                ["diff", "ignore_arch", arch] => fixture
+                    .diff_ignore_arch
+                    .push(((*arch).to_string(), strings()?)),
                 ["diff", "skip"] => fixture.diff_skip = Some(string()?),
                 _ => return Err(at("unknown key".to_string())),
             }

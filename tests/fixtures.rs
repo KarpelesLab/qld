@@ -178,6 +178,19 @@ fn readelf_patterns_per_architecture() {
     );
 }
 
+/// `diff.ignore_arch.<arch>` only widens the differential's ignores on that
+/// architecture.
+#[test]
+fn differential_ignores_per_architecture() {
+    let fixtures = Fixture::load_all(&fixture::fixtures_root()).unwrap_or_else(|e| panic!("{e}"));
+    let fixture = fixtures
+        .iter()
+        .find(|f| f.name == "tls-shared-gd")
+        .expect("the tls-shared-gd fixture");
+    assert!(fixture.diff_ignores("x86_64").is_empty());
+    assert_eq!(fixture.diff_ignores("aarch64"), ["TLSDESC"]);
+}
+
 #[test]
 fn triples_normalize() {
     use common::tools::Triple;
