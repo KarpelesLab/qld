@@ -839,10 +839,11 @@ impl Arch {
 
     /// Whether a preemptible function that also has a GOT entry is called
     /// through `.plt.got` (jumping through that entry) rather than getting
-    /// a PLT slot. PowerPC64 linkers give every called function a slot.
+    /// a PLT slot. PowerPC64 linkers give every called function a slot, and
+    /// so does GNU ld's AArch64 backend, which has no `.plt.got`.
     #[must_use]
     pub fn uses_plt_got(self) -> bool {
-        self != Self::Ppc64
+        !matches!(self, Self::Ppc64 | Self::AArch64)
     }
 
     /// Whether a dynamic output's `IRELATIVE` relocations go to

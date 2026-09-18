@@ -15,3 +15,6 @@ expect.readelf = [
 ]
 targets = ["aarch64-linux-gnu"]
 determinism = true
+# GNU ld also gives the personality routine, which only `.eh_frame` data
+# references (R_AARCH64_ABS64), a PLT slot that nothing calls; qld does not.
+diff.ignore = ["JUMP_SLOT __gxx_personality_v0"]
