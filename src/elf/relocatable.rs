@@ -421,6 +421,8 @@ struct Plan<'a> {
     arch: crate::elf::arch::Arch,
     /// The output section list index of each linker script output.
     script_outs: Vec<u32>,
+    /// `e_flags` of the output, taken from the inputs.
+    flags: u32,
 }
 
 fn align_to(value: u64, align: u64) -> Result<u64> {
@@ -474,6 +476,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
     let mut os_abi = 0u8;
     let arch = crate::elf::arch::Arch::of_files(files).unwrap_or_default();
     let machine = arch.machine();
+    let flags = arch.output_flags(files);
     let mut kept: KeptGroups<'a> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6b65_7074));
     for (file_index, file) in files.iter().enumerate() {
@@ -1059,6 +1062,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         machine,
         arch,
         script_outs,
+        flags,
     })
 }
 
@@ -1763,7 +1767,7 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
     let path = input.options.output_path();
     let options = OutputOptions {
         mode: FileMode::Regular,
-        ..OutputOptions::default()
+        ..OutputOptions::for_link(input.options)
     };
     let mut file = OutputFile::create(&path, plan.file_size, &options)?;
     file.write_chunks(&ranges, |index, out| {
@@ -1886,6 +1890,7 @@ fn write_header(plan: &Plan<'_>, out: &mut [u8]) {
     header[18..20].copy_from_slice(&plan.machine.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[40..48].copy_from_slice(&plan.shoff.to_le_bytes());
+    header[48..52].copy_from_slice(&plan.flags.to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());
     header[58..60].copy_from_slice(&64u16.to_le_bytes());
     let (shnum, shstrndx) = if plan.section_count >= u32::from(SHN_LORESERVE) {

@@ -210,8 +210,10 @@ pub struct DarwinArgs {
     pub function_starts: bool,
     /// `-data_in_code_info` (default) / `-no_data_in_code_info`.
     pub data_in_code: bool,
-    /// `-lto_library`: recorded; Mach-O LTO is not implemented.
+    /// `-lto_library`: the libLTO for bitcode inputs.
     pub lto_library: Option<PathBuf>,
+    /// The other LTO options.
+    pub lto: DarwinLto,
     /// `-bundle_loader`: the executable a bundle is loaded into.
     pub bundle_loader: Option<PathBuf>,
     /// `-v` given together with a link: print the version first.
@@ -264,12 +266,41 @@ impl Default for DarwinArgs {
             function_starts: true,
             data_in_code: true,
             lto_library: None,
+            lto: DarwinLto::default(),
             bundle_loader: None,
             print_version: false,
             keep_private_externs: false,
             flat_namespace: false,
         }
     }
+}
+
+/// The LTO options of an ld64 command line, used when inputs are bitcode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DarwinLto {
+    /// `-object_path_lto`: where to keep the objects LTO produces (a file
+    /// for full LTO, a directory for ThinLTO), so the debug map can refer
+    /// to them.
+    pub object_path: Option<PathBuf>,
+    /// `-cache_path_lto`: the ThinLTO cache directory.
+    pub cache_path: Option<PathBuf>,
+    /// `-prune_interval_lto`: seconds between cache prunings (negative:
+    /// never).
+    pub prune_interval: Option<i32>,
+    /// `-prune_after_lto`: seconds after which a cache entry expires.
+    pub prune_after: Option<u32>,
+    /// `-max_relative_cache_size_lto`: cache size limit, in percent of the
+    /// free space.
+    pub max_relative_cache_size: Option<u32>,
+    /// `-mllvm` options, in order.
+    pub mllvm: Vec<String>,
+    /// `-mcpu`: the CPU to generate code for.
+    pub mcpu: Option<String>,
+    /// `-export_dynamic`: LTO keeps every global symbol of an executable.
+    pub export_dynamic: bool,
+    /// `-flto-codegen-only`: generate code from the bitcode without
+    /// optimizing it.
+    pub codegen_only: bool,
 }
 
 /// How an ld64 option takes its value.
@@ -339,6 +370,15 @@ enum Act {
     NoExported,
     OrderFile,
     LtoLibrary,
+    LtoObjectPath,
+    LtoCachePath,
+    LtoPruneInterval,
+    LtoPruneAfter,
+    LtoMaxCacheSize,
+    Mllvm,
+    Mcpu,
+    ExportDynamic,
+    LtoCodegenOnly,
     Demangle,
     AdhocCodesign(bool),
     Headerpad,
@@ -915,6 +955,18 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     ignored("objc_category_merging", Flag),
     ignored("objc_abi_version", V1),
     ignored("ld_classic", Flag),
+    // Obsolete options ld64 accepts and ignores.
+    ignored("single_module", Flag),
+    ignored("multi_module", Flag),
+    ignored("prebind", Flag),
+    ignored("noprebind", Flag),
+    ignored("nofixprebinding", Flag),
+    ignored("twolevel_namespace_hints", Flag),
+    ignored("nomultidefs", Flag),
+    ignored("whatsloaded", Flag),
+    ignored("force_cpusubtype_ALL", Flag),
+    ignored("seglinkedit", Flag),
+    ignored("noseglinkedit", Flag),
     ignored("ld_new", Flag),
     ignored("merge_zero_fill_sections", Flag),
     ignored("ignore_optimization_hints", Flag),
@@ -923,23 +975,62 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     ignored("no_weak_imports", Flag),
     ignored("dylib_file", V1),
     ignored("thread_count", V1),
-    // LTO: Mach-O LTO is not implemented, so these only matter for bitcode
-    // inputs, which the driver rejects by name.
+    // LTO: used when inputs are bitcode (see `macho::lto`).
     opt(
         "lto_library",
         V1,
         Act::LtoLibrary,
         "libLTO to use for bitcode inputs",
     ),
-    ignored("object_path_lto", V1),
-    ignored("cache_path_lto", V1),
-    ignored("prune_interval_lto", V1),
-    ignored("prune_after_lto", V1),
-    ignored("max_relative_cache_size_lto", V1),
-    ignored("mllvm", V1),
-    ignored("mcpu", V1),
-    ignored("export_dynamic", Flag),
-    ignored("flto-codegen-only", Flag),
+    opt(
+        "object_path_lto",
+        V1,
+        Act::LtoObjectPath,
+        "Keep the LTO object (ThinLTO: objects) at this path",
+    ),
+    opt(
+        "cache_path_lto",
+        V1,
+        Act::LtoCachePath,
+        "ThinLTO cache directory",
+    ),
+    opt(
+        "prune_interval_lto",
+        V1,
+        Act::LtoPruneInterval,
+        "Seconds between ThinLTO cache prunings",
+    ),
+    opt(
+        "prune_after_lto",
+        V1,
+        Act::LtoPruneAfter,
+        "Seconds after which ThinLTO cache entries expire",
+    ),
+    opt(
+        "max_relative_cache_size_lto",
+        V1,
+        Act::LtoMaxCacheSize,
+        "ThinLTO cache size limit, in percent of free space",
+    ),
+    opt(
+        "mllvm",
+        V1,
+        Act::Mllvm,
+        "Pass an option to LLVM's code generator",
+    ),
+    opt("mcpu", V1, Act::Mcpu, "CPU for LTO code generation"),
+    opt(
+        "export_dynamic",
+        Flag,
+        Act::ExportDynamic,
+        "Keep all global symbols of an executable during LTO",
+    ),
+    opt(
+        "flto-codegen-only",
+        Flag,
+        Act::LtoCodegenOnly,
+        "Generate code from bitcode without optimizing it",
+    ),
     // Rejected.
     unsupported("bitcode_bundle", Flag, "bitcode bundles"),
     unsupported("sectalign", V3, "-sectalign"),
@@ -1024,6 +1115,16 @@ pub fn parse(args: &[&OsStr], reader: &dyn FileReader) -> Result<ParseOutcome> {
             any_input = true;
             continue;
         };
+        // `-O<level>`: Apple clang passes the compiler's optimization level
+        // to a linker named with `-fuse-ld=<path>`, and ld64.lld accepts
+        // it. It has no effect on a Mach-O link.
+        if is_optimization_level(name) {
+            state
+                .options
+                .ignored
+                .push(OsString::from(format!("-{name}")));
+            continue;
+        }
         let (option, joined) = lookup(name)?;
         let mut values: Vec<String> = Vec::new();
         match option.arg {
@@ -1152,6 +1253,15 @@ fn missing(name: &str) -> Error {
     Error::Option(format!("-{name}: missing argument"))
 }
 
+/// Whether `name` (without its dash) is an optimization level: `O`, `O0`
+/// to `O3` (any number), `Os`, `Oz` or `Ofast`.
+fn is_optimization_level(name: &str) -> bool {
+    let Some(level) = name.strip_prefix('O') else {
+        return false;
+    };
+    level.bytes().all(|b| b.is_ascii_digit()) || matches!(level, "s" | "z" | "fast")
+}
+
 /// Finds the option for `name` (the argument without its dash), returning
 /// the joined value of `-l`-style options.
 fn lookup(name: &str) -> Result<(&'static DarwinOption, Option<&str>)> {
@@ -1186,6 +1296,11 @@ fn parse_number(option: &str, text: &str) -> Result<u64> {
         None => u64::from_str_radix(text, 16).ok(),
     };
     parsed.ok_or_else(|| Error::Option(format!("-{option}: malformed number: {text}")))
+}
+
+fn parse_decimal<T: std::str::FromStr>(option: &str, text: &str) -> Result<T> {
+    text.parse()
+        .map_err(|_| Error::Option(format!("-{option}: malformed number: {text}")))
 }
 
 /// Parses an ld64 platform name or number.
@@ -1316,6 +1431,19 @@ impl Parser<'_> {
             Act::NoExported => darwin.no_exported_symbols = true,
             Act::OrderFile => darwin.order_file = Some(PathBuf::from(first)),
             Act::LtoLibrary => darwin.lto_library = Some(PathBuf::from(first)),
+            Act::LtoObjectPath => darwin.lto.object_path = Some(PathBuf::from(first)),
+            Act::LtoCachePath => darwin.lto.cache_path = Some(PathBuf::from(first)),
+            Act::LtoPruneInterval => {
+                darwin.lto.prune_interval = Some(parse_decimal(name, first)?);
+            }
+            Act::LtoPruneAfter => darwin.lto.prune_after = Some(parse_decimal(name, first)?),
+            Act::LtoMaxCacheSize => {
+                darwin.lto.max_relative_cache_size = Some(parse_decimal(name, first)?);
+            }
+            Act::Mllvm => darwin.lto.mllvm.push(first.to_owned()),
+            Act::Mcpu => darwin.lto.mcpu = Some(first.to_owned()),
+            Act::ExportDynamic => darwin.lto.export_dynamic = true,
+            Act::LtoCodegenOnly => darwin.lto.codegen_only = true,
             Act::Demangle => self.options.demangle = false,
             Act::AdhocCodesign(sign) => darwin.adhoc_codesign = Some(sign),
             Act::Headerpad => darwin.headerpad = Some(parse_number(name, first)?),
@@ -1481,6 +1609,7 @@ mod tests {
                 | Act::CurrentVersion
                 | Act::CompatibilityVersion => "1.2",
                 Act::Headerpad | Act::ImageBase | Act::PagezeroSize | Act::StackSize => "0x1000",
+                Act::LtoPruneInterval | Act::LtoPruneAfter | Act::LtoMaxCacheSize => "10",
                 _ => "x",
             };
             let mut args = vec![format!("-{}", option.name)];
@@ -1572,6 +1701,19 @@ mod tests {
             DarwinInputKind::Library("System".into())
         );
         assert!(darwin.lto_library.is_some());
+        assert_eq!(darwin.lto.mllvm, ["-enable-linkonceodr-outlining"]);
+    }
+
+    #[test]
+    fn optimization_levels_are_ignored() {
+        // Apple clang passes `-O<n>` to a linker given with `-fuse-ld=`.
+        for level in ["-O", "-O0", "-O2", "-O3", "-Os", "-Oz", "-Ofast"] {
+            let options = parse_ok(&["-arch", "arm64", level, "a.o"]);
+            assert_eq!(options.ignored, [OsString::from(level)], "{level}");
+            assert_eq!(options.darwin.inputs.len(), 1, "{level}");
+        }
+        assert!(parse_err(&["-Ox", "a.o"]).contains("-Ox"));
+        assert!(parse_ok(&["-ObjC", "a.o"]).darwin.objc);
     }
 
     #[test]

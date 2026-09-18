@@ -246,7 +246,10 @@ doesn't hold up the link.
 
 ### Mach-O pipeline
 
-`macho::link` follows the same stages with Mach-O semantics. Each `-arch`
+`macho::link` follows the same stages with Mach-O semantics. With bitcode
+inputs, `macho::lto` runs first: resolution with stand-in objects decides
+what LTO preserves, libLTO (`plugin::liblto`) generates native objects, and
+the link proceeds with them. Each `-arch`
 value is an independent link; several run in parallel and `fat.rs` joins
 them into a universal binary. Per architecture:
 
@@ -318,6 +321,16 @@ Who works where, and which files each task owns, is in
   owned `String`s. Symbol names are raw bytes and are never assumed to be UTF-8.
 - **Teardown**: the CLI exits without dropping the link state, as mold and
   lld do. The library API frees everything in the normal way.
+
+## In-memory inputs and outputs
+
+The file table (`src/input/table.rs`) asks `LinkOptions::input_provider` for
+a path before reading the disk, and `InputKind::Bytes` inputs skip mapping
+entirely. `OutputOptions::for_link` (`src/output/file.rs`) carries the
+optional `OutputBuffer` capture and the `CancelToken`: with a capture, the
+finished image is handed to the buffer instead of being written to a file.
+`LinkOptions::check_cancelled` runs between stages, per file while loading
+inputs, and per chunk while writing.
 
 ## Process model
 

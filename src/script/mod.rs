@@ -18,7 +18,7 @@
 //!   `--defsym` expressions.
 //!
 //! Parsing produces a [`Script`] ([`parse_script`]). Expressions are
-//! evaluated with [`eval`] against an [`EvalContext`] that layout implements,
+//! evaluated with [`eval()`] against an [`EvalContext`] that layout implements,
 //! and input section descriptions are matched against input sections with
 //! [`InputSectionDescription::matches`].
 //!

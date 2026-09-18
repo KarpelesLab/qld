@@ -37,8 +37,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc g++ binutils libc6-dev libstdc++-13-dev \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-14-loongarch64-linux-gnu g++-14-loongarch64-linux-gnu \
+            binutils-loongarch64-linux-gnu libc6-dev-loong64-cross \
             qemu-user-static
+          # noble ships only the versioned LoongArch compiler names
+          sudo ln -sf /usr/bin/loongarch64-linux-gnu-gcc-14 /usr/local/bin/loongarch64-linux-gnu-gcc
+          sudo ln -sf /usr/bin/loongarch64-linux-gnu-g++-14 /usr/local/bin/loongarch64-linux-gnu-g++
       - run: cargo test --all-features --test fixtures -- --ignored --nocapture
+
+  loongarch64:
+    name: LoongArch64 links compared with lld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_LOONGARCH: "1"
+      QLD_TEST_LOONGARCH_CC: clang-22
+      QLD_TEST_LLD: ld.lld-22
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # noble's LLVM 18 predates lld's LoongArch TLSDESC and relaxation
+      - run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y lld-22
+      - run: cargo test --all-features --test loongarch -- --nocapture
 
   arm64-linux:
     name: AArch64 fixtures on arm64
@@ -74,6 +97,20 @@ jobs:
       # x86_64 slices of the fixtures run under Rosetta on the arm64 runner.
       - run: softwareupdate --install-rosetta --agree-to-license || true
       - run: cargo test --all-features --test macho_link -- --nocapture
+      - run: cargo test --all-features --test macho_lto -- --nocapture
+      - name: Real projects with -fuse-ld=qld (zlib, Lua, SQLite, {fmt})
+        if: success() || failure()
+        run: |
+          cargo build --release
+          tests/projects/macos-suite.sh target/release/qld "$RUNNER_TEMP/macos-suite"
+      - name: Keep the suite's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-suite-logs
+          path: |
+            ${{ runner.temp }}/macos-suite/build/*/*.log
+            ${{ runner.temp }}/macos-suite/links.log
 
   pe-windows:
     name: PE images run on Windows

@@ -1,0 +1,27 @@
+# Replace the Maintainer (here and in changelog) before uploading anywhere.
+Source: qld
+Section: devel
+Priority: optional
+Maintainer: qld packagers <packaging@qld.invalid>
+Build-Depends: debhelper-compat (= 13),
+               cargo (>= 1.89),
+               rustc (>= 1.89),
+Standards-Version: 4.7.0
+Homepage: https://github.com/KarpelesLab/qld
+Vcs-Git: https://github.com/KarpelesLab/qld.git
+Vcs-Browser: https://github.com/KarpelesLab/qld
+Rules-Requires-Root: no
+
+Package: qld
+Architecture: amd64 arm64
+Depends: ${misc:Depends},
+         ${shlibs:Depends},
+Suggests: clang | gcc,
+Description: fast, parallel linker compatible with GNU ld, gold, lld and mold
+ qld is a linker (link editor) written in Rust. It accepts the GNU ld, gold,
+ lld and mold command lines, so compiler drivers and build systems can use
+ it with no other changes, and it links in parallel at every stage.
+ .
+ This package installs /usr/bin/qld with the names compiler drivers look
+ for: ld.qld and ld64.qld, found by clang -fuse-ld=qld, and
+ /usr/libexec/qld/ld, found by gcc -B/usr/libexec/qld.

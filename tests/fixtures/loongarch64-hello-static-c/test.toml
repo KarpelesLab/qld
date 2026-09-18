@@ -1,0 +1,21 @@
+# M4: the LoongArch64 counterpart of `hello-static-c`. Static glibc: libc's
+# TLS accesses relax to local-exec, the IFUNC stubs of the string functions
+# are filled by IRELATIVE relocations, and libc's objects carry linker
+# relaxation (qld keeps the `nop`s relaxation frees, and the padding
+# `R_LARCH_ALIGN` marks).
+description = "static hello world in C, for LoongArch64"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "LoongArch",
+  "EXEC (Executable file)",
+  "DOUBLE-FLOAT",
+  "!INTERP",
+  "!.dynamic",
+  "!R_LARCH_JUMP_SLOT",
+]
+targets = ["loongarch64-linux-gnu"]
+determinism = true

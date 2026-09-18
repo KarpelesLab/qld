@@ -1,0 +1,18 @@
+# M4: C++ exceptions on LoongArch need `.eh_frame` relocated correctly,
+# including the R_LARCH_ADD*/SUB* label differences GCC emits for the
+# call frame advances when the code may relax, and `.eh_frame_hdr` sorted,
+# so that the unwinder finds the FDE of a frame two calls deep.
+description = "C++ exceptions across two frames, for LoongArch64"
+compile = ["c++ -O2 -fPIE -c throw.cpp"]
+driver = "c++"
+link = "-pie -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "LoongArch",
+  "GNU_EH_FRAME",
+  ".gcc_except_table",
+  "R_LARCH_JUMP_SLOT",
+]
+targets = ["loongarch64-linux-gnu"]
+determinism = true

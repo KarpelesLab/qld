@@ -1,0 +1,21 @@
+# M4: a dynamic PIE against glibc. Covers the LoongArch PLT header and
+# entries, `.got.plt` slots that point back at the header for lazy binding,
+# JUMP_SLOT and RELATIVE relocations (LoongArch has no GLOB_DAT), and the
+# 16 KiB maximum page size.
+description = "dynamic PIE hello world in C, for LoongArch64"
+compile = ["cc -O2 -fPIE -c hello.c"]
+driver = "cc"
+link = "-pie -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, dynamic world (20)\n"
+expect.readelf = [
+  "LoongArch",
+  "DYN (",
+  "INTERP",
+  "ld-linux-loongarch-lp64d.so.1",
+  "R_LARCH_JUMP_SLOT",
+  "R_LARCH_RELATIVE",
+  "0x4000",
+]
+targets = ["loongarch64-linux-gnu"]
+determinism = true
