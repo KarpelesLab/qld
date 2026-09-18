@@ -498,6 +498,14 @@ impl Arch {
         }))
     }
 
+    /// Whether [`Arch::annotate`] changes anything on this architecture, so
+    /// relocation loops must look one relocation ahead
+    /// ([`for_each_relocation!`]).
+    #[must_use]
+    pub fn annotates(self) -> bool {
+        self == Self::LoongArch64
+    }
+
     /// `rel` with what the architecture needs to know about the relocation
     /// that follows it (`next`) folded into its type: on LoongArch, whether
     /// an `R_LARCH_RELAX` allows the instructions to be relaxed
@@ -1037,6 +1045,29 @@ pub fn add_value(out: &mut [u8], offset: u64, width: Width, delta: u64) -> Resul
     }
     Ok(())
 }
+
+/// Runs `$body` for every relocation of `$relas` (a relocation slice), with
+/// `$rel` bound to it, as a `for` loop does (`continue` and `break` work).
+///
+/// On architectures that [`Arch::annotates`], `$rel` is
+/// [`Arch::annotate`]d with the relocation that follows it. The choice is
+/// made once, and the body is expanded into two loops, so architectures
+/// without annotation pay nothing per relocation.
+macro_rules! for_each_relocation {
+    ($arch:expr, $relas:expr, |$rel:ident| $body:block) => {{
+        let arch: $crate::elf::arch::Arch = $arch;
+        if arch.annotates() {
+            let mut relocations = $relas.iter().peekable();
+            while let Some(current) = relocations.next() {
+                let $rel = arch.annotate(current, relocations.peek());
+                $body
+            }
+        } else {
+            for $rel in $relas.iter() $body
+        }
+    }};
+}
+pub(crate) use for_each_relocation;
 
 /// The byte width of a relocation field.
 #[must_use]

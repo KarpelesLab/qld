@@ -1508,10 +1508,10 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
     let executable = input.context.mode.executable() || !input.context.mode.dynamic;
     let arch = input.context.arch;
     let order = file.position.raw();
+    let tls = addresses.layout.tls.unwrap_or_default();
+    let tp = tls.tp(arch);
     let mut skip = false;
-    let mut pending = relas.iter().peekable();
-    while let Some(rel) = pending.next() {
-        let rel = arch.annotate(rel, pending.peek());
+    arch::for_each_relocation!(arch, relas, |rel| {
         if skip {
             skip = false;
             continue;
@@ -1599,8 +1599,6 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
             }
         }
         let sa = s.wrapping_add_signed(a);
-        let tls = addresses.layout.tls.unwrap_or_default();
-        let tp = tls.tp(arch);
         let slot_address = || -> Result<u64, ApplyError> {
             addresses
                 .got_entry_address(owner, class.slot)
@@ -1763,7 +1761,7 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
             };
             report(message);
         }
-    }
+    });
     if alloc && arch == Arch::AArch64 && input.context.relax {
         // AArch64 ADRP relaxations: they look at pairs of relocations, so
         // they run over the relocated section rather than in the loop.
