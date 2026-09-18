@@ -45,11 +45,12 @@ use hashbrown::hash_table::Entry;
 use rayon::prelude::*;
 
 use super::{
-    InternJob, MIN_PARALLEL_CHUNK, PENDING, SHARD_COUNT, Shard, Slot, SymbolTable, get_mut, low32,
-    overflow, shard_of, table_hash,
+    Definitions, InternJob, MIN_PARALLEL_CHUNK, PENDING, SHARD_COUNT, Shard, Slot, SymbolTable,
+    get_mut, low32, overflow, shard_of, table_hash,
 };
 use crate::error::Result;
 use crate::ids::SymbolId;
+use crate::symbols::definition::Definition;
 use crate::symbols::name::SymbolName;
 
 /// The partitioning passes split the sequence into chunks of at least this
@@ -123,9 +124,29 @@ impl<'s, 'a> Sequence<'s, 'a> {
 pub struct LookupView<'t, 'a> {
     shards: Vec<&'t Shard<'a>>,
     names: &'t [SymbolName<'a>],
+    definitions: Definitions<'t>,
 }
 
 impl<'a> LookupView<'_, 'a> {
+    /// The current definition of `id` (see [`SymbolTable::definition`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` was not issued by the table.
+    #[inline]
+    #[must_use]
+    pub fn definition(&self, id: SymbolId) -> Definition {
+        self.definitions.get(id.index())
+    }
+
+    /// Whether `id` is an ID [`find_all`](Self::find_all) found, rather
+    /// than its placeholder for a name the table does not hold.
+    #[inline]
+    #[must_use]
+    pub fn is_found(id: SymbolId) -> bool {
+        id.as_u32() & PENDING == 0
+    }
+
     /// The ID of `name`, or `PENDING` if the table does not hold it.
     #[inline]
     fn find_raw(&self, name: &SymbolName<'a>) -> u32 {
@@ -193,6 +214,13 @@ impl<'a> SymbolTable<'a> {
         LookupView {
             shards: self.shards.iter_mut().map(|s| &*get_mut(s)).collect(),
             names: &self.names,
+            definitions: Definitions {
+                kind: &self.def_kind,
+                file: &self.def_file,
+                index: &self.def_index,
+                position: &self.def_position,
+                aux: &self.def_aux,
+            },
         }
     }
 

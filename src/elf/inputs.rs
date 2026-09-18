@@ -358,6 +358,21 @@ impl<'a> ResolveFile<'a> for ElfInput<'a> {
         };
         uses.get(index).copied().unwrap_or(SymbolUse::Ignore)
     }
+
+    /// Members of regular archives: parsing one only fills `object`, and
+    /// maybe adds decompressed sections to the file table, which nothing
+    /// reads unless the member is extracted. (Loading a thin member adds
+    /// the member itself to the table, so it waits for extraction.)
+    fn can_load_early(&self) -> bool {
+        self.role == InputRole::Member
+            && self.thin.is_none()
+            && self.object.is_none()
+            && self.ir.is_none()
+    }
+
+    fn unload(&mut self) {
+        self.object = None;
+    }
 }
 
 /// Everything collected from the command line.

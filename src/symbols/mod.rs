@@ -44,7 +44,7 @@ pub mod resolve;
 pub mod table;
 mod util;
 
-pub use claims::{ClaimRound, GroupClaims};
+pub use claims::{ClaimRound, GroupClaims, GroupSlots};
 pub use definition::{Definition, DefinitionKind, Resolver, takes_precedence};
 pub use flags::SymbolFlags;
 pub use name::{InputPosition, SymbolName};

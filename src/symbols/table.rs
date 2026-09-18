@@ -988,16 +988,18 @@ impl<'a> SymbolTable<'a> {
 
     #[inline]
     fn load_definition(&self, index: usize) -> Definition {
-        let kind = DefinitionKind::from_u8(self.def_kind[index].load(Ordering::Relaxed));
-        if kind == DefinitionKind::Undefined {
-            return Definition::undefined();
-        }
-        Definition {
-            kind,
-            file: FileId::from_u32(self.def_file[index].load(Ordering::Relaxed)),
-            index: self.def_index[index].load(Ordering::Relaxed),
-            position: InputPosition::from_raw(self.def_position[index].load(Ordering::Relaxed)),
-            aux: self.def_aux[index].load(Ordering::Relaxed),
+        self.definitions().get(index)
+    }
+
+    /// The definition vectors, for reading.
+    #[inline]
+    fn definitions(&self) -> Definitions<'_> {
+        Definitions {
+            kind: &self.def_kind,
+            file: &self.def_file,
+            index: &self.def_index,
+            position: &self.def_position,
+            aux: &self.def_aux,
         }
     }
 
@@ -1008,6 +1010,33 @@ impl<'a> SymbolTable<'a> {
         self.def_position[index].store(definition.position.raw(), Ordering::Relaxed);
         self.def_aux[index].store(definition.aux, Ordering::Relaxed);
         self.def_kind[index].store(definition.kind as u8, Ordering::Relaxed);
+    }
+}
+
+/// The per-field definition vectors of a table, borrowed for reading.
+#[derive(Clone, Copy)]
+struct Definitions<'t> {
+    kind: &'t [AtomicU8],
+    file: &'t [AtomicU32],
+    index: &'t [AtomicU32],
+    position: &'t [AtomicU64],
+    aux: &'t [AtomicU64],
+}
+
+impl Definitions<'_> {
+    #[inline]
+    fn get(&self, index: usize) -> Definition {
+        let kind = DefinitionKind::from_u8(self.kind[index].load(Ordering::Relaxed));
+        if kind == DefinitionKind::Undefined {
+            return Definition::undefined();
+        }
+        Definition {
+            kind,
+            file: FileId::from_u32(self.file[index].load(Ordering::Relaxed)),
+            index: self.index[index].load(Ordering::Relaxed),
+            position: InputPosition::from_raw(self.position[index].load(Ordering::Relaxed)),
+            aux: self.aux[index].load(Ordering::Relaxed),
+        }
     }
 }
 

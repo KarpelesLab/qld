@@ -16,7 +16,8 @@
 //! [`GroupClaims::begin_round`] seals the claims of earlier rounds.
 
 use core::fmt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
@@ -219,10 +220,168 @@ impl<'a> ClaimRound<'_, 'a> {
     }
 }
 
+/// Entries in the first segment of [`GroupSlots`]; segment `k` holds
+/// `SLOT_BASE << k`.
+const SLOT_BASE: usize = 1024;
+/// Segments of [`GroupSlots`]: enough for every `u32` slot.
+const SLOT_SEGMENTS: usize = 23;
+
+/// A shard of [`GroupSlots`]' keys: each key with its slot.
+type KeyShard<'a> = Mutex<HashTable<(SymbolName<'a>, u32)>>;
+
+/// Claims on named groups, like [`GroupClaims`], split in two steps so
+/// that the key lookup can happen before the round is known:
+///
+/// 1. [`slot`](Self::slot) maps a key to a dense slot number, from any
+///    thread (a hash lookup under a shard lock). Numbers depend on
+///    scheduling; nothing else does.
+/// 2. [`offer`](Self::offer) and [`holds`](Self::holds) work on the slot
+///    with one atomic operation, no lock and no hashing.
+///
+/// A claim is the pair (round, rank), where `rank` orders files by input
+/// position: the lowest pair wins, so a claim from an earlier round is
+/// final and within a round the file with the lowest position wins,
+/// exactly as with [`GroupClaims`]. Ranks must be distinct and fit in 32
+/// bits, and so must rounds.
+pub struct GroupSlots<'a> {
+    keys: Box<[KeyShard<'a>]>,
+    next: AtomicU32,
+    /// Slot `s`'s claim, `round << 32 | rank`, or `u64::MAX`; segment `k`
+    /// holds `SLOT_BASE << k` slots.
+    claims: [OnceLock<Box<[AtomicU64]>>; SLOT_SEGMENTS],
+}
+
+impl Default for GroupSlots<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for GroupSlots<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupSlots")
+            .field("slots", &self.next.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> GroupSlots<'a> {
+    /// Creates an empty table; it allocates only the shard array.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            keys: (0..1usize << CLAIM_SHARD_BITS)
+                .map(|_| Mutex::new(HashTable::new()))
+                .collect(),
+            next: AtomicU32::new(0),
+            claims: [const { OnceLock::new() }; SLOT_SEGMENTS],
+        }
+    }
+
+    /// The slot of `key`, allocated on first use. `None` only if more than
+    /// `u32::MAX` keys were given slots.
+    pub fn slot(&self, key: SymbolName<'a>) -> Option<u32> {
+        let mut shard = lock(&self.keys[shard_of(key.hash())]);
+        let entry = shard.entry(
+            table_hash(key.hash()),
+            |(claimed, _)| *claimed == key,
+            |(claimed, _)| table_hash(claimed.hash()),
+        );
+        match entry {
+            Entry::Occupied(occupied) => Some(occupied.get().1),
+            Entry::Vacant(vacant) => {
+                let slot = self
+                    .next
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                    .ok()?;
+                vacant.insert((key, slot));
+                Some(slot)
+            }
+        }
+    }
+
+    /// The claim cell of `slot`, created on first use.
+    fn cell(&self, slot: u32) -> &AtomicU64 {
+        // Segment k starts at SLOT_BASE * (2^k - 1).
+        let scaled = slot as usize / SLOT_BASE + 1;
+        let segment = (usize::BITS - 1 - scaled.leading_zeros()) as usize;
+        let start = SLOT_BASE * ((1usize << segment) - 1);
+        let cells = self.claims[segment].get_or_init(|| {
+            (0..SLOT_BASE << segment)
+                .map(|_| AtomicU64::new(u64::MAX))
+                .collect()
+        });
+        &cells[slot as usize - start]
+    }
+
+    /// Offers the file of rank `rank` in round `round` as the holder of
+    /// `slot`; the lowest (round, rank) wins.
+    pub fn offer(&self, slot: u32, round: u32, rank: u32) {
+        self.cell(slot)
+            .fetch_min(u64::from(round) << 32 | u64::from(rank), Ordering::Relaxed);
+    }
+
+    /// Whether the file of rank `rank`, which offered `slot` in round
+    /// `round`, holds it. Final once every offer of the round is made.
+    #[must_use]
+    pub fn holds(&self, slot: u32, round: u32, rank: u32) -> bool {
+        self.cell(slot).load(Ordering::Relaxed) == u64::from(round) << 32 | u64::from(rank)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rayon::prelude::*;
+
+    #[test]
+    fn slots_follow_the_same_rules_as_claims() {
+        let keys: Vec<String> = (0..1500).map(|k| format!("group{k}")).collect();
+        let mut claims = GroupClaims::new();
+        let slots = GroupSlots::new();
+        // (round, rank, key)
+        let offers: Vec<(u32, u32, usize)> = (0..3000u32)
+            .map(|i| (i % 3 + 1, (i * 7919) % 3000, (i as usize * 31) % 1500))
+            .collect();
+        for round in 1..=3 {
+            let this: Vec<&(u32, u32, usize)> =
+                offers.iter().filter(|(r, _, _)| *r == round).collect();
+            {
+                let claim = claims.begin_round();
+                this.par_iter().for_each(|&&(_, rank, k)| {
+                    claim.offer(
+                        SymbolName::new(keys[k].as_bytes()),
+                        InputPosition::new(rank, 0),
+                        FileId::new(rank as usize),
+                    );
+                });
+            }
+            this.par_iter().for_each(|&&(_, rank, k)| {
+                let slot = slots.slot(SymbolName::new(keys[k].as_bytes())).unwrap();
+                slots.offer(slot, round, rank);
+            });
+            for &&(_, rank, k) in &this {
+                let key = SymbolName::new(keys[k].as_bytes());
+                let slot = slots.slot(key).unwrap();
+                assert_eq!(
+                    slots.holds(slot, round, rank),
+                    claims.owner(&key) == Some(FileId::new(rank as usize)),
+                    "{} rank {rank} round {round}",
+                    keys[k]
+                );
+            }
+        }
+        // Slots past the first segment work too.
+        let names: Vec<String> = (0..5000).map(|k| format!("k{k}")).collect();
+        let many = GroupSlots::new();
+        for (i, name) in names.iter().enumerate() {
+            let slot = many.slot(SymbolName::new(name.as_bytes())).unwrap();
+            assert_eq!(slot as usize, i);
+            many.offer(slot, 1, 10);
+            many.offer(slot, 1, 5);
+            assert!(many.holds(slot, 1, 5) && !many.holds(slot, 1, 10));
+        }
+    }
 
     fn key(name: &'static str) -> SymbolName<'static> {
         SymbolName::new(name.as_bytes())
