@@ -1,5 +1,5 @@
 # M2: position-independent executable. Absolute pointers in data become
-# R_X86_64_RELATIVE relocations; the file type is DYN with DF_1_PIE.
+# RELATIVE relocations; the file type is DYN with DF_1_PIE.
 description = "position-independent executable with relative relocations"
 compile = ["cc -O2 -fPIE -c main.c", "cc -O2 -fPIE -c table.c"]
 driver = "cc"
@@ -13,10 +13,11 @@ pointer to main is non-null: yes
 """
 expect.readelf = [
   "DYN (Position-Independent Executable file)",
-  "R_X86_64_RELATIVE",
   "INTERP",
   "(FLAGS_1)",
   "PIE",
   "!TEXTREL",
 ]
+expect.readelf_arch.x86_64 = ["R_X86_64_RELATIVE"]
+expect.readelf_arch.aarch64 = ["R_AARCH64_RELATIVE"]
 determinism = true

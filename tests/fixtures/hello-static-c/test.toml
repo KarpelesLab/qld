@@ -10,6 +10,7 @@ expect.readelf = [
   "GNU_STACK",
   "!INTERP",
   "!.dynamic",
-  "!R_X86_64_JUMP_SLOT",
 ]
+expect.readelf_arch.x86_64 = ["!R_X86_64_JUMP_SLOT"]
+expect.readelf_arch.aarch64 = ["!R_AARCH64_JUMP_SLOT"]
 determinism = true

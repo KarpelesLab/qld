@@ -12,4 +12,6 @@ via pointer: 2
 from other object: 2
 same address: yes
 """
-expect.readelf = ["R_X86_64_IRELATIVE", "IFUNC", "!INTERP"]
+expect.readelf = ["IFUNC", "!INTERP"]
+expect.readelf_arch.x86_64 = ["R_X86_64_IRELATIVE"]
+expect.readelf_arch.aarch64 = ["R_AARCH64_IRELATIVE"]

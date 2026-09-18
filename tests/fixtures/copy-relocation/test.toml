@@ -14,4 +14,6 @@ lib_counter=100 lib_message=initialized in the library
 after lib_increment: 101
 after exe write: lib sees 500
 """
-expect.readelf = ["R_X86_64_COPY", "lib_counter", "EXEC (Executable file)"]
+expect.readelf = ["lib_counter", "EXEC (Executable file)"]
+expect.readelf_arch.x86_64 = ["R_X86_64_COPY"]
+expect.readelf_arch.aarch64 = ["R_AARCH64_COPY"]
