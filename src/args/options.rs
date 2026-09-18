@@ -1196,7 +1196,15 @@ pub struct LinkOptions {
     pub dependent_libraries: bool,
     /// Optimization level (`-O`).
     pub optimize: u8,
-    /// Thread count. `None` means one thread per available core.
+    /// Thread count (`--threads`). `Some(n)` runs the link in a pool of
+    /// `n` threads that [`crate::link`] creates for it.
+    ///
+    /// `None`, the default, leaves the choice to the format driver: the ELF
+    /// driver sizes a pool from the input (small links run faster on few
+    /// threads), at most 16 threads and at most the available parallelism.
+    /// Called inside a rayon pool of your own
+    /// ([`rayon::ThreadPool::install`]), a link with `None` runs in that
+    /// pool and creates none, however large it is.
     pub threads: Option<usize>,
     /// Write a link map to this path (`-Map`).
     pub map_file: Option<PathBuf>,

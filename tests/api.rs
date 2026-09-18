@@ -323,6 +323,50 @@ fn links_run_in_the_callers_pool_and_concurrently() {
     assert!(images.iter().all(|image| *image == expected));
 }
 
+/// An input provider that records the size of the rayon pool the link is
+/// reading its inputs in.
+#[derive(Debug)]
+struct PoolSize {
+    files: MemoryFiles,
+    threads: AtomicUsize,
+}
+
+impl InputProvider for PoolSize {
+    fn read(&self, path: &Path) -> Option<Arc<[u8]>> {
+        self.threads
+            .store(rayon::current_num_threads(), Ordering::Relaxed);
+        self.files.read(path)
+    }
+}
+
+/// A pool the caller installed is the caller's to size: the driver runs in
+/// it as it is, however large, and creates no pool of its own. With
+/// `--threads` (`LinkOptions::threads`) the pool belongs to the link, and
+/// the driver may still narrow the stages that do not scale.
+#[test]
+fn a_large_caller_pool_is_used_as_it_is() {
+    // One more than the 16 threads the ELF driver would otherwise narrow to.
+    const THREADS: usize = 17;
+    let provider = Arc::new(PoolSize {
+        files: MemoryFiles::new()
+            .with("main.o", objects::main_object())
+            .with("answer.o", objects::answer_object(7)),
+        threads: AtomicUsize::new(0),
+    });
+    let mut options = LinkOptions::new();
+    options.kind = OutputKind::StaticExecutable;
+    options.input_provider = Some(provider.clone());
+    options.push_input(InputKind::File("main.o".into()), InputAttrs::default());
+    options.push_input(InputKind::File("answer.o".into()), InputAttrs::default());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(THREADS)
+        .build()
+        .unwrap();
+    let image = pool.install(|| link_to_memory(&mut options)).unwrap();
+    assert!(objects::entry_point(&image).is_some());
+    assert_eq!(provider.threads.load(Ordering::Relaxed), THREADS);
+}
+
 #[test]
 fn output_buffers_and_tokens_compare_by_identity() {
     let buffer = OutputBuffer::new();
