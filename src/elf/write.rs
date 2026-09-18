@@ -280,7 +280,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         OutputFile::create(
             &path,
             layout.file_size,
-            &crate::output::OutputOptions::default(),
+            &crate::output::OutputOptions::for_link(input.options),
         )?
     };
     // Chunks report into a collector; problems are emitted afterwards in
@@ -321,7 +321,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         let name = path.as_os_str().as_encoded_bytes().to_vec();
         let bytes = super::rawout::render(format, layout, file.as_slice()?, input.entry, &name)?;
         drop(file);
-        let mut options = crate::output::OutputOptions::default();
+        let mut options = crate::output::OutputOptions::for_link(input.options);
         if format != super::rawout::Format::Binary {
             options.mode = crate::output::FileMode::Regular;
         }

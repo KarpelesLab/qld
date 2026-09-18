@@ -11,7 +11,7 @@ use super::mmap::map_output;
 use super::positional;
 use super::stats::{Backing, WritePhase, WriteStats};
 use super::written::{self, HashPlan, Precomputed};
-use crate::args::BuildId;
+use crate::args::{BuildId, CancelToken, LinkOptions, OutputBuffer};
 use crate::error::{Error, Result};
 use memmap2::MmapMut;
 use std::ffi::OsString;
@@ -128,12 +128,36 @@ pub struct OutputOptions {
     pub background_release_threshold: Option<u64>,
     /// How the image is held while it is written.
     pub backing: BackingPolicy,
+    /// Keep the image in memory and hand it to this buffer on
+    /// [`OutputFile::finish`] instead of creating a file: the path is then
+    /// only a name. See [`LinkOptions::output_buffer`].
+    pub capture: Option<OutputBuffer>,
+    /// Fail [`OutputFile::write_chunks`] and [`OutputFile::finish`] once this
+    /// token is cancelled, leaving no output behind. See
+    /// [`LinkOptions::cancel`].
+    pub cancel: Option<CancelToken>,
 }
 
 impl OutputOptions {
     /// Default threshold for [`Self::background_release_threshold`]: 32 MiB,
     /// where freeing starts to cost milliseconds.
     pub const DEFAULT_RELEASE_THRESHOLD: u64 = 32 << 20;
+
+    /// The defaults, with the output buffer and cancellation token of a link
+    /// ([`LinkOptions::output_buffer`], [`LinkOptions::cancel`]). Link drivers
+    /// create their main output with these.
+    #[must_use]
+    pub fn for_link(options: &LinkOptions) -> Self {
+        Self {
+            capture: options.output_buffer.clone(),
+            cancel: options.cancel.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        self.cancel.as_ref().map_or(Ok(()), CancelToken::check)
+    }
 }
 
 impl Default for OutputOptions {
@@ -144,6 +168,8 @@ impl Default for OutputOptions {
             sync: false,
             background_release_threshold: Some(Self::DEFAULT_RELEASE_THRESHOLD),
             backing: BackingPolicy::Auto,
+            capture: None,
+            cancel: None,
         }
     }
 }
@@ -361,6 +387,12 @@ impl OutputFile {
     /// Returns [`Error::Io`] naming `path` if the file cannot be created,
     /// sized or opened, or if `size` does not fit in memory.
     pub fn create(path: &Path, size: u64, options: &OutputOptions) -> Result<Self> {
+        options.check_cancelled()?;
+        if options.capture.is_some() {
+            let mut out = Self::in_memory(size)?;
+            out.options = options.clone();
+            return Ok(out);
+        }
         let start = Instant::now();
         let len = usize::try_from(size).map_err(|_| Error::io(path, too_large()))?;
 
@@ -622,6 +654,13 @@ impl OutputFile {
         let start = Instant::now();
         let path = self.path.as_deref();
         let len = self.storage.len() as u64;
+        let cancel = self.options.cancel.clone();
+        let write = |index: usize, chunk: &mut [u8]| {
+            if let Some(token) = &cancel {
+                token.check()?;
+            }
+            write(index, chunk)
+        };
         let result = chunks::validate_layout(ranges, len)
             .map_err(|e| layout_error(path, e))
             .and_then(|()| match &mut self.storage {
@@ -744,6 +783,8 @@ impl OutputFile {
     /// Returns [`Error::Io`] naming the output path. A temporary file is
     /// removed on failure, and the previous output is left in place.
     pub fn finish(mut self) -> Result<Finished> {
+        // Dropping `self` on this error removes a partial file.
+        self.options.check_cancelled()?;
         let start = Instant::now();
         let storage = std::mem::replace(&mut self.storage, Storage::Buffer(Vec::new()));
         let destination = std::mem::replace(&mut self.destination, Destination::Done);
@@ -802,6 +843,11 @@ impl OutputFile {
             }
         }
 
+        if let Some(buffer) = &self.options.capture
+            && let Some(image) = bytes.take()
+        {
+            buffer.store(image);
+        }
         let mut stats = std::mem::take(&mut self.stats);
         stats.background_release |= release.is_some();
         stats.record(WritePhase::Commit, start.elapsed());
