@@ -75,6 +75,9 @@ pub struct Decoded {
     pub addend: i64,
     /// For a `SUBTRACTOR` pair, what is subtracted.
     pub subtrahend: Option<Referent>,
+    /// The file of the relocation (whose symbol table `Referent::Local`
+    /// indexes).
+    pub file: usize,
 }
 
 /// The extra PC offset of x86_64 `SIGNED_n` relocations.
@@ -264,6 +267,7 @@ pub fn decode(
         referent,
         addend,
         subtrahend,
+        file,
     })
 }
 
@@ -339,14 +343,18 @@ pub fn place(
                         .ok_or_else(|| fail(format!("symbol {symbol} has no section")))?;
                     let target = entry.n_value.wrapping_add(addend as u64);
                     // Stay with the symbol's atom when the target is inside
-                    // it (or at its end).
+                    // it (or at its end), or outside the section altogether
+                    // (the arm64 C++ ABI sets the top bit of type name
+                    // pointers: `__ZTS… + 0x8000000000000000`).
                     if let Some(atom) = object.atoms.symbol_atom(symbol)
                         && let Some(info) = object.atoms.atoms().get(atom)
                         && let Some(header) = object.file.sections().get(section)
                     {
                         let start = header.addr.saturating_add(info.offset);
                         let end = start.saturating_add(info.size);
-                        if target >= start && target <= end {
+                        let in_section_range = target >= header.addr
+                            && target <= header.addr.saturating_add(header.size);
+                        if (target >= start && target <= end) || !in_section_range {
                             return Ok(Place::Atom {
                                 atom: link.atom_id(file, atom),
                                 offset: target.wrapping_sub(start) as i64,
@@ -446,6 +454,8 @@ pub trait Resolve {
     fn value(&self, place: Place, addend: i64) -> Result<Value>;
     /// The `__got` slot of a symbol.
     fn got(&self, id: SymbolId) -> Option<u64>;
+    /// The `__got` slot of local symbol `symbol` of file `file`.
+    fn local_got(&self, file: usize, symbol: u32) -> Option<u64>;
     /// The `__stubs` entry of a symbol.
     fn stub(&self, id: SymbolId) -> Option<u64>;
     /// The `__thread_ptrs` slot of a symbol.
@@ -675,7 +685,7 @@ pub fn apply(
                 put_insn(out, at, (insn & !0x003f_fc00) | (imm << 10))?;
             }
             ARM64_RELOC_POINTER_TO_GOT => {
-                let slot = symbol.and_then(|id| resolve.got(id)).ok_or_else(|| {
+                let slot = got_slot(decoded, resolve).ok_or_else(|| {
                     Error::Internal(format!(
                         "POINTER_TO_GOT relocation at {place_address:#x} without a GOT slot"
                     ))
@@ -716,8 +726,8 @@ pub fn apply(
         X86_64_RELOC_GOT_LOAD | X86_64_RELOC_GOT | X86_64_RELOC_TLV => {
             let slot = match (decoded.r_type, symbol) {
                 (X86_64_RELOC_TLV, Some(id)) => resolve.tlv_pointer(id),
-                (_, Some(id)) => resolve.got(id),
-                _ => None,
+                (X86_64_RELOC_TLV, None) => None,
+                _ => got_slot(decoded, resolve),
             };
             match slot {
                 Some(slot) => slot.wrapping_add(addend as u64),
@@ -771,6 +781,15 @@ pub fn apply(
         i32::try_from(delta).map_err(|_| range_error("PC-relative", delta, place_address))?;
     put32(out, at, delta32 as u32)?;
     Ok(None)
+}
+
+/// The `__got` slot of the referent of `decoded`, global or local.
+fn got_slot(decoded: &Decoded, resolve: &dyn Resolve) -> Option<u64> {
+    match decoded.referent {
+        Referent::Global(id) => resolve.got(id),
+        Referent::Local(symbol) => resolve.local_got(decoded.file, symbol),
+        Referent::Address { .. } => None,
+    }
 }
 
 /// The destination of an arm64 page relocation: the symbol itself, its GOT

@@ -311,7 +311,7 @@ fn link_arch_once(
     let unwind_plan = super::unwind::plan(&link, unwind_entries);
     let sizes = SyntheticSizes {
         stubs: to_u64(synthetic.stubs.len()),
-        got: to_u64(synthetic.got.len()),
+        got: to_u64(synthetic.got_slots()),
         thread_ptrs: to_u64(synthetic.thread_ptrs.len()),
         unwind_info: unwind_plan.size(),
         eh_frame: eh_frame_plan.size(),
@@ -553,7 +553,7 @@ fn link_arch_once(
 
 /// Sets `reserved1` of the sections the indirect symbol table indexes.
 fn fill_section_indices(layout: &mut Layout, synthetic: &scan::Synthetic) {
-    let got = u32::try_from(synthetic.got.len()).unwrap_or(0);
+    let got = u32::try_from(synthetic.got_slots()).unwrap_or(0);
     let tlv = u32::try_from(synthetic.thread_ptrs.len()).unwrap_or(0);
     for section in &mut layout.sections {
         section.reserved1 = match section.kind {

@@ -67,7 +67,10 @@ pub fn write(
                 SectionKind::Input => write_input(addresses, index, section, out),
                 SectionKind::Stubs => write_stubs(addresses, section, out).map(|()| Vec::new()),
                 SectionKind::Got => {
-                    write_pointers(addresses, section, &addresses.synthetic.got, out)
+                    let mut fixups =
+                        write_pointers(addresses, section, &addresses.synthetic.got, out)?;
+                    fixups.extend(write_local_pointers(addresses, section, out)?);
+                    Ok(fixups)
                 }
                 SectionKind::ThreadPtrs => {
                     write_pointers(addresses, section, &addresses.synthetic.thread_ptrs, out)
@@ -222,6 +225,40 @@ fn write_stubs(addresses: &Addresses<'_, '_>, section: &OutSection, out: &mut [u
         }
     }
     Ok(())
+}
+
+/// The `__got` slots of local symbols, after the global ones.
+fn write_local_pointers(
+    addresses: &Addresses<'_, '_>,
+    section: &OutSection,
+    out: &mut [u8],
+) -> Result<Vec<Fixup>> {
+    let synthetic = addresses.synthetic;
+    let mut fixups = Vec::with_capacity(synthetic.local_got.len());
+    for (index, &(file, symbol)) in synthetic.local_got.iter().enumerate() {
+        let slot = synthetic.got.len().saturating_add(index);
+        let offset = to_usize(8u64.saturating_mul(u64::try_from(slot).unwrap_or(0)));
+        let address = section.addr.saturating_add(offset as u64);
+        let value = addresses
+            .object_symbol(to_usize(u64::from(file)), symbol)
+            .ok_or_else(|| {
+                Error::Internal("__got slot of a local symbol not in the output".into())
+            })?;
+        let (written, rebase) = match value {
+            Value::Address(target) => (target, true),
+            Value::Absolute(value) => (value, false),
+            Value::Import(..) => (0, false),
+        };
+        put64(out, offset, written)
+            .ok_or_else(|| Error::Internal("pointer outside its section".into()))?;
+        if rebase {
+            fixups.push(Fixup {
+                address,
+                kind: FixupKind::Rebase(written),
+            });
+        }
+    }
+    Ok(fixups)
 }
 
 fn write_pointers(

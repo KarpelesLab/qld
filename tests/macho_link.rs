@@ -1609,6 +1609,47 @@ fn pcrel_immediate_stores() {
     }
 }
 
+/// An exception of a type with internal linkage: the LSDA's type table
+/// reaches the local type info through a `__got` slot (`POINTER_TO_GOT` or
+/// `X86_64_RELOC_GOT` against a local symbol), which must exist although
+/// no global symbol owns it. Also through `-r` twice, where the type info
+/// name is a local symbol with the arm64 top-bit addend.
+#[test]
+fn local_type_info() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "local_type_info",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("local_rtti");
+        let object = compile("local_rtti", "local_rtti.cpp", arch, &[]);
+        let exceptions = compile("local_rtti", "exceptions.cpp", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[object.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("local_rtti-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "local 7\n");
+        }
+        // Private-extern type infos become local with -r; a second -r and
+        // a link read them back.
+        let once = dir.join(format!("once-{arch}.o"));
+        link_relocatable(arch, &[&exceptions], &once);
+        let twice = dir.join(format!("twice-{arch}.o"));
+        link_relocatable(arch, &[&once], &twice);
+        let mut args = base_args(arch);
+        args.extend(strings(&[twice.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("exceptions-twice-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "caught 84 after 10 cleanups\n");
+        }
+    }
+}
+
 /// Identical C strings and floating-point literals from two objects are
 /// merged, as ld64 and lld merge them: one copy in the output, and both
 /// objects' references resolve to it.

@@ -516,7 +516,10 @@ pub fn build(
     for &id in &synthetic.got {
         push32(&mut tables.indirect, indirect_entry(id));
     }
-    tables.tlv_first = u32::try_from(synthetic.got.len()).unwrap_or(0);
+    for _ in &synthetic.local_got {
+        push32(&mut tables.indirect, INDIRECT_SYMBOL_LOCAL);
+    }
+    tables.tlv_first = u32::try_from(synthetic.got_slots()).unwrap_or(0);
     for &id in &synthetic.thread_ptrs {
         push32(&mut tables.indirect, indirect_entry(id));
     }
