@@ -1,10 +1,398 @@
-# Benchmarks (W24, roadmap M5)
+# Benchmarks (W24, W26; roadmap M5)
 
 qld against GNU ld, lld, mold and wild on real links, replayed from build
 trees that already exist. The drivers are in `benches/`; this file records
-the method, the corpus and the results.
+the method, the corpus and the results. W26's results come first; W24's
+(the first round, with GNU ld) follow from [Standing after W24](#standing-after-w24-stated-plainly).
 
-## Standing, stated plainly
+## Standing after W26, stated plainly
+
+Measured on 2026-09-18 on the same shared 32-core / 64-thread machine as
+W24, at a load average of 9–25 (other work ran on it; per row in the full
+tables below; runs are interleaved, so load changes hit every linker alike).
+"Default" is each linker's own thread count (qld: one thread per 4 MiB of
+input, at most 16). qld now forks by default like mold and wild (see
+[Method](#method)). Minimum wall times; "qld before" is the tree W26 started
+from (master 0bebc9d, the end of W24), "qld after" this branch:
+
+| benchmark | threads | lld | mold | wild | qld before | qld after |
+| --- | --- | --- | --- | --- | --- | --- |
+| clang | default | 336 ms | 186 ms | 100 ms | 190 ms | 140 ms |
+| clang | 1 | 405 ms | 510 ms | 447 ms | 600 ms | 525 ms |
+| clang | 8 | 286 ms | 134 ms | 111 ms | 200 ms | 157 ms |
+| clang | 64 | 367 ms | 222 ms | 98 ms | 238 ms | 155 ms |
+| clang-debug | default | 1386 ms | 1221 ms | 647 ms | 784 ms | 755 ms |
+| clang-debug | 1 | 2493 ms | 1888 ms | 2556 ms | 3635 ms | 3363 ms |
+| clang-debug | 8 | 1006 ms | 651 ms | 804 ms | 856 ms | 809 ms |
+| clang-debug | 64 | 1556 ms | 1286 ms | 690 ms | 901 ms | 744 ms |
+| libclang-cpp | default | 227 ms | 124 ms | 74 ms | 130 ms | 110 ms |
+| libclang-cpp | 1 | 297 ms | 322 ms | 281 ms | 404 ms | 383 ms |
+| libclang-cpp | 8 | 203 ms | 101 ms | 75 ms | 139 ms | 122 ms |
+| libclang-cpp | 64 | 242 ms | 161 ms | 71 ms | 203 ms | 118 ms |
+| rust-qld-debug | default | 235 ms | 204 ms | 135 ms | 201 ms | 172 ms |
+| rust-qld-debug | 1 | 360 ms | 382 ms | 403 ms | 722 ms | 710 ms |
+| rust-qld-debug | 8 | 203 ms | 166 ms | 132 ms | 207 ms | 182 ms |
+| rust-qld-debug | 64 | 268 ms | 234 ms | 131 ms | 218 ms | 166 ms |
+| small-count | default | 10 ms | 17 ms | 8 ms | 10 ms | 9 ms |
+| small-count | 1 | 10 ms | 12 ms | 5 ms | 9 ms | 9 ms |
+| small-count | 8 | 9 ms | 10 ms | 4 ms | 9 ms | 7 ms |
+| small-count | 64 | 11 ms | 19 ms | 9 ms | 16 ms | 11 ms |
+| vmlinux | default | 180 ms | fails | fails | 142 ms | 124 ms |
+| vmlinux | 1 | 224 ms | fails | fails | 422 ms | 382 ms |
+| vmlinux | 8 | 175 ms | fails | fails | 146 ms | 127 ms |
+| vmlinux | 64 | 177 ms | fails | fails | 157 ms | 124 ms |
+
+- **wild is still faster than qld on every benchmark it links, at every
+  thread count**: clang 100 against 140 ms at default threads,
+  `libclang-cpp` 74 against 110, qld's debug binary 135 against 172. The gap
+  is smallest for clang with debug information (647 against 755 ms at
+  default threads, 804 against 809 at 8), where qld used to pay for process
+  exit, and largest on links dominated by symbol resolution (see below).
+- **qld is now faster than mold at default and 64 threads on every
+  benchmark** (clang 140 against 186 ms, 155 against 222; `libclang-cpp` 110
+  against 124, 118 against 161; clang with debug information 755 against
+  1221, 744 against 1286). mold is still faster at 8 threads on the large
+  links (clang 134 against 157, `libclang-cpp` 101 against 122, clang with
+  debug information 651 against 809, qld's debug binary 166 against 182)
+  and on one thread.
+- **64 threads is now about as fast as the default 16** (it was 17-56%
+  slower): clang 155 ms against 238 before W26, `libclang-cpp` 118 against
+  203, clang with debug information 744 against 901; the CPU time at 64
+  threads fell by two thirds (clang 5.1 s to 1.7 s). See
+  [Scaling past 16 threads](#scaling-past-16-threads).
+- **qld is faster than lld** at default, 8 and 64 threads on every benchmark
+  (small-count at 64 threads: a tie), including `vmlinux`. On one thread lld, mold and wild are still faster on
+  every large link (clang: lld 405, wild 447, mold 510, qld 525 ms); qld's
+  own debug binary is the outlier (710 against 360-403 ms), because its
+  `--build-id` is SHA-1 over 170 MiB on that one thread (see below).
+- **Output is byte-identical** across 1, 2, 8 and 64 threads on all six
+  benchmarks, and identical to the output of the tree W26 started from
+  (and so to W24's). Peak RSS is below lld's and mold's on every large
+  link, and below wild's on the two debug links.
+
+So the M5 exit criterion (wall time at or below mold's and wild's at 8 and
+64 cores) is **met against mold at 64 threads, not at 8, and not against
+wild**. The W26 changes took 4-26% off qld's wall times at default threads
+(clang 190 → 140 ms, `libclang-cpp` 130 → 110, qld's debug binary 201 →
+172, `vmlinux` 142 → 124, clang with debug information 784 → 755),
+17-42% at 64 threads, and up to 13% on one thread.
+
+### W26 changes
+
+Each is one commit, with its measurements in the commit message (A/B runs
+of the previous and the new binary, interleaved; stage laps from
+`QLD_TIMING=1`).
+
+| Commit | Change | Effect (min wall or stage lap) |
+| --- | --- | --- |
+| 0638def | `--fork` (default on Unix): the link runs in a child process and `qld` returns once the output is complete, leaving the child to free memory and unmap the inputs (see [Method](#method)) | clang 192 → 163 ms, clang-debug 745 → 659, libclang-cpp 122 → 111 |
+| 227b30b | `reloc::decide` always inlined (a store-forwarding stall on every relocation) | clang, one thread: 577 → 565 ms (scan lap 77 → 64) |
+| 60143bf | Archive members found in parallel, one task per archive, before the (serial) input walk | clang inputs 13.6 → 8.1 ms |
+| 8160790 | Symbol versions (`@`) found a word at a time | clang resolution, one thread: 158 → 152 ms |
+| 786ee3a | COMDAT claims look up again only the offers that held their key | clang resolution, one thread: 150 → 145 ms |
+| 2d8b69c | Interning of later resolution batches in parallel from 16,384 names (was 65,536) | rust-qld-debug resolution 58 → 48 ms; clang 61 → 56 ms at 64 threads |
+| 41d4cab | In a pool over 16 threads, every stage but the relocation scan and section merging runs in a pool of 16 | 64 threads: clang 203 → 155 ms, clang-debug 771 → 670, libclang-cpp 189 → 121 |
+| 6c82625 | Links with at least 4 Mi merge pieces merge them on every core | clang-debug 687 → 664 ms (merge lap 184 → 169) |
+| 6bf6161, ba07b13 | Code padding written with the input section before it: 147,000 fewer chunks for clang, found by a forward walk | clang write lap 51 → 48 ms; one thread 219 → 193 ms |
+| a8193a8 | Dynamic symbols' import versions looked up once, in parallel | dynamic lap: clang 14.8 → 13.4 ms, libclang-cpp 10.1 → 8.8 |
+| 0da64af | `--fork` stays on for paths that merely contain `dev` (only `/dev/…` and `/proc/…` keep the link in process) | correctness of the fork decision |
+| 6f1215d | Section merging runs side by side with the relocation scan | clang scan + merge laps 10.9 → 9.5 ms; 8 threads 14.5 → 12.1 |
+| 6ef8e0b | On one thread, symbols are interned in order whatever the batch size | resolution, one thread: clang 154 → 128 ms, rust-qld-debug 110 → 99 |
+
+### Scaling past 16 threads
+
+Before W26, qld at 64 threads was slower than at 16 (clang 238 against 190
+ms) and burnt three times the CPU time. Two causes, found with `perf`
+(user space only on this machine) and `strace -c`:
+
+- **Idle workers.** The pipeline is dozens of short parallel steps separated
+  by short serial ones. Between steps, rayon's idle workers spin: each round
+  of looking for work tries to steal from every other worker's deque, then
+  calls `sched_yield`, 32 rounds before sleeping; waking them for the next
+  step is a chain of futex wake-ups. At 64 threads, half of the samples of
+  a clang link were in `Stealer::steal`, the crossbeam epoch and rayon's
+  sleep code; even at 16 threads the link made 31,700 `sched_yield` and
+  19,600 `futex` calls. On 32 cores the spinning workers also share cores
+  with the busy ones.
+- **The kernel.** Mapping 1,014 objects took 5 ms on 16 threads and 28-53 ms
+  on 64 (many threads mapping files into one address space); the write of a 1.2 GiB output took 353 against 451 ms
+  (buffered writes to one file are serialized by the inode lock, and more
+  writers only wait longer). glibc's per-thread malloc arenas grow 4 KiB at
+  a time, each growth an `mprotect` that takes the process's `mmap_lock` for
+  writing: 13,800 `mprotect` calls in a clang link, 10,700 of them during
+  resolution.
+
+Stage laps at 4-24 threads (clang, after W26, load 11) show where it
+flattens:
+
+| stage | 4 | 8 | 12 | 16 | 24 |
+| --- | --- | --- | --- | --- | --- |
+| inputs | 9.1 ms | 7.0 | 7.8 | 7.6 | 7.6 |
+| resolution | 52.7 | 43.8 | 42.0 | 40.7 | 42.9 |
+| placement | 18.1 | 14.1 | 13.5 | 11.0 | 11.6 |
+| scan | 18.0 | 10.8 | 9.6 | 7.2 | 7.4 |
+| merge | 4.3 | 3.7 | 4.0 | 3.9 | 4.6 |
+| dynamic | 14.2 | 13.3 | 13.3 | 12.6 | 14.4 |
+| layout | 10.9 | 9.9 | 9.6 | 9.5 | 9.2 |
+| write | 67.0 | 47.1 | 47.9 | 46.7 | 46.8 |
+
+Past 8 threads only the scan and placement still gain; merging still gains
+with 18 million pieces (clang-debug: 182 ms on 16 threads, 153 on 64). So
+(41d4cab) when the pool is larger than 16 threads, as with `--threads=64`,
+the ELF driver runs every stage but the scan and merging in a second pool
+of 16 threads (`Narrow` in `src/elf/link.rs`); the large pool's workers
+then sleep instead of spinning. The default stays capped at 16 threads:
+clang took 166-174 ms from 8 to 32 threads and 186-201 at 48-64 before this
+change, and a default above 16 gains nothing now that the extra threads
+would only serve the scan (a large debug link's merge gets its own pool of
+one thread per core, 6c82625).
+
+What remains at 64 threads: rayon still spins between the scan's and the
+merge's steps, and `mprotect` from malloc arena growth. glibc's tunables
+would help (`glibc.malloc.top_pad=16777216` took clang's resolution from
+47 to 39 ms and cut `mprotect` calls from 13,800 to 1,200;
+`glibc.malloc.hugetlb=1` to 174), but they can only be set in the
+environment, results on the other benchmarks were mixed (clang-debug was
+slower with both), and a child's environment is inherited by the LTO
+plugin's subprocesses: not kept.
+
+### Where qld's time goes after W26
+
+Stage laps (`QLD_TIMING=1`, `--no-fork` to include the exit), min of 7 runs
+at load 6 (clang-debug: 5 runs at load 15), before and after W26:
+
+| stage | clang before | clang after | clang-debug before | clang-debug after |
+| --- | --- | --- | --- | --- |
+| inputs | 13.9 ms | 7.2 ms | 15.0 ms | 8.4 ms |
+| resolution | 40.3 | 34.6 | 92.4 | 90.6 |
+| placement | 11.2 | 12.5 | 11.9 | 13.2 |
+| scan (after: and merge) | 8.4 | 9.5 | 8.5 | 178.0 |
+| merge | 4.2 | 0.2 | 197.3 | 0.4 |
+| dynamic | 14.9 | 13.5 | 11.4 | 13.5 |
+| layout | 10.7 | 9.9 | 9.6 | 11.1 |
+| write | 54.2 | 51.0 | 406.9 | 389.8 |
+| after the write (hidden by `--fork`) | 31.4 | 33.3 | 86.8 | 100.5 |
+
+- **Resolution** is the largest gap to wild (clang: 35-45 ms against about
+  15 for wild's loading and resolution). It is ten rounds of load, COMDAT
+  claims, interning and insertion, each ending in a barrier, and the first
+  round interns 298,000 archive index names (150,000 distinct) into an
+  empty table: 10-17 ms at 16 threads, of which 6-14 ms in the lookup pass
+  and 5 ms numbering the new names by first occurrence. Symbol IDs follow
+  first occurrence and decide output order (`.dynsym` within a hash
+  bucket), so a design that interns every archive member's symbols up
+  front, as wild does, would change the output; closing this gap needs a
+  new resolution design that keeps the IDs.
+- **Write**: rendering is parallel, but buffered writes to one file are
+  serialized by the kernel (131 MiB take 30 ms with `dd` on this btrfs; 1.2
+  GiB 310 ms from one thread or from eight, with or without `fallocate`).
+  clang's write lap is 46-51 ms from 8 threads up.
+- **One thread**: clang 525 ms against wild's 447 and lld's 405. The write
+  (193 ms, relocation processing and copying) and resolution (128 ms, half
+  of it parsing archive members) dominate. qld's own debug binary spends
+  265 ms of its 473 ms write in SHA-1 for `--build-id` (170 MiB at 640
+  MB/s, portable code: SHA-NI would need `unsafe` outside the modules that
+  may use it). lld reads `--build-id` without a value as its fast hash,
+  where qld follows GNU ld's SHA-1.
+
+### Tried in W26 and not kept
+
+Each was measured with interleaved A/B runs and did not help beyond noise,
+or was slower somewhere:
+
+- Parsing every archive member ahead of time, in parallel with the first
+  resolution round (a `ResolveFile::prepare` hook): resolution 49 → 55-74 ms
+  at 16 threads, 171 → 215 ms on one thread (13% more members parsed, and
+  the parsed data evicted from cache before use).
+- Interning partitioned by shard (a counting sort of each batch's names by
+  shard, then one lock-free task per shard) instead of taking each shard's
+  lock per name: the lock's atomic operations take 90% of the lookup's
+  samples, but they only absorb the cache misses; resolution unchanged at
+  16 and 64 threads (median 47 ms both ways), 164 → 175 ms on one thread.
+- Sizing the symbol table from the archive index names up front: the first
+  round's lookup pass got faster (12-14 → 7-10 ms), resolution did not.
+- An index of the default section rules by the name's first four bytes:
+  placement unchanged (52 → 51 ms on one thread); the cost is reading the
+  section names, not the patterns.
+- `ElfFile::relocation_section` always inlined, and a smaller `relocations`
+  accessor for the scan and the write (the profile blamed a store-forward
+  stall after the call): no change.
+- Skipping the atomic OR of a symbol's flags in the scan when the flags
+  are already set: no change.
+- Grouping layout's members per output section in parallel (a stable sort
+  per file, then a gather per output): slower on one thread, unchanged on
+  16.
+- Running the dynamic and regular symbol table plans side by side: not
+  correct, as the dynamic plan sets reference flags on strong aliases of
+  weak imports (`environ`) that the symbol table reads.
+- glibc malloc tunables in the child's environment (see above).
+
+Not attempted, for later: freeing the inputs' mappings in parallel
+(`madvise(MADV_DONTNEED)`, as mold does) for `--no-fork` and library links;
+interning each repeated archive's index names once (clang names 22 archives
+twice: 84,500 of the first round's 298,000 names); overlapping the COMDAT
+claims of a resolution round with its interning; splitting the reading of
+a large archive's symbol index (the inputs stage reads each archive's in
+one task, 4 ms for clang).
+
+### Full results (W26)
+
+Wall time, CPU (user+system, from a `--no-fork` run for the forking
+linkers), peak RSS and output size, from the run of the table above
+(`benches/run.py SPECS --linker qld-base=... --only lld,mold,wild,qld-base,qld
+--json`; `benches/report.py --compact` prints the summary table).
+
+#### clang
+
+| linker | threads | wall min | wall median | CPU | peak RSS | output | load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 336 ms | 360 ms | 2.20 s | 737 MiB | 131.3 MiB | 9–15 |
+| lld | 1 | 405 ms | 426 ms | 0.42 s | 732 MiB | 131.3 MiB | 9–15 |
+| lld | 8 | 286 ms | 328 ms | 1.15 s | 736 MiB | 131.3 MiB | 9–15 |
+| lld | 64 | 367 ms | 384 ms | 4.87 s | 730 MiB | 131.3 MiB | 9–15 |
+| mold | default | 186 ms | 199 ms | 5.34 s | 840 MiB | 131.8 MiB | 9–15 |
+| mold | 1 | 510 ms | 601 ms | 0.52 s | 669 MiB | 131.8 MiB | 9–19 |
+| mold | 8 | 134 ms | 206 ms | 1.12 s | 717 MiB | 131.8 MiB | 9–19 |
+| mold | 64 | 222 ms | 239 ms | 12.64 s | 1001 MiB | 131.8 MiB | 9–19 |
+| wild | default | 100 ms | 105 ms | 1.56 s | 499 MiB | 131.0 MiB | 9–19 |
+| wild | 1 | 447 ms | 494 ms | 0.49 s | 504 MiB | 131.0 MiB | 9–19 |
+| wild | 8 | 111 ms | 119 ms | 0.59 s | 503 MiB | 131.0 MiB | 9–19 |
+| wild | 64 | 98 ms | 100 ms | 1.50 s | 506 MiB | 131.0 MiB | 11–19 |
+| qld before | default | 190 ms | 205 ms | 1.53 s | 628 MiB | 131.3 MiB | 11–19 |
+| qld before | 1 | 600 ms | 659 ms | 0.62 s | 586 MiB | 131.3 MiB | 11–19 |
+| qld before | 8 | 200 ms | 210 ms | 1.06 s | 605 MiB | 131.3 MiB | 11–19 |
+| qld before | 64 | 238 ms | 254 ms | 5.11 s | 704 MiB | 131.3 MiB | 11–19 |
+| qld after | default | 140 ms | 155 ms | 1.44 s | 612 MiB | 131.3 MiB | 11–18 |
+| qld after | 1 | 525 ms | 563 ms | 0.61 s | 574 MiB | 131.3 MiB | 12–18 |
+| qld after | 8 | 157 ms | 165 ms | 1.00 s | 581 MiB | 131.3 MiB | 12–18 |
+| qld after | 64 | 155 ms | 165 ms | 1.65 s | 614 MiB | 131.3 MiB | 12–18 |
+
+#### clang-debug
+
+| linker | threads | wall min | wall median | CPU | peak RSS | output | load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 1386 ms | 1619 ms | 20.81 s | 4617 MiB | 1213.7 MiB | 13–19 |
+| lld | 1 | 2493 ms | 2689 ms | 2.68 s | 4612 MiB | 1213.7 MiB | 12–19 |
+| lld | 8 | 1006 ms | 1153 ms | 7.17 s | 4613 MiB | 1213.7 MiB | 11–20 |
+| lld | 64 | 1556 ms | 1590 ms | 71.52 s | 4650 MiB | 1213.7 MiB | 13–20 |
+| mold | default | 1221 ms | 1279 ms | 40.65 s | 5143 MiB | 1214.2 MiB | 13–20 |
+| mold | 1 | 1888 ms | 1980 ms | 2.08 s | 4688 MiB | 1214.2 MiB | 14–20 |
+| mold | 8 | 651 ms | 864 ms | 4.84 s | 4809 MiB | 1214.2 MiB | 14–19 |
+| mold | 64 | 1286 ms | 1319 ms | 69.65 s | 5562 MiB | 1214.2 MiB | 14–19 |
+| wild | default | 647 ms | 685 ms | 10.60 s | 4407 MiB | 1213.4 MiB | 15–25 |
+| wild | 1 | 2556 ms | 2635 ms | 2.73 s | 4363 MiB | 1213.4 MiB | 15–25 |
+| wild | 8 | 804 ms | 823 ms | 3.29 s | 4379 MiB | 1213.4 MiB | 14–23 |
+| wild | 64 | 690 ms | 769 ms | 10.67 s | 4403 MiB | 1213.4 MiB | 14–23 |
+| qld before | default | 784 ms | 832 ms | 9.36 s | 3775 MiB | 1213.7 MiB | 14–22 |
+| qld before | 1 | 3635 ms | 4135 ms | 3.97 s | 3335 MiB | 1213.7 MiB | 14–22 |
+| qld before | 8 | 856 ms | 926 ms | 5.77 s | 3466 MiB | 1213.7 MiB | 14–22 |
+| qld before | 64 | 901 ms | 942 ms | 30.20 s | 3882 MiB | 1213.7 MiB | 14–21 |
+| qld after | default | 755 ms | 790 ms | 12.77 s | 3696 MiB | 1213.7 MiB | 14–21 |
+| qld after | 1 | 3363 ms | 3474 ms | 3.52 s | 3335 MiB | 1213.7 MiB | 14–21 |
+| qld after | 8 | 809 ms | 868 ms | 5.40 s | 3439 MiB | 1213.7 MiB | 13–20 |
+| qld after | 64 | 744 ms | 873 ms | 13.69 s | 3956 MiB | 1213.7 MiB | 13–19 |
+
+#### libclang-cpp
+
+| linker | threads | wall min | wall median | CPU | peak RSS | output | load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 227 ms | 231 ms | 1.34 s | 398 MiB | 77.4 MiB | 22–25 |
+| lld | 1 | 297 ms | 312 ms | 0.31 s | 401 MiB | 77.4 MiB | 22–25 |
+| lld | 8 | 203 ms | 233 ms | 0.81 s | 402 MiB | 77.4 MiB | 22–25 |
+| lld | 64 | 242 ms | 252 ms | 2.27 s | 387 MiB | 77.4 MiB | 22–25 |
+| mold | default | 124 ms | 141 ms | 3.79 s | 573 MiB | 78.0 MiB | 22–25 |
+| mold | 1 | 322 ms | 335 ms | 0.33 s | 361 MiB | 78.0 MiB | 22–25 |
+| mold | 8 | 101 ms | 128 ms | 0.82 s | 402 MiB | 78.0 MiB | 22–25 |
+| mold | 64 | 161 ms | 167 ms | 8.75 s | 744 MiB | 78.0 MiB | 21–25 |
+| wild | default | 74 ms | 75 ms | 1.37 s | 297 MiB | 77.3 MiB | 21–25 |
+| wild | 1 | 281 ms | 287 ms | 0.31 s | 307 MiB | 77.3 MiB | 21–24 |
+| wild | 8 | 75 ms | 78 ms | 0.36 s | 308 MiB | 77.3 MiB | 21–24 |
+| wild | 64 | 71 ms | 90 ms | 1.12 s | 299 MiB | 77.3 MiB | 21–24 |
+| qld before | default | 130 ms | 138 ms | 0.90 s | 334 MiB | 77.5 MiB | 21–24 |
+| qld before | 1 | 404 ms | 436 ms | 0.40 s | 307 MiB | 77.5 MiB | 21–25 |
+| qld before | 8 | 139 ms | 143 ms | 0.67 s | 336 MiB | 77.5 MiB | 21–25 |
+| qld before | 64 | 203 ms | 227 ms | 3.42 s | 387 MiB | 77.5 MiB | 21–25 |
+| qld after | default | 110 ms | 117 ms | 1.05 s | 325 MiB | 77.5 MiB | 21–25 |
+| qld after | 1 | 383 ms | 401 ms | 0.37 s | 300 MiB | 77.5 MiB | 21–25 |
+| qld after | 8 | 122 ms | 129 ms | 0.64 s | 320 MiB | 77.5 MiB | 21–25 |
+| qld after | 64 | 118 ms | 120 ms | 1.11 s | 327 MiB | 77.5 MiB | 21–25 |
+
+#### rust-qld-debug
+
+| linker | threads | wall min | wall median | CPU | peak RSS | output | load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 235 ms | 248 ms | 2.25 s | 613 MiB | 170.6 MiB | 16–21 |
+| lld | 1 | 360 ms | 398 ms | 0.40 s | 616 MiB | 170.6 MiB | 16–20 |
+| lld | 8 | 203 ms | 237 ms | 1.19 s | 613 MiB | 170.6 MiB | 16–20 |
+| lld | 64 | 268 ms | 296 ms | 7.50 s | 613 MiB | 170.6 MiB | 16–20 |
+| mold | default | 204 ms | 216 ms | 6.28 s | 798 MiB | 189.7 MiB | 16–20 |
+| mold | 1 | 382 ms | 412 ms | 0.40 s | 622 MiB | 189.7 MiB | 16–20 |
+| mold | 8 | 166 ms | 178 ms | 1.26 s | 689 MiB | 189.7 MiB | 16–20 |
+| mold | 64 | 234 ms | 251 ms | 12.66 s | 911 MiB | 189.7 MiB | 16–20 |
+| wild | default | 135 ms | 137 ms | 1.95 s | 587 MiB | 169.6 MiB | 16–20 |
+| wild | 1 | 403 ms | 412 ms | 0.42 s | 595 MiB | 169.6 MiB | 15–20 |
+| wild | 8 | 132 ms | 145 ms | 0.55 s | 592 MiB | 169.6 MiB | 15–20 |
+| wild | 64 | 131 ms | 135 ms | 1.60 s | 596 MiB | 169.6 MiB | 15–20 |
+| qld before | default | 201 ms | 205 ms | 1.52 s | 568 MiB | 169.6 MiB | 15–20 |
+| qld before | 1 | 722 ms | 781 ms | 0.83 s | 521 MiB | 169.6 MiB | 15–20 |
+| qld before | 8 | 207 ms | 225 ms | 1.10 s | 556 MiB | 169.6 MiB | 15–18 |
+| qld before | 64 | 218 ms | 222 ms | 3.42 s | 616 MiB | 169.6 MiB | 15–18 |
+| qld after | default | 172 ms | 182 ms | 1.41 s | 577 MiB | 169.6 MiB | 15–18 |
+| qld after | 1 | 710 ms | 780 ms | 0.80 s | 517 MiB | 169.6 MiB | 15–18 |
+| qld after | 8 | 182 ms | 191 ms | 1.10 s | 563 MiB | 169.6 MiB | 15–18 |
+| qld after | 64 | 166 ms | 184 ms | 1.90 s | 595 MiB | 169.6 MiB | 15–18 |
+
+#### small-count
+
+| linker | threads | wall min | wall median | CPU | peak RSS | output | load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 10 ms | 10 ms | 0.02 s | 37 MiB | 0.0 MiB | 16–16 |
+| lld | 1 | 10 ms | 11 ms | 0.01 s | 38 MiB | 0.0 MiB | 16–16 |
+| lld | 8 | 9 ms | 10 ms | 0.01 s | 37 MiB | 0.0 MiB | 16–16 |
+| lld | 64 | 11 ms | 12 ms | 0.02 s | 37 MiB | 0.0 MiB | 16–16 |
+| mold | default | 17 ms | 17 ms | 0.29 s | 106 MiB | 0.0 MiB | 16–16 |
+| mold | 1 | 12 ms | 12 ms | 0.01 s | 37 MiB | 0.0 MiB | 16–16 |
+| mold | 8 | 10 ms | 11 ms | 0.05 s | 54 MiB | 0.0 MiB | 16–16 |
+| mold | 64 | 19 ms | 20 ms | 0.39 s | 120 MiB | 0.0 MiB | 16–16 |
+| wild | default | 8 ms | 10 ms | 0.13 s | 20 MiB | 0.0 MiB | 16–16 |
+| wild | 1 | 5 ms | 5 ms | 0.01 s | 20 MiB | 0.0 MiB | 16–16 |
+| wild | 8 | 4 ms | 5 ms | 0.02 s | 20 MiB | 0.0 MiB | 16–16 |
+| wild | 64 | 9 ms | 10 ms | 0.14 s | 20 MiB | 0.0 MiB | 16–16 |
+| qld before | default | 10 ms | 13 ms | 0.03 s | 21 MiB | 0.0 MiB | 16–16 |
+| qld before | 1 | 9 ms | 9 ms | 0.01 s | 24 MiB | 0.0 MiB | 16–16 |
+| qld before | 8 | 9 ms | 10 ms | 0.03 s | 22 MiB | 0.0 MiB | 16–16 |
+| qld before | 64 | 16 ms | 20 ms | 0.44 s | 22 MiB | 0.0 MiB | 16–16 |
+| qld after | default | 9 ms | 10 ms | 0.03 s | 20 MiB | 0.0 MiB | 16–16 |
+| qld after | 1 | 9 ms | 10 ms | 0.01 s | 24 MiB | 0.0 MiB | 16–16 |
+| qld after | 8 | 7 ms | 8 ms | 0.02 s | 22 MiB | 0.0 MiB | 16–16 |
+| qld after | 64 | 11 ms | 12 ms | 0.11 s | 20 MiB | 0.0 MiB | 16–16 |
+
+#### vmlinux
+
+| linker | threads | wall min | wall median | CPU | peak RSS | output | load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 180 ms | 193 ms | 0.78 s | 326 MiB | 98.6 MiB | 15–17 |
+| lld | 1 | 224 ms | 234 ms | 0.23 s | 331 MiB | 98.6 MiB | 15–17 |
+| lld | 8 | 175 ms | 184 ms | 0.49 s | 327 MiB | 98.6 MiB | 15–17 |
+| lld | 64 | 177 ms | 195 ms | 1.15 s | 329 MiB | 98.6 MiB | 15–17 |
+| mold | default | fails: link failed:                                               ^ unknown l | | | | | |
+| mold | 1 | fails: link failed:                                               ^ unknown l | | | | | |
+| mold | 8 | fails: link failed:                                               ^ unknown l | | | | | |
+| mold | 64 | fails: link failed:                                               ^ unknown l | | | | | |
+| wild | default | fails: link failed: wild: error: unrecognized option(s): --emit-relocs | | | | | |
+| wild | 1 | fails: link failed: wild: error: unrecognized option(s): --emit-relocs | | | | | |
+| wild | 8 | fails: link failed: wild: error: unrecognized option(s): --emit-relocs | | | | | |
+| wild | 64 | fails: link failed: wild: error: unrecognized option(s): --emit-relocs | | | | | |
+| qld before | default | 142 ms | 146 ms | 0.67 s | 210 MiB | 98.6 MiB | 15–17 |
+| qld before | 1 | 422 ms | 457 ms | 0.41 s | 146 MiB | 98.6 MiB | 15–17 |
+| qld before | 8 | 146 ms | 153 ms | 0.53 s | 199 MiB | 98.6 MiB | 15–17 |
+| qld before | 64 | 157 ms | 167 ms | 1.49 s | 221 MiB | 98.6 MiB | 15–17 |
+| qld after | default | 124 ms | 132 ms | 0.68 s | 215 MiB | 98.6 MiB | 15–17 |
+| qld after | 1 | 382 ms | 418 ms | 0.43 s | 144 MiB | 98.6 MiB | 15–17 |
+| qld after | 8 | 127 ms | 139 ms | 0.54 s | 204 MiB | 98.6 MiB | 15–17 |
+| qld after | 64 | 124 ms | 131 ms | 0.77 s | 216 MiB | 98.6 MiB | 15–17 |
+
+## Standing after W24, stated plainly
 
 Measured on 2026-09-15 on a shared 32-core / 64-thread machine, at a load
 average of 2–17 (per row in the tables below). "Default" is each linker's
@@ -98,10 +486,14 @@ ninja clang
    `--orphan-handling=error`).
 3. **Measures**: wall time (min and median), user+system CPU time and peak
    RSS from `wait4`, output size, and the 1-minute load average before each
-   run. mold and wild fork by default and return once the output is written,
-   leaving a child to clean up; their wall time is measured that way, but
-   CPU and RSS come from an extra `--no-fork` run, since `wait4` does not
-   see the child.
+   run. mold, wild and (since W26) qld fork by default and return once the
+   output is written, leaving a child to clean up; their wall time is
+   measured that way, but CPU and RSS come from an extra `--no-fork` run,
+   since `wait4` does not see the child. The wall time ends when the
+   linker's process has exited and its stderr pipe is closed: wild and qld
+   close theirs when they return (qld relays the child's pipes, see
+   `src/main.rs`), mold's child keeps them until it exits, so mold's times
+   include its exit.
 4. **Smoke check**: every configuration's output must pass the benchmark's
    check; one that fails counts as broken, not as a time.
 5. **Determinism**: `run.py --determinism QLD --hashes FILE` links every
@@ -120,7 +512,7 @@ benches/report.py results.json
 mold and wild cannot link `vmlinux`: mold rejects a command of
 `vmlinux.lds`, and wild does not support `--emit-relocs`.
 
-## Results
+## Results (W24)
 
 "qld before" is the tree W24 started from (commit a85c629), "qld after"
 this branch; both ran in the same interleaved runs as the other linkers.
@@ -284,8 +676,12 @@ Times are wall-clock; CPU is user+system.
 
 ## Determinism
 
-Every benchmark, with qld at 1, 2, 8 and 64 threads, after the
-optimizations:
+After W26, every benchmark links to the same bytes with qld at 1, 2, 8 and
+64 threads, and to the same bytes as the tree W26 started from (checked
+after every W26 commit with `run.py --determinism` and the hashes saved
+before W24's changes).
+
+After W24, every benchmark, with qld at 1, 2, 8 and 64 threads:
 
 | benchmark | 1 / 2 / 8 / 64 threads | same bytes as before W24 |
 | --- | --- | --- |
@@ -301,7 +697,7 @@ and `vmlinux` with `-O2` (string tail merging), and W23's
 `synthetic:320 --build-id=sha1` link. Every optimization was checked the
 same way before it was committed.
 
-## Optimizations
+## Optimizations (W24)
 
 Each is one commit, with its measurements in the commit message (A/B runs
 of the previous and the new binary, interleaved; stage laps from
@@ -335,7 +731,7 @@ thread fed by the rendering workers, reusing region buffers per thread,
 buckets, a further SHA-1 variant, and the mapped output backing at one
 thread.
 
-## Where qld's time goes
+## Where qld's time went after W24
 
 Stage laps (`QLD_TIMING=1`, two runs at load 3) at default threads, after
 the optimizations:

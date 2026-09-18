@@ -23,6 +23,8 @@ def main():
     p.add_argument("--linkers", default="gnu,lld,mold,wild,qldbase,qld")
     p.add_argument("--threads", default="default,1,8,64")
     p.add_argument("--label", action="append", default=[])
+    p.add_argument("--compact", action="store_true",
+                   help="one table: a row per benchmark and thread count, a column per linker (min wall)")
     o = p.parse_args()
     labels = dict(kv.split("=", 1) for kv in o.label)
     rows = {}
@@ -34,6 +36,24 @@ def main():
                     rows[row["bench"]] = {}
                     order.append(row["bench"])
                 rows[row["bench"]][(row["linker"], row["threads"])] = row
+    if o.compact:
+        linkers = o.linkers.split(",")
+        print("| benchmark | threads | " + " | ".join(labels.get(l, l) for l in linkers) + " |")
+        print("| --- | --- |" + " --- |" * len(linkers))
+        for bench in order:
+            for threads in o.threads.split(","):
+                cells = []
+                for linker in linkers:
+                    row = rows[bench].get((linker, threads))
+                    if row is None:
+                        cells.append("")
+                    elif "broken" in row:
+                        cells.append("fails")
+                    else:
+                        cells.append(fmt_ms(row["wall_min"]))
+                if any(cells):
+                    print(f"| {bench} | {threads} | " + " | ".join(cells) + " |")
+        return
     for bench in order:
         print(f"\n### {bench}\n")
         print("| linker | threads | wall min | wall median | CPU | peak RSS | output | load |")
