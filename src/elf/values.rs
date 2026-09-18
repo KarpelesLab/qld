@@ -327,6 +327,17 @@ impl<'x, 'a> Addresses<'x, 'a> {
                     let offset = value.checked_add_signed(addend)?;
                     return Some((self.section_offset_address(file, section, offset)?, 0));
                 }
+                // A section symbol plus an offset into code that linker
+                // relaxation shrank (RISC-V): the offset moves too.
+                if target.is_section_symbol()
+                    && !self.layout.relax.is_empty()
+                    && let Some(id) = self.refs.sections.id(file, section)
+                    && let Some(relax) = self.layout.relax.section(id)
+                    && let Some(offset) = value.checked_add_signed(addend)
+                {
+                    let base = self.section_address(id)?;
+                    return Some((base.wrapping_add(relax.map(offset)), 0));
+                }
                 if let Some(global) = target.global {
                     if !self.refs.sections.is_present_in(file, section) {
                         return None;

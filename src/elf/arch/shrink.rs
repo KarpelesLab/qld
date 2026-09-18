@@ -503,6 +503,15 @@ impl Pass<'_, '_, '_> {
                         value.checked_add_signed(addend)?,
                     );
                 }
+                // As `Addresses::symbol_address`: a section symbol's offset
+                // into relaxed code moves with the code.
+                if target.is_section_symbol()
+                    && let Some(id) = refs.sections.id(file, section)
+                    && self.previous.section(id).is_some()
+                    && let Some(offset) = value.checked_add_signed(addend)
+                {
+                    return addresses.section_offset_address(file, section, offset);
+                }
                 Some(
                     addresses
                         .section_offset_address(file, section, value)?

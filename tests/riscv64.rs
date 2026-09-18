@@ -1365,3 +1365,54 @@ fn global_pointer_relaxation_matches_lld() {
     let lui = |file: &str| listing(tools, &dir, file).matches("  lui ").count();
     assert!(lui(&ours) < lui("default.qld"));
 }
+
+/// A call that relaxes, then a label; `.data` points at the label once by
+/// name and once as `.text` plus its offset (a section symbol, as some
+/// assemblers write local references).
+const SECTION_SYMBOL_S: &str = r#"
+    .option norvc
+    .text
+    .globl _start
+_start:
+    call callee
+    nop
+target:
+    j _start
+callee:
+    ret
+    .data
+    .globl by_name
+by_name:
+    .quad target
+    .globl by_section
+by_section:
+    .reloc ., R_RISCV_64, .text+12
+    .quad 0
+"#;
+
+#[test]
+fn section_symbol_offsets_follow_relaxation() {
+    let tools = require!();
+    let dir = scratch("section-symbol");
+    compile(tools, &dir, "s.s", SECTION_SYMBOL_S, "s.o", &[]);
+    let ours = "s.qld";
+    run_ok(
+        &dir,
+        Path::new(env!("CARGO_BIN_EXE_qld")),
+        &["--threads=2", "-static", "s.o", "-o", ours],
+    );
+    let image = Image::load(tools, &dir, ours);
+    let word = |name: &str| {
+        let (value, _, _) = image
+            .symbols
+            .iter()
+            .find(|(_, _, n)| n == name)
+            .unwrap_or_else(|| panic!("no {name}"));
+        image.word(*value).unwrap()
+    };
+    // The call shrank to a `jal`, so `target` moved back four bytes, and
+    // both references follow it.
+    assert_eq!(word("by_section"), word("by_name"));
+    let code = listing(tools, &dir, ours);
+    assert!(code.contains("jal ra callee"), "{code}");
+}
