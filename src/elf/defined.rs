@@ -7,13 +7,24 @@
 //! definition with a [`LINKER_FILE`] definition whose index is a slot in
 //! [`LinkerSymbols`]. `__start_SEC`/`__stop_SEC` are defined for every output
 //! section whose name is a C identifier. Values are computed after layout.
+//!
+//! `--defsym name=expr` takes any linker script expression, as in GNU ld.
+//! Under a linker script the script engine evaluates it (it is an
+//! assignment before the script's statements); otherwise
+//! [`evaluate_defsyms`] does after layout, with GNU ld's rules for which
+//! values are absolute. A symbol assigned from an expression that reads one
+//! symbol gets that symbol's type ([`linker_type`]).
 
 #![deny(clippy::arithmetic_side_effects)]
 
 use rayon::prelude::*;
 
 use crate::args::LinkOptions;
+use crate::error::{Error, Result};
 use crate::ids::SymbolId;
+use crate::script::{
+    Assignment, EvalContext, EvalError, Value as ExprValue, ValueSection, eval_symbol_assignment,
+};
 use crate::symbols::{
     Definition, DefinitionKind, InputPosition, SymbolFlags, SymbolName, SymbolTable,
 };
@@ -122,6 +133,9 @@ pub struct LinkerSymbols {
     /// Output sections referenced by `__start_`/`__stop_` symbols, which
     /// GC keeps.
     pub start_stop_outputs: Vec<u32>,
+    /// `(symbol, source)`, sorted: the symbol whose type a script or
+    /// `--defsym` symbol copies ([`linker_type`]).
+    pub type_sources: Vec<(SymbolId, SymbolId)>,
 }
 
 impl LinkerSymbols {
@@ -247,16 +261,30 @@ pub fn register(
     }
 
     // --defsym: resolution already made the internal file the definition.
+    // (Under a linker script, the script evaluates them.)
     for (index, (name, expr)) in options.defsym.iter().enumerate() {
         if let Some(id) = symbols.lookup(&SymbolName::new(name.as_bytes()))
             && symbols.definition(id).file.index() == 0
         {
-            if let Some(DefsymExpr::Absolute(_)) = parse_defsym(expr) {
+            let assignment = defsym_assignment(name, expr).ok();
+            if assignment
+                .as_ref()
+                .is_none_or(|a| defsym_is_absolute(symbols, files, a))
+            {
                 symbols.set_flags(id, ABSOLUTE);
+            }
+            if let Some(source) = assignment
+                .as_ref()
+                .and_then(|a| a.expr.type_source())
+                .and_then(|n| symbols.lookup(&SymbolName::new(n)))
+            {
+                result.type_sources.push((id, source));
             }
             result.entries.push((id, Value::Defsym(index)));
         }
     }
+    result.type_sources.sort_unstable();
+    result.type_sources.dedup_by_key(|(id, _)| *id);
     result
 }
 
@@ -291,6 +319,14 @@ fn register_script(
         };
         needed.push(apply);
         if apply && let Some(id) = id {
+            if let Some(source) = script
+                .type_sources
+                .get(slot)
+                .and_then(Option::as_deref)
+                .and_then(|n| symbols.lookup(&SymbolName::new(n)))
+            {
+                result.type_sources.push((id, source));
+            }
             let slot = u32::try_from(slot).unwrap_or(u32::MAX);
             define(
                 id,
@@ -383,8 +419,356 @@ pub fn linker_shndx(
 /// does not relocate it.
 pub const ABSOLUTE: SymbolFlags = SymbolFlags::backend(7);
 
-/// The parsed `--defsym` expression for slot value `Defsym(index)`.
+/// The parsed `--defsym` expression for slot value `Defsym(index)`, when
+/// it is a number or `symbol+offset`.
 #[must_use]
 pub fn defsym_expr(options: &LinkOptions, index: usize) -> Option<DefsymExpr> {
     options.defsym.get(index).and_then(|(_, e)| parse_defsym(e))
+}
+
+// ---------------------------------------------------------------------------
+// `--defsym` expressions.
+// ---------------------------------------------------------------------------
+
+/// The script assignment `--defsym name=expr` stands for: GNU ld parses it
+/// as a linker script assignment, so any expression is allowed.
+///
+/// # Errors
+///
+/// [`Error::Script`] for a syntax error.
+pub fn defsym_assignment(name: &str, expr: &str) -> Result<Assignment> {
+    let text = format!("{name}={expr}");
+    crate::script::parse_defsym(text.as_bytes()).map_err(|e| Error::Script(Box::new(e)))
+}
+
+/// The symbols whose values a `--defsym` expression reads: the linker's
+/// references (archive members that define them are loaded, and garbage
+/// collection keeps their sections). Malformed expressions read nothing;
+/// they are reported before the link starts.
+#[must_use]
+pub fn defsym_references(name: &str, expr: &str) -> Vec<Vec<u8>> {
+    let mut names = Vec::new();
+    if let Ok(assignment) = defsym_assignment(name, expr) {
+        assignment.expr.for_each_value_symbol(&mut |symbol| {
+            if symbol != name.as_bytes() && !names.iter().any(|n: &Vec<u8>| n == symbol) {
+                names.push(symbol.to_vec());
+            }
+        });
+    }
+    names
+}
+
+/// The type a linker-defined symbol gets in symbol tables: the type of the
+/// symbol its assignment copies (`sym = other;`, or any expression reading
+/// one symbol, as GNU ld's `bfd_copy_link_hash_symbol_type`), or
+/// `STT_NOTYPE`.
+#[must_use]
+pub fn linker_type(refs: &super::refs::Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) -> u8 {
+    use crate::elf::read::consts::STT_NOTYPE;
+    let mut id = id;
+    // A chain of copies ends at an input's symbol; cycles stop.
+    for _ in 0..8 {
+        let Ok(at) = linker.type_sources.binary_search_by_key(&id, |(i, _)| *i) else {
+            return STT_NOTYPE;
+        };
+        let Some(&(_, source)) = linker.type_sources.get(at) else {
+            return STT_NOTYPE;
+        };
+        let target = refs.global_target(source, true);
+        match target.def {
+            super::refs::Def::Linker(_) => id = source,
+            _ => return target.raw.map_or(STT_NOTYPE, |raw| raw.kind()),
+        }
+    }
+    STT_NOTYPE
+}
+
+/// A section handle for defsym evaluation: an output section by position
+/// in the layout, or "the image" for linker-defined addresses whose section
+/// the symbol table works out from the address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefsymSection {
+    Output(u32),
+    Image,
+}
+
+/// What `--defsym` expressions read after layout.
+struct DefsymContext<'c, 'x, 'a> {
+    refs: &'c super::refs::Refs<'x, 'a>,
+    layout: &'c super::layout::Layout<'a>,
+    options: &'c LinkOptions,
+    globals: &'c [u64],
+    /// Defsym results so far (this pass, else the previous one).
+    values: &'c [(SymbolId, ExprValue<DefsymSection>)],
+}
+
+impl DefsymContext<'_, '_, '_> {
+    fn position_named(&self, name: &[u8]) -> Option<u32> {
+        let position = self.layout.sections.iter().position(|s| s.name == name)?;
+        u32::try_from(position).ok()
+    }
+}
+
+impl EvalContext for DefsymContext<'_, '_, '_> {
+    type Section = DefsymSection;
+
+    fn section_vma(&self, section: DefsymSection) -> u64 {
+        match section {
+            DefsymSection::Output(position) => self
+                .layout
+                .sections
+                .get(position as usize)
+                .map_or(0, |s| s.addr),
+            DefsymSection::Image => 0,
+        }
+    }
+
+    fn dot(&self) -> std::result::Result<u64, EvalError> {
+        Ok(0)
+    }
+
+    fn symbol(&mut self, name: &[u8]) -> std::result::Result<ExprValue<DefsymSection>, EvalError> {
+        use super::refs::Def;
+        let Some(id) = self.refs.symbols.lookup(&SymbolName::new(name)) else {
+            return Err(EvalError::UndefinedSymbol(name.to_vec()));
+        };
+        if let Some((_, value)) = self.values.iter().find(|(i, _)| *i == id) {
+            return Ok(*value);
+        }
+        let address = self.globals.get(id.index()).copied().unwrap_or(0);
+        let target = self.refs.global_target(id, true);
+        Ok(match target.def {
+            Def::Section { file, section, .. } => {
+                let position = self
+                    .refs
+                    .sections
+                    .id(file, section)
+                    .and_then(|s| self.refs.sections.resolve(s))
+                    .and_then(|s| self.layout.section_shndx.get(s.index()).copied())
+                    .and_then(|shndx| shndx.checked_sub(1))
+                    .filter(|&p| (p as usize) < self.layout.sections.len());
+                match position {
+                    Some(position) => {
+                        let base = self.section_vma(DefsymSection::Output(position));
+                        ExprValue::relative(
+                            DefsymSection::Output(position),
+                            address.wrapping_sub(base),
+                        )
+                    }
+                    None => ExprValue::absolute(address),
+                }
+            }
+            Def::Absolute(value) => ExprValue::absolute(value),
+            Def::Linker(_) if self.refs.symbols.flags(id).contains(ABSOLUTE) => {
+                ExprValue::absolute(address)
+            }
+            Def::Linker(_) | Def::Common(_) | Def::Shared(_) => {
+                ExprValue::relative(DefsymSection::Image, address)
+            }
+            // Undefined symbols are reported as undefined references.
+            Def::Undefined { .. } => ExprValue::absolute(0),
+        })
+    }
+
+    fn is_defined(&mut self, name: &[u8]) -> bool {
+        self.refs
+            .symbols
+            .lookup(&SymbolName::new(name))
+            .is_some_and(|id| {
+                matches!(
+                    self.refs.symbols.definition_kind(id),
+                    DefinitionKind::Regular | DefinitionKind::Weak | DefinitionKind::Common
+                )
+            })
+    }
+
+    fn section_addr(
+        &mut self,
+        name: &[u8],
+    ) -> std::result::Result<ExprValue<DefsymSection>, EvalError> {
+        self.position_named(name)
+            .map(|p| ExprValue::relative(DefsymSection::Output(p), 0))
+            .ok_or_else(|| EvalError::UndefinedSection(name.to_vec()))
+    }
+
+    fn section_load_addr(&mut self, name: &[u8]) -> std::result::Result<u64, EvalError> {
+        self.position_named(name)
+            .and_then(|p| self.layout.sections.get(p as usize))
+            .map(|s| s.lma)
+            .ok_or_else(|| EvalError::UndefinedSection(name.to_vec()))
+    }
+
+    fn section_size(&mut self, name: &[u8]) -> std::result::Result<u64, EvalError> {
+        // GNU ld gives 0 for sections that do not exist.
+        Ok(self
+            .position_named(name)
+            .and_then(|p| self.layout.sections.get(p as usize))
+            .map_or(0, |s| s.size))
+    }
+
+    fn section_alignment(&mut self, name: &[u8]) -> std::result::Result<u64, EvalError> {
+        self.position_named(name)
+            .and_then(|p| self.layout.sections.get(p as usize))
+            .map(|s| s.align)
+            .ok_or_else(|| EvalError::UndefinedSection(name.to_vec()))
+    }
+
+    fn max_page_size(&self) -> std::result::Result<u64, EvalError> {
+        Ok(self.options.max_page_size.unwrap_or(0x1000))
+    }
+
+    fn common_page_size(&self) -> std::result::Result<u64, EvalError> {
+        Ok(self.options.common_page_size.unwrap_or(0x1000))
+    }
+}
+
+/// Evaluates the `--defsym` expressions of `defsyms` (symbol, index in the
+/// options) after layout, into `globals`, as GNU ld evaluates them: in
+/// command-line order before the default script's `SECTIONS`, with `.` at
+/// 0, repeated so that forward references to later `--defsym`s settle.
+/// Symbols whose value is absolute (every expression but a lone symbol,
+/// `.` or `ADDR`) get [`ABSOLUTE`].
+pub fn evaluate_defsyms<'a>(
+    globals: &mut [u64],
+    refs: &super::refs::Refs<'_, 'a>,
+    layout: &super::layout::Layout<'a>,
+    options: &LinkOptions,
+    defsyms: &[(SymbolId, usize)],
+) {
+    let assignments: Vec<(SymbolId, Option<Assignment>)> = defsyms
+        .iter()
+        .map(|&(id, index)| {
+            let assignment = options
+                .defsym
+                .get(index)
+                .and_then(|(name, expr)| defsym_assignment(name, expr).ok());
+            (id, assignment)
+        })
+        .collect();
+    let mut values: Vec<(SymbolId, ExprValue<DefsymSection>)> = Vec::new();
+    for _pass in 0..=assignments.len().min(8) {
+        let mut next: Vec<(SymbolId, ExprValue<DefsymSection>)> = Vec::new();
+        for (id, assignment) in &assignments {
+            let value = match assignment {
+                Some(assignment) => {
+                    // This pass's values first, then the previous pass's.
+                    let mut seen = next.clone();
+                    seen.extend(
+                        values
+                            .iter()
+                            .filter(|(i, _)| !next.iter().any(|(n, _)| n == i)),
+                    );
+                    let mut context = DefsymContext {
+                        refs,
+                        layout,
+                        options,
+                        globals,
+                        values: &seen,
+                    };
+                    eval_symbol_assignment(assignment, &mut context)
+                        .unwrap_or_else(|_| ExprValue::absolute(0))
+                }
+                None => ExprValue::absolute(0),
+            };
+            next.retain(|(i, _)| i != id);
+            next.push((*id, value));
+        }
+        let settled = next == values;
+        values = next;
+        if settled {
+            break;
+        }
+    }
+    let context = DefsymContext {
+        refs,
+        layout,
+        options,
+        globals,
+        values: &[],
+    };
+    let resolved: Vec<(SymbolId, u64, bool)> = values
+        .iter()
+        .map(|(id, value)| {
+            let absolute = !matches!(value.section, ValueSection::Relative(_));
+            (*id, value.resolve(&context), absolute)
+        })
+        .collect();
+    for (id, address, absolute) in resolved {
+        if absolute {
+            refs.symbols.set_flags(id, ABSOLUTE);
+        } else {
+            refs.symbols.clear_flags(id, ABSOLUTE);
+        }
+        if let Some(slot) = globals.get_mut(id.index()) {
+            *slot = address;
+        }
+    }
+}
+
+/// Whether a `--defsym` expression gives an absolute value, decided before
+/// layout (the relocation scan needs it) from how its symbols are defined:
+/// GNU ld's rules make every expression but a lone symbol, `.`, `ADDR` and
+/// the like absolute outside output sections.
+fn defsym_is_absolute(
+    symbols: &SymbolTable<'_>,
+    files: &[ElfInput<'_>],
+    assignment: &Assignment,
+) -> bool {
+    /// Values are irrelevant here, only the sections results end up in.
+    struct Classify<'c, 's, 'f> {
+        symbols: &'c SymbolTable<'s>,
+        files: &'c [ElfInput<'f>],
+    }
+    impl EvalContext for Classify<'_, '_, '_> {
+        type Section = ();
+        fn section_vma(&self, _section: ()) -> u64 {
+            0
+        }
+        fn dot(&self) -> std::result::Result<u64, EvalError> {
+            Ok(0)
+        }
+        fn symbol(&mut self, name: &[u8]) -> std::result::Result<ExprValue<()>, EvalError> {
+            let Some(id) = self.symbols.lookup(&SymbolName::new(name)) else {
+                return Ok(ExprValue::absolute(0));
+            };
+            Ok(match symbol_def(self.symbols, self.files, id) {
+                SymbolDef::Absolute(_) | SymbolDef::Undefined => ExprValue::absolute(0),
+                SymbolDef::Linker if self.symbols.flags(id).contains(ABSOLUTE) => {
+                    ExprValue::absolute(0)
+                }
+                _ => ExprValue::relative((), 0),
+            })
+        }
+        fn is_defined(&mut self, name: &[u8]) -> bool {
+            self.symbols
+                .lookup(&SymbolName::new(name))
+                .is_some_and(|id| {
+                    matches!(
+                        self.symbols.definition_kind(id),
+                        DefinitionKind::Regular | DefinitionKind::Weak | DefinitionKind::Common
+                    )
+                })
+        }
+        fn section_addr(&mut self, _name: &[u8]) -> std::result::Result<ExprValue<()>, EvalError> {
+            Ok(ExprValue::relative((), 0))
+        }
+        fn section_load_addr(&mut self, _name: &[u8]) -> std::result::Result<u64, EvalError> {
+            Ok(0)
+        }
+        fn section_size(&mut self, _name: &[u8]) -> std::result::Result<u64, EvalError> {
+            Ok(0)
+        }
+        fn section_alignment(&mut self, _name: &[u8]) -> std::result::Result<u64, EvalError> {
+            Ok(1)
+        }
+        fn max_page_size(&self) -> std::result::Result<u64, EvalError> {
+            Ok(0x1000)
+        }
+        fn common_page_size(&self) -> std::result::Result<u64, EvalError> {
+            Ok(0x1000)
+        }
+    }
+    let mut context = Classify { symbols, files };
+    eval_symbol_assignment(assignment, &mut context)
+        .map_or(true, |v| !matches!(v.section, ValueSection::Relative(())))
 }

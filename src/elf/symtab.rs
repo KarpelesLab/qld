@@ -524,7 +524,7 @@ pub fn write_symtab(
                     let absolute = refs.symbols.flags(id).contains(super::defined::ABSOLUTE);
                     (
                         STB_GLOBAL,
-                        STT_NOTYPE,
+                        super::defined::linker_type(refs, linker, id),
                         visibility,
                         if absolute {
                             SHN_ABS

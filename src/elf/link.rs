@@ -236,12 +236,7 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
         return unimplemented("--compress-debug-sections with -r", "M5");
     }
     for (name, expr) in &options.defsym {
-        if inputs::parse_defsym(expr).is_none() {
-            return unimplemented(
-                &format!("--defsym {name}={expr}: expressions beyond `symbol+offset`"),
-                "M3",
-            );
-        }
+        defined::defsym_assignment(name, expr)?;
     }
     Ok(())
 }

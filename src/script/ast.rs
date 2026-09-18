@@ -761,6 +761,82 @@ impl Expr {
         }
     }
 
+    /// Calls `f` with the name of every symbol whose value the expression
+    /// reads: [`Expr::for_each_symbol`] without the names only tested with
+    /// `DEFINED`, which GNU ld does not treat as references.
+    pub fn for_each_value_symbol(&self, f: &mut dyn FnMut(&[u8])) {
+        match self {
+            Self::Symbol(name) => f(name),
+            Self::Unary(_, a)
+            | Self::Absolute(a)
+            | Self::Align(a)
+            | Self::Block(a)
+            | Self::DataSegmentEnd(a)
+            | Self::Log2Ceil(a)
+            | Self::Next(a)
+            | Self::SegmentStart(_, a)
+            | Self::Assert(a, _) => a.for_each_value_symbol(f),
+            Self::Binary(_, a, b)
+            | Self::AlignExpr(a, b)
+            | Self::DataSegmentAlign(a, b)
+            | Self::DataSegmentRelroEnd(a, b)
+            | Self::Max(a, b)
+            | Self::Min(a, b) => {
+                a.for_each_value_symbol(f);
+                b.for_each_value_symbol(f);
+            }
+            Self::Conditional(c, a, b) => {
+                c.for_each_value_symbol(f);
+                a.for_each_value_symbol(f);
+                b.for_each_value_symbol(f);
+            }
+            _ => {}
+        }
+    }
+
+    /// The symbol whose type an assignment of this expression copies, as
+    /// GNU ld's `exp_fold_tree` does: the only symbol the expression reads
+    /// (`DEFINED` does not count, nor do the conditions of `?:`; both
+    /// branches do, where GNU ld counts only the one taken).
+    #[must_use]
+    pub fn type_source(&self) -> Option<&[u8]> {
+        fn walk<'e>(expr: &'e Expr, found: &mut Option<&'e [u8]>, count: &mut u32) {
+            match expr {
+                Expr::Symbol(name) => {
+                    *count = count.saturating_add(1);
+                    *found = Some(name);
+                }
+                Expr::Conditional(_, a, b) => {
+                    walk(a, found, count);
+                    walk(b, found, count);
+                }
+                Expr::Unary(_, a)
+                | Expr::Absolute(a)
+                | Expr::Align(a)
+                | Expr::Block(a)
+                | Expr::DataSegmentEnd(a)
+                | Expr::Log2Ceil(a)
+                | Expr::Next(a)
+                | Expr::SegmentStart(_, a)
+                | Expr::Assert(a, _) => walk(a, found, count),
+                Expr::Binary(_, a, b)
+                | Expr::AlignExpr(a, b)
+                | Expr::DataSegmentAlign(a, b)
+                | Expr::DataSegmentRelroEnd(a, b)
+                | Expr::Max(a, b)
+                | Expr::Min(a, b) => {
+                    walk(a, found, count);
+                    walk(b, found, count);
+                }
+                _ => {}
+            }
+        }
+        let mut found = None;
+        let mut count = 0u32;
+        walk(self, &mut found, &mut count);
+        found.filter(|_| count == 1)
+    }
+
     /// Whether the expression reads the location counter, directly or
     /// through `ALIGN`, `NEXT` or `DATA_SEGMENT_ALIGN`.
     #[must_use]

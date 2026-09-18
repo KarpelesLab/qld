@@ -1252,3 +1252,200 @@ alias_off = fa + 1;
     .unwrap();
     compare_relocatable(&dir, &["-T", "module.ld", "a.o", "b.o"]);
 }
+
+/// `-T` scripts and the scripts they `INCLUDE` are read through
+/// `LinkOptions::input_provider`, like other inputs, and give the same
+/// output as the files on disk.
+#[test]
+fn scripts_from_the_input_provider() {
+    require_tools!();
+    let dir = scratch("provider-script");
+    bare_metal(&dir);
+    fs::write(dir.join("flash.ld"), FLASH_SCRIPT).unwrap();
+    let (ok, stderr) = qld_only(
+        &dir,
+        &["-T", "flash.ld", "start.o", "main.o", "-o", "disk.out"],
+    );
+    assert!(ok, "{stderr}");
+    let memory = qld::input::source::MemoryFiles::new()
+        .with("virtual/outer.ld", &b"INCLUDE inner.ld\n"[..])
+        .with("virtual/inner.ld", FLASH_SCRIPT.as_bytes().to_vec());
+    let mut options = LinkOptions::new();
+    options.kind = OutputKind::StaticExecutable;
+    options.output = Some(dir.join("memory.out"));
+    options.search_paths.push("virtual".into());
+    options.input_provider = Some(Arc::new(memory));
+    options.push_input(
+        InputKind::Script("virtual/outer.ld".into()),
+        InputAttrs::default(),
+    );
+    for name in ["start.o", "main.o"] {
+        options.push_input(InputKind::File(dir.join(name)), InputAttrs::default());
+    }
+    let sink = Collect::new();
+    qld::elf::link(&options, &sink).unwrap_or_else(|e| panic!("{e}: {:?}", sink));
+    assert_eq!(
+        fs::read(dir.join("disk.out")).unwrap(),
+        fs::read(dir.join("memory.out")).unwrap(),
+        "the scripts from memory give another output"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--defsym` with linker script expressions.
+// ---------------------------------------------------------------------------
+
+const DEFSYM_INPUT: &str = r#"
+	.text
+	.globl _start
+_start:
+	mov $60, %eax
+	syscall
+	.globl fn
+	.type fn,@function
+fn:	ret
+	.size fn, 1
+	.data
+	.globl table, table_end
+table:	.quad 1,2,3
+table_end:
+	.quad use_me
+"#;
+
+/// `--defsym` options exercising GNU ld's expression rules: arithmetic
+/// makes a value absolute, a lone symbol keeps its section, the type of the
+/// one symbol an expression reads is copied, built-ins read the final
+/// layout, and forward references to later `--defsym`s settle.
+const DEFSYMS: &[&str] = &[
+    "--defsym=d_off=fn+4",
+    "--defsym=d_mul=fn*2",
+    "--defsym=d_addr=ADDR(.data)+0x10",
+    "--defsym=d_size=SIZEOF(.text)",
+    "--defsym=d_diff=table_end-table",
+    "--defsym=d_later=table+8",
+    "--defsym=d_cond=DEFINED(fn)?fn:0",
+    "--defsym=d_align=ALIGN(table,0x100)",
+    "--defsym=d_abs=ABSOLUTE(fn)",
+    "--defsym=d_page=CONSTANT(MAXPAGESIZE)",
+    "--defsym=d_load=LOADADDR(.data)",
+    "--defsym=d_max=MAX(fn,table)",
+    "--defsym=d_alias=fn",
+    "--defsym=use_me=table_end-8",
+];
+
+/// `name value type binding absolute` of the symbols starting with `d_`
+/// or named `use_me`, sorted.
+fn defsym_symbols(dir: &Path, file: &str) -> Vec<String> {
+    let text = stdout_ok(dir, "readelf", &["-sW", file]);
+    let mut out: Vec<String> = text
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let name = *f.get(7)?;
+            (name.starts_with("d_") || name == "use_me" || name == "script_uses").then(|| {
+                format!(
+                    "{name} {} {} {} {}",
+                    f[1],
+                    f[3],
+                    f[4],
+                    if f[6] == "ABS" { "ABS" } else { "section" }
+                )
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn compare_defsyms(dir: &Path, args: &[&str]) {
+    let Some(ld) = comparable_gnu_ld() else {
+        println!("SKIPPED: no GNU ld 2.44 or newer to compare against");
+        return;
+    };
+    for (linker, out) in [(ld, "gnu.out"), (qld_path(), "qld.out")] {
+        let mut full = args.to_vec();
+        full.extend(["-o", out]);
+        let result = run(dir, &linker, &full);
+        assert!(
+            result.status.success(),
+            "{} {} failed: {}",
+            linker.display(),
+            full.join(" "),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let expected = defsym_symbols(dir, "gnu.out");
+    assert!(expected.len() >= 10, "{expected:?}");
+    assert_eq!(
+        expected,
+        defsym_symbols(dir, "qld.out"),
+        "--defsym symbols differ in {}",
+        dir.display()
+    );
+}
+
+#[test]
+fn defsym_expressions_like_gnu_ld() {
+    require_tools!();
+    let dir = scratch("defsym-expressions");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    let mut args = vec!["-static", "a.o"];
+    args.extend_from_slice(DEFSYMS);
+    compare_defsyms(&dir, &args);
+}
+
+/// Under a linker script, `--defsym`s are assignments before the script's
+/// own statements, which may read them.
+#[test]
+fn defsym_expressions_with_a_script() {
+    require_tools!();
+    let dir = scratch("defsym-script");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    fs::write(
+        dir.join("t.ld"),
+        "SECTIONS {
+  . = 0x10000;
+  .text : { *(.text) }
+  . = ALIGN(0x1000);
+  .data : { *(.data) data_end = .; }
+  script_uses = d_mul + 1;
+}
+",
+    )
+    .unwrap();
+    let mut args = vec!["-static", "-T", "t.ld", "a.o", "--defsym=d_end=data_end-4"];
+    args.extend_from_slice(DEFSYMS);
+    compare_defsyms(&dir, &args);
+}
+
+/// Relocatable output: values relative to sections or absolute, and copied
+/// types, as GNU ld writes them.
+#[test]
+fn defsym_expressions_in_relocatable_output() {
+    require_tools!();
+    let dir = scratch("defsym-relocatable");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    compare_relocatable(
+        &dir,
+        &[
+            "a.o",
+            "--defsym=r_mul=fn*2",
+            "--defsym=r_off=fn+4",
+            "--defsym=r_alias=table",
+            "--defsym=r_num=0x42",
+            "--defsym=r_cond=DEFINED(nothing)?1:table_end",
+        ],
+    );
+}
+
+#[test]
+fn defsym_syntax_errors_are_reported() {
+    require_tools!();
+    let dir = scratch("defsym-syntax");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    let (ok, stderr) = qld_only(&dir, &["-static", "a.o", "--defsym=bad=fn+*2", "-o", "out"]);
+    assert!(!ok, "a malformed --defsym links");
+    assert!(stderr.contains("--defsym"), "{stderr}");
+    assert!(!stderr.contains("not implemented"), "{stderr}");
+}

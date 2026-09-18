@@ -1514,7 +1514,7 @@ fn plan_globals(
                         Def::Absolute(value) => Some(defined(Place::Absolute, value)),
                         Def::Linker(_) if input.script.and_then(|s| s.symbol(id)).is_some() => {
                             let definition = input.script.and_then(|s| s.symbol(id))?;
-                            script_global(context, definition, vis)
+                            script_global(context, input.script, definition, vis)
                         }
                         Def::Linker(_) => {
                             let (_, expr) = defsyms.iter().find(|(d, _)| *d == id)?;
@@ -1542,6 +1542,7 @@ fn plan_globals(
 /// The global symbol a linker script defines.
 fn script_global(
     context: &Context<'_, '_, '_>,
+    script: Option<&RelocatableScript<'_>>,
     definition: &ScriptDefinition,
     visibility: u8,
 ) -> Option<Global> {
@@ -1558,10 +1559,22 @@ fn script_global(
             (Place::Out(out), base.wrapping_add(offset))
         }
     };
-    let kind = definition
-        .type_from
-        .and_then(|other| refs.global_target(other, false).raw)
-        .map_or(STT_NOTYPE, |raw| raw.kind());
+    // The type of the symbol the assignment copies, through other script
+    // symbols.
+    let mut kind = STT_NOTYPE;
+    let mut from = definition.type_from;
+    for _ in 0..8 {
+        let Some(other) = from else {
+            break;
+        };
+        if let Some(raw) = refs.global_target(other, false).raw {
+            kind = raw.kind();
+            break;
+        }
+        from = script
+            .and_then(|s| s.symbol(other))
+            .and_then(|d| d.type_from);
+    }
     Some(Global {
         id: definition.id,
         place,

@@ -143,6 +143,9 @@ pub struct ScriptPlacement {
     /// For each of [`ScriptPlacement::symbol_names`]: whether every
     /// assignment is a `PROVIDE`, and whether the last one hides the symbol.
     pub symbol_kinds: Vec<(bool, bool)>,
+    /// For each of [`ScriptPlacement::symbol_names`], the symbol whose type
+    /// its last assignment copies ([`crate::script::Expr::type_source`]).
+    pub type_sources: Vec<Option<Vec<u8>>>,
     /// The symbols scripts read.
     pub referenced: Vec<Vec<u8>>,
     /// Filled in after placement by [`crate::elf::defined::register`].
@@ -1357,9 +1360,11 @@ pub fn place<'a>(
     let input_flags = placer.flags.clone();
     let symbol_names = assigned_names(script, &placer.statements);
     let symbol_kinds = symbol_kinds(script, &placer.statements, &symbol_names);
+    let type_sources = type_sources(script, &placer.statements, &symbol_names);
     let script_placement = ScriptPlacement {
         symbol_names,
         symbol_kinds,
+        type_sources,
         referenced: script.referenced.iter().map(|(n, _)| n.clone()).collect(),
         resolved: std::sync::OnceLock::new(),
         statements: placer.statements,
@@ -1440,6 +1445,44 @@ fn assigned_names(script: &LayoutScript, statements: &[Statement]) -> Vec<Vec<u8
 
 /// For each assigned name: whether all its assignments are `PROVIDE`s, and
 /// whether the last one hides it.
+/// For each assigned symbol, the symbol whose type its last assignment
+/// copies.
+fn type_sources(
+    script: &LayoutScript,
+    statements: &[Statement],
+    names: &[Vec<u8>],
+) -> Vec<Option<Vec<u8>>> {
+    let mut sources = vec![None; names.len()];
+    let mut note = |assignment: &crate::script::Assignment| {
+        if let Some(slot) = names.iter().position(|n| *n == assignment.target)
+            && let Some(source) = sources.get_mut(slot)
+        {
+            *source = assignment
+                .op
+                .binary()
+                .is_none()
+                .then(|| assignment.expr.type_source().map(<[u8]>::to_vec))
+                .flatten();
+        }
+    };
+    for statement in statements {
+        match statement {
+            Statement::Assign { assignment, .. } => note(assignment),
+            Statement::Assert { .. } => {}
+            Statement::Output(index) => {
+                if let Some(stmt) = script.outputs.get(*index as usize) {
+                    for item in &stmt.items {
+                        if let Item::Assign { assignment, .. } = item {
+                            note(assignment);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sources
+}
+
 fn symbol_kinds(
     script: &LayoutScript,
     statements: &[Statement],

@@ -819,10 +819,14 @@ fn copied_type(script: &LayoutScript, name: &[u8], symbols: &SymbolTable<'_>) ->
     let mut last = None;
     let mut visit = |assignment: &crate::script::Assignment| {
         if assignment.target == name {
-            last = Some(match &assignment.expr {
-                crate::script::Expr::Symbol(other) => Some(other.clone()),
-                _ => None,
-            });
+            last = Some(
+                assignment
+                    .op
+                    .binary()
+                    .is_none()
+                    .then(|| assignment.expr.type_source().map(<[u8]>::to_vec))
+                    .flatten(),
+            );
         }
     };
     for statement in &script.statements {
