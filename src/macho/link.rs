@@ -60,15 +60,25 @@ use super::write::{self, Commands, DylibLoad, HeaderInput, Linkedit};
 /// Links a Mach-O output described by `options`.
 ///
 /// Called by [`crate::link`] when the target's format is
-/// [`BinaryFormat::MachO`](crate::BinaryFormat::MachO).
+/// [`BinaryFormat::MachO`](crate::BinaryFormat::MachO). The library options
+/// apply: inputs are read from [`LinkOptions::input_provider`] before the
+/// file system, the image goes to [`LinkOptions::output_buffer`] instead of
+/// the output file when one is set, and [`LinkOptions::cancel`] is checked
+/// between stages.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Reported`] when errors were reported to `diagnostics`,
-/// [`Error::Unimplemented`] for features a later step covers, and any I/O
-/// or parse error.
+/// [`Error::Unimplemented`] for features a later step covers,
+/// [`Error::Cancelled`] once the link is cancelled, and any I/O or parse
+/// error.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
     let bytes = link_to_bytes(options, diagnostics)?;
+    options.check_cancelled()?;
+    if let Some(buffer) = &options.output_buffer {
+        buffer.store(bytes);
+        return Ok(());
+    }
     let path = options.output_path();
     let mut output = OutputFile::create(
         &path,
@@ -127,7 +137,7 @@ fn infer_arch(options: &LinkOptions) -> Result<Arch> {
         let DarwinInputKind::File(path) = &input.kind else {
             continue;
         };
-        let Ok(data) = std::fs::read(path) else {
+        let Ok(data) = inputs::read_input(options.input_provider.as_deref(), path) else {
             continue;
         };
         if let Ok(file) = MachOFile::parse(&data, Source::new(path)) {
@@ -148,7 +158,7 @@ fn infer_platform(options: &LinkOptions, arch: Arch) -> Option<PlatformVersion> 
         let DarwinInputKind::File(path) = &input.kind else {
             continue;
         };
-        let Ok(data) = std::fs::read(path) else {
+        let Ok(data) = inputs::read_input(options.input_provider.as_deref(), path) else {
             continue;
         };
         let source = Source::new(path);
@@ -228,11 +238,12 @@ fn link_arch_once(
     generated: &[(std::path::PathBuf, std::sync::Arc<[u8]>)],
 ) -> Result<Attempt> {
     let config = Config::new(options, arch, infer_platform(options, arch))?;
-    let table = FileTable::new();
+    let table = FileTable::for_link(options);
     let collected = inputs::collect(options, &config, &table, diagnostics, generated)?;
     let internal = InternalNames::new(options, &config);
     let mut files = collected.files(&internal)?;
 
+    options.check_cancelled()?;
     let mut symbols = SymbolTable::new();
     let resolution = resolve_symbols(&mut symbols, &MachRules, &mut files)?;
     // `-r` leaves both to the final link.
@@ -287,6 +298,7 @@ fn link_arch_once(
     )?;
     link.mark_live(options)?;
     link.report_live_undefined(options, diagnostics)?;
+    options.check_cancelled()?;
     if config.is_relocatable() {
         return super::relocatable::write(&link, options, diagnostics).map(Attempt::Done);
     }
@@ -329,7 +341,7 @@ fn link_arch_once(
     let mut sectcreate_data = Vec::new();
     let mut sectcreate = Vec::new();
     for (segment, section, path) in &options.darwin.sectcreate {
-        let data = std::fs::read(path).map_err(|error| Error::io(path, error))?;
+        let data = inputs::read_input(options.input_provider.as_deref(), path)?;
         sectcreate.push((
             segment.as_bytes().to_vec(),
             section.as_bytes().to_vec(),
@@ -445,6 +457,7 @@ fn link_arch_once(
         }
     }
 
+    options.check_cancelled()?;
     let linkedit_start = layout.segment(b"__LINKEDIT").map_or(0, |s| s.fileoff);
     let mut image = vec![0u8; to_usize(linkedit_start)];
     let pointer_fixups = sections::write(&addresses, &sectcreate_data, &mut image)?;
