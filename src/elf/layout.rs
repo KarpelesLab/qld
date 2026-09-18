@@ -200,6 +200,9 @@ impl Tls {
     /// alignment ([`Arch::tcb_size`]).
     #[must_use]
     pub fn tp(&self, arch: Arch) -> u64 {
+        if let Some(offset) = arch.tp_past_tls_start() {
+            return self.start.wrapping_add(offset);
+        }
         let align = self.align.max(1);
         if arch.tls_variant1() {
             let tcb = arch
@@ -841,7 +844,11 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         .max_page_size
         .filter(|p| p.is_power_of_two())
         .unwrap_or_else(|| input.synth.arch.default_max_page());
-    let default_base = if mode.pic { 0 } else { DEFAULT_BASE };
+    let default_base = if mode.pic {
+        0
+    } else {
+        input.synth.arch.default_base()
+    };
     let base = input
         .options
         .text_segment

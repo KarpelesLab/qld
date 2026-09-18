@@ -189,6 +189,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
             Value::OutputEnd(output) => {
                 layout.output_places.get(output as usize).map_or(0, |p| p.1)
             }
+            Value::GotBase if self.synth.arch.toc_bias().is_some() => self.got_base(),
             Value::GotBase => layout
                 .synthetic(Synthetic::GotPlt)
                 .or_else(|| layout.synthetic(Synthetic::Got))
@@ -361,9 +362,16 @@ impl<'x, 'a> Addresses<'x, 'a> {
         base.checked_add(slot.checked_mul(8)?)
     }
 
-    /// The GOT base (`_GLOBAL_OFFSET_TABLE_`).
+    /// The GOT base (`_GLOBAL_OFFSET_TABLE_`; on PowerPC64 the TOC pointer
+    /// `.TOC.`, 0x8000 bytes into `.got`).
     #[must_use]
     pub fn got_base(&self) -> u64 {
+        if let Some(bias) = self.synth.arch.toc_bias() {
+            return self
+                .layout
+                .synthetic(Synthetic::Got)
+                .map_or(0, |(addr, ..)| addr.wrapping_add(bias));
+        }
         self.layout
             .synthetic(Synthetic::GotPlt)
             .or_else(|| self.layout.synthetic(Synthetic::Got))
@@ -415,7 +423,7 @@ pub fn plt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u
     }
     let index = synth.plt_index(owner)?;
     if let Some((base, ..)) = layout.synthetic(Synthetic::PltSec) {
-        return base.checked_add(index.checked_mul(arch.plt_entry_size(flags))?);
+        return base.checked_add(index.checked_mul(arch.plt_sec_entry_size(flags))?);
     }
     lazy_plt_address(synth, layout, index)
 }

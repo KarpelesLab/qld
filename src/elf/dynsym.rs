@@ -82,6 +82,8 @@ pub enum DynValue {
     OutputSize(&'static [u8]),
     /// The address of a symbol.
     Symbol(SymbolId),
+    /// An address inside a synthetic part: its start plus an offset.
+    AddressPlus(Synthetic, u64),
 }
 
 /// The planned dynamic symbol table and `.dynamic` section.
@@ -1069,6 +1071,12 @@ fn dynamic_entries(
         entries.push((DT_PLTRELSZ, Size(Synthetic::RelaPlt)));
         entries.push((DT_PLTREL, Value(crate::elf::read::consts::DT_RELA as u64)));
         entries.push((DT_JMPREL, Address(Synthetic::RelaPlt)));
+        if let Some(offset) = synth.arch.glink_offset() {
+            entries.push((
+                crate::elf::read::consts::ppc64::DT_PPC64_GLINK,
+                DynValue::AddressPlus(Synthetic::Plt, offset),
+            ));
+        }
     }
     if synth.rela_dyn_count() > 0 {
         entries.push((DT_RELA, Address(Synthetic::RelaDyn)));
@@ -1323,6 +1331,9 @@ pub fn write_dynamic(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mu
             DynValue::OutputAddress(name) => output(name).0,
             DynValue::OutputSize(name) => output(name).1,
             DynValue::Symbol(id) => addresses.globals.get(id.index()).copied().unwrap_or(0),
+            DynValue::AddressPlus(kind, offset) => layout
+                .synthetic(kind)
+                .map_or(0, |(addr, ..)| addr.wrapping_add(offset)),
         };
         slot[0..8].copy_from_slice(&tag.to_le_bytes());
         slot[8..16].copy_from_slice(&value.to_le_bytes());

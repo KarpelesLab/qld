@@ -17,20 +17,24 @@
 //! caller in it, so an output section holding more than 128 MiB of code
 //! still gets "relocation out of range" from the writer. Splitting the pool
 //! is the next step if that ever matters.
+//!
+//! PowerPC64 uses the same machinery: its `bl` reaches ±32 MiB, and its
+//! thunks ([`crate::arch::ppc64::thunk`]) also serve calls from code
+//! without a TOC pointer to functions that need one. The architecture
+//! decides which branches need a thunk and where they lead
+//! ([`Arch::branch_thunk`]), so planning and the writer agree.
 
 #![deny(clippy::arithmetic_side_effects)]
 
-use crate::arch::aarch64;
 use crate::elf::layout::{Layout, LayoutInput};
 use crate::elf::object::SectionKind;
 use crate::elf::read::Relocations;
-use crate::elf::read::consts::aarch64::{R_AARCH64_CALL26, R_AARCH64_JUMP26};
 use crate::elf::read::consts::{SHF_ALLOC, SHF_EXECINSTR};
 use crate::elf::refs::Def;
 use crate::elf::synth::Owner;
 use crate::symbols::SymbolFlags;
 
-use super::Arch;
+use super::{Arch, Branch};
 
 /// How many times layout may be repeated before giving up on a fixpoint.
 pub const MAX_ROUNDS: u32 = 8;
@@ -52,6 +56,8 @@ pub struct Thunk {
 pub struct Thunks {
     /// Every thunk, sorted.
     pub entries: Vec<Thunk>,
+    /// The architecture whose thunks these are.
+    pub arch: Arch,
 }
 
 impl Thunks {
@@ -67,7 +73,7 @@ impl Thunks {
         let count = self.entries.iter().filter(|t| t.output == output).count();
         u64::try_from(count)
             .unwrap_or(0)
-            .saturating_mul(aarch64::THUNK_SIZE)
+            .saturating_mul(self.arch.thunk_size())
     }
 
     /// The offset in its output section of the thunk of `output` that
@@ -81,12 +87,13 @@ impl Thunks {
         self.entries.get(at).map(|t| t.offset)
     }
 
-    /// Builds the table from the destinations each output section needs,
-    /// starting each section's pool at `pool_start`.
+    /// Builds the table of `arch` from the destinations each output section
+    /// needs, starting each section's pool at `pool_start`.
     #[must_use]
-    pub fn build(mut needed: Vec<(u32, u64)>, pool_start: &dyn Fn(u32) -> u64) -> Self {
+    pub fn build(arch: Arch, mut needed: Vec<(u32, u64)>, pool_start: &dyn Fn(u32) -> u64) -> Self {
         needed.sort_unstable();
         needed.dedup();
+        let size = arch.thunk_size();
         let mut entries = Vec::with_capacity(needed.len());
         let mut current = None;
         let mut next = 0u64;
@@ -100,9 +107,9 @@ impl Thunks {
                 target,
                 offset: next,
             });
-            next = next.saturating_add(aarch64::THUNK_SIZE);
+            next = next.saturating_add(size);
         }
-        Self { entries }
+        Self { entries, arch }
     }
 
     /// The bytes of the thunks of output section `output`, whose contents
@@ -110,10 +117,15 @@ impl Thunks {
     #[must_use]
     pub fn render(&self, output: u32, base: u64) -> Vec<(u64, Vec<u8>)> {
         let mut out = Vec::new();
+        let size = usize::try_from(self.arch.thunk_size()).unwrap_or(0);
         for thunk in self.entries.iter().filter(|t| t.output == output) {
-            let mut bytes = vec![0u8; aarch64::THUNK_SIZE as usize];
+            let mut bytes = vec![0u8; size];
             let address = base.wrapping_add(thunk.offset);
-            if aarch64::write_thunk(&mut bytes, 0, address, thunk.target).is_ok() {
+            if self
+                .arch
+                .write_thunk(&mut bytes, 0, address, thunk.target)
+                .is_ok()
+            {
                 out.push((thunk.offset, bytes));
             }
         }
@@ -138,14 +150,15 @@ fn plt_address(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, owner: Owner) -
 }
 
 /// The address a `bl`/`b` against `symbol` of `file` ends up branching to,
-/// as the writer will compute it.
+/// as the writer will compute it, whether that is a stub, and the callee's
+/// `st_other`.
 fn branch_target(
     input: &LayoutInput<'_, '_>,
     layout: &Layout<'_>,
     file: usize,
     symbol: u32,
     addend: i64,
-) -> Option<u64> {
+) -> Option<(u64, bool, u8)> {
     let refs = &input.refs;
     let target = refs.target(file, symbol as usize)?;
     let owner = match target.global {
@@ -158,7 +171,7 @@ fn branch_target(
     if target.is_ifunc()
         && let Some(stub) = crate::elf::values::iplt_address(input.synth, layout, owner)
     {
-        return Some(stub);
+        return Some((stub, true, 0));
     }
     let flags = target
         .global
@@ -166,8 +179,9 @@ fn branch_target(
     if flags.contains(SymbolFlags::NEEDS_PLT | crate::elf::export::PREEMPTIBLE)
         && let Some(plt) = plt_address(input, layout, owner)
     {
-        return Some(plt);
+        return Some((plt, true, 0));
     }
+    let st_other = target.raw.map_or(0, |raw| raw.st_other);
     let address = match target.def {
         Def::Section {
             file,
@@ -190,14 +204,15 @@ fn branch_target(
         // reported by the writer if it really is out of range.
         _ => return None,
     };
-    Some(address.wrapping_add_signed(addend))
+    Some((address.wrapping_add_signed(addend), false, st_other))
 }
 
 /// Plans the thunks the layout in `layout` needs, given the ones `previous`
 /// round planned (whose space `layout` already reserves).
 #[must_use]
 pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks) -> Thunks {
-    if input.synth.arch != Arch::AArch64 {
+    let arch = input.synth.arch;
+    if !arch.needs_thunks() {
         return Thunks::default();
     }
     let refs = &input.refs;
@@ -238,16 +253,24 @@ pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks)
                 continue;
             };
             for rel in relas.iter() {
-                if !matches!(rel.r_type, R_AARCH64_CALL26 | R_AARCH64_JUMP26) {
+                if !arch.is_thunk_branch(rel.r_type) {
                     continue;
                 }
                 let place = base.wrapping_add(rel.offset);
-                let Some(target) = branch_target(input, layout, file_index, rel.symbol, rel.addend)
+                let Some((target, via_stub, st_other)) =
+                    branch_target(input, layout, file_index, rel.symbol, rel.addend)
                 else {
                     continue;
                 };
-                if !aarch64::branch_in_range(place, target) {
-                    needed.push((output, target));
+                let branch = Branch {
+                    r_type: rel.r_type,
+                    place,
+                    target,
+                    st_other,
+                    via_stub,
+                };
+                if let Some(destination) = arch.branch_thunk(branch) {
+                    needed.push((output, destination));
                 }
             }
         }
@@ -264,16 +287,18 @@ pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks)
         let base = size.saturating_sub(previous.size_of(output));
         base.saturating_add(3) & !3
     };
-    Thunks::build(needed, &pool_start)
+    Thunks::build(arch, needed, &pool_start)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::aarch64;
 
     #[test]
     fn thunks_are_shared_and_ordered() {
         let plan = Thunks::build(
+            Arch::AArch64,
             vec![(1, 0x9000_0000), (1, 0x8000_0000), (1, 0x9000_0000)],
             &|_| 0x100,
         );
@@ -289,7 +314,7 @@ mod tests {
 
     #[test]
     fn rendered_thunks_branch_to_their_target() {
-        let plan = Thunks::build(vec![(0, 0x8000_1000)], &|_| 0);
+        let plan = Thunks::build(Arch::AArch64, vec![(0, 0x8000_1000)], &|_| 0);
         let rendered = plan.render(0, 0x1000);
         assert_eq!(rendered.len(), 1);
         let (offset, bytes) = &rendered[0];

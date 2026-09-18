@@ -43,7 +43,6 @@ use super::scan::{ScanResult, location};
 use super::symtab::{SymtabPlan, write_strtab, write_symtab};
 use super::synth::{Owner, SlotReloc, got_slot_relocs, write_build_id_header};
 use super::values::Addresses;
-use crate::arch::aarch64::Field as A64Field;
 
 /// What one output chunk holds.
 #[derive(Clone, Copy, Debug)]
@@ -542,6 +541,7 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     };
     header[32..40].copy_from_slice(&phoff.to_le_bytes());
     header[40..48].copy_from_slice(&layout.shoff.to_le_bytes());
+    header[48..52].copy_from_slice(&input.context.arch.e_flags().to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());
     let phentsize: u16 = if layout.segments.is_empty() { 0 } else { 56 };
     header[54..56].copy_from_slice(&phentsize.to_le_bytes());
@@ -673,14 +673,20 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
                 .layout
                 .synthetic(Synthetic::PltSec)
                 .unwrap_or_default();
-            let size = arch.plt_entry_size(synth.plt_flags());
+            let size = arch.plt_sec_entry_size(synth.plt_flags());
             let step = usize::try_from(size).unwrap_or(16);
             for (index, entry) in out.chunks_exact_mut(step).enumerate() {
                 let index64 = u64::try_from(index).unwrap_or(u64::MAX);
                 let address = base.saturating_add(index64.saturating_mul(size));
                 let slot = addresses.igot_address(index).unwrap_or(0);
-                arch.write_plt_jump(entry, address, slot, synth.plt_flags())
-                    .map_err(|_| Error::Internal("PLT slot out of range".into()))?;
+                arch.write_plt_jump(
+                    entry,
+                    address,
+                    slot,
+                    synth.plt_flags(),
+                    addresses.got_base(),
+                )
+                .map_err(|_| Error::Internal("PLT slot out of range".into()))?;
             }
         }
         Synthetic::PltGot => {
@@ -697,8 +703,14 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
                 };
                 let address = base.saturating_add(u64::try_from(start).unwrap_or(0));
                 let slot = addresses.got_address(owner).unwrap_or(0);
-                arch.write_plt_jump(entry, address, slot, synth.plt_flags())
-                    .map_err(|_| Error::Internal("PLT GOT slot out of range".into()))?;
+                arch.write_plt_jump(
+                    entry,
+                    address,
+                    slot,
+                    synth.plt_flags(),
+                    addresses.got_base(),
+                )
+                .map_err(|_| Error::Internal("PLT GOT slot out of range".into()))?;
             }
         }
         Synthetic::RelaPlt => write_rela_plt(input, out),
@@ -745,6 +757,11 @@ fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
         }
     };
     let refs = &addresses.refs;
+    // PowerPC64 keeps the TOC pointer's link-time value in the first word.
+    if synth.arch.got_header_words() > 0 {
+        put(base, addresses.got_base());
+    }
+    let dtv_offset = synth.arch.dtv_offset();
     for (list, kind) in [
         (&synth.got, GotKind::Address),
         (&synth.tlsgd, GotKind::TlsGd),
@@ -776,9 +793,10 @@ fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
                     put(address, word);
                 }
                 GotKind::TlsGd => {
+                    let dtpoff = value.wrapping_sub(tls.start).wrapping_sub(dtv_offset);
                     let (module, offset) = match relocs {
-                        [SlotReloc::None, SlotReloc::None] => (1, value.wrapping_sub(tls.start)),
-                        [_, SlotReloc::None] => (0, value.wrapping_sub(tls.start)),
+                        [SlotReloc::None, SlotReloc::None] => (1, dtpoff),
+                        [_, SlotReloc::None] => (0, dtpoff),
                         _ => (0, 0),
                     };
                     put(address, module);
@@ -858,7 +876,8 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         {
             let stub = base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(size));
             let slot = addresses.igot_address(index).unwrap_or(0);
-            arch.write_iplt(entry, stub, slot).map_err(|_| range())?;
+            arch.write_iplt(entry, stub, slot, addresses.got_base())
+                .map_err(|_| range())?;
         }
         return Ok(());
     }
@@ -1366,8 +1385,15 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
     let executable = input.context.mode.executable() || !input.context.mode.dynamic;
     let arch = input.context.arch;
     let order = file.position.raw();
+    // PowerPC64: `.toc` entries this section takes the address of, whose
+    // accesses keep going through the entry.
+    let pinned_toc = if arch == super::arch::Arch::Ppc64 && alloc {
+        super::arch::ppc64::pinned_toc_entries(refs, file_index, Relocations::Rela(relas))
+    } else {
+        Vec::new()
+    };
     let mut skip = false;
-    for rel in relas.iter() {
+    for (rel_index, rel) in relas.iter().enumerate() {
         if skip {
             skip = false;
             continue;
@@ -1434,11 +1460,13 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 continue;
             }
         };
+        let mut via_stub = false;
         if alloc {
             if target.is_ifunc()
                 && let Some(stub) = addresses.iplt_address(owner)
             {
                 s = stub;
+                via_stub = true;
             }
             if class.kind == Kind::Pc
                 && arch.is_branch(rel.r_type)
@@ -1446,9 +1474,26 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 && let Some(plt) = addresses.plt_address(owner)
             {
                 s = plt;
+                via_stub = true;
             }
         }
-        let sa = s.wrapping_add_signed(a);
+        let mut sa = s.wrapping_add_signed(a);
+        let mut class = class;
+        // PowerPC64: a load through a `.toc` entry becomes the TOC-relative
+        // address of the symbol the entry holds.
+        if alloc
+            && arch == super::arch::Arch::Ppc64
+            && let Some((address, field)) = super::arch::ppc64::toc_indirection(
+                addresses,
+                file_index,
+                &rel,
+                &pinned_toc,
+                input.context.mode.pic,
+            )
+        {
+            sa = address;
+            class.width = Width::Ppc(field);
+        }
         let tls = addresses.layout.tls.unwrap_or_default();
         let tp = tls.tp(arch);
         let slot_address = || -> Result<u64, ApplyError> {
@@ -1478,20 +1523,27 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 // A branch that cannot reach its target goes through the
                 // range-extension thunk layout placed for this output
                 // section (`elf::arch::thunk`).
-                let mut sa = sa;
-                if class.width == Width::Field(A64Field::Branch26)
-                    && !crate::arch::aarch64::branch_in_range(place, sa)
+                let branch = super::arch::Branch {
+                    r_type: rel.r_type,
+                    place,
+                    target: sa,
+                    st_other: target.raw.map_or(0, |raw| raw.st_other),
+                    via_stub,
+                };
+                let mut sa = arch.branch_destination(branch);
+                if let Some(destination) = arch.branch_thunk(branch)
                     && let Some(output) = addresses
                         .layout
                         .section_shndx
                         .get(id.index())
                         .copied()
                         .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
-                    && let Some(thunk) = addresses.layout.thunk_for(output, sa)
+                    && let Some(thunk) = addresses.layout.thunk_for(output, destination)
                 {
                     sa = thunk;
                 }
-                put(out, sa.wrapping_sub(place))
+                arch.finish_call(out, rel.offset, branch)
+                    .and_then(|()| put(out, sa.wrapping_sub(place)))
             }
             Kind::Page => put(out, page(sa).wrapping_sub(page(place))),
             Kind::Got => {
@@ -1534,6 +1586,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                             got: g,
                             got_pc: g.wrapping_add_signed(a).wrapping_sub(place) as i64,
                             place,
+                            next_type: relas.get(rel_index.wrapping_add(1)).map(|r| r.r_type),
                         },
                     )
                 }),
@@ -1553,6 +1606,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 let size = target.raw.map_or(0, |r| r.st_size);
                 put(out, size.wrapping_add_signed(a))
             }
+            Kind::Addend => put(out, rel.addend as u64),
             // An undefined (weak) TLS symbol has no thread pointer offset;
             // GNU ld and lld write the addend, as for an absolute value.
             Kind::TpOff if matches!(target.def, super::refs::Def::Undefined { .. }) => {
@@ -1563,10 +1617,14 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 put(out, a as u64)
             }
             Kind::DtpOff => {
-                let value = if alloc && executable {
+                // Where the dynamic thread vector is biased (PowerPC64),
+                // relaxed local-dynamic code computes the biased block
+                // start too, so the offset is the same either way.
+                let dtv_offset = arch.dtv_offset();
+                let value = if alloc && executable && dtv_offset == 0 {
                     sa.wrapping_sub(tp)
                 } else {
-                    sa.wrapping_sub(tls.start)
+                    sa.wrapping_sub(tls.start).wrapping_sub(dtv_offset)
                 };
                 put(out, value)
             }
@@ -1589,6 +1647,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                         got: 0,
                         got_pc: 0,
                         place,
+                        next_type: relas.get(rel_index.wrapping_add(1)).map(|r| r.r_type),
                     },
                 )
             }
