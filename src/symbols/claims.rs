@@ -115,6 +115,20 @@ impl<'a> GroupClaims<'a> {
         }
     }
 
+    /// Takes offers for round `round` (numbered from 1) without `&mut`
+    /// access, so that offers can be made while files load.
+    ///
+    /// Use either this or [`begin_round`](Self::begin_round) for a whole
+    /// resolution, with increasing round numbers: an offer can replace only
+    /// a claim made in its own round.
+    #[must_use]
+    pub fn in_round(&self, round: u32) -> ClaimRound<'_, 'a> {
+        ClaimRound {
+            claims: self,
+            round,
+        }
+    }
+
     /// Returns the file that holds `key`, if any file claimed it.
     #[must_use]
     pub fn owner(&self, key: &SymbolName<'_>) -> Option<FileId> {

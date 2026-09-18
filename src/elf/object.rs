@@ -267,6 +267,11 @@ pub struct ObjectInput<'a> {
     pub group_ignored: Vec<(u32, SymbolUse)>,
     /// Whether the object carries GCC LTO IR (`.gnu.lto_*` sections).
     pub gcc_lto: GccLto,
+    /// For each of [`groups`](Self::groups), whether the claim offered for
+    /// it while the object loaded held the group (see
+    /// [`ComdatHook`](super::resolve::ComdatHook)); taken by the round's
+    /// claim settlement.
+    pub held_offers: Option<Vec<bool>>,
 }
 
 /// Whether an ELF object carries GCC LTO IR.
@@ -578,6 +583,7 @@ impl<'a> ObjectInput<'a> {
             has_default_versions,
             discarded_groups: Vec::new(),
             group_ignored: Vec::new(),
+            held_offers: None,
             gcc_lto: match (has_lto_ir, slim) {
                 (false, _) => GccLto::None,
                 (true, true) => GccLto::Slim,

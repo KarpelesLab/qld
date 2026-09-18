@@ -50,6 +50,7 @@ pub use flags::SymbolFlags;
 pub use name::{InputPosition, SymbolName};
 pub use report::{DuplicateSymbol, SymbolReference, UndefinedSymbol};
 pub use resolve::{
-    Resolution, ResolveFile, RoundFile, RoundHook, SymbolUse, resolve_symbols, resolve_symbols_with,
+    LoadHook, Resolution, ResolveFile, RoundFile, RoundHook, SymbolUse, resolve_symbols,
+    resolve_symbols_with,
 };
-pub use table::{InternJob, SymbolTable};
+pub use table::{InternJob, LookupView, SymbolTable};

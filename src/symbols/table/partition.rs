@@ -118,6 +118,41 @@ impl<'s, 'a> Sequence<'s, 'a> {
     }
 }
 
+/// Lock-free lookups into a table that nothing modifies meanwhile; see
+/// [`SymbolTable::lookup_view`].
+pub struct LookupView<'t, 'a> {
+    shards: Vec<&'t Shard<'a>>,
+    names: &'t [SymbolName<'a>],
+}
+
+impl<'a> LookupView<'_, 'a> {
+    /// The ID of `name`, or `PENDING` if the table does not hold it.
+    #[inline]
+    fn find_raw(&self, name: &SymbolName<'a>) -> u32 {
+        let h32 = low32(name.hash());
+        self.shards[shard_of(name.hash())]
+            .table
+            .find(table_hash(h32), |slot| {
+                slot.h32 == h32 && self.names[slot.value as usize] == *name
+            })
+            .map_or(PENDING, |slot| slot.value)
+    }
+
+    /// Writes the ID of each of `names` to `ids` (which must be as long),
+    /// or a placeholder for the names the table does not hold, to be
+    /// interned by [`SymbolTable::try_intern_missing`]. Returns the number
+    /// of names not found.
+    pub fn find_all(&self, names: &[SymbolName<'a>], ids: &mut [SymbolId]) -> usize {
+        let mut missing = 0usize;
+        for (id, name) in ids.iter_mut().zip(names) {
+            let value = self.find_raw(name);
+            missing += usize::from(value == PENDING);
+            *id = SymbolId::from_u32(value);
+        }
+        missing
+    }
+}
+
 fn atomics_u64(len: usize) -> Vec<AtomicU64> {
     if len < 1 << 20 {
         (0..len).map(|_| AtomicU64::new(0)).collect()
@@ -152,6 +187,40 @@ fn split_outputs<'o>(
 }
 
 impl<'a> SymbolTable<'a> {
+    /// A view for looking names up from many threads without locks, while
+    /// the `&mut` borrow keeps the table unchanged.
+    pub fn lookup_view(&mut self) -> LookupView<'_, 'a> {
+        LookupView {
+            shards: self.shards.iter_mut().map(|s| &*get_mut(s)).collect(),
+            names: &self.names,
+        }
+    }
+
+    /// Interns the names that [`LookupView::find_all`] did not find in
+    /// `jobs`, whose `ids` it filled (and which the table has not changed
+    /// since), numbering new names by first occurrence as
+    /// [`try_intern_batch`](Self::try_intern_batch) does. The jobs'
+    /// positions must be distinct.
+    ///
+    /// # Errors
+    ///
+    /// As for [`try_intern_batch`](Self::try_intern_batch).
+    ///
+    /// # Panics
+    ///
+    /// Panics if two jobs share a position.
+    pub fn try_intern_missing(&mut self, jobs: &mut [InternJob<'a, '_>]) -> Result<()> {
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        order.sort_unstable_by_key(|&j| jobs[j].position);
+        assert!(
+            order
+                .windows(2)
+                .all(|pair| jobs[pair[0]].position != jobs[pair[1]].position),
+            "try_intern_missing: jobs share a position"
+        );
+        self.intern_missing(jobs, &order)
+    }
+
     /// Whether [`intern_partitioned`](Self::intern_partitioned) can take a
     /// batch of `total` names: sequence indices must fit beside the
     /// provisional mark.
@@ -179,10 +248,20 @@ impl<'a> SymbolTable<'a> {
             return self.number_sequence(&sequence, ordered);
         }
 
-        let misses = self.look_up_known(jobs, total);
-        if misses == 0 {
+        if self.look_up_known(jobs, total) == 0 {
             return Ok(());
         }
+        self.intern_missing(jobs, order)
+    }
+
+    /// Interns the names of `jobs` whose `ids` hold `PENDING` (the others
+    /// hold the IDs a lookup found), in first-occurrence order. `order`
+    /// lists the jobs by position; positions are distinct.
+    pub(super) fn intern_missing(
+        &mut self,
+        jobs: &mut [InternJob<'a, '_>],
+        order: &[usize],
+    ) -> Result<()> {
         // The names not found, in first-occurrence order, and where their
         // IDs go.
         let missing: Vec<(usize, Vec<u32>)> = order
@@ -237,17 +316,8 @@ impl<'a> SymbolTable<'a> {
     /// table, in parallel and without locks. Found names get their IDs;
     /// the others get `PENDING`. Returns the number of names not found.
     fn look_up_known(&mut self, jobs: &mut [InternJob<'a, '_>], total: usize) -> usize {
-        let shards: Vec<&Shard<'a>> = self.shards.iter_mut().map(|s| &*get_mut(s)).collect();
-        let names = &self.names;
-        let find = |name: &SymbolName<'a>| -> u32 {
-            let h32 = low32(name.hash());
-            shards[shard_of(name.hash())]
-                .table
-                .find(table_hash(h32), |slot| {
-                    slot.h32 == h32 && names[slot.value as usize] == *name
-                })
-                .map_or(PENDING, |slot| slot.value)
-        };
+        let view = self.lookup_view();
+        let find = |name: &SymbolName<'a>| -> u32 { view.find_raw(name) };
         let find = &find;
         let jobs_per_task = (MIN_PARALLEL_CHUNK * jobs.len() / total.max(1)).max(1);
         jobs.par_iter_mut()

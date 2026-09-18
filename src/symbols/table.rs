@@ -102,6 +102,8 @@ use crate::ids::{FileId, SymbolId};
 
 mod partition;
 
+pub use partition::LookupView;
+
 /// Number of bits of the name hash that select a shard.
 ///
 /// Chosen by measurement (the `stress_intern_millions_of_symbols` test, 12M
