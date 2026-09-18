@@ -172,13 +172,14 @@ binary.
 In priority order. Each one needs its relocations, thunks and relaxations,
 and TLS models.
 
-- [~] **AArch64**: done — the static and dynamic relocation set, range
-      extension thunks, PLT/GOT, all four TLS models with TLSDESC and the TLS
-      relaxations, BTI properties, `-r`, and script layout. Outstanding:
-      ADRP+LDR→ADRP+ADD and ADRP+ADD→ADR+NOP relaxations (need relocation
-      lookahead), the Cortex-A53 erratum workarounds and `-z pac-plt` (both
-      rejected with a clear error), `-z force-bti` (needs an option), and the
-      lazy TLSDESC PLT (qld binds eagerly, as lld does)
+- [x] **AArch64**: the static and dynamic relocation set, range extension
+      thunks, PLT/GOT, all four TLS models with TLSDESC and the TLS
+      relaxations, ADRP+LDR→ADRP+ADD and ADRP+ADD→NOP+ADR relaxations, BTI
+      properties, `-z force-bti`, `-z pac-plt`, the Cortex-A53 843419 and
+      835769 workarounds, `-r`, and script layout. TLSDESC is bound eagerly,
+      as in lld: glibc and musl need no lazy TLSDESC PLT. Outstanding: erratum
+      fixes under linker-script layout (the kernel uses them), a patch pool
+      per 128 MiB of code
 - [ ] **RISC-V 64/32**: linker relaxation with section shrinking (iterative
       layout), `__global_pointer$`, attribute section merging
 - [ ] **i386**: GOT-relative relocations, `-z ibtplt`, TLS GNU dialect
@@ -315,7 +316,7 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 - [x] Compact unwind (`__unwind_info`) synthesis, `__eh_frame`
 - [x] Ad-hoc code signature (`LC_CODE_SIGNATURE`), which arm64 macOS requires
 - [x] STABS debug map (`N_OSO`) so `dsymutil` can find DWARF in object files
-- [~] Objective-C / Swift sections handled correctly (basic handling and selector stubs done; category merging and relative method lists later)
+- [x] Objective-C / Swift sections handled correctly: selector stubs, relative method lists (default from macOS 11), category merging (`-objc_category_merging`)
 - [x] `-r` (relocatable output; DWARF sections not carried over yet), C string and literal merging, `-init`, `-alias`, `-bundle_loader`, `-flat_namespace`
 - [x] LTO through `libLTO` (full and thin, `-object_path_lto`, `-cache_path_lto`)
 - [ ] arm64e
@@ -334,7 +335,11 @@ and runs natively on both architectures.
 (std: threads, unwinding, TLS) programs with Apple clang and rustc against
 the real SDK and runs them on arm64 and, under Rosetta, x86_64, including a
 universal binary. `-r` output is checked against Apple's `ld -r` there.
-Still open for the exit criteria: a broader test suite through `-fuse-ld`.
+The broader `-fuse-ld` suite runs there too: 18 self-checking C, C++ and
+Objective-C programs in three variants per arch, and zlib, Lua, SQLite and
+{fmt} built with `-fuse-ld=qld` running their own tests, with every image
+checked to be linked by qld. Mach-O LTO goes through Xcode's libLTO. Open:
+arm64e.
 
 ---
 
