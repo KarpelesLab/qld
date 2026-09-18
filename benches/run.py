@@ -112,7 +112,7 @@ def run_one(argv, cwd, env):
     proc.returncode = os.waitstatus_to_exitcode(status)
     return {
         "ok": proc.returncode == 0,
-        "stderr": stderr.decode(errors="replace")[-2000:],
+        "stderr": stderr.decode(errors="replace"),
         "wall": wall,
         "cpu": usage.ru_utime + usage.ru_stime,
         "rss_kib": usage.ru_maxrss,
@@ -187,7 +187,7 @@ def main():
                 remove(out)
                 r = run_one(argv_for(spec, "qld", o.determinism, t, out, shlex.split(o.qld_args)), spec["cwd"], env)
                 if not r["ok"]:
-                    sys.stderr.write(r["stderr"])
+                    sys.stderr.write(r["stderr"][-2000:])
                     raise SystemExit(f"{spec['name']}: qld failed at {t} threads")
                 sums.append(digest(out))
                 remove(out)
@@ -306,7 +306,7 @@ def laps(o, linkers, specs):
                     argv = [o.perf, "stat", "-x", ",", "-e", "instructions:u", "-o", stat, "--", *argv]
                 r = run_one(argv, spec["cwd"], env)
                 if not r["ok"]:
-                    sys.stderr.write(r["stderr"])
+                    sys.stderr.write(r["stderr"][-2000:])
                     raise SystemExit(f"{spec['name']}: {c[0]} failed at {c[1]} threads")
                 values = {}
                 previous = 0.0
