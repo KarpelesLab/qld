@@ -643,6 +643,7 @@ fn link_inputs<'a>(
             exec_stack,
             mode,
             compressed: &[],
+            relax: None,
         })
     })?;
     // `.relr.dyn`'s size depends on the addresses it encodes: lay out with an
@@ -687,6 +688,7 @@ fn link_inputs<'a>(
                 exec_stack,
                 mode,
                 compressed: &[],
+                relax: None,
             })?;
         }
     }
@@ -767,6 +769,7 @@ fn link_inputs<'a>(
                 exec_stack,
                 mode,
                 compressed: &sizes,
+                relax: None,
             })?;
         }
         lap("compress");

@@ -31,12 +31,13 @@ use crate::args::{ExecStack, LinkOptions, SeparateCode};
 use crate::elf::read::consts::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_RELRO, PT_GNU_STACK,
     PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE,
-    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
+    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS, SHT_RISCV_ATTRIBUTES, SHT_STRTAB, SHT_SYMTAB,
 };
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 
 use super::arch::Arch;
+use super::arch::riscv::relax::Relaxation;
 use super::arch::thunk::{self, Thunks};
 use super::ehframe::EhFrames;
 use super::export::Mode;
@@ -286,6 +287,9 @@ pub struct Layout<'a> {
     /// Range-extension thunks with their addresses, sorted by output
     /// section and destination.
     pub thunks: Vec<thunk::Placed>,
+    /// Linker relaxation edits (RISC-V): the bytes deleted from each code
+    /// section, which symbol addresses and the writer follow.
+    pub relax: Relaxation,
 }
 
 impl Layout<'_> {
@@ -352,6 +356,9 @@ pub struct LayoutInput<'l, 'a> {
     pub mode: Mode,
     /// Output sections written compressed (`--compress-debug-sections`).
     pub compressed: &'l [CompressedOutput],
+    /// The linker relaxation edits to lay out with; set by
+    /// [`crate::elf::arch::riscv::relax::layout`] while it iterates.
+    pub relax: Option<&'l Relaxation>,
 }
 
 /// The compressed size of an output section.
@@ -410,6 +417,9 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 /// Returns [`Error::Limit`] when the image does not fit the address space.
 pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     input.synth.arch.check_options(input.options)?;
+    if input.relax.is_none() && input.synth.arch.relaxes() {
+        return super::arch::riscv::relax::layout(input, &|input| layout(input));
+    }
     if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
         return crate::elf::script_layout::layout(input, script, placed);
     }
@@ -820,6 +830,11 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
     let has_property = input.synth.property_note.is_some();
     let has_eh_hdr = input.synth.eh_frame_hdr && input.synth.fde_count > 0;
     let gnu_stack = input.options.gnu_stack;
+    // RISC-V: `PT_RISCV_ATTRIBUTES` covers `.riscv.attributes`.
+    let has_attributes = input.synth.arch == Arch::RiscV64
+        && out_sections
+            .iter()
+            .any(|s| s.sh_type == SHT_RISCV_ATTRIBUTES);
     let phnum = load_count
         .saturating_add(usize::from(has_interp).saturating_mul(2))
         .saturating_add(usize::from(has_dynamic))
@@ -828,7 +843,8 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         .saturating_add(usize::from(has_property))
         .saturating_add(usize::from(has_eh_hdr))
         .saturating_add(usize::from(gnu_stack))
-        .saturating_add(usize::from(has_relro));
+        .saturating_add(usize::from(has_relro))
+        .saturating_add(usize::from(has_attributes));
     let phnum_u64 = u64::try_from(phnum).unwrap_or(u64::MAX);
 
     // 4. Addresses. Each new PT_LOAD starts on a page boundary; a writable
@@ -841,7 +857,11 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         .max_page_size
         .filter(|p| p.is_power_of_two())
         .unwrap_or_else(|| input.synth.arch.default_max_page());
-    let default_base = if mode.pic { 0 } else { DEFAULT_BASE };
+    let default_base = if mode.pic {
+        0
+    } else {
+        input.synth.arch.default_base()
+    };
     let base = input
         .options
         .text_segment
@@ -1194,6 +1214,22 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
             align: 1,
         });
     }
+    if has_attributes
+        && let Some(section) = out_sections
+            .iter()
+            .find(|s| s.sh_type == SHT_RISCV_ATTRIBUTES)
+    {
+        segments.push(Segment {
+            p_type: super::arch::riscv::PT_RISCV_ATTRIBUTES,
+            flags: PF_R,
+            offset: section.offset,
+            vaddr: 0,
+            paddr: None,
+            filesz: section.size,
+            memsz: section.size,
+            align: 1,
+        });
+    }
     if segments.len() != phnum {
         return Err(Error::Internal(format!(
             "program header count changed during layout ({phnum} planned, {} made)",
@@ -1258,6 +1294,7 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
     Ok(Layout {
         sections: out_sections,
         thunks: placed_thunks,
+        relax: Relaxation::default(),
         output_places,
         section_addr,
         section_shndx,
@@ -1616,7 +1653,23 @@ pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result
                     .map_or(0, |s| s.size);
                 return Ok((size, 1));
             }
-            (section.header.sh_size, section.header.sh_addralign)
+            // RISC-V: the merged `.riscv.attributes` takes the place of the
+            // first input section; the others are empty.
+            if section.header.sh_type == SHT_RISCV_ATTRIBUTES
+                && let Some(merged) = &input.synth.riscv_attributes
+            {
+                let size = if merged.first == id {
+                    u64::try_from(merged.bytes.len()).unwrap_or(u64::MAX)
+                } else {
+                    0
+                };
+                return Ok((size, 1));
+            }
+            let removed = input.relax.map_or(0, |relax| relax.removed(id));
+            (
+                section.header.sh_size.saturating_sub(removed),
+                section.header.sh_addralign,
+            )
         }
         Member::Merge(group) => {
             let merged = input

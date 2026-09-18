@@ -187,6 +187,8 @@ pub struct Synth {
     pub verneed_count: u64,
     /// Number of `.gnu.version_d` entries (`sh_info`).
     pub verdef_count: u64,
+    /// RISC-V: the merged `.riscv.attributes`.
+    pub riscv_attributes: Option<super::arch::riscv::attributes::Output>,
 }
 
 /// The string the linker adds to `.comment`.
@@ -300,7 +302,14 @@ impl Synth {
             || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
         // `.got.plt` words.
-        self.got_plt_reserved = if dynamic && has_got_plt { 3 } else { 0 };
+        self.got_plt_reserved = if dynamic && has_got_plt {
+            self.arch.got_plt_header_words()
+        } else {
+            0
+        };
+        if self.arch == Arch::RiscV64 {
+            self.riscv_attributes = super::arch::riscv::attributes::collect(refs);
+        }
         self.section_dyn_relocs = scan.section_dyn_relocs();
         self.section_packable = scan.section_packable();
         self.got_dyn_relocs = self.count_got_relocs(refs);

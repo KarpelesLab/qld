@@ -55,6 +55,9 @@ pub enum Value {
     RelaIpltEnd,
     /// `_DYNAMIC`: the `.dynamic` section.
     Dynamic,
+    /// RISC-V `__global_pointer$`: 0x800 past the start of `.sdata`, or of
+    /// the image when there is none (lld's definition).
+    GlobalPointer,
     /// `--defsym`, by index in the options.
     Defsym(usize),
     /// A linker script symbol, by slot in the script placement's symbol
@@ -202,6 +205,16 @@ pub fn register(
         {
             define(id, value, &mut result);
         }
+    }
+
+    // RISC-V executables: `__global_pointer$`, which the C runtime loads
+    // into `gp`.
+    if options.kind != crate::args::OutputKind::Shared
+        && super::arch::Arch::of_files(files) == Some(super::arch::Arch::RiscV64)
+        && let Some(id) = symbols.lookup(&SymbolName::new(b"__global_pointer$"))
+        && wanted(symbols, id)
+    {
+        define(id, Value::GlobalPointer, &mut result);
     }
 
     // __start_SEC / __stop_SEC.

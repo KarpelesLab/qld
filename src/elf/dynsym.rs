@@ -1257,10 +1257,14 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
                 // By section rather than by address: a symbol in a
                 // non-allocated section (rustc's `rust_metadata_*` in
                 // `.rustc`) has no address but keeps its section, as in GNU ld.
-                Def::Section { file, section, .. } => (
+                Def::Section {
+                    file,
+                    section,
+                    value: offset,
+                } => (
                     raw.binding(),
                     raw.kind(),
-                    raw.st_size,
+                    addresses.symbol_size(file, section, offset, raw.st_size),
                     match super::symtab::shndx_for(addresses, file, section) {
                         SHN_UNDEF | SHN_ABS => shndx_of_address(addresses, value),
                         shndx => shndx,

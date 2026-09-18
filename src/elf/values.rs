@@ -204,6 +204,14 @@ impl<'x, 'a> Addresses<'x, 'a> {
             Value::Dynamic => layout
                 .synthetic(Synthetic::Dynamic)
                 .map_or(0, |(addr, ..)| addr),
+            Value::GlobalPointer => placement
+                .outputs
+                .iter()
+                .position(|o| o.name == b".sdata")
+                .and_then(|i| layout.output_places.get(i))
+                .filter(|place| place.2 != super::sections::NONE)
+                .map_or(layout.base, |place| place.0)
+                .wrapping_add(0x800),
             Value::Defsym(_) => 0,
             Value::Script { slot, .. } => layout
                 .script_symbols
@@ -221,6 +229,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
         if !refs.sections.is_live(id) {
             // Folded by ICF: the kept section has the same contents.
             let kept = refs.sections.resolve(id)?;
+            let offset = self.layout.relax.map(kept, offset);
             return Some(self.section_address(kept)?.wrapping_add(offset));
         }
         let kind = *refs.sections.kind.get(id.index())?;
@@ -263,7 +272,25 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 // start of the section's contribution.
                 Some(start)
             }
-            _ => Some(self.section_address(id)?.wrapping_add(offset)),
+            // Linker relaxation (RISC-V) moves offsets in code sections.
+            _ => Some(
+                self.section_address(id)?
+                    .wrapping_add(self.layout.relax.map(id, offset)),
+            ),
+        }
+    }
+
+    /// The size of a symbol at `value` with size `size` in section
+    /// `section` of `file`: smaller than `size` when linker relaxation
+    /// deleted bytes inside it.
+    #[must_use]
+    pub fn symbol_size(&self, file: usize, section: u32, value: u64, size: u64) -> u64 {
+        if self.layout.relax.is_empty() {
+            return size;
+        }
+        match self.refs.sections.id(file, section) {
+            Some(id) => self.layout.relax.symbol_size(id, value, size),
+            None => size,
         }
     }
 
