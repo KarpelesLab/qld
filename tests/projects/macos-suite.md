@@ -33,7 +33,7 @@ QLD_SUITE_ARCHS=arm64 tests/projects/macos-suite.sh target/release/qld /tmp/maco
 | zlib | 1.3.1 | `configure`, static and shared | `make test` |
 | Lua | 5.4.7 | `make macosx`; the test suite's C modules as bundles with `-undefined dynamic_lookup` | `lua -e"_U=true" all.lua` (`final OK`, C modules loaded) |
 | SQLite | 3.46.1 amalgamation | shell static, with `-dead_strip`, and against `libsqlite3.dylib` | `macos-suite.sql` (WAL, triggers, window functions, JSON, FTS5, R*Tree, math); output identical to the same objects linked by Apple's `ld` |
-| {fmt} | 11.0.2 | CMake, `BUILD_SHARED_LIBS=ON`, `FMT_TEST=ON` | `ctest` |
+| {fmt} | 12.2.0 | CMake, `BUILD_SHARED_LIBS=ON`, `FMT_TEST=ON` | `ctest` |
 
 The compilers get `-fuse-ld=$SCRATCH/bin/ld64.qld`, a wrapper that records
 each output path and runs `qld -flavor darwin`. After each build, every
