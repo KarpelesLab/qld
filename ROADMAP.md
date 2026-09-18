@@ -180,8 +180,13 @@ and TLS models.
       as in lld: glibc and musl need no lazy TLSDESC PLT. Outstanding: erratum
       fixes under linker-script layout (the kernel uses them), a patch pool
       per 128 MiB of code
-- [ ] **RISC-V 64/32**: linker relaxation with section shrinking (iterative
-      layout), `__global_pointer$`, attribute section merging
+- [~] **RISC-V 64** done: the full relocation set, PLT/GOT, TLS GD/IE/LE and
+      TLSDESC with relaxation, linker relaxation with section shrinking (an
+      architecture-neutral fixpoint in `src/elf/arch/shrink.rs`), `--relax-gp`,
+      `__global_pointer$`, `.riscv.attributes` merging, `-r`, `--emit-relocs`;
+      compared with lld symbolically, fixtures run under qemu in CI. RV32
+      waits for ELF32; `DT_RISCV_VARIANT_CC` and `PT_RISCV_ATTRIBUTES` under
+      linker scripts are open
 - [ ] **i386**: GOT-relative relocations, `-z ibtplt`, TLS GNU dialect
 - [ ] **ARM (32-bit)**: Thumb/ARM interworking, veneers, `.ARM.exidx`
       ordering and synthesis, BE8, `R_ARM_V4BX`
@@ -327,7 +332,7 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 - [x] Objective-C / Swift sections handled correctly: selector stubs, relative method lists (default from macOS 11), category merging (`-objc_category_merging`)
 - [x] `-r` (relocatable output; DWARF sections not carried over yet), C string and literal merging, `-init`, `-alias`, `-bundle_loader`, `-flat_namespace`
 - [x] LTO through `libLTO` (full and thin, `-object_path_lto`, `-cache_path_lto`)
-- [ ] arm64e
+- [x] arm64e (ptrauth chained fixups `DYLD_CHAINED_PTR_ARM64E`/`_USERLAND24`, `__auth_stubs`, `__auth_got`); checked structurally, since stock macOS does not run third-party arm64e code
 - [x] **Universal (fat) binaries**: link each slice in parallel from multiple
       `-arch` values and write the `fat_header`; accept fat objects, archives
       and dylibs as inputs by selecting the matching slice

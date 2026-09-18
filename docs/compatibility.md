@@ -420,6 +420,25 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   - x86 code padding is `nop`;
   - DLLs use a fixed default image base, not GNU's automatic one.
 
+## RISC-V 64
+
+- **Relaxation follows lld**, not GNU ld. gp-relative relaxation is off
+  unless `--relax-gp` is given; GNU ld does it by default.
+- **`__global_pointer$`** is lld's: `.sdata` + 0x800, or the image base +
+  0x800.
+- **Output bytes:**
+  - code gaps are zero-filled;
+  - `.got[0]` does not hold `_DYNAMIC`.
+- **Attributes:**
+  - the merged architecture string does not add implied extensions;
+  - attribute conflicts are warnings;
+  - a floating-point ABI mismatch is an error.
+- **Relocations:**
+  - section-symbol offsets into relaxed code are mapped to the moved code
+    (lld leaves them);
+  - `-r` does not synthesize `R_RISCV_ALIGN` as lld does.
+- **Endianness:** big-endian RISC-V (`elf64briscv`) is rejected.
+
 ## PowerPC64 LE
 
 - Call stubs for PLT calls are in `.plt.sec`, not placed near callers (lld)
@@ -492,7 +511,15 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   compared with Apple's `ld -r` in CI.
 - `-init` is an error unless `-dylib`, as in ld64 (ld64.lld ignores it).
 - `-force_flat_namespace` (executables only) and `-alias_list` are
-  supported. arm64e is not supported yet and is rejected with an error.
+  supported.
+- arm64e: authenticated pointers keep their key, address diversity and
+  discriminator; chained fixups use `DYLD_CHAINED_PTR_ARM64E` up to macOS 11
+  and `_USERLAND24` from macOS 12, as ld64 chooses; imports go through
+  `__auth_stubs`/`__auth_got`; `-no_fixup_chains` is an error. arm64e
+  selector stubs use a plain `br`.
+- Merged Objective-C categories keep the first category's slot in
+  `__objc_catlist` (lld moves it first), and qld reuses existing selector
+  references where lld makes new ones.
 - **LTO** goes through the libLTO C API, as ld64 does, not through the GNU
   plugin API.
   - **Finding libLTO:** `-lto_library`, then the libLTO next to the clang
