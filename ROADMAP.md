@@ -311,7 +311,8 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 - [x] STABS debug map (`N_OSO`) so `dsymutil` can find DWARF in object files
 - [~] Objective-C / Swift sections handled correctly (basic handling and selector stubs done; category merging and relative method lists later)
 - [x] `-r` (relocatable output; DWARF sections not carried over yet), C string and literal merging, `-init`, `-alias`, `-bundle_loader`, `-flat_namespace`
-- [ ] arm64e, LTO through `libLTO`
+- [x] LTO through `libLTO` (full and thin, `-object_path_lto`, `-cache_path_lto`)
+- [ ] arm64e
 - [x] **Universal (fat) binaries**: link each slice in parallel from multiple
       `-arch` values and write the `fat_header`; accept fat objects, archives
       and dylibs as inputs by selecting the matching slice
@@ -344,7 +345,9 @@ Still open for the exit criteria: a broader test suite through `-fuse-ld`.
       (`CancelToken`, `Error::Cancelled`): done for ELF; PE and Mach-O pending
 - [~] Complete rustdoc with examples (crate-level and `link` examples, five
       programs in `examples/`); published on crates.io
-- [ ] Packaging: prebuilt binaries, distribution packages, `ld.qld` and `ld64.qld` symlinks
+- [~] Packaging: prebuilt binaries, distribution packages, `ld.qld` and `ld64.qld` symlinks.
+      Release workflow (`.github/workflows/release.yml`, tags only) and recipes in
+      `packaging/` (Gentoo, Arch, Debian, Homebrew) are in; the first tagged release is pending
 
 **Exit criteria:** M1–M8 exit criteria still pass. The API has had no breaking
 changes for one release cycle.

@@ -27,6 +27,8 @@ tests/projects/coreutils.sh ~/.cache/qld-projects/qld ~/.cache/qld-projects
 | `rust-lto.sh` | M6: `-C linker-plugin-lto` (Rust and C, and qld's unit tests) through LLVMgold | [lto.md](lto.md) |
 | `kernel.sh` | M3: the Linux kernel, built with a shim, compared with GNU ld and booted in QEMU | [kernel.md](kernel.md) |
 | `bench-capture.sh` | M5: captures the benchmark corpus (clang, clang with debug info, `libclang-cpp.so`, `vmlinux`, qld's debug binary) for `benches/run.py` | [bench.md](bench.md) |
+| `packaging.sh` | M9: installs qld into a temporary prefix and links hello world with `gcc -B…/libexec/qld` and `clang -fuse-ld=qld` | [packaging.md](packaging.md) |
+| `macos-suite.sh` | M8: zlib, Lua, SQLite and {fmt} built with `-fuse-ld=qld` on macOS, running their own tests | [macos-suite.md](macos-suite.md) |
 | `baremetal.sh` | M3: a firmware image from a linker script, compared with GNU ld down to the raw bytes | [baremetal.md](baremetal.md) |
 
 `coreutils.sh`, `curl.sh`, `openssl.sh` and `python.sh` take a third

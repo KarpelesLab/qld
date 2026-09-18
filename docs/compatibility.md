@@ -174,6 +174,12 @@ succeed. The error message names the missing search path.
   1 MiB blocks in parallel and then hashes the block digests.
   `--build-id=fast` is an 8-byte xxHash64 tree hash. Values are stable
   across platforms and thread counts.
+- **Compiler drivers.** `clang -fuse-ld=qld` finds `ld.qld` (and
+  `ld64.qld` for Darwin targets). gcc accepts only `bfd`, `gold`, `lld`,
+  `mold` and (gcc 16) `wild` for `-fuse-ld`, so gcc users pass
+  `-B<prefix>/libexec/qld`, a directory whose `ld` is qld; the packages
+  install it. On macOS, qld invoked as plain `ld` parses a GNU command line,
+  so gcc on macOS cannot use it yet.
 - **Threads.** Parallel by default. `--threads=N`, `--no-threads` and
   `--thread-count=N` (gold) are honored. Without them, inputs are mapped
   with at most 16 threads and the rest of the link uses one thread per 4 MiB
@@ -404,6 +410,26 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   compared with Apple's `ld -r` in CI.
 - `-init` is an error unless `-dylib`, as in ld64 (ld64.lld ignores it).
 - Not supported yet, rejected with an error: `-force_flat_namespace`,
-  `-alias_list`, arm64e, and LTO/bitcode.
-- `-lto_library` is accepted. Mach-O LTO uses `libLTO` through the plugin
-  layer, not the GNU plugin API. See [optimizations.md](optimizations.md#lto).
+  `-alias_list` and arm64e.
+- **LTO** goes through the libLTO C API, as ld64 does, not through the GNU
+  plugin API.
+  - **Finding libLTO:** `-lto_library`, then the libLTO next to the clang
+    that `xcrun` or `PATH` finds, then Xcode's.
+  - **Options:** `-object_path_lto`, `-cache_path_lto`, the ThinLTO cache
+    pruning options, `-mllvm`, `-mcpu` and `-flto-codegen-only` are honored.
+  - **Differences from ld64:**
+    - Dead stripping runs after LTO, not before, so references from native
+      code that would have been stripped still keep their bitcode targets.
+    - The LTO objects, and the native members of archives that held
+      bitcode, are placed after the command-line inputs.
+    - `-hidden-l` is not applied to archives containing bitcode (a warning
+      says so).
+    - `linkonce_odr unnamed_addr` symbols are not preserved in dylibs, as in
+      lld.
+    - A mix of ThinLTO and full-LTO modules is compiled as full LTO.
+    - `-object_path_lto` gets an `.<arch>` suffix in multi-arch links.
+    - LLVM reads `-mllvm` options once per process per libLTO.
+    - ThinLTO errors inside LLVM end the process, because the C API cannot
+      return them.
+    - Bitcode reached only through `LC_LINKER_OPTION` auto-linking, or passed
+      as an in-memory input, is not supported yet.
