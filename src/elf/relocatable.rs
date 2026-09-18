@@ -521,7 +521,9 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     let mut file_groups: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
     let mut file_plans: Vec<FilePlan> = (0..files.len()).map(|_| FilePlan::default()).collect();
     let mut os_abi = 0u8;
-    let arch = crate::elf::arch::Arch::of_files(files).unwrap_or_default();
+    // `-m`, else the first object's, else the default (`-b binary` inputs
+    // alone name no machine).
+    let arch = crate::elf::arch::Arch::of(input.options, files);
     let machine = arch.machine();
     let flags = arch.output_flags(files);
     let riscv_attributes = (arch == crate::elf::arch::Arch::RiscV64)

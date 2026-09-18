@@ -380,8 +380,10 @@ impl<'a, F: ElfFormat> ResolveFile<'a> for ElfInput<'a, F> {
 pub struct Inputs<'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// All inputs, file 0 being the internal file.
     pub files: Vec<ElfInput<'a, F>>,
-    /// The target: from `-m`, or inferred from the first object.
-    pub target: Target,
+    /// The target: from `-m`, or inferred from the first input that names
+    /// one (see [`super::target`]). `None` when nothing did, and
+    /// [`super::target::default_target`] applies.
+    pub target: Option<Target>,
 }
 
 /// Owned strings the internal file borrows.
@@ -632,7 +634,7 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
         }
     }
     walker.finish()?;
-    let target = walker.target.unwrap_or(Target::X86_64_LINUX);
+    let target = walker.target.unwrap_or_else(super::target::default_target);
     if super::arch::Arch::from_target(target).is_none() {
         return Err(Error::Unimplemented(format!(
             "linking for {:?} (roadmap M4: more ELF architectures)",
@@ -641,7 +643,7 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
     }
     Ok(Inputs {
         files: walker.files,
-        target,
+        target: walker.target,
     })
 }
 
@@ -763,28 +765,41 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
         }
     }
 
+    /// Takes the target from `file` if none is known yet: from the ELF
+    /// header of an object, a shared library or a GCC LTO object, or from
+    /// the triple of LLVM bitcode.
     fn infer_target(&mut self, file: &InputFile) {
         if self.target.is_some() {
             return;
         }
-        if let FileFormat::Elf(ident) = file.format()
-            && let Some(arch) = ident.architecture()
-        {
-            let mut target = Target::X86_64_LINUX;
-            target.arch = arch;
-            target.endian = ident.endian;
-            target.pointer_width = ident.class;
-            self.target = Some(target);
-        }
+        self.target = match file.format() {
+            FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident) => {
+                ident.architecture().map(|arch| {
+                    let mut target = Target::X86_64_LINUX;
+                    target.arch = arch;
+                    target.endian = ident.endian;
+                    target.pointer_width = ident.class;
+                    target
+                })
+            }
+            FileFormat::LlvmBitcode(_) => super::target::of_bitcode(file.data()),
+            _ => None,
+        };
     }
 
     /// Rejects an ELF object built for another machine, class or byte order
     /// than the target, as GNU `ld` does, instead of linking its
     /// relocations as the target's (an x32 object read as i386).
     fn check_machine(&self, file: &InputFile) -> Result<()> {
-        let (FileFormat::Elf(ident), Some(target)) = (file.format(), self.target) else {
+        let (FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident), Some(target)) =
+            (file.format(), self.target)
+        else {
             return Ok(());
         };
+        if ident.machine == crate::elf::read::consts::EM_NONE {
+            // Machine-neutral: `-b binary` inputs (`binary_input`).
+            return Ok(());
+        }
         let found = ident.architecture();
         if found == Some(target.arch) && ident.endian == target.endian {
             return Ok(());
@@ -857,6 +872,8 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                         self.lto,
                     ));
                 }
+                self.infer_target(file);
+                self.check_machine(file)?;
                 // Claimed when resolution loads it. `--start-lib` IR is
                 // linked eagerly: only the plugin knows what it defines.
                 let input_number = self.next_position()?;
@@ -1143,7 +1160,8 @@ fn defined_names<F: ElfFormat>(file: &InputFile) -> Result<(Vec<SymbolName<'_>>,
 /// Adds the inputs an LTO plugin asked for after code generation: `objects`
 /// (already in the file table) that are not relocatable objects, which the
 /// caller places itself, and the `-l` `libraries`, searched in
-/// `library_paths` and then the `-L` paths.
+/// `library_paths` and then the `-L` paths. They must be for `target`,
+/// the target the first walk found ([`Inputs::target`]).
 /// Libraries already in the link, and libraries not found, are skipped, and
 /// relocatable output takes no libraries. The new inputs come after every
 /// existing one, with the `-Bstatic`/`--as-needed` state of the last
@@ -1155,6 +1173,7 @@ fn defined_names<F: ElfFormat>(file: &InputFile) -> Result<(Vec<SymbolName<'_>>,
 pub fn add_after_lto<'a, F: crate::elf::read::ElfFormat>(
     files: &mut Vec<ElfInput<'a, F>>,
     options: &LinkOptions,
+    target: Option<Target>,
     objects: &[FileId],
     libraries: &[std::ffi::OsString],
     library_paths: &[PathBuf],
@@ -1201,7 +1220,9 @@ pub fn add_after_lto<'a, F: crate::elf::read::ElfFormat>(
             .collect(),
         files: std::mem::take(files),
         ordinal,
-        target: Some(Target::X86_64_LINUX),
+        // What the first walk found; if nothing named a target, the
+        // generated objects and libraries do.
+        target,
         depth: 0,
         static_output,
         lto: LtoMode::AfterLto,

@@ -446,7 +446,8 @@ impl Arch {
     }
 
     /// The architecture of a link: the emulation (`-m`) when one was given,
-    /// otherwise the first relocatable object's machine.
+    /// otherwise the first relocatable object's machine, otherwise the
+    /// default target's ([`crate::elf::target::default_target`]).
     #[must_use]
     pub fn of<F: crate::elf::read::ElfFormat>(
         options: &LinkOptions,
@@ -456,6 +457,7 @@ impl Arch {
             .target
             .and_then(Self::from_target)
             .or_else(|| Self::of_files(files))
+            .or_else(|| Self::from_target(crate::elf::target::default_target()))
             .unwrap_or_default()
     }
 
@@ -481,8 +483,10 @@ impl Arch {
         if self != Self::RiscV64 {
             return None;
         }
+        // RISC-V objects only: not `-b binary` inputs, which are `EM_NONE`.
         let flags = |f: &super::inputs::ElfInput<'_, F>| {
-            f.object.as_ref().map(|o| o.elf.elf().header().e_flags)
+            let header = f.object.as_ref()?.elf.elf().header();
+            (header.e_machine == crate::elf::read::consts::EM_RISCV).then_some(header.e_flags)
         };
         let (first_index, first) = files
             .iter()

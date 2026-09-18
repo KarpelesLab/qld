@@ -316,7 +316,11 @@ impl<'a, F: ElfFormat> ObjectInput<'a, F> {
     /// [`Error::Unimplemented`] for objects qld cannot link yet.
     pub fn parse(data: &'a [u8], source: Source<'a>, config: &ParseConfig<'a>) -> Result<Self> {
         let elf = ObjectFile::<F>::parse(data, source)?;
-        if crate::elf::arch::Arch::from_machine(elf.elf().header().e_machine).is_none() {
+        let machine = elf.elf().header().e_machine;
+        // `EM_NONE`: a machine-neutral `-b binary` input (`binary_input`).
+        if machine != crate::elf::read::consts::EM_NONE
+            && crate::elf::arch::Arch::from_machine(machine).is_none()
+        {
             return Err(source.malformed(18, "ELF machine (not an architecture qld links)"));
         }
 

@@ -97,9 +97,9 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
 }
 
 /// The ELF class and byte order of the link: the emulation's (`-m`) when one
-/// was given, else the first ELF input's named on the command line (an
-/// object, or the first object member of an archive), else 64-bit
-/// little-endian.
+/// was given, else the first input's named on the command line that names
+/// one (an object, a GCC LTO object, LLVM bitcode, or the first such member
+/// of an archive), else the default target's ([`super::target`]).
 fn input_kind(options: &LinkOptions) -> ElfKind {
     if let Some(arch) = options.target.and_then(super::arch::Arch::from_target) {
         return arch.kind();
@@ -112,20 +112,35 @@ fn input_kind(options: &LinkOptions) -> ElfKind {
             crate::args::InputKind::Bytes { data, .. } => sniff_bytes(data),
             _ => None,
         })
+        .or_else(|| {
+            super::arch::Arch::from_target(super::target::default_target())
+                .map(super::arch::Arch::kind)
+        })
         .unwrap_or(ElfKind::Elf64Le)
 }
 
-/// The ELF kind of `data`: an ELF file's, or its first ELF member's if it is
+/// The ELF kind of `data`: an ELF file's (a GCC LTO object's included) or
+/// the one LLVM bitcode's triple names, or its first such member's if it is
 /// an archive.
 fn sniff_bytes(data: &[u8]) -> Option<ElfKind> {
-    if let Some(kind) = ElfKind::identify(data) {
+    let one = |data: &[u8]| {
+        // `EM_NONE` objects (`-b binary` inputs) name no target.
+        let neutral = data.get(18..20) == Some(&[0, 0]);
+        let elf = ElfKind::identify(data).filter(|_| !neutral);
+        elf.or_else(|| {
+            super::target::of_bitcode(data)
+                .and_then(super::arch::Arch::from_target)
+                .map(super::arch::Arch::kind)
+        })
+    };
+    if let Some(kind) = one(data) {
         return Some(kind);
     }
     let archive = crate::input::archive::Archive::parse(std::path::Path::new(""), data).ok()?;
     archive
         .members()
         .filter_map(core::result::Result::ok)
-        .find_map(|member| member.bytes().and_then(ElfKind::identify))
+        .find_map(|member| member.bytes().and_then(one))
 }
 
 /// [`sniff_bytes`] for a file on disk, reading as little of it as it can.
@@ -137,10 +152,12 @@ fn sniff_file(path: &std::path::Path) -> Option<ElfKind> {
     if let Some(kind) = ElfKind::identify(&head) {
         return Some(kind);
     }
-    if &head != b"!<arch>\n" {
+    let bitcode =
+        head.starts_with(b"BC\xc0\xde") || head.starts_with(&0x0b17_c0de_u32.to_le_bytes());
+    if &head != b"!<arch>\n" && !bitcode {
         return None;
     }
-    // An archive: map it through the input layer's reader.
+    // An archive or bitcode: read it whole.
     let data = std::fs::read(path).ok()?;
     sniff_bytes(&data)
 }
@@ -150,6 +167,13 @@ fn link_as<F: crate::elf::read::ElfFormat>(
     diagnostics: &dyn DiagnosticSink,
 ) -> Result<()> {
     let options = &prepared.options;
+    if options.kind == crate::args::OutputKind::Relocatable && F::KIND != ElfKind::Elf64Le {
+        // `relocatable` writes 64-bit records, and has no `SHT_REL` output.
+        return Err(Error::Unimplemented(format!(
+            "relocatable output (-r) for {:?} (roadmap M4: more ELF architectures)",
+            F::KIND
+        )));
+    }
     let timing = options.timing.as_ref();
     let start = Instant::now();
     let lap = |what: &str| {

@@ -981,6 +981,7 @@ mod plugin_link {
         inputs::add_after_lto(
             &mut files,
             options,
+            inputs.target,
             &others,
             &output.libraries,
             &output.library_paths,
