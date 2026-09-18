@@ -775,3 +775,33 @@ fn cxx_exceptions() {
         }
     }
 }
+
+/// An object for another x86 ABI is rejected, not linked as i386: an x32
+/// object has the same class, and its relocation numbers mean other things.
+#[test]
+fn foreign_objects_rejected() {
+    let tools = require!();
+    let dir = scratch("foreign");
+    // No headers: an x32 compiler usually has no x32 C library.
+    let source = format!("{DATA}/misc_lib.c");
+    compile(tools, &dir, "misc_lib.c", "i386.o", &[]);
+    let qld = PathBuf::from(env!("CARGO_BIN_EXE_qld"));
+    for (flag, object) in [("-mx32", "x32.o"), ("-m64", "x86_64.o")] {
+        // The host compiler may lack x32 support: skip that ABI then.
+        let built = run(&dir, &tools.cc, &[flag, "-c", &source, "-o", object]);
+        if !built.status.success() {
+            continue;
+        }
+        for args in [
+            ["-m", "elf_i386", "-r", object, "-o", "out.o"].as_slice(),
+            ["-r", "i386.o", object, "-o", "out.o"].as_slice(),
+        ] {
+            let output = run(&dir, &qld, args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success() && stderr.contains("is incompatible with X86 "),
+                "{args:?}: {stderr}"
+            );
+        }
+    }
+}

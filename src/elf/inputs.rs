@@ -778,6 +778,30 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
         }
     }
 
+    /// Rejects an ELF object built for another machine, class or byte order
+    /// than the target, as GNU `ld` does, instead of linking its
+    /// relocations as the target's (an x32 object read as i386).
+    fn check_machine(&self, file: &InputFile) -> Result<()> {
+        let (FileFormat::Elf(ident), Some(target)) = (file.format(), self.target) else {
+            return Ok(());
+        };
+        let found = ident.architecture();
+        if found == Some(target.arch) && ident.endian == target.endian {
+            return Ok(());
+        }
+        let found = found.map_or_else(
+            || format!("machine {:#x}", ident.machine),
+            |arch| format!("{arch:?}"),
+        );
+        Err(Error::Option(format!(
+            "{}: {found} ({:?}-endian) architecture of input file is incompatible with {:?} ({:?}-endian) output",
+            file.path().display(),
+            ident.endian,
+            target.arch,
+            target.endian,
+        )))
+    }
+
     /// Adds input `id`. `prepared` holds its members if it is an archive
     /// whose members were found before the walk ([`prepare_members`]).
     fn add(
@@ -794,6 +818,7 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
         match file.format() {
             FileFormat::Elf(ident) if ident.file_type == ET_REL => {
                 self.infer_target(file);
+                self.check_machine(file)?;
                 let input_number = self.next_position()?;
                 let mut input = self.input(InputPosition::new(input_number, 0), InputRole::Object);
                 input.file = Some(file);
@@ -915,6 +940,7 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                     let member_file = walker.table.get(member_id);
                     if let Some(member_file) = member_file {
                         walker.infer_target(member_file);
+                        walker.check_machine(member_file)?;
                     }
                     input.file = member_file;
                 }

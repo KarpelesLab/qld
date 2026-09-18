@@ -575,6 +575,15 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         sections: &sections,
     };
     let arch = super::arch::Arch::of(options, files);
+    if arch.kind() != F::KIND {
+        // x32 (ELF32 x86-64) and the other ELF32 or big-endian variants of
+        // a 64-bit architecture.
+        return Err(Error::Unimplemented(format!(
+            "linking {:?} objects for {} (roadmap M4: more ELF architectures)",
+            F::KIND,
+            arch.emulation()
+        )));
+    }
     let context = reloc::Context {
         mode,
         relax: options.relax,

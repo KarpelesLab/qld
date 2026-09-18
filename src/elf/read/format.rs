@@ -228,6 +228,8 @@ pub trait ElfFormat: Copy + Default + Debug + Eq + Send + Sync + 'static {
     /// The byte order.
     type Endian: Endian;
 
+    /// This class and byte order as a run-time value.
+    const KIND: ElfKind;
     /// `e_ident[EI_CLASS]` for this class.
     const CLASS: u8;
     /// Pointer width of the class.
@@ -328,6 +330,10 @@ fn ident_fields(b: &[u8]) -> (u8, u8, u8, u8) {
 
 impl<E: Endian> ElfFormat for Elf64<E> {
     type Endian = E;
+    const KIND: ElfKind = match E::ENDIANNESS {
+        Endianness::Little => ElfKind::Elf64Le,
+        Endianness::Big => ElfKind::Elf64Be,
+    };
     const CLASS: u8 = ELFCLASS64;
     const POINTER_WIDTH: PointerWidth = PointerWidth::Bits64;
     const WORD_SIZE: usize = 8;
@@ -566,6 +572,10 @@ impl<E: Endian> ElfFormat for Elf64<E> {
 
 impl<E: Endian> ElfFormat for Elf32<E> {
     type Endian = E;
+    const KIND: ElfKind = match E::ENDIANNESS {
+        Endianness::Little => ElfKind::Elf32Le,
+        Endianness::Big => ElfKind::Elf32Be,
+    };
     const CLASS: u8 = ELFCLASS32;
     const POINTER_WIDTH: PointerWidth = PointerWidth::Bits32;
     const WORD_SIZE: usize = 4;
