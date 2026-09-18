@@ -263,6 +263,30 @@ impl FileTable {
     /// range lies outside it, and [`Error::Io`] if a thin member's file cannot
     /// be loaded.
     pub fn add_member(&self, archive: FileId, member: &Member<'_>) -> Result<FileId> {
+        let entry = self.member_entry(archive, member)?;
+        self.push_member(entry)
+    }
+
+    /// Adds an entry made by [`FileTable::member_entry`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Limit`] if the table is full.
+    pub fn push_member(&self, entry: MemberEntry) -> Result<FileId> {
+        self.push(entry.0)
+    }
+
+    /// Describes a member of the archive `archive` as [`FileTable::add_member`]
+    /// would add it, without adding it: [`FileTable::push_member`] does.
+    ///
+    /// This lets a caller describe the members of many archives in parallel
+    /// (which reads each member's header and first bytes) and still add them
+    /// in a deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// As [`FileTable::add_member`].
+    pub fn member_entry(&self, archive: FileId, member: &Member<'_>) -> Result<MemberEntry> {
         let Some(parent) = self.get(archive) else {
             return Err(Error::malformed(
                 "<unknown archive>",
@@ -304,9 +328,14 @@ impl FileTable {
                 file
             }
         };
-        self.push(file)
+        Ok(MemberEntry(file))
     }
 }
+
+/// An archive member described by [`FileTable::member_entry`], ready to be
+/// added with [`FileTable::push_member`].
+#[derive(Debug)]
+pub struct MemberEntry(InputFile);
 
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)] // Test code builds fixtures, not parses input.
