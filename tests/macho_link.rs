@@ -1533,19 +1533,103 @@ fn undefined_symbols_are_reported() {
     assert_eq!(import(&imports, "_missing").lib_ordinal, -2, "{imports:?}");
 }
 
-/// The names of the sections of a Mach-O image, in load command order.
-fn section_names(data: &[u8]) -> Vec<String> {
+/// The sections of a Mach-O image, in load command order, as (segment,
+/// section, file offset, size).
+fn section_list(data: &[u8]) -> Vec<(String, String, usize, usize)> {
     let file = MachOFile::parse(data, Source::new(Path::new("out"))).unwrap();
-    let mut names = Vec::new();
+    let mut sections = Vec::new();
     for command in file.load_commands() {
         let command = command.unwrap();
         if command.cmd == qld::macho::read::consts::LC_SEGMENT_64 {
             for section in command.segment().unwrap().sections.iter() {
-                names.push(String::from_utf8_lossy(section.sectname).into_owned());
+                sections.push((
+                    String::from_utf8_lossy(section.segname).into_owned(),
+                    String::from_utf8_lossy(section.sectname).into_owned(),
+                    section.offset as usize,
+                    section.size as usize,
+                ));
             }
         }
     }
-    names
+    sections
+}
+
+/// The names of the sections of a Mach-O image, in load command order.
+fn section_names(data: &[u8]) -> Vec<String> {
+    section_list(data).into_iter().map(|s| s.1).collect()
+}
+
+/// The contents of section `name` (the first with that name).
+fn section_contents<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    section_list(data)
+        .into_iter()
+        .find(|s| s.1 == name)
+        .map(|(_, _, offset, size)| &data[offset..offset + size])
+}
+
+/// How many times `needle` occurs in `haystack`.
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// Identical C strings and floating-point literals from two objects are
+/// merged, as ld64 and lld merge them: one copy in the output, and both
+/// objects' references resolve to it.
+#[test]
+fn literal_deduplication() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "literal_deduplication",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let a = compile("literals", "literals_a.c", arch, &[]);
+        let b = compile("literals", "literals_b.c", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let exe = scratch("literals").join(format!("literals-{arch}"));
+        let bytes = link_and_compare(&args, &exe);
+        let cstrings = section_contents(&bytes, "__cstring").expect("__cstring");
+        assert_eq!(
+            occurrences(cstrings, b"shared string\0"),
+            1,
+            "{arch}: {cstrings:?}"
+        );
+        assert_eq!(occurrences(cstrings, b"only in a\0"), 1, "{arch}");
+        if arch == "x86_64" {
+            // The multiplier is a `__literal8` in both objects.
+            let literals = section_contents(&bytes, "__literal8").expect("__literal8");
+            assert_eq!(
+                // 3.14159265358979
+                occurrences(literals, &0x4009_21fb_5444_2d11_u64.to_le_bytes()),
+                1,
+                "{arch}: {literals:?}"
+            );
+        }
+        let reference = PathBuf::from(format!("{}-lld", exe.display()));
+        if let Ok(theirs) = std::fs::read(&reference) {
+            assert_eq!(
+                section_contents(&theirs, "__cstring").map(<[u8]>::len),
+                Some(cstrings.len()),
+                "{arch}: __cstring size, qld vs ld64.lld"
+            );
+        }
+        if host_can_run(arch) {
+            assert_eq!(
+                run(&exe).unwrap(),
+                "shared string shared string 1 only in a 9.42478\n"
+            );
+        }
+    }
 }
 
 /// Whether `rustc` has the standard library for `target`.
