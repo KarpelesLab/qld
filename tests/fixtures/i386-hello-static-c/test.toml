@@ -1,0 +1,22 @@
+# M4: the i386 counterpart of `hello-static-c`. Static glibc: ELF32,
+# `SHT_REL` input relocations with their addends in the code, every TLS
+# access relaxed to local-exec, and the string functions' IFUNCs resolved
+# through `.rel.plt` IRELATIVE relocations between `__rel_iplt_start` and
+# `__rel_iplt_end`.
+description = "static hello world in C, for i386"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "ELF32",
+  "Intel 80386",
+  "EXEC (Executable file)",
+  "!INTERP",
+  "!.dynamic",
+  "R_386_IRELATIVE",
+  "!R_386_JUMP_SLOT",
+]
+targets = ["i686-linux-gnu"]
+determinism = true

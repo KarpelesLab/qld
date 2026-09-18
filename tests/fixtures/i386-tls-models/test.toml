@@ -1,0 +1,32 @@
+# M4: the four TLS models in an i386 executable, once with the GNU
+# sequences and once with TLS descriptors (`-mtls-dialect=gnu2`). Every
+# variable is in the executable, so everything relaxes to local-exec and no
+# TLS dynamic relocation is left. As with GNU ld, `___tls_get_addr` keeps a
+# PLT slot although every call to it was relaxed away.
+description = "i386 TLS: general-dynamic, local-dynamic, initial-exec and local-exec relaxed to local-exec"
+compile = [
+  "cc -O2 -fPIC -mtls-dialect=gnu2 -c tls.c -o tls-desc.o",
+  "cc -O2 -fPIC -mtls-dialect=gnu -c tls.c -o tls-trad.o",
+]
+driver = "cc"
+link = [
+  "-pie -o out-desc tls-desc.o",
+  "-pie -o out-trad tls-trad.o",
+]
+output = "out-desc"
+run = "./out-desc && ./out-trad"
+expect.stdout = "tls 31\ntls 31\n"
+expect.readelf = [
+  "ELF32",
+  "TLS",
+  "!R_386_TLS_DESC",
+  "!R_386_TLS_DTPMOD32",
+  "!R_386_TLS_TPOFF",
+]
+expect.readelf_files."out-trad" = [
+  "TLS",
+  "!R_386_TLS_DTPMOD32",
+  "!R_386_TLS_TPOFF",
+]
+targets = ["i686-linux-gnu"]
+determinism = true

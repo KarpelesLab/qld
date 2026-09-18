@@ -1,0 +1,21 @@
+# M4: a dynamic PIE against glibc, for i386. Covers the `%ebx`-relative
+# PLT, `.rel.dyn`/`.rel.plt` with `DT_REL`, `DT_PLTREL = DT_REL`, and
+# addends kept in the relocated words.
+description = "dynamic PIE hello world in C, for i386"
+compile = ["cc -O2 -fPIE -c hello.c"]
+driver = "cc"
+link = "-pie -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, dynamic world (20)\n"
+expect.readelf = [
+  "ELF32",
+  "Intel 80386",
+  "DYN (",
+  "INTERP",
+  "ld-linux.so.2",
+  "(REL)",
+  "R_386_JUMP_SLOT",
+  "R_386_RELATIVE",
+]
+targets = ["i686-linux-gnu"]
+determinism = true

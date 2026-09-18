@@ -1,0 +1,17 @@
+# M4: C++ exceptions on i386 need `.eh_frame`'s `SHT_REL` relocations
+# applied with the addends stored in the section, and `.eh_frame_hdr`
+# sorted, so that the unwinder finds the FDE of a frame two calls deep.
+description = "C++ exceptions across two frames, for i386"
+compile = ["c++ -O2 -fPIE -c throw.cpp"]
+driver = "c++"
+link = "-pie -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "ELF32",
+  "GNU_EH_FRAME",
+  ".gcc_except_table",
+  "R_386_JUMP_SLOT",
+]
+targets = ["i686-linux-gnu"]
+determinism = true
