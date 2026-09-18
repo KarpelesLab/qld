@@ -240,6 +240,7 @@ const STT_FUNC: u8 = 2;
 const STT_SECTION: u8 = 3;
 const STT_FILE: u8 = 4;
 const STT_TLS: u8 = 6;
+const STT_GNU_IFUNC: u8 = 10;
 /// `andi $zero, $zero, 0`.
 const NOP: u32 = 0x0340_0000;
 
@@ -386,7 +387,7 @@ impl Elf {
     fn named(&self) -> impl Iterator<Item = &Symbol> {
         self.symbols.iter().filter(|s| {
             !s.name.is_empty()
-                && !matches!(s.kind, STT_SECTION | STT_FILE | STT_TLS)
+                && !matches!(s.kind, STT_SECTION | STT_FILE | STT_TLS | STT_GNU_IFUNC)
                 && s.shndx != 0
                 && s.shndx < 0xff00
                 && !s.name.starts_with(".L")
@@ -422,20 +423,12 @@ fn describe(elf: &Elf, address: u64) -> String {
 }
 
 fn describe_depth(elf: &Elf, address: u64, depth: u32) -> String {
-    // A named symbol at, or containing, the address.
-    let mut exact: Vec<&str> = elf
-        .named()
-        .filter(|s| s.value == address)
-        .map(|s| s.name.as_str())
-        .collect();
-    exact.sort_unstable();
-    if let Some(name) = exact.first() {
-        return (*name).to_string();
-    }
     let Some(section) = elf.section_at(address) else {
         return format!("{address:#x}");
     };
     let offset = address - section.addr;
+    // Linker-generated tables first: lld names a static executable's IFUNC
+    // stub after the IFUNC, GNU ld and qld do not.
     match section.name.as_str() {
         // `.got.plt` may be part of `.got` (GNU ld and qld merge them with
         // `-z now`): both are "the GOT", and the words reserved for the
@@ -448,12 +441,19 @@ fn describe_depth(elf: &Elf, address: u64, depth: u32) -> String {
             }
             return format!("GOT[{}]", slot(elf, address, depth));
         }
-        ".plt" => {
-            if offset < 32 {
+        // lld calls the IFUNC stubs of a static executable `.iplt`; they
+        // have no header.
+        ".plt" | ".iplt" => {
+            let header = if elf.section(".dynamic").is_some() {
+                32
+            } else {
+                0
+            };
+            if offset < header {
                 return format!("PLT0+{offset}");
             }
             // Evaluate the entry: pcaddu12i $t3, hi; ld.d $t3, $t3, lo.
-            let entry = address - (offset - 32) % 16;
+            let entry = address - (offset - header) % 16;
             let hi = elf
                 .bytes(entry, 4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
@@ -473,6 +473,16 @@ fn describe_depth(elf: &Elf, address: u64, depth: u32) -> String {
             return format!(".plt+{offset}");
         }
         _ => {}
+    }
+    // A named symbol at, or containing, the address.
+    let mut exact: Vec<&str> = elf
+        .named()
+        .filter(|s| s.value == address)
+        .map(|s| s.name.as_str())
+        .collect();
+    exact.sort_unstable();
+    if let Some(name) = exact.first() {
+        return (*name).to_string();
     }
     if let Some(symbol) = elf
         .named()
@@ -501,9 +511,11 @@ fn slot(elf: &Elf, address: u64, depth: u32) -> String {
         return relocs
             .iter()
             .map(|r| {
-                if r.kind == 3 && depth < 2 {
+                // RELATIVE and IRELATIVE: the addend is an address.
+                if matches!(r.kind, 3 | 12) && depth < 2 {
                     format!(
-                        "RELATIVE &{}",
+                        "{} &{}",
+                        reloc_name(r.kind),
                         describe_depth(elf, r.addend as u64, depth + 1)
                     )
                 } else {
@@ -888,7 +900,7 @@ fn dynamic_relocations(elf: &Elf) -> Vec<String> {
                 Some(".got" | ".got.plt") => "got".to_string(),
                 _ => describe(elf, r.offset),
             };
-            let value = if r.kind == 3 {
+            let value = if matches!(r.kind, 3 | 12) {
                 format!("&{}", describe(elf, r.addend as u64))
             } else {
                 format!("{}{:+}", r.symbol, r.addend)
@@ -983,6 +995,10 @@ const STATIC_OTHER: &str = r#"
 extern int counter;
 extern const char *msg;
 int other(int x) { return x * counter + msg[1]; }
+#ifdef DEFINE_TLS_GET_ADDR
+/* What static glibc provides for general-dynamic accesses. */
+void *__tls_get_addr(void *p) { return p; }
+#endif
 "#;
 
 #[test]
@@ -996,6 +1012,26 @@ fn static_executable_matches_lld() {
             &["-O2", "-fPIE", "-mno-relax", "-mcmodel=medium"][..],
         ),
         ("O0", &["-O0", "-fPIE", "-mno-relax"][..]),
+        // General-dynamic in a static executable: lld (and qld) keep the
+        // `__tls_get_addr` calls, with a module/offset pair in the GOT.
+        // lld does not relax GOT loads in a section that has
+        // general-dynamic sequences (their `GOT_PC_LO12` has no
+        // `GOT_PC_HI20` before it) and qld does, so each function gets its
+        // own section.
+        (
+            "gd",
+            &[
+                "-O2",
+                "-fPIC",
+                "-mno-relax",
+                "-DDEFINE_TLS_GET_ADDR",
+                "-ffunction-sections",
+            ][..],
+        ),
+        (
+            "desc",
+            &["-O2", "-fPIC", "-mno-relax", "-mtls-dialect=desc"][..],
+        ),
     ] {
         let dir = scratch(&format!("static-{variant}"));
         compile(&tools, &dir, "main", STATIC_MAIN, flags);
@@ -1419,5 +1455,97 @@ fn label_differences_are_computed() {
             continue;
         };
         assert_eq!(a.size, b.size, "{name} size");
+    }
+}
+
+/// An IFUNC in a static executable: a stub that jumps through a GOT slot
+/// the startup code fills from an `R_LARCH_IRELATIVE`.
+#[test]
+fn static_ifunc_matches_lld() {
+    let tools = require!();
+    let dir = scratch("ifunc");
+    let source = r#"
+int pick = 1;
+static int first(void) { return 42; }
+static int second(void) { return 43; }
+static void *resolver(void) {
+    return *(volatile int *)&pick ? (void *)first : (void *)second;
+}
+int chosen(void) __attribute__((ifunc("resolver")));
+int (*volatile pointer)(void) = chosen;
+void _start(void) {
+    int r = chosen() + pointer();
+    for (;;) { __asm__ volatile("" :: "r"(r)); }
+}
+"#;
+    compile(
+        &tools,
+        &dir,
+        "ifunc",
+        source,
+        &["-O2", "-fPIE", "-mno-relax"],
+    );
+    link_both(
+        &tools,
+        &dir,
+        "out",
+        &["-static", "ifunc.o"],
+        &["--no-relax"],
+    );
+    assert_same_code(&dir, "out", false);
+    let dynamic = |name: &str| dynamic_relocations(&Elf::read(&dir.join(name)));
+    assert_eq!(dynamic("out.lld"), dynamic("out.qld"));
+    assert!(
+        dynamic("out.qld")
+            .iter()
+            .any(|r| r.contains("IRELATIVE &resolver")),
+        "{:#?}",
+        dynamic("out.qld")
+    );
+}
+
+/// `-r` keeps the machine, the ABI flags and every relocation, including
+/// `R_LARCH_RELAX` and `R_LARCH_ALIGN`: lld links qld's relocatable output
+/// as it links its own.
+#[test]
+fn relocatable_output_links_like_lld() {
+    let tools = require!();
+    for (variant, flags, final_link) in [
+        (
+            "norelax",
+            &["-O2", "-fPIE", "-mno-relax"][..],
+            &["--no-relax"][..],
+        ),
+        (
+            "relax",
+            &["-O2", "-fPIE", "-mrelax", "-DNO_WEAK"][..],
+            &[][..],
+        ),
+    ] {
+        let dir = scratch(&format!("relocatable-{variant}"));
+        compile(&tools, &dir, "main", STATIC_MAIN, flags);
+        compile(&tools, &dir, "other", STATIC_OTHER, flags);
+        run_ok(
+            &dir,
+            &tools.lld,
+            &["-r", "main.o", "other.o", "-o", "lld.o"],
+        );
+        let output = qld(&dir, &["-r", "main.o", "other.o", "-o", "qld.o"]);
+        assert!(
+            output.status.success(),
+            "qld -r failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let flags_of = |name: &str| u32_at(&fs::read(dir.join(name)).unwrap(), 48);
+        assert_eq!(flags_of("qld.o"), flags_of("main.o"), "{variant}: e_flags");
+        for (input, output) in [("lld.o", "out.lld"), ("qld.o", "out.qld")] {
+            let mut args = vec!["-static", input, "-o", output];
+            args.extend_from_slice(final_link);
+            run_ok(&dir, &tools.lld, &args);
+        }
+        // lld's `-r` pads each input section after the first to its
+        // alignment and marks the padding with a synthesized R_LARCH_ALIGN;
+        // qld does not yet, so compare without the padding.
+        assert_same_code(&dir, "out", variant == "relax");
     }
 }
