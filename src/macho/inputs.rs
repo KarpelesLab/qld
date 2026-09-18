@@ -22,7 +22,8 @@ use std::sync::Arc;
 use hashbrown::HashSet;
 
 use crate::args::LinkOptions;
-use crate::args::darwin::{DarwinInput, DarwinInputKind, LoadMode, MachOutputType};
+use crate::args::darwin::{LoadMode, MachOutputType};
+use crate::args::{InputKind as ArgInputKind, InputSpec};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
@@ -542,8 +543,52 @@ pub fn read_input(provider: Option<&dyn InputProvider>, path: &Path) -> Result<V
     std::fs::read(path).map_err(|error| Error::io(path, error))
 }
 
+/// One input a Mach-O link loads, taken from [`LinkOptions::inputs`] or
+/// asked for by an `LC_LINKER_OPTION`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DarwinInput {
+    /// What the input names.
+    pub kind: ArgInputKind,
+    /// How it is linked (`-weak-l` and its relatives).
+    pub mode: LoadMode,
+    /// `-force_load` (or `--whole-archive`): load every member of this
+    /// archive.
+    pub force_load: bool,
+}
+
+impl DarwinInput {
+    /// The input an [`InputSpec`] describes.
+    fn from_spec(spec: &InputSpec) -> Self {
+        Self {
+            kind: spec.kind.clone(),
+            mode: spec.attrs.load,
+            force_load: spec.attrs.whole_archive,
+        }
+    }
+
+    /// A library or framework an `LC_LINKER_OPTION` asks for.
+    fn requested(kind: ArgInputKind) -> Self {
+        Self {
+            kind,
+            mode: LoadMode::Normal,
+            force_load: false,
+        }
+    }
+
+    /// Appends this input to [`LinkOptions::inputs`], which is how the
+    /// `LC_LINKER_OPTION` rounds add what the objects asked for.
+    pub fn push_onto(&self, options: &mut LinkOptions) {
+        let attrs = crate::args::InputAttrs {
+            load: self.mode,
+            whole_archive: self.force_load,
+            ..crate::args::InputAttrs::default()
+        };
+        options.push_input(self.kind.clone(), attrs);
+    }
+}
+
 struct Pending {
-    path: PathBuf,
+    source: Source,
     input: DarwinInput,
 }
 
@@ -563,38 +608,13 @@ pub fn collect<'t>(
 ) -> Result<Collected<'t>> {
     let search = SearchPaths::new(options);
     let mut specs: Vec<DarwinInput> = Vec::new();
-    for spec in &options.inputs {
-        match &spec.kind {
-            crate::args::InputKind::File(path) => specs.push(DarwinInput {
-                kind: DarwinInputKind::File(path.clone()),
-                mode: LoadMode::Normal,
-                force_load: spec.attrs.whole_archive,
-            }),
-            crate::args::InputKind::Library(name) => specs.push(DarwinInput {
-                kind: DarwinInputKind::Library(name.clone()),
-                mode: LoadMode::Normal,
-                force_load: false,
-            }),
-            _ => {
-                return Err(Error::Unimplemented(format!(
-                    "input {:?} for Mach-O links",
-                    spec.kind
-                )));
-            }
-        }
-    }
     // The bundle loader comes first, as in lld.
     if let Some(loader) = &options.darwin.bundle_loader {
-        specs.insert(
-            0,
-            DarwinInput {
-                kind: DarwinInputKind::File(loader.clone()),
-                mode: LoadMode::Normal,
-                force_load: false,
-            },
-        );
+        specs.push(DarwinInput::requested(ArgInputKind::File(loader.clone())));
     }
-    specs.extend(options.darwin.inputs.iter().cloned());
+    for spec in &options.inputs {
+        specs.push(DarwinInput::from_spec(spec));
+    }
 
     let mut walker = Walker {
         options,
@@ -617,11 +637,7 @@ pub fn collect<'t>(
         let id = table.add_bytes(name.clone(), Arc::clone(data))?;
         walker.add(
             id,
-            &DarwinInput {
-                kind: DarwinInputKind::File(name.clone()),
-                mode: LoadMode::Normal,
-                force_load: false,
-            },
+            &DarwinInput::requested(ArgInputKind::File(name.clone())),
         )?;
     }
 
@@ -644,7 +660,7 @@ pub fn collect<'t>(
     for request in &requested {
         match resolve_spec(&search, request) {
             Ok(path) => extra.push(Pending {
-                path,
+                source: Source::Path(path),
                 input: request.clone(),
             }),
             Err(Error::NotFound(message)) => {
@@ -693,19 +709,15 @@ pub fn missing_linker_options(
         for hint in hints {
             let kind = match hint {
                 LinkerOptionHint::Library(name) => {
-                    DarwinInputKind::Library(String::from_utf8_lossy(name).into_owned())
+                    ArgInputKind::Library(String::from_utf8_lossy(name).into_owned())
                 }
-                LinkerOptionHint::Framework(name) => DarwinInputKind::Framework {
+                LinkerOptionHint::Framework(name) => ArgInputKind::Framework {
                     name: String::from_utf8_lossy(name).into_owned(),
                     suffix: None,
                 },
                 LinkerOptionHint::Other => continue,
             };
-            let input = DarwinInput {
-                kind,
-                mode: LoadMode::Normal,
-                force_load: false,
-            };
+            let input = DarwinInput::requested(kind);
             let known = collected.requested.iter().any(|r| r.kind == input.kind)
                 || out.iter().any(|r| r.kind == input.kind);
             if !known && resolve_spec(&search, &input).is_ok() {
@@ -716,15 +728,31 @@ pub fn missing_linker_options(
     out
 }
 
+/// Where an input's bytes come from. In-memory inputs
+/// ([`ArgInputKind::Bytes`]) are carried as they are; everything else is a
+/// path the search rules find.
+fn resolve_source(search: &SearchPaths, input: &DarwinInput) -> Result<Source> {
+    Ok(match &input.kind {
+        ArgInputKind::Bytes { name, data } => Source::Bytes {
+            name: PathBuf::from(name),
+            data: Arc::clone(data),
+        },
+        _ => Source::Path(resolve_spec(search, input)?),
+    })
+}
+
 fn resolve_spec(search: &SearchPaths, input: &DarwinInput) -> Result<PathBuf> {
     match &input.kind {
-        DarwinInputKind::File(path) => Ok(path.clone()),
-        DarwinInputKind::Library(name) => search
+        ArgInputKind::File(path) => Ok(path.clone()),
+        ArgInputKind::Library(name) => search
             .find_library(name)
             .ok_or_else(|| Error::NotFound(format!("library not found for -l{name}"))),
-        DarwinInputKind::Framework { name, suffix } => search
+        ArgInputKind::Framework { name, suffix } => search
             .find_framework(name, suffix.as_deref())
             .ok_or_else(|| Error::NotFound(format!("framework not found for -framework {name}"))),
+        other => Err(Error::Unimplemented(format!(
+            "input {other:?} for Mach-O links"
+        ))),
     }
 }
 
@@ -733,7 +761,7 @@ fn resolve_specs(search: &SearchPaths, specs: &[DarwinInput]) -> Result<Vec<Pend
         .iter()
         .map(|input| {
             Ok(Pending {
-                path: resolve_spec(search, input)?,
+                source: resolve_source(search, input)?,
                 input: input.clone(),
             })
         })
@@ -764,10 +792,7 @@ impl<'t> Walker<'_, 't> {
     }
 
     fn walk(&mut self, pending: &[Pending]) -> Result<()> {
-        let sources: Vec<Source> = pending
-            .iter()
-            .map(|p| Source::Path(p.path.clone()))
-            .collect();
+        let sources: Vec<Source> = pending.iter().map(|p| p.source.clone()).collect();
         let loaded = self.table.load_all(&sources);
         for (entry, id) in pending.iter().zip(loaded) {
             let id = id?;
@@ -888,9 +913,9 @@ impl<'t> Walker<'_, 't> {
         for hint in object.linker_option_hints()? {
             let kind = match hint {
                 LinkerOptionHint::Library(name) => {
-                    DarwinInputKind::Library(String::from_utf8_lossy(name).into_owned())
+                    ArgInputKind::Library(String::from_utf8_lossy(name).into_owned())
                 }
-                LinkerOptionHint::Framework(name) => DarwinInputKind::Framework {
+                LinkerOptionHint::Framework(name) => ArgInputKind::Framework {
                     name: String::from_utf8_lossy(name).into_owned(),
                     suffix: None,
                 },

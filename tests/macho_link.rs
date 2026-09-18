@@ -30,7 +30,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use qld::args::{ParseOutcome, parse_darwin};
+use qld::args::{InputAttrs, InputKind, ParseOutcome, parse_darwin};
 use qld::diag::{Collect, DiagnosticSink};
 use qld::macho::read::consts::{
     LC_CODE_SIGNATURE, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_LOAD_DYLIB, LC_MAIN,
@@ -524,6 +524,72 @@ fn host_can_run(arch: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A Mach-O link reads [`LinkOptions::inputs`] like every other format, so
+/// a library caller can hand it an object as bytes and name a framework
+/// without an ld64 command line. Linking the same program both ways must
+/// give the same image.
+#[test]
+fn in_memory_inputs_link_like_files() {
+    let arch = "x86_64";
+    if !clang_for(arch) {
+        skip(
+            "in_memory_inputs_link_like_files",
+            &format!("clang cannot target {arch}-apple-macos"),
+        );
+        return;
+    }
+    let object = compile("memory-inputs", "hello.c", arch, &[]);
+    let args = os(&[
+        "-arch",
+        arch,
+        "-platform_version",
+        "macos",
+        "13.0",
+        "13.0",
+        "-syslibroot",
+        syslibroot().to_str().unwrap(),
+        object.to_str().unwrap(),
+        "-lSystem",
+        "-o",
+        "unused",
+    ]);
+    let (from_files, _) = link_bytes(&args).unwrap();
+
+    // The same link, with the object passed as bytes and the inputs built
+    // by hand instead of parsed.
+    let mut argv = vec![OsString::from("ld64.qld")];
+    argv.extend_from_slice(&args);
+    let mut options = match parse_darwin(&argv) {
+        Ok(ParseOutcome::Link(options)) => options,
+        other => panic!("{other:?}"),
+    };
+    let data = std::fs::read(&object).unwrap();
+    assert!(
+        options
+            .inputs
+            .iter()
+            .any(|spec| spec.kind == InputKind::File(object.clone())),
+        "the ld64 front end fills LinkOptions::inputs: {:?}",
+        options.inputs
+    );
+    let rest: Vec<_> = options
+        .inputs
+        .drain(..)
+        .filter(|spec| spec.kind != InputKind::File(object.clone()))
+        .collect();
+    options.inputs.clear();
+    options.push_input(
+        InputKind::bytes(object.to_string_lossy().into_owned(), data),
+        InputAttrs::default(),
+    );
+    for spec in rest {
+        options.push_input(spec.kind, spec.attrs);
+    }
+    let from_memory = qld::macho::link_to_bytes(&options, &Collect::new()).unwrap();
+    assert!(!from_memory.is_empty());
+    assert_eq!(from_memory, from_files);
+}
 
 #[test]
 fn hello_executables() {

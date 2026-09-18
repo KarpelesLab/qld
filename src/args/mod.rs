@@ -24,7 +24,7 @@ pub mod parse;
 pub mod response;
 pub mod table;
 
-pub use darwin::DarwinArgs;
+pub use darwin::{DarwinArgs, LoadMode};
 pub use options::{
     BuildId, CancelToken, ColorChoice, DebugCompression, DiscardMode, DynamicFlags, ExecStack,
     Flavor, HashStyle, IcfMode, InputAttrs, InputFormat, InputKind, InputSpec, LinkOptions,

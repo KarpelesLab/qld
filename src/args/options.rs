@@ -419,7 +419,7 @@ impl OutputFormat {
 
 /// How the inputs that follow `-b` / `--format` are interpreted.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InputFormat {
     /// Identify the format from the file contents (default).
     #[default]
@@ -436,9 +436,10 @@ pub enum InputFormat {
 /// struct is `#[non_exhaustive]`, because later milestones keep adding
 /// positional options.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct InputAttrs {
-    /// `--whole-archive` was in effect.
+    /// `--whole-archive` was in effect. On a Mach-O link this is
+    /// `-force_load`, which `-all_load` sets for every input.
     pub whole_archive: bool,
     /// `--as-needed` was in effect.
     pub as_needed: bool,
@@ -453,16 +454,28 @@ pub struct InputAttrs {
     pub lazy: bool,
     /// The `-b` / `--format` in effect.
     pub format: InputFormat,
+    /// How a Mach-O link loads this input (`-weak-l`, `-reexport_library`,
+    /// `-needed_framework`, `-hidden-l`). Other formats ignore it.
+    pub load: crate::args::darwin::LoadMode,
 }
 
 /// What an input entry refers to.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum InputKind {
     /// A file named directly on the command line.
     File(PathBuf),
     /// `-lfoo`: search for `libfoo.so` and `libfoo.a` in the search paths.
+    /// On a Mach-O link, `libfoo.tbd`, `libfoo.dylib` and `libfoo.a`.
     Library(String),
+    /// `-framework Foo[,suffix]`: `Foo.framework/Foo` in the framework
+    /// search paths. Mach-O links only.
+    Framework {
+        /// The framework name.
+        name: String,
+        /// The optional suffix (`-framework Foo,_debug`).
+        suffix: Option<String>,
+    },
     /// `-l:libfoo.a`: search for that exact file name.
     LibraryExact(String),
     /// `-T script`, or a script named as an input file.
