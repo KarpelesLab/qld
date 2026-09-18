@@ -273,7 +273,9 @@ them into a universal binary. Per architecture:
 ### ELF class and byte order
 
 The ELF pipeline is generic over `F: ElfFormat` (class and byte order).
-`elf::link` picks the format once from the target, so ELF64 and ELF32
+`elf::link` picks the format once from the target (`elf::target` infers it
+from the first input that names one: ELF headers, GCC LTO objects, or an LLVM
+bitcode triple), so ELF64 and ELF32
 little-endian are two monomorphized copies of the pipeline. Run-time
 dispatch on the format in readers cost 5.8% on the clang link, and
 target-only checks inside the hottest relocation code cost up to 8%, so

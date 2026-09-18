@@ -48,6 +48,9 @@ jobs:
           sudo ln -sf /usr/bin/loongarch64-linux-gnu-gcc-14 /usr/local/bin/loongarch64-linux-gnu-gcc
           sudo ln -sf /usr/bin/loongarch64-linux-gnu-g++-14 /usr/local/bin/loongarch64-linux-gnu-g++
       - run: cargo test --all-features --test fixtures -- --ignored --nocapture
+      # target inference from GCC LTO objects and LLVM bitcode (LLVMgold.so)
+      - run: sudo apt-get install -y clang llvm-18-linker-tools
+      - run: cargo test --all-features --test elf_target -- --nocapture
 
   i386:
     name: i386 links compared with GNU ld

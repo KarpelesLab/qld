@@ -493,6 +493,14 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   as in GNU ld (lld does neither).
 - Inputs for another machine, class or byte order are rejected with GNU's
   "is incompatible with" wording.
+- Without `-m`, the target is that of the first input that names one (ELF
+  objects, shared libraries, GCC LTO objects, LLVM bitcode), else the host's,
+  as GNU ld's default emulation would be.
+- `-r` and `-b binary` are not implemented for 32-bit ELF yet (clear errors).
+  `-b binary` wrappers are machine-neutral (`EM_NONE`) on the other targets.
+- GNU ld 2.46 adds the `GLIBC_ABI_GNU_TLS` / `GLIBC_ABI_GNU2_TLS` version
+  dependencies (`--gnu-tls-tag`, `--gnu2-tls-tag`); qld adds neither yet, on
+  x86-64 as well.
 
 ## PowerPC64 LE
 
