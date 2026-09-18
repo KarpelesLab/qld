@@ -250,10 +250,12 @@ impl Synth {
                 .collect()
         };
         let dynamic = mode.dynamic;
+        let uses_plt_got = self.arch.uses_plt_got();
         // A preemptible function with both a GOT entry and calls goes
         // through `.plt.got`, unless its PLT entry is its canonical address.
         let plt_got = move |f: SymbolFlags| {
             dynamic
+                && uses_plt_got
                 && f.contains(SymbolFlags::NEEDS_PLT | SymbolFlags::NEEDS_GOT)
                 && !f.contains(SymbolFlags::NEEDS_CANONICAL_PLT)
         };
@@ -445,6 +447,10 @@ impl Synth {
             add(SlotReloc::Module(DynKind::DtpMod));
         }
         other = other.saturating_add(u64_len(self.copies.len()));
+        // IFUNC slots whose IRELATIVE relocations go to `.rela.dyn`.
+        if !self.arch.irelative_in_rela_plt() {
+            other = other.saturating_add(u64_len(self.iplt.len()));
+        }
         (relative, other)
     }
 
@@ -483,7 +489,9 @@ impl Synth {
     /// Number of words the GOT occupies.
     #[must_use]
     pub fn got_words(&self) -> u64 {
-        u64_len(self.got.len())
+        self.arch
+            .got_header_words()
+            .saturating_add(u64_len(self.got.len()))
             .saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2))
             .saturating_add(u64_len(self.gottpoff.len()))
             .saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2))
@@ -493,12 +501,13 @@ impl Synth {
     /// The first GOT word of each kind of entry.
     #[must_use]
     pub fn got_base_word(&self, kind: GotKind) -> u64 {
-        let address = u64_len(self.got.len());
+        let header = self.arch.got_header_words();
+        let address = header.saturating_add(u64_len(self.got.len()));
         let tlsgd = address.saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2));
         let tpoff = tlsgd.saturating_add(u64_len(self.gottpoff.len()));
         let desc = tpoff.saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2));
         match kind {
-            GotKind::Address => 0,
+            GotKind::Address => header,
             GotKind::TlsGd => address,
             GotKind::TpOff => tlsgd,
             GotKind::TlsDesc => tpoff,
@@ -575,7 +584,9 @@ impl Synth {
                 }
             }
             Synthetic::RelaPlt => {
-                let entries = if dynamic {
+                let entries = if dynamic && !self.arch.irelative_in_rela_plt() {
+                    u64_len(self.plt.len())
+                } else if dynamic {
                     self.plt_entries()
                 } else {
                     count(&self.iplt)
@@ -607,11 +618,12 @@ impl Synth {
                 }
             }
             Synthetic::PltSec => {
-                // Only x86-64 IBT splits the PLT in two.
-                if dynamic && self.ibt && self.arch == Arch::X86_64 {
+                // x86-64 IBT splits the PLT in two, and PowerPC64 calls
+                // through stubs there.
+                if dynamic && self.arch.has_plt_sec(self.ibt) {
                     (
                         self.plt_entries()
-                            .saturating_mul(self.arch.plt_entry_size(self.plt_flags())),
+                            .saturating_mul(self.arch.plt_sec_entry_size(self.plt_flags())),
                         self.arch.plt_align(),
                     )
                 } else {

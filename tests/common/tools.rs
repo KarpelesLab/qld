@@ -180,6 +180,8 @@ impl Triple {
     pub fn qemu_arch(&self) -> &str {
         match self.arch.as_str() {
             "i686" => "i386",
+            "powerpc64le" => "ppc64le",
+            "powerpc64" => "ppc64",
             a if a.starts_with("armv") => "arm",
             a => a,
         }

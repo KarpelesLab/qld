@@ -30,6 +30,7 @@ macro_rules! relocation_types {
 
 pub mod aarch64;
 pub mod i386;
+pub mod ppc64;
 pub mod riscv;
 pub mod x86_64;
 
@@ -42,6 +43,7 @@ pub fn reloc_name(e_machine: u16, r_type: u32) -> Option<&'static str> {
         EM_AARCH64 => aarch64::reloc_name(r_type),
         EM_RISCV => riscv::reloc_name(r_type),
         EM_386 | EM_IAMCU => i386::reloc_name(r_type),
+        EM_PPC64 => ppc64::reloc_name(r_type),
         _ => None,
     }
 }

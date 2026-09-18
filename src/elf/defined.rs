@@ -105,6 +105,8 @@ const FIXED: &[(&str, Value)] = &[
     ("__fini_array_end", Value::SectionEnd(".fini_array")),
     ("__tdata_start", Value::SectionStart(".tdata")),
     ("_GLOBAL_OFFSET_TABLE_", Value::GotBase),
+    // PowerPC64's TOC pointer, which takes the place of the GOT base.
+    (".TOC.", Value::GotBase),
     ("__rela_iplt_start", Value::RelaIpltStart),
     ("__rela_iplt_end", Value::RelaIpltEnd),
     ("_DYNAMIC", Value::Dynamic),

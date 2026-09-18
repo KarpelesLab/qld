@@ -200,6 +200,9 @@ impl Tls {
     /// alignment ([`Arch::tcb_size`]).
     #[must_use]
     pub fn tp(&self, arch: Arch) -> u64 {
+        if let Some(offset) = arch.tp_past_tls_start() {
+            return self.start.wrapping_add(offset);
+        }
         let align = self.align.max(1);
         if arch.tls_variant1() {
             let tcb = arch
