@@ -39,11 +39,28 @@ jobs:
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             gcc-14-loongarch64-linux-gnu g++-14-loongarch64-linux-gnu \
             binutils-loongarch64-linux-gnu libc6-dev-loong64-cross \
+            gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu \
+            binutils-powerpc64le-linux-gnu \
             qemu-user-static
           # noble ships only the versioned LoongArch compiler names
           sudo ln -sf /usr/bin/loongarch64-linux-gnu-gcc-14 /usr/local/bin/loongarch64-linux-gnu-gcc
           sudo ln -sf /usr/bin/loongarch64-linux-gnu-g++-14 /usr/local/bin/loongarch64-linux-gnu-g++
       - run: cargo test --all-features --test fixtures -- --ignored --nocapture
+
+  ppc64le:
+    name: PowerPC64 LE links compared with lld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+      QLD_TEST_LLD: ld.lld
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+      - run: cargo test --all-features --test ppc64 -- --nocapture
 
   loongarch64:
     name: LoongArch64 links compared with lld

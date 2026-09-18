@@ -126,15 +126,15 @@ fn link_argv_via(driver: &str, dir: &Path, args: &[&str]) -> Option<Vec<String>>
         .lines()
         .rfind(|line| line.contains("collect2") || line.contains("/ld"))?;
     let mut argv = Vec::new();
-    for word in split_words(line) {
-        if word.starts_with("-plugin") || word.contains("collect2") || word.contains("liblto") {
+    // The first word is the program name. Dropping it before filtering
+    // matters: without `-fno-lto` the next word is `-plugin`, and removing
+    // "the first word" after filtering would drop `-m` on toolchains that
+    // pass no `--sysroot`.
+    for word in split_words(line).into_iter().skip(1) {
+        if word.starts_with("-plugin") || word.contains("liblto") {
             continue;
         }
         argv.push(word);
-    }
-    // The first word is the program name.
-    if !argv.is_empty() {
-        argv.remove(0);
     }
     Some(argv)
 }

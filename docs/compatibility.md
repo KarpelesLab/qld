@@ -375,6 +375,24 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - **Data exports of a DLL linked directly** are recognized from the section's
   code/execute flags; GNU ld looks at the section name.
 
+## AArch64 ELF
+
+- **ADRP relaxations** (ADRP+LDR→ADRP+ADD, ADRP+ADD→NOP+ADR) are on by
+  default, as in lld. GNU ld does neither; `--no-relax` gives GNU ld's code.
+- **Cortex-A53 843419** is always fixed through a veneer, as in lld. GNU ld
+  rewrites the ADRP to ADR when the target is in range. The
+  `--fix-cortex-a53-843419=adr|adrp|full` values are not accepted.
+- **Cortex-A53 835769** uses GNU ld's detection and veneers (lld has no fix).
+- Both erratum options are refused when a linker script drives layout.
+- **`.plt.got` entries** are never authenticated: they jump through GOT
+  slots filled by `GLOB_DAT`, which nothing signs.
+- **`-z pac-plt`** sets no PAC property and gives no warning, as GNU ld does
+  (lld does both).
+- **TLSDESC** is bound eagerly: there is no `DT_TLSDESC_PLT` or
+  `DT_TLSDESC_GOT`.
+- **BTI:** executables' PLT entries start with `bti c` when the output has the
+  BTI property.
+
 ## PE/COFF: i386 and ARM64
 
 - **SafeSEH** is a qld addition; GNU ld has none. It follows link.exe:
@@ -391,6 +409,12 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   names `_StdFunc`, where GNU writes `_StdFunc@8`.
 - **Pseudo-relocations** are also accepted for PC-relative x86 references
   (REL32 auto-import).
+- **Debug sections** follow GNU:
+  - `.stab` and `.debug_*` sections come after `.reloc`, in the order GNU's
+    PE scripts give;
+  - no base relocations are written for addresses in debug sections;
+  - `IMAGE_FILE_DEBUG_STRIPPED` is set only when the image has no debug
+    sections.
 - **Linking:**
   - archive members for another machine are skipped;
   - x86 code padding is `nop`;
@@ -428,11 +452,24 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   timestamps.
 - `-order_file` accepts ld64's syntax: one symbol per line, optional
   `arch:` and `object.o:` prefixes, `#` comments.
-- Known differences: no Objective-C relative method lists; unused CIEs in
-  `__eh_frame` are dropped; legacy (`LC_DYLD_INFO_ONLY`) output binds every
-  import at load time and does not use weak binding. Undefined symbols are
-  reported before dead stripping, where ld64 reports only those reached from
-  live code.
+- Known differences:
+  - unused CIEs in `__eh_frame` are dropped;
+  - legacy (`LC_DYLD_INFO_ONLY`) output binds every non-lazy import at load
+    time, and it does write the weak binding stream.
+- With `-dead_strip`, only undefined symbols that live code reaches are
+  errors, as in ld64. Symbols named on the command line are always reported:
+  the entry point, `-u`, and `-alias` targets.
+- Objective-C:
+  - Method lists are relative by default from macOS 11 / iOS 14, as in ld64
+    and lld.
+  - Category merging needs `-objc_category_merging`; it is off by default,
+    as in lld.
+- The compiler optimization level that clang passes to a linker named with
+  `-fuse-ld=<path>` (`-O`, `-O<n>`, `-Os`, `-Oz`, `-Ofast`) is accepted and
+  ignored. So are obsolete ld64 options: `-single_module`, `-prebind`,
+  `-noprebind`, `-seglinkedit`.
+- Relative `-L` and `-F` paths are not looked up under `-syslibroot`; only
+  absolute ones are, as in ld64.
 - Weak definitions marked "can be hidden" in every object are hidden, as in
   ld64 and lld.
 - `-r` keeps `.subsections_via_symbols`, compact unwind, `__eh_frame`,
@@ -442,8 +479,8 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   and `N_INDR` symbols are rejected. ld64.lld has no `-r`; qld's output is
   compared with Apple's `ld -r` in CI.
 - `-init` is an error unless `-dylib`, as in ld64 (ld64.lld ignores it).
-- Not supported yet, rejected with an error: `-force_flat_namespace`,
-  `-alias_list` and arm64e.
+- `-force_flat_namespace` (executables only) and `-alias_list` are
+  supported. arm64e is not supported yet and is rejected with an error.
 - **LTO** goes through the libLTO C API, as ld64 does, not through the GNU
   plugin API.
   - **Finding libLTO:** `-lto_library`, then the libLTO next to the clang

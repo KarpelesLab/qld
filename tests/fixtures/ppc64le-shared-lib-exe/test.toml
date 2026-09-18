@@ -1,0 +1,34 @@
+# M4: a shared library and an executable linked against it, on PowerPC64
+# LE. Covers PLT calls in both directions (the library calls back into the
+# executable), the library's data reached through TOC entries, and a TLS
+# variable of the library: general-dynamic in the library, initial-exec in
+# the executable.
+description = "PowerPC64 LE shared library plus executable, with a callback and library TLS"
+compile = ["cc -O2 -fPIC -c greet.c", "cc -O2 -fPIE -c main.c"]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libgreet.so -o libgreet.so greet.o",
+  "-o out main.o -L. -lgreet -Wl,-rpath,$ORIGIN -rdynamic",
+]
+run = "./out"
+expect.stdout = """
+hello from libgreet (tls=5)
+callback: 10
+greet_calls=1 lib_tls=5
+"""
+expect.readelf = [
+  "PowerPC64",
+  "Shared library: [libgreet.so]",
+  "$ORIGIN",
+  "exe_callback_qld",
+  "R_PPC64_JMP_SLOT",
+  "R_PPC64_TPREL64",
+]
+expect.readelf_files."libgreet.so" = [
+  "DYN (",
+  "Library soname: [libgreet.so]",
+  "R_PPC64_DTPMOD64",
+  "greet_calls_qld",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true

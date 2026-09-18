@@ -277,7 +277,11 @@ fn pair_before(data: &[u8], offset: u64, second: fn(u32) -> bool) -> bool {
 /// dynamic-only types, the stack-machine relocations of object ABI v0, the
 /// 24-bit label arithmetic lld also rejects, and the LA32 `pcaddu12i`
 /// forms.
+///
+/// Kept out of line so that [`super::Arch::classify`] stays small enough
+/// to inline into the other architectures' relocation loops.
 #[allow(clippy::too_many_lines)]
+#[inline(never)]
 pub fn classify(
     r_type: u32,
     addend: i64,

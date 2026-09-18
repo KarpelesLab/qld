@@ -324,8 +324,15 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
     // IMAGE_FILE_HEADER.
     let count = u16::try_from(layout.sections.len())
         .map_err(|_| Error::Limit("too many output sections".into()))?;
-    let mut characteristics =
-        IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LINE_NUMS_STRIPPED | IMAGE_FILE_DEBUG_STRIPPED;
+    let mut characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LINE_NUMS_STRIPPED;
+    // As GNU ld: "debug stripped" unless a debugging section is written.
+    if !layout
+        .sections
+        .iter()
+        .any(|section| super::layout::is_debug_section(&section.name))
+    {
+        characteristics |= IMAGE_FILE_DEBUG_STRIPPED;
+    }
     if input.symbols.is_empty() {
         characteristics |= IMAGE_FILE_LOCAL_SYMS_STRIPPED;
     }
