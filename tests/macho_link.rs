@@ -1896,6 +1896,55 @@ fn relocatable_variants() {
             assert_eq!(run(&exe).unwrap(), "1 12345678 1122334455667788\n");
         }
 
+        // DWARF unwind information: `__eh_frame` rebuilt, its pointers
+        // PC-relative without relocations (arm64 inputs have them).
+        let main = compile("relocatable_variants", "dwarf_unwind.cpp", arch, &[]);
+        let asm = compile(
+            "relocatable_variants",
+            &format!("dwarf-{arch}.s"),
+            arch,
+            &[],
+        );
+        let merged = dir.join(format!("dwarf-{arch}.o"));
+        let bytes = link_relocatable(arch, &[&main, &asm], &merged);
+        check_object(&bytes, true);
+        assert!(section_names(&bytes).iter().any(|n| n == "__eh_frame"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("dwarf-{arch}"));
+        let linked = link_and_compare(&args, &exe);
+        let function = symbol_address(&linked, "_call_through").unwrap();
+        if let Ok(frames) = Command::new(tool("dwarfdump"))
+            .arg("--eh-frame")
+            .arg(&exe)
+            .output()
+            && frames.status.success()
+        {
+            let frames = String::from_utf8_lossy(&frames.stdout);
+            let wanted = format!("pc={function:08x}...");
+            assert!(
+                frames.contains(&wanted),
+                "{arch}: no FDE for {wanted}:\n{frames}"
+            );
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "dwarf 7\n");
+            // Apple's linker takes the rebuilt `__eh_frame` too.
+            let apple = dir.join(format!("dwarf-apple-{arch}"));
+            let status = Command::new("clang++")
+                .args(["-arch", arch])
+                .arg(&merged)
+                .arg("-o")
+                .arg(&apple)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "{arch}: Apple's linker rejects the object"
+            );
+            assert_eq!(run(&apple).unwrap(), "dwarf 7\n");
+        }
+
         // Private externs, and debug information.
         let source = dir.join("hidden.c");
         std::fs::write(
