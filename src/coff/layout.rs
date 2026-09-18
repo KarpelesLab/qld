@@ -27,9 +27,13 @@
 
 #![deny(clippy::arithmetic_side_effects)]
 
+use std::collections::BTreeMap;
+
 use crate::error::{Error, Result};
 
+use super::arm64::Thunks;
 use super::inputs::CoffInput;
+use super::machine::Machine;
 use super::options::PeOptions;
 use super::read::consts::{
     IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_CNT_UNINITIALIZED_DATA,
@@ -145,6 +149,9 @@ enum Step {
     Place(Rule),
     Insert(&'static [u8], Marker),
     Align(&'static [u8], u32),
+    /// An alignment only the PE32+ scripts (`i386pep`, `arm64pe`) have;
+    /// `i386pe` packs these places to 4 bytes.
+    AlignWide(&'static [u8], u32),
 }
 
 /// The recipe, in output order. Output sections appear in the order their
@@ -161,7 +168,7 @@ const RECIPE: &[Step] = &[
     )),
     Step::Place(rule(b".text", Match::Exact(b".glue_7t"), Sort::None)),
     Step::Place(rule(b".text", Match::Exact(b".glue_7"), Sort::None)),
-    Step::Align(b".text", 8),
+    Step::AlignWide(b".text", 8),
     Step::Place(rule(b".text", Match::Exact(b".fini"), Sort::None)),
     Step::Place(rule(b".text", Match::Exact(b".gcc_exc"), Sort::None)),
     Step::Place(rule(
@@ -205,7 +212,7 @@ const RECIPE: &[Step] = &[
         Sort::None,
     )),
     Step::Insert(b".rdata", Marker::PseudoEnd),
-    Step::Align(b".rdata", 8),
+    Step::AlignWide(b".rdata", 8),
     Step::Insert(b".rdata", Marker::CtorHead),
     Step::Place(rule(b".rdata", Match::Exact(b".ctors"), Sort::None)),
     Step::Place(rule(b".rdata", Match::Exact(b".ctor"), Sort::None)),
@@ -249,7 +256,7 @@ const RECIPE: &[Step] = &[
     Step::Place(rule(b".idata", Match::Exact(b".idata$2"), Sort::ByFile)),
     Step::Place(rule(b".idata", Match::Exact(b".idata$3"), Sort::ByFile)),
     Step::Insert(b".idata", Marker::IdataNull),
-    Step::Align(b".idata", 8),
+    Step::AlignWide(b".idata", 8),
     Step::Place(rule(b".idata", Match::Exact(b".idata$4"), Sort::ByFile)),
     Step::Insert(b".idata", Marker::IatStart),
     Step::Place(rule(b".idata", Match::Exact(b".idata$5"), Sort::ByFile)),
@@ -281,6 +288,14 @@ pub enum Piece {
     Fill(Vec<u8>),
     /// Zero bytes (padding, `.bss`, common symbols).
     Zero,
+    /// The ARM64 range-extension thunks for the branches of an input
+    /// section, placed right after it.
+    Thunks {
+        /// Index into the input file list.
+        file: u32,
+        /// The 1-based COFF section number.
+        section: u32,
+    },
 }
 
 /// A placed piece of an output section.
@@ -371,6 +386,12 @@ pub struct Layout {
     pub file_size: u64,
     /// Offset of each marker in its output section, by [`Marker`].
     pub markers: Vec<(Marker, u32, u32)>,
+    /// The range-extension thunks laid out, as planned.
+    pub thunks: Thunks,
+    /// RVA of each thunk block, by `(file, section)`.
+    pub thunk_rvas: BTreeMap<(u32, u32), u32>,
+    /// The machine the image is for.
+    pub machine: Machine,
 }
 
 impl Layout {
@@ -470,6 +491,9 @@ pub struct LayoutInput<'i, 'a> {
     /// Bytes to reserve for the MinGW runtime pseudo-relocation list, which
     /// sits between the `__RUNTIME_PSEUDO_RELOC_LIST__` bounds in `.rdata`.
     pub pseudo_reloc_size: u32,
+    /// ARM64 range-extension thunks, each block placed after the input
+    /// section whose branches need it.
+    pub thunks: &'i Thunks,
 }
 
 /// Assigns every live input section to an output section and gives each one
@@ -488,7 +512,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
     for (index, step) in RECIPE.iter().enumerate() {
         let name = match step {
             Step::Place(rule) => rule.output,
-            Step::Insert(name, _) | Step::Align(name, _) => name,
+            Step::Insert(name, _) | Step::Align(name, _) | Step::AlignWide(name, _) => name,
         };
         let rank = u32::try_from(index).unwrap_or(0);
         step_output.push(build.section(name, rank));
@@ -514,7 +538,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
             let name: &[u8] = &section.name;
             let step = RECIPE.iter().position(|step| match step {
                 Step::Place(rule) => rule.pattern.matches(name),
-                Step::Insert(..) | Step::Align(..) => false,
+                Step::Insert(..) | Step::Align(..) | Step::AlignWide(..) => false,
             });
             let (at, sort, step_index) = match step {
                 Some(step) => {
@@ -575,6 +599,8 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
     }
 
     // Order the contributions of each output section and place them.
+    let pointer = options.target().pointer_size();
+    let wide = !options.target().is_pe32();
     let mut markers = Vec::new();
     for at in 0..build.sections.len() {
         let mut list = std::mem::take(&mut build.order[at]);
@@ -591,8 +617,11 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                 Step::Align(step_name, step_align) if *step_name == name.as_slice() => {
                     offset = align_up32(offset, *step_align);
                 }
+                Step::AlignWide(step_name, step_align) if wide && *step_name == name.as_slice() => {
+                    offset = align_up32(offset, *step_align);
+                }
                 Step::Insert(step_name, marker) if *step_name == name.as_slice() => {
-                    let bytes = marker_bytes(*marker);
+                    let bytes = marker_bytes(*marker, pointer);
                     markers.push((*marker, u32::try_from(at).unwrap_or(u32::MAX), offset));
                     if !bytes.is_empty() {
                         let size = u32::try_from(bytes.len()).unwrap_or(0);
@@ -622,15 +651,15 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                             break;
                         }
                         cursor = cursor.saturating_add(1);
-                        offset = push_input(&mut chunks, input.files, placed, offset);
+                        offset = push_input(&mut chunks, input, placed, offset);
                     }
                 }
-                Step::Align(..) | Step::Insert(..) => {}
+                Step::Align(..) | Step::AlignWide(..) | Step::Insert(..) => {}
             }
         }
         while let Some(placed) = list.get(cursor).copied() {
             cursor = cursor.saturating_add(1);
-            offset = push_input(&mut chunks, input.files, placed, offset);
+            offset = push_input(&mut chunks, input, placed, offset);
         }
         if name == b".bss" {
             for common in input.commons {
@@ -685,7 +714,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
         .collect();
 
     // Headers, then the sections, at the section and file alignments.
-    let header_size = u64::try_from(super::write::header_size(sections.len()))
+    let header_size = u64::try_from(super::write::header_size(sections.len(), options.target()))
         .map_err(|_| Error::Limit("too many output sections".into()))?;
     let file_alignment = u64::from(options.file_alignment);
     let section_alignment = options.section_alignment;
@@ -710,6 +739,20 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
             .checked_add(section.virtual_size)
             .map(|end| align_up32(end, section_alignment))
             .ok_or_else(|| Error::Limit("image larger than 4 GiB".into()))?;
+    }
+
+    // Record where the thunk blocks ended up.
+    let mut thunk_rvas = BTreeMap::new();
+    for section in &sections {
+        for chunk in &section.chunks {
+            if let Piece::Thunks {
+                file,
+                section: number,
+            } = chunk.piece
+            {
+                thunk_rvas.insert((file, number), section.rva.wrapping_add(chunk.offset));
+            }
+        }
     }
 
     // Record where every input section ended up.
@@ -744,6 +787,9 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
         rvas,
         outputs: placements,
         markers,
+        thunks: input.thunks.clone(),
+        thunk_rvas,
+        machine: options.target(),
     })
 }
 
@@ -786,15 +832,16 @@ impl Builder {
     }
 }
 
-/// Appends an input section's chunk to `chunks`, aligned, and returns the
-/// new offset.
+/// Appends an input section's chunk to `chunks`, aligned, followed by its
+/// thunk block if it has one, and returns the new offset.
 fn push_input(
     chunks: &mut Vec<Chunk>,
-    files: &[CoffInput<'_>],
+    input: &LayoutInput<'_, '_>,
     placed: Placed,
     offset: u32,
 ) -> u32 {
-    let Some(section) = files
+    let Some(section) = input
+        .files
         .get(placed.file as usize)
         .and_then(CoffInput::object)
         .and_then(|parsed| parsed.section(placed.section))
@@ -810,7 +857,21 @@ fn push_input(
             section: placed.section,
         },
     });
-    offset.saturating_add(section.size)
+    let end = offset.saturating_add(section.size);
+    let thunks = input.thunks.block_size(placed.file, placed.section);
+    if thunks == 0 {
+        return end;
+    }
+    let at = align_up32(end, 4);
+    chunks.push(Chunk {
+        offset: at,
+        size: thunks,
+        piece: Piece::Thunks {
+            file: placed.file,
+            section: placed.section,
+        },
+    });
+    at.saturating_add(thunks)
 }
 
 /// Sorts the contributions of one output section: by recipe step, then by
@@ -846,16 +907,14 @@ fn orphan_name(name: &[u8]) -> &[u8] {
     }
 }
 
-/// The bytes a marker inserts.
-fn marker_bytes(marker: Marker) -> Vec<u8> {
+/// The bytes a marker inserts, for an image whose pointers are `pointer`
+/// bytes wide: the constructor lists hold one pointer-sized `-1` head and
+/// a null tail (`LONG (-1); LONG (-1);` in `i386pep`, `LONG (-1);` in
+/// `i386pe`).
+fn marker_bytes(marker: Marker, pointer: u32) -> Vec<u8> {
     match marker {
-        Marker::CtorHead | Marker::DtorHead => {
-            let mut bytes = Vec::with_capacity(8);
-            bytes.extend_from_slice(&(-1i32).to_le_bytes());
-            bytes.extend_from_slice(&(-1i32).to_le_bytes());
-            bytes
-        }
-        Marker::CtorTail | Marker::DtorTail => vec![0u8; 8],
+        Marker::CtorHead | Marker::DtorHead => vec![0xffu8; pointer as usize],
+        Marker::CtorTail | Marker::DtorTail => vec![0u8; pointer as usize],
         // A null `IMAGE_IMPORT_DESCRIPTOR` ends the import directory.
         Marker::IdataNull => vec![0u8; 20],
         // Position-only markers for linker-defined symbols.

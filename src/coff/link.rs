@@ -29,6 +29,7 @@ use crate::ids::{FileId, SymbolId};
 use crate::input::FileTable;
 use crate::symbols::{DefinitionKind, SymbolFlags, SymbolName, SymbolTable, resolve_symbols_with};
 
+use super::arm64::Thunks;
 use super::defined;
 use super::directives::{Directives, ExportRequest};
 use super::edata;
@@ -47,6 +48,10 @@ use super::write::{self, WriteInput};
 
 /// Largest alignment a common symbol gets without `-aligncomm:`.
 const MAX_COMMON_ALIGN: u32 = 16;
+
+/// How many times the image is laid out before the driver gives up on the
+/// generated sizes and thunks settling. lld allows ten thunk passes.
+const MAX_LAYOUT_PASSES: u32 = 12;
 
 /// Links a PE/COFF output described by `options`.
 ///
@@ -214,10 +219,14 @@ fn link_once<'a>(
     }
 
     // Lay out, relocate, then lay out again with the real `.reloc` and
-    // pseudo-relocation sizes. Both only grow the end of a section, so the
-    // pass converges in two rounds.
+    // pseudo-relocation sizes, and with the ARM64 range-extension thunks the
+    // relocation pass asked for. The two sizes only grow the end of a
+    // section, so they settle in two rounds; thunks move code, and may push
+    // another branch out of range, so they take as many rounds as it takes
+    // for no branch to ask for a new one.
     let mut reloc_size = 0u32;
     let mut pseudo_size = 0u32;
+    let mut thunks = Thunks::default();
     let mut attempt = 0u32;
     loop {
         let mut synthetic: Vec<(Vec<u8>, u32, u32)> = Vec::new();
@@ -233,6 +242,7 @@ fn link_once<'a>(
             commons: &commons,
             synthetic: &synthetic,
             pseudo_reloc_size: pseudo_size,
+            thunks: &thunks,
         })?;
         let linker = defined::values(&plan, &symbols, pe.section_alignment);
         let addresses = Addresses {
@@ -247,12 +257,14 @@ fn link_once<'a>(
             auto_imported: auto_imported.clone(),
         };
         let mut generated: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // Export problems are reported once, from the final pass.
+        let export_diagnostics = crate::diag::Collect::new();
         if export_size > 0
             && let Some(section) = plan.by_name(b".edata")
         {
             generated.push((
                 b".edata".to_vec(),
-                exports.render(&addresses, section.rva, diagnostics),
+                exports.render(&addresses, section.rva, &export_diagnostics),
             ));
         }
         let (contents, applied) = write::render(&addresses, &generated);
@@ -265,8 +277,9 @@ fn link_once<'a>(
         let wanted = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
         let wanted_pseudo = u32::try_from(pseudo.len()).unwrap_or(u32::MAX);
         attempt = attempt.saturating_add(1);
-        if (emit_relocs && wanted != reloc_size) || wanted_pseudo != pseudo_size {
-            if attempt > 4 {
+        let more_thunks = thunks.add(&applied.thunk_requests);
+        if (emit_relocs && wanted != reloc_size) || wanted_pseudo != pseudo_size || more_thunks {
+            if attempt > MAX_LAYOUT_PASSES {
                 return Err(Error::Internal(
                     "the generated section sizes did not converge".into(),
                 ));
@@ -276,6 +289,9 @@ fn link_once<'a>(
             continue;
         }
 
+        for diagnostic in export_diagnostics.take_sorted() {
+            diagnostics.emit(diagnostic);
+        }
         let errors = write::report(&applied.errors, diagnostics);
         if errors > 0 && !options.noinhibit_exec {
             return Err(Error::Reported { errors });
@@ -311,7 +327,8 @@ fn link_once<'a>(
         let subsystem = subsystem(&addresses, pe);
         let entry = entry_rva(&addresses, options, pe, subsystem, diagnostics);
         let mut directories = write::section_directories(&plan);
-        write::symbol_directories(&addresses, &mut directories);
+        write::symbol_directories(&addresses, pe.target(), &mut directories);
+        write::load_config_size(&plan, pe, subsystem, &contents, &mut directories);
         write::write(
             &WriteInput {
                 addresses: &addresses,
@@ -366,10 +383,19 @@ fn check_supported(options: &LinkOptions, pe: &PeOptions) -> Result<()> {
     if options.kind == OutputKind::Relocatable {
         return unimplemented("-r");
     }
-    if pe.machine != super::read::consts::IMAGE_FILE_MACHINE_AMD64 {
-        return Err(Error::Unimplemented(format!(
-            "PE output for machine {:#x} (roadmap M7: x86-64 first)",
-            pe.machine
+    let machine = super::machine::Machine::from_coff(pe.machine)?;
+    // `--oformat` names a BFD target, which must be this machine's.
+    if let Some(format) = &options.output_format
+        && !machine.bfd_names().contains(&format.as_str())
+    {
+        return Err(Error::Option(format!(
+            "--oformat {format} does not match the {} emulation (expected {})",
+            match machine {
+                super::machine::Machine::Amd64 => "i386pep",
+                super::machine::Machine::I386 => "i386pe",
+                super::machine::Machine::Arm64 => "arm64pe",
+            },
+            machine.bfd_names().join(" or ")
         )));
     }
     if options.gc_sections {
@@ -406,17 +432,15 @@ fn with_libraries(options: &LinkOptions, libraries: &[Vec<u8>]) -> LinkOptions {
 }
 
 /// The symbol the link starts from, used as a resolution root.
+///
+/// `-e` names a COFF symbol as written (`-e _start` on i386); the default
+/// is a C name, decorated for the machine.
 fn entry_symbol(options: &LinkOptions, pe: &PeOptions) -> Vec<u8> {
     if let Some(entry) = &options.entry {
         return entry.as_bytes().to_vec();
     }
-    if pe.dll {
-        return b"DllMainCRTStartup".to_vec();
-    }
-    match pe.subsystem {
-        Some(IMAGE_SUBSYSTEM_WINDOWS_GUI) => b"WinMainCRTStartup".to_vec(),
-        _ => b"mainCRTStartup".to_vec(),
-    }
+    let gui = pe.subsystem == Some(IMAGE_SUBSYSTEM_WINDOWS_GUI);
+    pe.target().default_entry(pe.dll, gui)
 }
 
 /// The subsystem of the image: `--subsystem` if given, otherwise inferred
@@ -425,8 +449,13 @@ fn subsystem(addresses: &Addresses<'_, '_>, pe: &PeOptions) -> u16 {
     if let Some(subsystem) = pe.subsystem {
         return subsystem;
     }
-    let defined = |name: &[u8]| addresses.by_name(name).is_some();
-    let gui = defined(b"WinMain") || defined(b"wWinMain");
+    let machine = pe.target();
+    let defined = |name: &[u8]| addresses.by_name(&machine.decorate(name)).is_some();
+    // `WinMain` is `__stdcall`: `_WinMain@16` on i386.
+    let gui = defined(b"WinMain")
+        || defined(b"wWinMain")
+        || defined(b"WinMain@16")
+        || defined(b"wWinMain@16");
     let console = defined(b"main") || defined(b"wmain");
     if gui && !console {
         IMAGE_SUBSYSTEM_WINDOWS_GUI
@@ -443,16 +472,17 @@ fn entry_rva(
     subsystem: u16,
     diagnostics: &dyn DiagnosticSink,
 ) -> u32 {
+    let machine = pe.target();
     let mut candidates: Vec<Vec<u8>> = Vec::new();
     if let Some(entry) = &options.entry {
         candidates.push(entry.as_bytes().to_vec());
     } else if pe.dll {
-        candidates.push(b"DllMainCRTStartup".to_vec());
+        candidates.push(machine.default_entry(true, false));
     } else if subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI {
-        candidates.push(b"WinMainCRTStartup".to_vec());
-        candidates.push(b"mainCRTStartup".to_vec());
+        candidates.push(machine.default_entry(false, true));
+        candidates.push(machine.default_entry(false, false));
     } else {
-        candidates.push(b"mainCRTStartup".to_vec());
+        candidates.push(machine.default_entry(false, false));
     }
     for name in &candidates {
         if let Some(Value::Address { rva, .. }) = addresses.by_name(name) {

@@ -10,6 +10,7 @@ use crate::output::{FileMode, OutputFile, OutputOptions};
 
 use super::inputs::CoffInput;
 use super::layout::{Layout, Piece, align_up64};
+use super::machine::Machine;
 use super::options::PeOptions;
 use super::read::consts::{
     IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_DIRECTORY_ENTRY_EXPORT,
@@ -19,9 +20,10 @@ use super::read::consts::{
     IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLLCHARACTERISTICS_NO_BIND,
     IMAGE_DLLCHARACTERISTICS_NO_ISOLATION, IMAGE_DLLCHARACTERISTICS_NO_SEH,
     IMAGE_DLLCHARACTERISTICS_NX_COMPAT, IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE,
-    IMAGE_DLLCHARACTERISTICS_WDM_DRIVER, IMAGE_FILE_DEBUG_STRIPPED, IMAGE_FILE_DLL,
-    IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE, IMAGE_FILE_LINE_NUMS_STRIPPED,
-    IMAGE_FILE_LOCAL_SYMS_STRIPPED, IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE,
+    IMAGE_DLLCHARACTERISTICS_WDM_DRIVER, IMAGE_FILE_32BIT_MACHINE, IMAGE_FILE_DEBUG_STRIPPED,
+    IMAGE_FILE_DLL, IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE,
+    IMAGE_FILE_LINE_NUMS_STRIPPED, IMAGE_FILE_LOCAL_SYMS_STRIPPED, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
+    IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE,
 };
 use super::reloc::{self, Addresses, Applied};
 
@@ -40,6 +42,8 @@ pub const DOS_STUB: [u8; 128] = [
 
 /// Size of the PE32+ optional header with 16 data directories.
 pub const OPTIONAL_HEADER_SIZE_64: usize = 240;
+/// Size of the PE32 optional header with 16 data directories.
+pub const OPTIONAL_HEADER_SIZE_32: usize = 224;
 /// Number of data directories in the optional header.
 pub const DATA_DIRECTORIES: usize = 16;
 /// Size of one section header.
@@ -49,11 +53,11 @@ const NT_HEADER_SIZE: usize = 24;
 
 /// The unrounded size of everything before the first section.
 #[must_use]
-pub fn header_size(sections: usize) -> usize {
+pub fn header_size(sections: usize, machine: Machine) -> usize {
     DOS_STUB
         .len()
         .saturating_add(NT_HEADER_SIZE)
-        .saturating_add(OPTIONAL_HEADER_SIZE_64)
+        .saturating_add(machine.optional_header_size())
         .saturating_add(sections.saturating_mul(SECTION_HEADER_SIZE))
 }
 
@@ -133,6 +137,22 @@ pub fn render(
             };
             match &chunk.piece {
                 Piece::Zero => {}
+                &Piece::Thunks {
+                    file,
+                    section: number,
+                } => {
+                    let targets = layout
+                        .thunks
+                        .blocks
+                        .get(&(file, number))
+                        .map_or(&[][..], Vec::as_slice);
+                    let rva = section.rva.wrapping_add(chunk.offset);
+                    if let Some(slot) = bytes.get_mut(start..end)
+                        && let Err(problem) = super::arm64::render_block(slot, rva, targets)
+                    {
+                        applied.errors.push(Diagnostic::error(problem));
+                    }
+                }
                 Piece::Fill(fill) => {
                     let len = fill.len().min(chunk.size as usize);
                     if let Some(slot) = bytes.get_mut(start..start.saturating_add(len)) {
@@ -171,29 +191,35 @@ pub fn render(
             }
         }
         if section.name == b".pdata" {
-            sort_pdata(&mut bytes);
+            sort_pdata(&mut bytes, layout.machine);
         }
         contents.push(bytes);
     }
     (contents, applied)
 }
 
-/// Size of an x86-64 `RUNTIME_FUNCTION`.
-const RUNTIME_FUNCTION_SIZE: usize = 12;
-
 /// Sorts the `.pdata` table by `BeginAddress`.
 ///
 /// The Windows unwinder binary-searches the exception table, so its entries
 /// must be in ascending address order. Concatenating each object's `.pdata`
 /// happens to produce that order when the linker keeps the objects' `.text`
-/// order, but qld does not promise that order, so it sorts.
-fn sort_pdata(bytes: &mut [u8]) {
-    let (records, _) = bytes.as_chunks_mut::<RUNTIME_FUNCTION_SIZE>();
-    records.sort_unstable_by_key(|record| {
-        record
-            .first_chunk::<4>()
-            .map_or(0, |begin| u32::from_le_bytes(*begin))
-    });
+/// order, but qld does not promise that order, so it sorts. An x86-64
+/// `RUNTIME_FUNCTION` is 12 bytes; an ARM64 one is 8, its second word
+/// holding either the `.xdata` RVA or packed unwind data.
+fn sort_pdata(bytes: &mut [u8], machine: Machine) {
+    fn by_begin<const N: usize>(bytes: &mut [u8]) {
+        let (records, _) = bytes.as_chunks_mut::<N>();
+        records.sort_by_key(|record| {
+            record
+                .first_chunk::<4>()
+                .map_or(0, |begin| u32::from_le_bytes(*begin))
+        });
+    }
+    match machine.pdata_entry_size() {
+        12 => by_begin::<12>(bytes),
+        8 => by_begin::<8>(bytes),
+        _ => {}
+    }
 }
 
 /// Writes the image described by `input`, with `contents` as the section
@@ -265,6 +291,7 @@ fn checksum_offset() -> usize {
 fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
     let layout = input.addresses.layout;
     let options = input.options;
+    let machine = options.target();
     let mut w = Cursor::new(bytes);
     w.put(&DOS_STUB)?;
     w.put(&IMAGE_NT_SIGNATURE)?;
@@ -283,6 +310,9 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
     if options.dll {
         characteristics |= IMAGE_FILE_DLL;
     }
+    if machine.is_pe32() {
+        characteristics |= IMAGE_FILE_32BIT_MACHINE;
+    }
     w.u16(options.machine)?;
     w.u16(count)?;
     w.u32(0)?; // TimeDateStamp; deterministic unless --insert-timestamp.
@@ -296,10 +326,11 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
         )?;
         w.u32(input.symbols.count)?;
     }
-    w.u16(u16::try_from(OPTIONAL_HEADER_SIZE_64).unwrap_or(0))?;
+    w.u16(u16::try_from(machine.optional_header_size()).unwrap_or(0))?;
     w.u16(characteristics)?;
 
-    // IMAGE_OPTIONAL_HEADER64.
+    // IMAGE_OPTIONAL_HEADER64, or IMAGE_OPTIONAL_HEADER32 which adds
+    // `BaseOfData` and has 32-bit image base, stack and heap fields.
     let sum = |pick: fn(&super::layout::OutSection) -> bool| -> u32 {
         layout
             .sections
@@ -314,7 +345,28 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
         sum(|section| section.characteristics & 0x40 != 0 && section.characteristics & 0x20 == 0);
     let uninitialized = sum(super::layout::OutSection::is_bss);
     let base_of_code = layout.by_name(b".text").map_or(0, |section| section.rva);
-    w.u16(IMAGE_NT_OPTIONAL_HDR64_MAGIC)?;
+    // GNU ld's `BaseOfData` is the first section after the code.
+    let base_of_data = layout
+        .sections
+        .iter()
+        .find(|section| section.characteristics & 0x20 == 0)
+        .map_or(0, |section| section.rva);
+    let pe32 = machine.is_pe32();
+    // A PE32 field that PE32+ widens to 64 bits.
+    let wide = |w: &mut Cursor<'_>, value: u64| -> Result<()> {
+        if pe32 {
+            w.u32(u32::try_from(value).map_err(|_| {
+                Error::Limit(format!("{value:#x} does not fit a PE32 header field"))
+            })?)
+        } else {
+            w.u64(value)
+        }
+    };
+    w.u16(if pe32 {
+        IMAGE_NT_OPTIONAL_HDR32_MAGIC
+    } else {
+        IMAGE_NT_OPTIONAL_HDR64_MAGIC
+    })?;
     w.u8(2)?; // MajorLinkerVersion, as GNU ld reports.
     w.u8(44)?;
     w.u32(code)?;
@@ -322,7 +374,10 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
     w.u32(uninitialized)?;
     w.u32(input.entry)?;
     w.u32(base_of_code)?;
-    w.u64(options.effective_image_base())?;
+    if pe32 {
+        w.u32(base_of_data)?;
+    }
+    wide(&mut w, options.effective_image_base())?;
     w.u32(options.section_alignment)?;
     w.u32(options.file_alignment)?;
     w.u16(options.os_version.major)?;
@@ -337,10 +392,10 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
     w.u32(0)?; // CheckSum, filled in after the image is complete.
     w.u16(input.subsystem)?;
     w.u16(dll_characteristics(options))?;
-    w.u64(options.stack.0)?;
-    w.u64(options.stack.1)?;
-    w.u64(options.heap.0)?;
-    w.u64(options.heap.1)?;
+    wide(&mut w, options.stack.0)?;
+    wide(&mut w, options.stack.1)?;
+    wide(&mut w, options.heap.0)?;
+    wide(&mut w, options.heap.1)?;
     w.u32(0)?; // LoaderFlags
     w.u32(u32::try_from(DATA_DIRECTORIES).unwrap_or(0))?;
     for directory in &input.directories {
@@ -379,7 +434,8 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
 /// The `DllCharacteristics` bits the options ask for.
 fn dll_characteristics(options: &PeOptions) -> u16 {
     let mut bits = 0u16;
-    if options.high_entropy_va {
+    // 64-bit ASLR means nothing to a 32-bit image.
+    if options.high_entropy_va && !options.target().is_pe32() {
         bits |= IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
     }
     if options.dynamicbase {
@@ -467,6 +523,7 @@ pub fn section_directories(layout: &Layout) -> [Directory; DATA_DIRECTORIES] {
 /// address table (`__IAT_start__` … `__IAT_end__`).
 pub fn symbol_directories(
     addresses: &Addresses<'_, '_>,
+    machine: Machine,
     directories: &mut [Directory; DATA_DIRECTORIES],
 ) {
     let mut set = |index: usize, name: &[u8], size: u32| {
@@ -476,10 +533,20 @@ pub fn symbol_directories(
             *slot = Directory { rva, size };
         }
     };
-    // IMAGE_TLS_DIRECTORY64 is 40 bytes; IMAGE_LOAD_CONFIG_DIRECTORY64 is
-    // variable, and its first field is its own size.
-    set(IMAGE_DIRECTORY_ENTRY_TLS, b"_tls_used", 40);
-    set(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, b"_load_config_used", 0);
+    // The C runtime defines both structures under C names, which i386
+    // decorates. IMAGE_TLS_DIRECTORY is six fields of pointer size.
+    set(
+        IMAGE_DIRECTORY_ENTRY_TLS,
+        &machine.decorate(b"_tls_used"),
+        machine.tls_directory_size(),
+    );
+    // The load configuration's size is its first field; `load_config_size`
+    // fills it in once the contents are known.
+    set(
+        IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG,
+        &machine.decorate(b"_load_config_used"),
+        0,
+    );
     // The import address table is `.idata$5`, whose bounds the layout
     // markers record: nothing has to reference `__IAT_start__` for the data
     // directory to be right.
@@ -494,6 +561,52 @@ pub fn symbol_directories(
             size: end.wrapping_sub(start),
         };
     }
+}
+
+/// Sets the load configuration directory's size from the structure's own
+/// `Size` field, now that the section contents are known.
+///
+/// GNU `ld` does the same, except that it writes 64 for an i386 image whose
+/// subsystem version is 5.01 or less: Windows XP and older accept only the
+/// size of their own structure. `i386pe`'s default subsystem version, 4.0,
+/// is such an image.
+pub fn load_config_size(
+    layout: &Layout,
+    options: &PeOptions,
+    subsystem: u16,
+    contents: &[Vec<u8>],
+    directories: &mut [Directory; DATA_DIRECTORIES],
+) {
+    let Some(directory) = directories.get_mut(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) else {
+        return;
+    };
+    if directory.rva == 0 {
+        return;
+    }
+    let Some((index, section)) = layout.sections.iter().enumerate().find(|(_, section)| {
+        directory.rva >= section.rva
+            && directory.rva.wrapping_sub(section.rva) < section.virtual_size
+    }) else {
+        return;
+    };
+    let offset = directory.rva.wrapping_sub(section.rva) as usize;
+    let Some(size) = contents
+        .get(index)
+        .and_then(|bytes| bytes.get(offset..))
+        .and_then(<[u8]>::first_chunk::<4>)
+        .map(|bytes| u32::from_le_bytes(*bytes))
+    else {
+        return;
+    };
+    let version = options.subsystem_version;
+    let legacy = options.target().is_pe32()
+        && (version.major, version.minor) <= (5, 1)
+        && matches!(
+            subsystem,
+            super::read::consts::IMAGE_SUBSYSTEM_WINDOWS_CUI
+                | super::read::consts::IMAGE_SUBSYSTEM_WINDOWS_GUI
+        );
+    directory.size = if legacy { 64 } else { size };
 }
 
 /// A bounds-checked little-endian writer over the output buffer.
@@ -563,7 +676,9 @@ mod tests {
     #[test]
     fn header_size_matches_gnu_ld() {
         // 128 + 4 + 20 + 240 + 9 * 40 = 752 for a nine-section image.
-        assert_eq!(header_size(9), 752);
+        assert_eq!(header_size(9, Machine::Amd64), 752);
+        // PE32's optional header is 16 bytes shorter.
+        assert_eq!(header_size(7, Machine::I386), 128 + 4 + 20 + 224 + 7 * 40);
     }
 
     #[test]
