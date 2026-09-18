@@ -1,0 +1,50 @@
+#!/usr/bin/make -f
+# A debhelper build of qld with the cargo and rustc on PATH. Copy this
+# directory to the top of the source tree as debian/, then:
+#
+#   dpkg-buildpackage -b -us -uc       # Debian's rustc must be >= 1.89
+#   dpkg-buildpackage -b -us -uc -d    # a rustup toolchain instead (-d skips
+#                                      # the Build-Depends check)
+#
+# Crates come from crates.io, or from debian/vendor if it exists
+# (`cargo vendor debian/vendor`), for builders without network access such
+# as Launchpad. See packaging/README.md.
+
+export DH_VERBOSE = 1
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR = $(CURDIR)/debian/cargo-target
+# Line tables stay (the release profile's debug = 1); dh_strip moves them
+# to the -dbgsym package.
+
+CARGO_ARGS = --release --locked
+ifneq (,$(wildcard debian/vendor))
+CARGO_ARGS += --offline
+endif
+ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+CARGO_ARGS += -j $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+ifneq (,$(wildcard debian/vendor))
+	printf '[source.crates-io]\nreplace-with = "vendored"\n\n[source.vendored]\ndirectory = "%s"\n' \
+		"$(CURDIR)/debian/vendor" > $(CARGO_HOME)/config.toml
+endif
+
+override_dh_auto_build:
+	cargo build $(CARGO_ARGS)
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test $(filter-out --release,$(CARGO_ARGS))
+endif
+
+override_dh_auto_install:
+	sh packaging/install.sh --prefix /usr --destdir $(CURDIR)/debian/qld \
+		$(CARGO_TARGET_DIR)/release/qld
+
+override_dh_auto_clean:
+	rm -rf $(CARGO_HOME) $(CARGO_TARGET_DIR)
