@@ -315,8 +315,9 @@ impl Synth {
             || self.tlsld
             || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
-        // `.got.plt` words.
-        self.got_plt_reserved = if dynamic && has_got_plt {
+        // `.got.plt` words; GNU ld's i386 backend still reserves them, and
+        // `_GLOBAL_OFFSET_TABLE_` points at them.
+        self.got_plt_reserved = if (dynamic || self.arch == Arch::I386) && has_got_plt {
             self.arch.got_plt_reserved()
         } else {
             0

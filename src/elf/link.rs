@@ -574,11 +574,13 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         resolution: &resolution,
         sections: &sections,
     };
+    let arch = super::arch::Arch::of(options, files);
     let context = reloc::Context {
         mode,
         relax: options.relax,
         copy_relocs: options.copy_relocs,
-        arch: super::arch::Arch::of(options, files),
+        arch,
+        weak_zero: reloc::Context::weak_zero(arch, mode),
     };
     // Section merging needs neither the scan's results nor anything it
     // changes (symbol flags), and neither stage keeps every thread busy on

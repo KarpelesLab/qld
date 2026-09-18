@@ -10,18 +10,25 @@
 //! Position-independent code keeps it in `%ebx`; `R_386_GOTOFF` and
 //! `R_386_GOT32` are relative to it, and `R_386_GOTPC` computes it.
 //!
-//! **Relaxations** follow GNU ld and lld:
+//! **Relaxations** follow GNU ld (`elf_i386_convert_load_reloc` and the
+//! TLS transitions of `elf_i386_relocate_section`):
 //!
-//! - `R_386_GOT32X` to a symbol defined in the output: `mov foo@GOT(%reg)`
-//!   becomes `lea foo@GOTOFF(%reg)`, `call *foo@GOT(%reg)` becomes
-//!   `addr32 call foo` and `jmp *foo@GOT(%reg)` becomes `jmp foo; nop`; in
-//!   position-dependent output, `mov foo@GOT, %reg` (no base register)
-//!   becomes `mov $foo, %reg`;
+//! - `R_386_GOT32X` with a zero addend to a symbol defined in the output:
+//!   in position-dependent output `mov foo@GOT[(%reg)], %reg2` becomes
+//!   `mov $foo, %reg2` and `test`/binary operators take the immediate; in
+//!   PIC the `mov` becomes `lea foo@GOTOFF(%reg)`; `call *foo@GOT(%reg)`
+//!   becomes `addr32 call foo` and `jmp *foo@GOT(%reg)` `jmp foo; nop`. In a
+//!   static executable an undefined weak symbol relaxes the same way, to 0;
 //! - TLS, GNU dialect ([`TlsMode`]): general-dynamic, local-dynamic,
 //!   initial-exec and descriptors become local-exec in an executable that
 //!   defines the variable, and general-dynamic and descriptors become
-//!   initial-exec for a shared library's variable. The Sun dialect
-//!   (`R_386_TLS_*_32` other than `LDO_32`) is not linked.
+//!   initial-exec for a shared library's variable. Initial-exec to
+//!   local-exec writes GNU ld's forms (`addl $x` for an `addl`, where lld
+//!   writes a `leal`). General-dynamic and descriptors relaxed to
+//!   initial-exec read the negative offset entry initial-exec code uses, as
+//!   lld does; GNU ld allocates a second, positive entry
+//!   (`R_386_TLS_TPOFF32`) and reads it with `subl` or negates it. The Sun
+//!   dialect (`R_386_TLS_*_32` other than `LDO_32`) is not linked.
 //!
 //! **The PLT** of an executable addresses `.got.plt` absolutely; that of a
 //! PIE or shared object through `%ebx`, as the ABI requires. Lazy entries
@@ -398,9 +405,10 @@ pub fn relax_tls(
                 put(out, offset, -2, 0xc7)?;
                 put(out, offset, -1, 0xc0 | reg)?;
             } else if op == 0x03 {
-                // addl foo@gotntpoff(%reg),%reg2 -> leal foo(%reg2),%reg2
-                put(out, offset, -2, 0x8d)?;
-                put(out, offset, -1, 0x80 | (reg << 3) | reg)?;
+                // addl foo@gotntpoff(%reg),%reg2 -> addl $foo,%reg2 (GNU
+                // ld's form; lld writes a `leal`)
+                put(out, offset, -2, 0x81)?;
+                put(out, offset, -1, 0xc0 | reg)?;
             } else {
                 return Err(ApplyError::BadInstruction);
             }
@@ -638,10 +646,10 @@ mod tests {
         };
         relax_tls(&mut code, 2, Kind::IeToLe, R_386_TLS_GOTIE, values).unwrap();
         assert_eq!(code, [0xc7, 0xc1, 0xfc, 0xff, 0xff, 0xff]);
-        // addl x@gotntpoff(%ebx),%edx -> leal x(%edx),%edx
+        // addl x@gotntpoff(%ebx),%edx -> addl $x,%edx
         let mut code = vec![0x03, 0x93, 0, 0, 0, 0];
         relax_tls(&mut code, 2, Kind::IeToLe, R_386_TLS_GOTIE, values).unwrap();
-        assert_eq!(code, [0x8d, 0x92, 0xfc, 0xff, 0xff, 0xff]);
+        assert_eq!(code, [0x81, 0xc2, 0xfc, 0xff, 0xff, 0xff]);
         // movl x@indntpoff,%eax (a1) -> movl $x,%eax (b8)
         let mut code = vec![0x90, 0xa1, 0, 0, 0, 0];
         relax_tls(&mut code, 2, Kind::IeToLe, R_386_TLS_IE, values).unwrap();

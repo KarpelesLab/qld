@@ -201,6 +201,23 @@ fn type_name(arch: Arch, r_type: u32) -> String {
     arch.reloc_label(r_type)
 }
 
+/// GNU ld's i386 backend still gives `___tls_get_addr` its PLT entry in a
+/// dynamic output when a TLS relaxation removed the call.
+#[cold]
+fn i386_removed_call<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    context: &Context,
+    id: crate::ids::SymbolId,
+    r_type: u32,
+) {
+    if context.mode.dynamic
+        && r_type == crate::elf::read::consts::i386::R_386_PLT32
+        && refs.symbols.flags(id).contains(super::export::PREEMPTIBLE)
+    {
+        refs.symbols.set_flags(id, SymbolFlags::NEEDS_PLT);
+    }
+}
+
 fn scan_file<F: crate::elf::read::ElfFormat>(
     refs: &Refs<'_, '_, F>,
     file_index: usize,
@@ -278,6 +295,9 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                 skip = false;
                 if let Some(id) = refs.global_id(file_index, rel.symbol as usize) {
                     refs.symbols.set_flags(id, REF_LIVE);
+                    if F::WORD_SIZE == 4 && context.arch == Arch::I386 {
+                        i386_removed_call(refs, context, id, rel.r_type);
+                    }
                 }
                 continue;
             }
@@ -300,31 +320,37 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
             {
                 refs.symbols.set_flags(id, REF_LIVE);
             }
-            let decision =
-                match reloc::decide(context, &rel, data, &target, flags, section.header.sh_flags) {
-                    Ok(decision) => decision,
-                    Err(error) => {
-                        let what = match error {
-                            ClassifyError::Unsupported => format!(
-                                "unsupported relocation type {}",
-                                type_name(context.arch, rel.r_type)
-                            ),
-                            ClassifyError::BadTlsInstruction => format!(
-                                "{} is not part of a TLS sequence qld can link",
-                                context
-                                    .arch
-                                    .reloc_name(rel.r_type)
-                                    .unwrap_or("a TLS relocation")
-                            ),
-                        };
-                        result.errors.push(
-                            Diagnostic::error(what)
-                                .at(location(refs, file_index, section_index, rel.offset))
-                                .order(order),
-                        );
-                        continue;
-                    }
-                };
+            let decision = match reloc::decide::<F>(
+                context,
+                &rel,
+                data,
+                &target,
+                flags,
+                section.header.sh_flags,
+            ) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    let what = match error {
+                        ClassifyError::Unsupported => format!(
+                            "unsupported relocation type {}",
+                            type_name(context.arch, rel.r_type)
+                        ),
+                        ClassifyError::BadTlsInstruction => format!(
+                            "{} is not part of a TLS sequence qld can link",
+                            context
+                                .arch
+                                .reloc_name(rel.r_type)
+                                .unwrap_or("a TLS relocation")
+                        ),
+                    };
+                    result.errors.push(
+                        Diagnostic::error(what)
+                            .at(location(refs, file_index, section_index, rel.offset))
+                            .order(order),
+                    );
+                    continue;
+                }
+            };
             let class = decision.class;
             skip = class.skip_next;
             if class.kind == Kind::None {

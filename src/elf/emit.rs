@@ -205,7 +205,7 @@ fn output_type<F: crate::elf::read::ElfFormat>(
     let flags = target
         .global
         .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
-    let Ok(decision) = reloc::decide(
+    let Ok(decision) = reloc::decide::<F>(
         &input.context,
         rel,
         data,

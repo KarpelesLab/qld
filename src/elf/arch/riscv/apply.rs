@@ -242,7 +242,7 @@ impl<'w, 'x, 'a, F: crate::elf::read::ElfFormat> Writer<'_, 'w, 'x, 'a, F> {
         target: &Target,
         flags: SymbolFlags,
     ) -> Option<reloc::Decision> {
-        reloc::decide(
+        reloc::decide::<F>(
             &self.input.context,
             rel,
             self.section.data,

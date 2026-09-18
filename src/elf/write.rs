@@ -1341,7 +1341,7 @@ fn section_dyn_relocs<F: crate::elf::read::ElfFormat>(
             .global
             .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
         let Ok(decision) =
-            reloc::decide(context, &rel, data, &target, flags, section.header.sh_flags)
+            reloc::decide::<F>(context, &rel, data, &target, flags, section.header.sh_flags)
         else {
             continue;
         };
@@ -1690,7 +1690,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         let flags = target
             .global
             .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
-        let Ok(decision) = reloc::decide(
+        let Ok(decision) = reloc::decide::<F>(
             &input.context,
             &rel,
             data,

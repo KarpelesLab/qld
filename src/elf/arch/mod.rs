@@ -539,10 +539,9 @@ impl Arch {
     #[must_use]
     #[inline]
     pub fn is_word(self, width: Width) -> bool {
-        if self.kind().is_32() {
-            matches!(width, Width::Any32 | Width::U32 | Width::I32)
-        } else {
-            width == Width::W64
+        match self {
+            Self::I386 => matches!(width, Width::Any32 | Width::U32 | Width::I32),
+            _ => width == Width::W64,
         }
     }
 

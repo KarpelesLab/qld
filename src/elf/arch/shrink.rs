@@ -756,6 +756,7 @@ fn relax_pass<'a, F: crate::elf::read::ElfFormat>(
             relax: input.options.relax,
             copy_relocs: input.options.copy_relocs,
             arch,
+            weak_zero: Context::weak_zero(arch, input.mode),
         },
         relax: input.options.relax,
         tp: layout.tls.map(|tls| tls.tp(arch)),
