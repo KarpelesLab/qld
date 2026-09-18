@@ -12,12 +12,16 @@
 //! `SHT_PROGBITS`) and allocation are concatenated into one output section,
 //! in order of first appearance. Members of a kept COMDAT group stay in
 //! sections of their own, listed by an output `SHT_GROUP` section (all group
-//! sections come first, as with GNU ld); `SHF_LINK_ORDER` sections are never
-//! combined, and one whose linked-to section is gone is dropped. Sections a
-//! final link consumes are kept: `SHF_EXCLUDE` sections, `.note.GNU-stack`
-//! and `.gnu.warning*`. `.note.gnu.property` is merged as in final links.
-//! Merged (`SHF_MERGE`) sections are concatenated, not deduplicated, and
-//! keep their merge flags only when all inputs agree. `-d` allocates common
+//! sections come first, as with GNU ld). `SHF_LINK_ORDER` sections outside
+//! groups are combined when the sections they link to share an output
+//! section (GNU ld's `elf_orphan_compatible`), ordered by where those
+//! sections ended up; one whose linked-to section is gone is dropped.
+//! Sections a final link consumes are kept: `SHF_EXCLUDE` sections,
+//! `.note.GNU-stack` and `.gnu.warning*`. `.note.gnu.property` is merged as
+//! in final links. Merged (`SHF_MERGE`) sections are concatenated, not
+//! deduplicated, and keep their merge flags only when all inputs agree.
+//! Alignment gaps in executable sections are filled with NOPs, as GNU ld
+//! does, so that disassemblers (objtool) stay in step. `-d` allocates common
 //! symbols at the end of `.bss`; otherwise they stay common.
 //!
 //! # Symbols
@@ -47,11 +51,12 @@ use rayon::prelude::*;
 use crate::args::{DiscardMode, LinkOptions, StripMode};
 use crate::elf::read::consts::x86_64::R_X86_64_NONE;
 use crate::elf::read::consts::{
-    ELFOSABI_GNU, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_GROUP, SHF_INFO_LINK, SHF_LINK_ORDER,
-    SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_LORESERVE, SHN_UNDEF,
-    SHN_XINDEX, SHT_GROUP, SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NOTE, SHT_NULL, SHT_PROGBITS, SHT_REL,
-    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL, STB_LOCAL, STB_WEAK,
-    STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
+    ELFOSABI_GNU, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP, SHF_INFO_LINK,
+    SHF_LINK_ORDER, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_LORESERVE,
+    SHN_UNDEF, SHN_XINDEX, SHT_GROUP, SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NOTE, SHT_NULL,
+    SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL,
+    STB_LOCAL, STB_WEAK, STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT, STV_HIDDEN,
+    STV_INTERNAL, STV_PROTECTED,
 };
 use crate::elf::read::{RawSymbol, Relocation, Relocations, SectionIndex};
 use crate::error::{Error, Result};
@@ -181,7 +186,41 @@ enum Key<'a> {
         name: &'a [u8],
         sh_type: u32,
     },
+    /// `SHF_LINK_ORDER` sections outside groups, merged when the sections
+    /// they link to share an output section (numbered by [`content_key`]).
+    LinkOrder {
+        name: &'a [u8],
+        sh_type: u32,
+        flags: u64,
+        linked: u32,
+    },
     Unique(u32),
+}
+
+/// The output section key of a copied section that is not
+/// `SHF_LINK_ORDER`: its group's copy for group members, else its name, type
+/// class and allocation.
+fn content_key<'a>(section: &InputSection<'a>, file: u32, group: u32) -> Key<'a> {
+    let header = &section.header;
+    let type_class = if header.sh_type == SHT_NOBITS {
+        SHT_PROGBITS
+    } else {
+        header.sh_type
+    };
+    if group != NONE {
+        Key::Group {
+            file,
+            group: section.group,
+            name: section.name,
+            sh_type: type_class,
+        }
+    } else {
+        Key::Named {
+            name: section.name,
+            sh_type: type_class,
+            flags: header.sh_flags & (SHF_ALLOC | SHF_TLS),
+        }
+    }
 }
 
 /// One input section of an output section.
@@ -353,6 +392,8 @@ struct Plan<'a> {
     os_abi: u8,
     /// `e_machine` of the output, taken from the inputs.
     machine: u16,
+    /// The architecture, for code padding.
+    arch: crate::elf::arch::Arch,
 }
 
 fn align_to(value: u64, align: u64) -> Result<u64> {
@@ -404,9 +445,8 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
     let mut file_groups: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
     let mut file_plans: Vec<FilePlan> = (0..files.len()).map(|_| FilePlan::default()).collect();
     let mut os_abi = 0u8;
-    let machine = crate::elf::arch::Arch::of_files(files)
-        .unwrap_or_default()
-        .machine();
+    let arch = crate::elf::arch::Arch::of_files(files).unwrap_or_default();
+    let machine = arch.machine();
     let mut kept: KeptGroups<'a> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6b65_7074));
     for (file_index, file) in files.iter().enumerate() {
@@ -464,6 +504,44 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         }
     }
 
+    let group_of =
+        |file_index: usize, section: &InputSection<'_>| match section.group.checked_sub(1) {
+            Some(g) => file_groups
+                .get(file_index)
+                .and_then(|groups| groups.get(g as usize))
+                .copied()
+                .unwrap_or(NONE),
+            None => NONE,
+        };
+
+    // The keys link-order sections may link to, numbered in order of first
+    // appearance: as GNU ld does (`elf_orphan_compatible`), link-order
+    // sections of one name are merged when the sections they link to share
+    // an output section.
+    let mut base_keys: HashMap<Key<'a>, u32, foldhash::fast::FixedState> =
+        HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6c69_6e6b));
+    let mut section_key = vec![NONE; sections.len()];
+    for (file_index, file) in files.iter().enumerate() {
+        let Some(object) = &file.object else {
+            continue;
+        };
+        let file_u32 = index_u32(file_index)?;
+        for (index, section) in object.sections.iter().enumerate() {
+            let Some(id) = sections.id(file_index, index_u32(index)?) else {
+                continue;
+            };
+            if !sections.is_live(id) || section.header.sh_flags & SHF_LINK_ORDER != 0 {
+                continue;
+            }
+            let key = content_key(section, file_u32, group_of(file_index, section));
+            let next = index_u32(base_keys.len())?;
+            let number = *base_keys.entry(key).or_insert(next);
+            if let Some(slot) = section_key.get_mut(id.index()) {
+                *slot = number;
+            }
+        }
+    }
+
     // Content sections, in order of first appearance.
     let mut keys: HashMap<Key<'a>, u32, foldhash::fast::FixedState> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x0072_656c_6f63));
@@ -499,34 +577,23 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             {
                 continue;
             }
-            let group = match section.group.checked_sub(1) {
-                Some(g) => file_groups
-                    .get(file_index)
-                    .and_then(|groups| groups.get(g as usize))
-                    .copied()
-                    .unwrap_or(NONE),
-                None => NONE,
-            };
-            let type_class = if header.sh_type == SHT_NOBITS {
-                SHT_PROGBITS
-            } else {
-                header.sh_type
-            };
+            let group = group_of(file_index, section);
             let key = if header.sh_flags & SHF_LINK_ORDER != 0 {
-                Key::Unique(id.as_u32())
-            } else if group != NONE {
-                Key::Group {
-                    file: file_u32,
-                    group: section.group,
-                    name: section.name,
-                    sh_type: type_class,
+                let linked = sections
+                    .id(file_index, header.sh_link)
+                    .map(|linked| slot(&section_key, linked.index()))
+                    .filter(|&k| k != NONE && group == NONE);
+                match linked {
+                    Some(linked) => Key::LinkOrder {
+                        name: section.name,
+                        sh_type: header.sh_type,
+                        flags: header.sh_flags & (SHF_ALLOC | SHF_TLS),
+                        linked,
+                    },
+                    None => Key::Unique(id.as_u32()),
                 }
             } else {
-                Key::Named {
-                    name: section.name,
-                    sh_type: type_class,
-                    flags: header.sh_flags & (SHF_ALLOC | SHF_TLS),
-                }
+                content_key(section, file_u32, group)
             };
             let out_index = match keys.entry(key) {
                 Entry::Occupied(entry) => *entry.get(),
@@ -613,10 +680,32 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
     }
 
     // Member offsets and section sizes.
+    // Sections with SHF_LINK_ORDER go last, ordered by where the sections
+    // they link to ended up (GNU ld's `elf_fixup_link_order`).
     let mut offsets = vec![0u64; sections.len()];
-    for out in &mut outs {
+    let link_order = |out: &OutSection<'_>| {
+        !out.members.is_empty()
+            && out.members.iter().all(|m| {
+                files
+                    .get(m.file as usize)
+                    .and_then(|f| f.object.as_ref())
+                    .and_then(|o| o.section(m.section))
+                    .is_some_and(|s| s.header.sh_flags & SHF_LINK_ORDER != 0)
+            })
+    };
+    let order: Vec<usize> = (0..outs.len())
+        .filter(|&i| outs.get(i).is_some_and(|o| !link_order(o)))
+        .chain((0..outs.len()).filter(|&i| outs.get(i).is_some_and(link_order)))
+        .collect();
+    for out_index in order {
+        let Some(out) = outs.get_mut(out_index) else {
+            continue;
+        };
         if out.kind != OutKind::Content {
             continue;
+        }
+        if link_order(out) {
+            sort_link_order(files, sections, &offsets, &mut out.members);
         }
         let (merge_flags, merge_entsize, mixed) = out.merge;
         if !mixed {
@@ -880,7 +969,35 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         file_size,
         os_abi,
         machine,
+        arch,
     })
+}
+
+/// Orders the members of a link-order output section as GNU ld's
+/// `compare_link_order` does: by the output offset of the sections they
+/// link to (every output section of a relocatable link is at address 0),
+/// then by that section's size and input order.
+fn sort_link_order(
+    files: &[ElfInput<'_>],
+    sections: &Sections,
+    offsets: &[u64],
+    members: &mut [Member],
+) {
+    members.sort_by_cached_key(|member| {
+        let linked = files
+            .get(member.file as usize)
+            .and_then(|f| f.object.as_ref())
+            .and_then(|o| {
+                let link = o.section(member.section)?.header.sh_link;
+                let id = sections.id(member.file as usize, link)?;
+                Some((
+                    slot(offsets, id.index()),
+                    o.section(link)?.header.sh_size,
+                    id.as_u32(),
+                ))
+            });
+        linked.unwrap_or((u64::MAX, u64::MAX, u32::MAX))
+    });
 }
 
 /// What relocation rewriting needs.
@@ -1384,6 +1501,9 @@ enum Chunk {
     Group(u32),
     Property,
     Member(u32, u32),
+    /// Padding between the members of an executable section: NOPs, as
+    /// GNU ld pads code (disassemblers such as objtool decode through it).
+    Nops,
     Rela(u32, u32),
     Symtab,
     Shndx,
@@ -1404,8 +1524,19 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
                 chunks.push((ChunkRange::new(out.offset, out.size), Chunk::Property));
             }
             OutKind::Content => {
+                let code = out.has_file_bytes() && out.flags & SHF_EXECINSTR != 0;
+                let mut cursor = 0u64;
                 for (member_index, member) in out.members.iter().enumerate() {
                     let member_u32 = index_u32(member_index)?;
+                    if code && member.offset > cursor {
+                        chunks.push((
+                            ChunkRange::new(
+                                add(out.offset, cursor)?,
+                                member.offset.saturating_sub(cursor),
+                            ),
+                            Chunk::Nops,
+                        ));
+                    }
                     if out.has_file_bytes() {
                         let section = input
                             .refs
@@ -1424,6 +1555,7 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
                                 ),
                                 Chunk::Member(out_u32, member_u32),
                             ));
+                            cursor = add(member.offset, section.header.sh_size)?;
                         }
                     }
                     if member.relocs > 0 {
@@ -1532,6 +1664,10 @@ fn write_chunk<'a>(
             if let Some(dest) = out.get_mut(..data.len()) {
                 dest.copy_from_slice(data);
             }
+            Ok(())
+        }
+        Chunk::Nops => {
+            plan.arch.write_nops(out);
             Ok(())
         }
         Chunk::Rela(out_index, member) => write_rela(input, plan, out_index, member, out),
