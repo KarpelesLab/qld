@@ -1821,8 +1821,13 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
                 // Local-dynamic code takes the start of the module's TLS
                 // block as its base, so that is what the relaxed sequence
                 // must compute.
+                // An undefined (weak) variable has no offset: like lld,
+                // relax to the addend (glibc's static `setlocale.o` reaches
+                // `_nl_current_LC_*` this way, behind a `_used` check).
                 let tpoff = if class.kind == Kind::LdToLe {
                     tls.start.wrapping_sub(tp) as i64
+                } else if matches!(target.def, super::refs::Def::Undefined { .. }) {
+                    a
                 } else {
                     sa.wrapping_sub(tp) as i64
                 };

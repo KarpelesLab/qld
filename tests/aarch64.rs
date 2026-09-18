@@ -459,6 +459,63 @@ int main(void) { return read_local_qld() + read_other_qld(); }
     }
 }
 
+/// An undefined weak TLS variable, as static glibc 2.39's `setlocale.o`
+/// reaches `_nl_current_LC_*` (behind a check that it is linked in): its
+/// initial-exec and descriptor accesses relax to local-exec with the
+/// addend as the offset, as in lld, instead of failing as out of range.
+#[test]
+fn undefined_weak_tls_relaxes_to_zero() {
+    let tools = require!();
+    let dir = scratch("weak-tls");
+    let source = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	adrp	x1, :gottprel:weak_tls_qld
+	ldr	x1, [x1, :gottprel_lo12:weak_tls_qld]
+	adrp	x0, :tlsdesc:weak_tls_qld
+	ldr	x2, [x0, :tlsdesc_lo12:weak_tls_qld]
+	add	x0, x0, :tlsdesc_lo12:weak_tls_qld
+	.tlsdesccall weak_tls_qld
+	blr	x2
+	ret
+	.size _start, . - _start
+	.weak	weak_tls_qld
+	.hidden	weak_tls_qld
+	.type	weak_tls_qld, %tls_object
+	.section .tbss, "awT", %nobits
+	.balign	8
+defined_tls_qld:
+	.zero	8
+"#;
+    compile(&tools, &dir, "weak", source, &[]);
+    for extra in [&[][..], &["--fix-cortex-a53-843419"][..]] {
+        let mut args = vec!["-static", "-o", "out", "weak.o", "-e", "_start"];
+        args.extend_from_slice(extra);
+        qld_ok(&dir, &args);
+        let text = run_ok(&dir, &tools.objdump, &["-d", "out"]);
+        assert_eq!(
+            mnemonics_of(&text, "_start"),
+            [
+                "movz x1, ADDR, lsl ADDR",
+                "movk x1, ADDR",
+                "movz x0, ADDR, lsl ADDR",
+                "movk x0, ADDR",
+                "nop",
+                "nop",
+                "ret",
+            ],
+            "{text}"
+        );
+        assert_eq!(
+            words_of(&text, "_start")[..4],
+            ["d2a00001", "f2800001", "d2a00000", "f2800000"],
+            "the offsets are not zero:\n{text}"
+        );
+    }
+}
+
 /// A shared object: PLT, GOT and dynamic relocations, without libc.
 #[test]
 fn shared_object_plt_and_got_match_gnu_ld() {
@@ -598,7 +655,12 @@ fn bti_plt_in_an_executable() {
     let tools = require!();
     for (name, flags, z) in [
         ("marked", &["-mbranch-protection=bti"][..], &[][..]),
-        ("forced", &[][..], &["-z", "force-bti"][..]),
+        // Unmarked whatever the compiler's default branch protection.
+        (
+            "forced",
+            &["-mbranch-protection=none"][..],
+            &["-z", "force-bti"][..],
+        ),
     ] {
         let dir = scratch(&format!("bti-exe-{name}"));
         plt_executable(&tools, &dir, flags);
@@ -618,9 +680,12 @@ fn bti_plt_in_an_executable() {
         assert!(dynamic.contains("AARCH64_BTI_PLT"), "{name}: {dynamic}");
         let notes = run_ok(&dir, &tools.readelf, &["-nW", "out.qld"]);
         assert!(notes.contains("BTI"), "{name}: {notes}");
-        let warning = "BTI is required by -z force-bti";
-        let ours_warn = String::from_utf8_lossy(&ours.stderr).contains(warning);
-        let gnu_warn = String::from_utf8_lossy(&gnu_err.stderr).contains(warning);
+        // qld words the warning as GNU ld 2.45 does; 2.42 (Ubuntu 24.04)
+        // says "BTI turned on by -z force-bti when all inputs do not have
+        // BTI in NOTE section".
+        let ours_warn = String::from_utf8_lossy(&ours.stderr)
+            .contains("BTI is required by -z force-bti, but this input object file lacks");
+        let gnu_warn = String::from_utf8_lossy(&gnu_err.stderr).contains("force-bti");
         assert_eq!(ours_warn, gnu_warn, "{name}: warnings differ");
         assert_eq!(ours_warn, name == "forced");
     }
