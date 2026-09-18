@@ -1005,3 +1005,616 @@ fn corrupted_scripts_never_panic() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Relocatable output with a script (`-r -T`), as the kernel links modules.
+// ---------------------------------------------------------------------------
+
+/// One section of a relocatable file: name, type, flags, size, alignment,
+/// entry size and contents.
+type RelSection = (String, u32, u64, u64, u64, u64, Vec<u8>);
+
+/// The sections of a relocatable ELF file in header order. Contents are
+/// left empty for `SHT_NOBITS`, groups, relocations (compared through
+/// readelf) and the linkers' own symbol and string tables.
+fn relocatable_sections(path: &Path) -> Vec<RelSection> {
+    let data = fs::read(path).unwrap();
+    let word = |at: usize, n: usize| -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes[..n].copy_from_slice(&data[at..at + n]);
+        u64::from_le_bytes(bytes)
+    };
+    let shoff = word(0x28, 8) as usize;
+    let shnum = word(0x3c, 2) as usize;
+    let shstrndx = word(0x3e, 2) as usize;
+    let header = |i: usize| shoff + i * 64;
+    let names = word(header(shstrndx) + 24, 8) as usize;
+    let mut out = Vec::new();
+    for i in 1..shnum {
+        let h = header(i);
+        let name_at = names + word(h, 4) as usize;
+        let end = data[name_at..].iter().position(|&b| b == 0).unwrap();
+        let name = String::from_utf8_lossy(&data[name_at..name_at + end]).into_owned();
+        let sh_type = word(h + 4, 4) as u32;
+        let (offset, size) = (word(h + 24, 8) as usize, word(h + 32, 8));
+        let contents = if matches!(sh_type, 2 | 3 | 4 | 8 | 17) {
+            Vec::new()
+        } else if name == ".note.gnu.build-id" {
+            // The note header; the hash is of different outputs.
+            data[offset..offset + 16].to_vec()
+        } else {
+            data[offset..offset + size as usize].to_vec()
+        };
+        let size = if matches!(sh_type, 2 | 3) { 0 } else { size };
+        out.push((
+            name,
+            sh_type,
+            word(h + 8, 8),
+            size,
+            word(h + 48, 8),
+            word(h + 56, 8),
+            contents,
+        ));
+    }
+    out
+}
+
+/// Symbols as `name value section binding type visibility`, sorted, without
+/// section symbols and file symbols.
+fn relocatable_symbols(dir: &Path, file: &str) -> Vec<String> {
+    let text = stdout_ok(dir, "readelf", &["-sW", file]);
+    let sections = stdout_ok(dir, "readelf", &["-SW", file]);
+    let section_name = |index: &str| -> String {
+        let Ok(index) = index.parse::<usize>() else {
+            return index.to_string();
+        };
+        sections
+            .lines()
+            .find_map(|l| {
+                let rest = l.trim_start().strip_prefix('[')?;
+                let (number, rest) = rest.split_once(']')?;
+                (number.trim().parse::<usize>().ok()? == index)
+                    .then(|| rest.split_whitespace().next().unwrap_or("").to_string())
+            })
+            .unwrap_or_default()
+    };
+    let mut symbols: Vec<String> = text
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 8 || !f[0].ends_with(':') || f[3] == "SECTION" || f[3] == "FILE" {
+                return None;
+            }
+            Some(format!(
+                "{} {} {} {} {} {}",
+                f[7],
+                f[1],
+                section_name(f[6]),
+                f[4],
+                f[3],
+                f[5]
+            ))
+        })
+        .collect();
+    symbols.sort();
+    symbols
+}
+
+/// Relocations as `section: offset type symbol+addend`.
+fn relocatable_relocations(dir: &Path, file: &str) -> Vec<String> {
+    let text = stdout_ok(dir, "readelf", &["-rW", file]);
+    let mut section = String::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Relocation section '") {
+            section = rest.split('\'').next().unwrap_or("").to_string();
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 3 && f[0].chars().all(|c| c.is_ascii_hexdigit()) {
+            let target = f.get(4..).map(|r| r.join(" ")).unwrap_or_default();
+            out.push(format!("{section}: {} {} {target}", f[0], f[2]));
+        }
+    }
+    out
+}
+
+/// Links `-r` with both linkers and compares sections (in order, with
+/// contents), symbols and relocations. Addresses are not compared:
+/// relocatable outputs have none.
+fn compare_relocatable(dir: &Path, args: &[&str]) {
+    let Some(ld) = comparable_gnu_ld() else {
+        println!("SKIPPED: no GNU ld 2.44 or newer to compare against");
+        return;
+    };
+    for (linker, out) in [(ld, "gnu.o"), (qld_path(), "qld.o")] {
+        let mut full = vec!["-r"];
+        full.extend_from_slice(args);
+        full.extend(["-o", out]);
+        let result = run(dir, &linker, &full);
+        assert!(
+            result.status.success(),
+            "{} {} failed: {}",
+            linker.display(),
+            full.join(" "),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let expected = relocatable_sections(&dir.join("gnu.o"));
+    let actual = relocatable_sections(&dir.join("qld.o"));
+    let names = |s: &[RelSection]| s.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        names(&expected),
+        names(&actual),
+        "section order differs in {}",
+        dir.display()
+    );
+    for (e, a) in expected.iter().zip(&actual) {
+        assert_eq!(e, a, "section {} differs in {}", e.0, dir.display());
+    }
+    assert_eq!(
+        relocatable_symbols(dir, "gnu.o"),
+        relocatable_symbols(dir, "qld.o"),
+        "symbols differ in {}",
+        dir.display()
+    );
+    assert_eq!(
+        relocatable_relocations(dir, "gnu.o"),
+        relocatable_relocations(dir, "qld.o"),
+        "relocations differ in {}",
+        dir.display()
+    );
+}
+
+/// A module-style link: sorted tables, `/DISCARD/`, sections with explicit
+/// addresses and `ALIGN`, data commands, `. = ALIGN(8)` (which pads by the
+/// addresses GNU ld gives sections while running the script), symbols
+/// inside and outside output sections, `PROVIDE`, orphans (same-named ones
+/// join the script's section), a COMDAT group (never matched by wildcards
+/// in `-r`) and a link-order section.
+#[test]
+fn relocatable_link_with_a_script() {
+    require_tools!();
+    let dir = scratch("relocatable-script");
+    assemble(
+        &dir,
+        "a",
+        r#"
+	.section .rodata,"a"
+ra:	.byte 1
+	.section .data.bar,"aw"
+	.globl bar
+bar:	.long 3
+	.section .text.a,"ax"
+	.globl fa
+fa:	ret
+	.section .init.text,"ax"
+	.globl init_a
+init_a:	nop
+	ret
+	.section .empty,"aw"
+	.section alloc_tags,"aw"
+	.quad 7
+	.section .tbl,"a"
+	.globl tbl_a
+tbl_a:	.quad ra
+	.section "__ksymtab+foo","a"
+	.quad fa
+	.section "__ksymtab+bar","a"
+	.quad bar
+	.section .discard.x,"a"
+	.quad 1
+	.section .text.inl,"axG",@progbits,inl,comdat
+	.weak inl
+inl:	ret
+	.section __patchable_function_entries,"awo",@progbits,.text.a
+	.quad fa
+"#,
+    );
+    assemble(
+        &dir,
+        "b",
+        r#"
+	.section .rodata,"a"
+rb:	.byte 2
+	.section .text.b,"ax"
+	.globl fb
+fb:	nop
+	ret
+	.section alloc_tags,"aw"
+	.quad 8
+	.section .tbl,"a"
+	.quad rb
+	.section .text.inl,"axG",@progbits,inl,comdat
+	.weak inl
+inl:	ret
+	.section .bss,"aw",@nobits
+	.zero 16
+"#,
+    );
+    fs::write(
+        dir.join("module.ld"),
+        r#"
+abs_sym = 0x1234;
+SECTIONS {
+ /DISCARD/ : { *(.discard) *(.discard.*) }
+ __ksymtab 0 : ALIGN(8) { *(SORT(__ksymtab+*)) }
+ .text : { *(.text.b) *(.text .text.*) }
+ .rodata : { a.o(.rodata) }
+ .onlysyms : { only_start = .; only_end = .; }
+ .dataish : { BYTE(1) SHORT(2) }
+ .codetag.alloc_tags : { . = ALIGN(8); __start_alloc_tags = .; KEEP(*(alloc_tags)) __stop_alloc_tags = .; }
+ .tbl : { tbl_start = .; *(.tbl) tbl_end = .; PROVIDE(tbl_unused = .); tbl_size = tbl_end - tbl_start; }
+ .emptyout : { *(.nothing) }
+ .aligned : { . = ALIGN(16); *(.data.bar) . = . + 4; after = .; }
+}
+alias_fa = fa;
+alias_off = fa + 1;
+"#,
+    )
+    .unwrap();
+    compare_relocatable(&dir, &["-T", "module.ld", "a.o", "b.o"]);
+    // Without a script, x86-64 relocatable output follows GNU ld's built-in
+    // `-r` layout, with `--build-id` first.
+    compare_relocatable(&dir, &["--build-id", "a.o", "b.o"]);
+}
+
+/// `-T` scripts and the scripts they `INCLUDE` are read through
+/// `LinkOptions::input_provider`, like other inputs, and give the same
+/// output as the files on disk.
+#[test]
+fn scripts_from_the_input_provider() {
+    require_tools!();
+    let dir = scratch("provider-script");
+    bare_metal(&dir);
+    fs::write(dir.join("flash.ld"), FLASH_SCRIPT).unwrap();
+    let (ok, stderr) = qld_only(
+        &dir,
+        &["-T", "flash.ld", "start.o", "main.o", "-o", "disk.out"],
+    );
+    assert!(ok, "{stderr}");
+    let memory = qld::input::source::MemoryFiles::new()
+        .with("virtual/outer.ld", &b"INCLUDE inner.ld\n"[..])
+        .with("virtual/inner.ld", FLASH_SCRIPT.as_bytes().to_vec());
+    let mut options = LinkOptions::new();
+    options.kind = OutputKind::StaticExecutable;
+    options.output = Some(dir.join("memory.out"));
+    options.search_paths.push("virtual".into());
+    options.input_provider = Some(Arc::new(memory));
+    options.push_input(
+        InputKind::Script("virtual/outer.ld".into()),
+        InputAttrs::default(),
+    );
+    for name in ["start.o", "main.o"] {
+        options.push_input(InputKind::File(dir.join(name)), InputAttrs::default());
+    }
+    let sink = Collect::new();
+    qld::elf::link(&options, &sink).unwrap_or_else(|e| panic!("{e}: {:?}", sink));
+    assert_eq!(
+        fs::read(dir.join("disk.out")).unwrap(),
+        fs::read(dir.join("memory.out")).unwrap(),
+        "the scripts from memory give another output"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--defsym` with linker script expressions.
+// ---------------------------------------------------------------------------
+
+const DEFSYM_INPUT: &str = r#"
+	.text
+	.globl _start
+_start:
+	mov $60, %eax
+	syscall
+	.globl fn
+	.type fn,@function
+fn:	ret
+	.size fn, 1
+	.data
+	.globl table, table_end
+table:	.quad 1,2,3
+table_end:
+	.quad use_me
+"#;
+
+/// `--defsym` options exercising GNU ld's expression rules: arithmetic
+/// makes a value absolute, a lone symbol keeps its section, the type of the
+/// one symbol an expression reads is copied, built-ins read the final
+/// layout, and forward references to later `--defsym`s settle.
+const DEFSYMS: &[&str] = &[
+    "--defsym=d_off=fn+4",
+    "--defsym=d_mul=fn*2",
+    "--defsym=d_addr=ADDR(.data)+0x10",
+    "--defsym=d_size=SIZEOF(.text)",
+    "--defsym=d_diff=table_end-table",
+    "--defsym=d_later=table+8",
+    "--defsym=d_cond=DEFINED(fn)?fn:0",
+    "--defsym=d_align=ALIGN(table,0x100)",
+    "--defsym=d_abs=ABSOLUTE(fn)",
+    "--defsym=d_page=CONSTANT(MAXPAGESIZE)",
+    "--defsym=d_load=LOADADDR(.data)",
+    "--defsym=d_max=MAX(fn,table)",
+    "--defsym=d_alias=fn",
+    "--defsym=use_me=table_end-8",
+];
+
+/// `name value type binding absolute` of the symbols starting with `d_`
+/// or named `use_me`, sorted.
+fn defsym_symbols(dir: &Path, file: &str) -> Vec<String> {
+    let text = stdout_ok(dir, "readelf", &["-sW", file]);
+    let mut out: Vec<String> = text
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let name = *f.get(7)?;
+            (name.starts_with("d_") || name == "use_me" || name == "script_uses").then(|| {
+                format!(
+                    "{name} {} {} {} {}",
+                    f[1],
+                    f[3],
+                    f[4],
+                    if f[6] == "ABS" { "ABS" } else { "section" }
+                )
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn compare_defsyms(dir: &Path, args: &[&str]) {
+    let Some(ld) = comparable_gnu_ld() else {
+        println!("SKIPPED: no GNU ld 2.44 or newer to compare against");
+        return;
+    };
+    for (linker, out) in [(ld, "gnu.out"), (qld_path(), "qld.out")] {
+        let mut full = args.to_vec();
+        full.extend(["-o", out]);
+        let result = run(dir, &linker, &full);
+        assert!(
+            result.status.success(),
+            "{} {} failed: {}",
+            linker.display(),
+            full.join(" "),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let expected = defsym_symbols(dir, "gnu.out");
+    assert!(expected.len() >= 10, "{expected:?}");
+    assert_eq!(
+        expected,
+        defsym_symbols(dir, "qld.out"),
+        "--defsym symbols differ in {}",
+        dir.display()
+    );
+}
+
+#[test]
+fn defsym_expressions_like_gnu_ld() {
+    require_tools!();
+    let dir = scratch("defsym-expressions");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    let mut args = vec!["-static", "a.o"];
+    args.extend_from_slice(DEFSYMS);
+    compare_defsyms(&dir, &args);
+}
+
+/// Under a linker script, `--defsym`s are assignments before the script's
+/// own statements, which may read them.
+#[test]
+fn defsym_expressions_with_a_script() {
+    require_tools!();
+    let dir = scratch("defsym-script");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    fs::write(
+        dir.join("t.ld"),
+        "SECTIONS {
+  . = 0x10000;
+  .text : { *(.text) }
+  . = ALIGN(0x1000);
+  .data : { *(.data) data_end = .; }
+  script_uses = d_mul + 1;
+}
+",
+    )
+    .unwrap();
+    let mut args = vec!["-static", "-T", "t.ld", "a.o", "--defsym=d_end=data_end-4"];
+    args.extend_from_slice(DEFSYMS);
+    compare_defsyms(&dir, &args);
+}
+
+/// Relocatable output: values relative to sections or absolute, and copied
+/// types, as GNU ld writes them.
+#[test]
+fn defsym_expressions_in_relocatable_output() {
+    require_tools!();
+    let dir = scratch("defsym-relocatable");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    compare_relocatable(
+        &dir,
+        &[
+            "a.o",
+            "--defsym=r_mul=fn*2",
+            "--defsym=r_off=fn+4",
+            "--defsym=r_alias=table",
+            "--defsym=r_num=0x42",
+            "--defsym=r_cond=DEFINED(nothing)?1:table_end",
+        ],
+    );
+}
+
+#[test]
+fn defsym_syntax_errors_are_reported() {
+    require_tools!();
+    let dir = scratch("defsym-syntax");
+    assemble(&dir, "a", DEFSYM_INPUT);
+    let (ok, stderr) = qld_only(&dir, &["-static", "a.o", "--defsym=bad=fn+*2", "-o", "out"]);
+    assert!(!ok, "a malformed --defsym links");
+    assert!(stderr.contains("--defsym"), "{stderr}");
+    assert!(!stderr.contains("not implemented"), "{stderr}");
+}
+
+/// Position-independent executables through the script engine (an
+/// implicit script, `-Ttext`): the program headers outgrow GNU ld's first
+/// `SIZEOF_HEADERS` estimate, and layout runs again with the real size, as
+/// GNU ld's `ldelf_map_segments` does, instead of failing. The text
+/// addresses are GNU ld's. (The dynamic sections themselves differ from
+/// GNU ld's in size, which is not the script engine's doing.)
+#[test]
+fn pie_program_headers_outgrowing_the_estimate() {
+    require_tools!();
+    let dir = scratch("pie-headers");
+    assemble(
+        &dir,
+        "start",
+        "\t.text\n\t.globl _start\n_start:\n\tlea x_sym(%rip), %rax\n\tret\n",
+    );
+    fs::write(dir.join("extra.ld"), "x_sym = 1;\n").unwrap();
+    let gnu = comparable_gnu_ld();
+    for extra in ["extra.ld", "-Ttext=0x2000"] {
+        let mut args = vec!["-pie", "--dynamic-linker=/lib/ld.so", "start.o", extra];
+        if extra.starts_with("-T") {
+            args.push("--defsym=x_sym=1");
+        }
+        let mut qld_args = args.clone();
+        qld_args.extend(["-o", "qld.out"]);
+        let (ok, stderr) = qld_only(&dir, &qld_args);
+        assert!(ok, "{extra}: {stderr}");
+        let headers = stdout_ok(&dir, "readelf", &["-lW", "qld.out"]);
+        let count = headers
+            .lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                l.starts_with("LOAD")
+                    || l.starts_with("PHDR")
+                    || l.starts_with("GNU_")
+                    || l.starts_with("INTERP")
+                    || l.starts_with("DYNAMIC")
+                    || l.starts_with("NOTE")
+            })
+            .count();
+        let phdr = headers
+            .lines()
+            .find(|l| l.trim_start().starts_with("PHDR"))
+            .unwrap_or_else(|| panic!("{extra}: no PT_PHDR:\n{headers}"));
+        let size = phdr.split_whitespace().nth(4).unwrap_or_default();
+        assert_eq!(
+            u64::from_str_radix(size.trim_start_matches("0x"), 16).unwrap(),
+            56 * count as u64,
+            "{extra}: {headers}"
+        );
+        if let Some(ld) = &gnu {
+            let mut gnu_args = args.clone();
+            gnu_args.extend(["-o", "gnu.out"]);
+            assert!(run(&dir, ld, &gnu_args).status.success());
+            let text = |file: &str| {
+                stdout_ok(&dir, "readelf", &["-SW", file])
+                    .lines()
+                    .find(|l| l.contains(" .text "))
+                    .map(|l| {
+                        l.split(']')
+                            .nth(1)
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .nth(2)
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .unwrap_or_default()
+            };
+            assert_eq!(text("gnu.out"), text("qld.out"), "{extra}: .text address");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symbol table conventions: bindings, file symbols.
+// ---------------------------------------------------------------------------
+
+/// `.symtab` as sorted `name type binding visibility` lines, file symbols
+/// included (the unnamed one as `<none>`); values and section indexes
+/// differ between the linkers' layouts and are left out.
+fn symtab_lines(dir: &Path, file: &str) -> Vec<String> {
+    let text = stdout_ok(dir, "readelf", &["-sW", file]);
+    let mut out: Vec<String> = text
+        .lines()
+        .skip_while(|l| !l.contains("'.symtab'"))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 7 || !f[0].ends_with(':') || f[3] == "SECTION" || f[0] == "0:" {
+                return None;
+            }
+            Some(format!(
+                "{} {} {} {}",
+                f.get(7).copied().unwrap_or("<none>"),
+                f[3],
+                f[4],
+                f[5]
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// GNU ld keeps hidden symbols of input objects global in executables,
+/// makes them local in shared objects, always makes the hidden symbols it
+/// and linker scripts define local (without visibility, after an unnamed
+/// file symbol), adds a file symbol named after each input without one,
+/// and always defines `_edata`, `__bss_start` and `_end` in executables and
+/// `_DYNAMIC` in dynamic outputs.
+#[test]
+fn symbol_table_bindings_like_gnu_ld() {
+    require_tools!();
+    let Some(ld) = comparable_gnu_ld() else {
+        println!("SKIPPED: no GNU ld 2.44 or newer to compare against");
+        return;
+    };
+    let dir = scratch("symtab-bindings");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    assemble(
+        &dir,
+        "sub/x",
+        "\t.text\n\t.globl _start\n_start:\n\tlea hidden_fn(%rip), %rax\n\tlea __ehdr_start(%rip), %rax\n\tlea script_hidden(%rip), %rax\n\tcall local_fn\n\tret\nlocal_fn:\n\tret\n",
+    );
+    assemble(
+        &dir,
+        "y",
+        "\t.file \"y.c\"\n\t.text\n\t.globl hidden_fn\n\t.hidden hidden_fn\n\t.type hidden_fn, @function\nhidden_fn:\n\tret\n\t.size hidden_fn, 1\n\t.globl prot_fn\n\t.protected prot_fn\nprot_fn:\n\tret\n\t.data\n\t.globl hidden_data\n\t.hidden hidden_data\nhidden_data:\n\t.long 1\nylocal:\n\t.long 2\n",
+    );
+    fs::write(dir.join("hide.ld"), "HIDDEN(script_hidden = 0x10);\n").unwrap();
+    let cases: &[&[&str]] = &[
+        &["-static", "sub/x.o", "y.o", "hide.ld"],
+        &[
+            "-pie",
+            "--dynamic-linker=/lib/ld.so",
+            "sub/x.o",
+            "y.o",
+            "hide.ld",
+        ],
+        &["-shared", "sub/x.o", "y.o", "hide.ld"],
+        &["-r", "sub/x.o", "y.o"],
+    ];
+    for args in cases {
+        for (linker, out) in [(&ld, "gnu.out"), (&qld_path(), "qld.out")] {
+            let mut full = args.to_vec();
+            full.extend(["-o", out]);
+            let result = run(&dir, linker, &full);
+            assert!(
+                result.status.success(),
+                "{} {}: {}",
+                linker.display(),
+                full.join(" "),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        assert_eq!(
+            symtab_lines(&dir, "gnu.out"),
+            symtab_lines(&dir, "qld.out"),
+            "symbol tables differ for {}",
+            args.join(" ")
+        );
+    }
+}

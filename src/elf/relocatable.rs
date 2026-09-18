@@ -8,16 +8,26 @@
 //!
 //! # Sections
 //!
+//! A linker script (`-T`, or on x86-64 the built-in `-r` layout of
+//! [`crate::elf::script_layout::defaults::relocatable_script`]) decides the
+//! output sections it names, in its order
+//! ([`crate::elf::script_layout::relocatable`]); the rules below place the
+//! rest after them.
+//!
 //! Input sections with the same name, type class (`SHT_NOBITS` joins
 //! `SHT_PROGBITS`) and allocation are concatenated into one output section,
 //! in order of first appearance. Members of a kept COMDAT group stay in
 //! sections of their own, listed by an output `SHT_GROUP` section (all group
-//! sections come first, as with GNU ld); `SHF_LINK_ORDER` sections are never
-//! combined, and one whose linked-to section is gone is dropped. Sections a
-//! final link consumes are kept: `SHF_EXCLUDE` sections, `.note.GNU-stack`
-//! and `.gnu.warning*`. `.note.gnu.property` is merged as in final links.
-//! Merged (`SHF_MERGE`) sections are concatenated, not deduplicated, and
-//! keep their merge flags only when all inputs agree. `-d` allocates common
+//! sections come first, as with GNU ld). `SHF_LINK_ORDER` sections outside
+//! groups are combined when the sections they link to share an output
+//! section (GNU ld's `elf_orphan_compatible`), ordered by where those
+//! sections ended up; one whose linked-to section is gone is dropped.
+//! Sections a final link consumes are kept: `SHF_EXCLUDE` sections,
+//! `.note.GNU-stack` and `.gnu.warning*`. `.note.gnu.property` is merged as
+//! in final links. Merged (`SHF_MERGE`) sections are concatenated, not
+//! deduplicated, and keep their merge flags only when all inputs agree.
+//! Alignment gaps in executable sections are filled with NOPs, as GNU ld
+//! does, so that disassemblers (objtool) stay in step. `-d` allocates common
 //! symbols at the end of `.bss`; otherwise they stay common.
 //!
 //! # Symbols
@@ -45,13 +55,15 @@ use hashbrown::hash_map::Entry;
 use rayon::prelude::*;
 
 use crate::args::{DiscardMode, LinkOptions, StripMode};
+use crate::elf::read::consts::STT_FILE;
 use crate::elf::read::consts::x86_64::R_X86_64_NONE;
 use crate::elf::read::consts::{
-    ELFOSABI_GNU, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_GROUP, SHF_INFO_LINK, SHF_LINK_ORDER,
-    SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_LORESERVE, SHN_UNDEF,
-    SHN_XINDEX, SHT_GROUP, SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NOTE, SHT_NULL, SHT_PROGBITS, SHT_REL,
-    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL, STB_LOCAL, STB_WEAK,
-    STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
+    ELFOSABI_GNU, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP, SHF_INFO_LINK,
+    SHF_LINK_ORDER, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_LORESERVE,
+    SHN_UNDEF, SHN_XINDEX, SHT_GROUP, SHT_LLVM_ADDRSIG, SHT_NOBITS, SHT_NOTE, SHT_NULL,
+    SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL,
+    STB_LOCAL, STB_WEAK, STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT, STV_HIDDEN,
+    STV_INTERNAL, STV_PROTECTED,
 };
 use crate::elf::read::{RawSymbol, Relocation, Relocations, SectionIndex};
 use crate::error::{Error, Result};
@@ -64,6 +76,7 @@ use super::inputs::{DefsymExpr, ElfInput, parse_defsym};
 use super::object::{InputSection, ObjectInput, SectionKind, is_debug_name};
 use super::refs::{Def, Refs};
 use super::resolve::AUX_COMDAT;
+use super::script_layout::relocatable::{RelocatableScript, ScriptDefinition, ScriptValue};
 use super::sections::{NONE, Sections};
 use super::synth::plan_property_note;
 
@@ -153,6 +166,8 @@ pub struct RelocatableInput<'r, 'a> {
     pub refs: Refs<'r, 'a>,
     /// The common block, when `-d` allocates common symbols.
     pub commons: Option<&'r Commons>,
+    /// The layout of a linker script's output sections (`-r -T`).
+    pub script: Option<&'r RelocatableScript<'a>>,
 }
 
 /// What an output section is made of.
@@ -165,6 +180,8 @@ enum OutKind {
     Group { file: u32, group: u32, symbol: u32 },
     /// The merged `.note.gnu.property`.
     Property,
+    /// `.note.gnu.build-id` (`--build-id`).
+    BuildId,
 }
 
 /// How input sections map to output sections.
@@ -181,7 +198,43 @@ enum Key<'a> {
         name: &'a [u8],
         sh_type: u32,
     },
+    /// `SHF_LINK_ORDER` sections outside groups, merged when the sections
+    /// they link to share an output section (numbered by [`content_key`]).
+    LinkOrder {
+        name: &'a [u8],
+        sh_type: u32,
+        flags: u64,
+        linked: u32,
+    },
     Unique(u32),
+    /// A linker script's output section.
+    Script(u32),
+}
+
+/// The output section key of a copied section that is not
+/// `SHF_LINK_ORDER`: its group's copy for group members, else its name, type
+/// class and allocation.
+fn content_key<'a>(section: &InputSection<'a>, file: u32, group: u32) -> Key<'a> {
+    let header = &section.header;
+    let type_class = if header.sh_type == SHT_NOBITS {
+        SHT_PROGBITS
+    } else {
+        header.sh_type
+    };
+    if group != NONE {
+        Key::Group {
+            file,
+            group: section.group,
+            name: section.name,
+            sh_type: type_class,
+        }
+    } else {
+        Key::Named {
+            name: section.name,
+            sh_type: type_class,
+            flags: header.sh_flags & (SHF_ALLOC | SHF_TLS),
+        }
+    }
 }
 
 /// One input section of an output section.
@@ -224,6 +277,9 @@ struct OutSection<'a> {
     rela_name_offset: u32,
     /// For group sections, the header indices of the members.
     group_members: Vec<u32>,
+    /// The linker script output this section is, by index in
+    /// [`RelocatableScript::outputs`].
+    script: Option<u32>,
 }
 
 impl<'a> OutSection<'a> {
@@ -249,7 +305,24 @@ impl<'a> OutSection<'a> {
             name_offset: 0,
             rela_name_offset: 0,
             group_members: Vec::new(),
+            script: None,
         }
+    }
+
+    /// Takes the flags, merge settings, type and alignment of a new member.
+    fn absorb(&mut self, header: &crate::elf::read::SectionHeader) {
+        self.flags |= header.sh_flags & !(SHF_MERGE | SHF_STRINGS | SHF_GROUP);
+        if (
+            header.sh_flags & (SHF_MERGE | SHF_STRINGS),
+            header.sh_entsize,
+        ) != (self.merge.0, self.merge.1)
+        {
+            self.merge.2 = true;
+        }
+        if self.sh_type == SHT_NOBITS && header.sh_type != SHT_NOBITS {
+            self.sh_type = SHT_PROGBITS;
+        }
+        self.align = self.align.max(header.sh_addralign.max(1));
     }
 
     fn has_file_bytes(&self) -> bool {
@@ -305,7 +378,10 @@ enum Rewritten {
 struct FilePlan {
     /// Kept local symbol indices, ascending.
     locals: Vec<u32>,
-    /// Output symbol index of the first kept local.
+    /// The name of the `STT_FILE` symbol written before the locals of an
+    /// input that has none, as GNU ld does.
+    file_name: Option<Vec<u8>>,
+    /// Output symbol index of the first local (the file symbol, if any).
     base: u32,
     /// String table offset of the first kept local's name.
     names: u64,
@@ -353,7 +429,12 @@ struct Plan<'a> {
     os_abi: u8,
     /// `e_machine` of the output, taken from the inputs.
     machine: u16,
-    /// `e_flags` of the output (RISC-V: the merged ABI flags).
+    /// The architecture, for code padding.
+    arch: crate::elf::arch::Arch,
+    /// The output section list index of each linker script output.
+    script_outs: Vec<u32>,
+    /// `e_flags` of the output, taken from the inputs (RISC-V: the merged
+    /// ABI flags).
     flags: u32,
     /// RISC-V: the merged `.riscv.attributes`, written in place of the
     /// first input section (the others become empty).
@@ -493,11 +574,130 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         }
     }
 
+    // `--build-id`: GNU ld creates the note in the first input object, so
+    // under a script it follows that object's orphans; its default `-r`
+    // script puts it first.
+    let build_id = crate::elf::synth::plan_build_id(input.options);
+    let make_build_id = |size: u64| {
+        let mut note = OutSection::new(b".note.gnu.build-id", OutKind::BuildId, SHT_NOTE);
+        note.flags = SHF_ALLOC;
+        note.align = 4;
+        note.size = size.saturating_add(16);
+        note
+    };
+    let mut build_id_pending = build_id;
+    if input.script.is_none_or(|s| s.build_id_first)
+        && let Some(size) = build_id_pending.take()
+    {
+        outs.push(make_build_id(size));
+    }
+
+    // A linker script's output sections come next, in statement order.
+    let mut assign = vec![NONE; sections.len()];
+    let mut script_outs: Vec<u32> = Vec::new();
+    if let Some(script) = input.script {
+        for (script_index, output) in script.outputs.iter().enumerate() {
+            let out_index = index_u32(outs.len())?;
+            let sh_type = if output.nobits {
+                SHT_NOBITS
+            } else {
+                SHT_PROGBITS
+            };
+            let mut new = OutSection::new(output.name, OutKind::Content, sh_type);
+            new.script = Some(index_u32(script_index)?);
+            new.flags = output.flags;
+            new.align = output.align.max(1);
+            new.size = output.size;
+            for (position, member) in output.members.iter().enumerate() {
+                let Some(section) = files
+                    .get(member.file as usize)
+                    .and_then(|f| f.object.as_ref())
+                    .and_then(|o| o.section(member.section))
+                else {
+                    continue;
+                };
+                let header = &section.header;
+                if position == 0 {
+                    if !output.nobits && output.data.is_empty() {
+                        new.sh_type = header.sh_type;
+                    }
+                    new.merge = (
+                        header.sh_flags & (SHF_MERGE | SHF_STRINGS),
+                        header.sh_entsize,
+                        false,
+                    );
+                    if header.sh_flags & SHF_LINK_ORDER != 0 {
+                        new.link_source = Some((member.file, header.sh_link));
+                    }
+                }
+                new.absorb(header);
+                if output.nobits {
+                    new.sh_type = SHT_NOBITS;
+                }
+                new.members.push(Member {
+                    file: member.file,
+                    section: member.section,
+                    offset: member.offset,
+                    relocs: 0,
+                    rela_offset: 0,
+                });
+                if let Some(id) = sections.id(member.file as usize, member.section)
+                    && let Some(slot) = assign.get_mut(id.index())
+                {
+                    *slot = out_index;
+                }
+            }
+            outs.push(new);
+            script_outs.push(out_index);
+        }
+    }
+
+    let group_of =
+        |file_index: usize, section: &InputSection<'_>| match section.group.checked_sub(1) {
+            Some(g) => file_groups
+                .get(file_index)
+                .and_then(|groups| groups.get(g as usize))
+                .copied()
+                .unwrap_or(NONE),
+            None => NONE,
+        };
+
+    // The keys link-order sections may link to, numbered in order of first
+    // appearance: as GNU ld does (`elf_orphan_compatible`), link-order
+    // sections of one name are merged when the sections they link to share
+    // an output section.
+    let mut base_keys: HashMap<Key<'a>, u32, foldhash::fast::FixedState> =
+        HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6c69_6e6b));
+    let mut section_key = vec![NONE; sections.len()];
+    for (file_index, file) in files.iter().enumerate() {
+        let Some(object) = &file.object else {
+            continue;
+        };
+        let file_u32 = index_u32(file_index)?;
+        for (index, section) in object.sections.iter().enumerate() {
+            let Some(id) = sections.id(file_index, index_u32(index)?) else {
+                continue;
+            };
+            if !sections.is_live(id) || section.header.sh_flags & SHF_LINK_ORDER != 0 {
+                continue;
+            }
+            let key = match slot(&assign, id.index()) {
+                NONE => content_key(section, file_u32, group_of(file_index, section)),
+                script => Key::Script(script),
+            };
+            let next = index_u32(base_keys.len())?;
+            let number = *base_keys.entry(key).or_insert(next);
+            if let Some(slot) = section_key.get_mut(id.index()) {
+                *slot = number;
+            }
+        }
+    }
+
     // Content sections, in order of first appearance.
     let mut keys: HashMap<Key<'a>, u32, foldhash::fast::FixedState> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x0072_656c_6f63));
-    let mut assign = vec![NONE; sections.len()];
     let mut property_out = None;
+    let mut first_object = true;
     for (file_index, file) in files.iter().enumerate() {
         let Some(object) = &file.object else {
             continue;
@@ -505,6 +705,10 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         if slot(&sections.base, file_index) == NONE {
             continue;
         }
+        if !first_object && let Some(size) = build_id_pending.take() {
+            outs.push(make_build_id(size));
+        }
+        first_object = false;
         let file_u32 = index_u32(file_index)?;
         for (index, section) in object.sections.iter().enumerate() {
             let index = index_u32(index)?;
@@ -519,7 +723,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             let Some(id) = sections.id(file_index, index) else {
                 continue;
             };
-            if !sections.is_live(id) {
+            if !sections.is_live(id) || slot(&assign, id.index()) != NONE {
                 continue;
             }
             let header = &section.header;
@@ -528,34 +732,23 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             {
                 continue;
             }
-            let group = match section.group.checked_sub(1) {
-                Some(g) => file_groups
-                    .get(file_index)
-                    .and_then(|groups| groups.get(g as usize))
-                    .copied()
-                    .unwrap_or(NONE),
-                None => NONE,
-            };
-            let type_class = if header.sh_type == SHT_NOBITS {
-                SHT_PROGBITS
-            } else {
-                header.sh_type
-            };
+            let group = group_of(file_index, section);
             let key = if header.sh_flags & SHF_LINK_ORDER != 0 {
-                Key::Unique(id.as_u32())
-            } else if group != NONE {
-                Key::Group {
-                    file: file_u32,
-                    group: section.group,
-                    name: section.name,
-                    sh_type: type_class,
+                let linked = sections
+                    .id(file_index, header.sh_link)
+                    .map(|linked| slot(&section_key, linked.index()))
+                    .filter(|&k| k != NONE && group == NONE);
+                match linked {
+                    Some(linked) => Key::LinkOrder {
+                        name: section.name,
+                        sh_type: header.sh_type,
+                        flags: header.sh_flags & (SHF_ALLOC | SHF_TLS),
+                        linked,
+                    },
+                    None => Key::Unique(id.as_u32()),
                 }
             } else {
-                Key::Named {
-                    name: section.name,
-                    sh_type: type_class,
-                    flags: header.sh_flags & (SHF_ALLOC | SHF_TLS),
-                }
+                content_key(section, file_u32, group)
             };
             let out_index = match keys.entry(key) {
                 Entry::Occupied(entry) => *entry.get(),
@@ -579,18 +772,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             let Some(out) = outs.get_mut(out_index as usize) else {
                 continue;
             };
-            out.flags |= header.sh_flags & !(SHF_MERGE | SHF_STRINGS | SHF_GROUP);
-            if (
-                header.sh_flags & (SHF_MERGE | SHF_STRINGS),
-                header.sh_entsize,
-            ) != (out.merge.0, out.merge.1)
-            {
-                out.merge.2 = true;
-            }
-            if out.sh_type == SHT_NOBITS && header.sh_type != SHT_NOBITS {
-                out.sh_type = SHT_PROGBITS;
-            }
-            out.align = out.align.max(header.sh_addralign.max(1));
+            out.absorb(header);
             out.members.push(Member {
                 file: file_u32,
                 section: index,
@@ -602,6 +784,9 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
                 *slot = out_index;
             }
         }
+    }
+    if let Some(size) = build_id_pending.take() {
+        outs.push(make_build_id(size));
     }
     let mut property = property;
     if property.is_some() && property_out.is_none() {
@@ -624,8 +809,13 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             sh_type: SHT_PROGBITS,
             flags: SHF_ALLOC,
         };
-        let out_index = match keys.get(&key) {
-            Some(&out) => out,
+        // A linker script's `.bss` takes them.
+        let script_bss = outs
+            .iter()
+            .position(|o| o.script.is_some() && o.name == b".bss" && o.kind == OutKind::Content)
+            .and_then(|o| u32::try_from(o).ok());
+        let out_index = match script_bss.or_else(|| keys.get(&key).copied()) {
+            Some(out) => out,
             None => {
                 let out = index_u32(outs.len())?;
                 let mut bss = OutSection::new(b".bss", OutKind::Content, SHT_NOBITS);
@@ -642,10 +832,55 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
     }
 
     // Member offsets and section sizes.
+    // Sections with SHF_LINK_ORDER go last, ordered by where the sections
+    // they link to ended up (GNU ld's `elf_fixup_link_order`).
     let mut offsets = vec![0u64; sections.len()];
-    for out in &mut outs {
+    let link_order = |out: &OutSection<'_>| {
+        !out.members.is_empty()
+            && out.members.iter().all(|m| {
+                files
+                    .get(m.file as usize)
+                    .and_then(|f| f.object.as_ref())
+                    .and_then(|o| o.section(m.section))
+                    .is_some_and(|s| s.header.sh_flags & SHF_LINK_ORDER != 0)
+            })
+    };
+    // The addresses GNU ld gives script outputs while it runs the script;
+    // link-order sections sort by them.
+    let addresses: Vec<u64> = {
+        let mut addresses = vec![0u64; sections.len()];
+        for out in &outs {
+            let Some(vma) = out
+                .script
+                .and_then(|i| input.script?.outputs.get(i as usize))
+                .map(|o| o.vma)
+            else {
+                continue;
+            };
+            for member in &out.members {
+                if let Some(id) = sections.id(member.file as usize, member.section)
+                    && let Some(slot) = addresses.get_mut(id.index())
+                {
+                    *slot = vma;
+                }
+            }
+        }
+        addresses
+    };
+    let order: Vec<usize> = (0..outs.len())
+        .filter(|&i| outs.get(i).is_some_and(|o| !link_order(o)))
+        .chain((0..outs.len()).filter(|&i| outs.get(i).is_some_and(link_order)))
+        .collect();
+    for out_index in order {
+        let Some(out) = outs.get_mut(out_index) else {
+            continue;
+        };
         if out.kind != OutKind::Content {
             continue;
+        }
+        let keep_offsets = out.script.is_some() && !link_order(out);
+        if link_order(out) {
+            sort_link_order(files, sections, &offsets, &addresses, &mut out.members);
         }
         let (merge_flags, merge_entsize, mixed) = out.merge;
         if !mixed {
@@ -664,7 +899,11 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             else {
                 continue;
             };
-            let offset = align_to(size, section.header.sh_addralign)?;
+            let offset = if keep_offsets {
+                member.offset
+            } else {
+                align_to(size, section.header.sh_addralign)?
+            };
             member.offset = offset;
             let id = sections.id(member.file as usize, member.section);
             size = add(offset, member_size(riscv_attributes.as_ref(), id, section))?;
@@ -681,7 +920,11 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             out.commons = Some(offset);
             size = add(offset, commons.size)?;
         }
-        out.size = size;
+        out.size = if keep_offsets {
+            out.size.max(size)
+        } else {
+            size
+        };
     }
     let commons = match commons_place {
         Some(out) => outs
@@ -697,6 +940,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         assign: &assign,
         offsets: &offsets,
         kept: &kept,
+        script_outs: &script_outs,
     };
     let scanned: Vec<Result<ScanOutput>> = files
         .par_iter()
@@ -741,10 +985,22 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         .collect();
     let mut next_symbol = add(1, outs.len() as u64)?;
     let mut names = 1u64;
-    for (plan, result) in file_plans.iter_mut().zip(kept_locals) {
-        let (locals, names_size) = result?;
+    for ((plan, result), file) in file_plans.iter_mut().zip(kept_locals).zip(files) {
+        let (locals, mut names_size) = result?;
+        plan.file_name = file
+            .object
+            .as_ref()
+            .filter(|o| !locals.is_empty() && !super::symtab::has_file_symbol(o))
+            .and_then(|_| super::symtab::file_symbol_name(file));
+        if let Some(name) = &plan.file_name {
+            names_size = add(names_size, add(name.len() as u64, 1)?)?;
+            next_symbol = add(next_symbol, 1)?;
+        }
         plan.base = u32::try_from(next_symbol)
             .map_err(|_| Error::Limit("more than 2^32 symbols".into()))?;
+        if plan.file_name.is_some() {
+            plan.base = plan.base.saturating_sub(1);
+        }
         plan.names = names;
         plan.names_size = names_size;
         next_symbol = add(next_symbol, locals.len() as u64)?;
@@ -910,9 +1166,38 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         file_size,
         os_abi,
         machine,
+        arch,
+        script_outs,
         flags,
         riscv_attributes,
     })
+}
+
+/// Orders the members of a link-order output section as GNU ld's
+/// `compare_link_order` does in relocatable links: by the address of the
+/// sections they link to (their output section's address while GNU ld runs
+/// the script, 0 for others, plus their offset), then in input order.
+fn sort_link_order(
+    files: &[ElfInput<'_>],
+    sections: &Sections,
+    offsets: &[u64],
+    addresses: &[u64],
+    members: &mut [Member],
+) {
+    members.sort_by_cached_key(|member| {
+        let linked = files
+            .get(member.file as usize)
+            .and_then(|f| f.object.as_ref())
+            .and_then(|o| {
+                let link = o.section(member.section)?.header.sh_link;
+                let id = sections.id(member.file as usize, link)?;
+                Some(slot(addresses, id.index()).wrapping_add(slot(offsets, id.index())))
+            });
+        let id = sections
+            .id(member.file as usize, member.section)
+            .map_or(u32::MAX, |id| id.as_u32());
+        (linked.unwrap_or(u64::MAX), id)
+    });
 }
 
 /// What relocation rewriting needs.
@@ -921,6 +1206,8 @@ struct Context<'c, 'r, 'a> {
     assign: &'c [u32],
     offsets: &'c [u64],
     kept: &'c KeptGroups<'a>,
+    /// The output section list index of each linker script output.
+    script_outs: &'c [u32],
 }
 
 impl Context<'_, '_, '_> {
@@ -1332,6 +1619,10 @@ fn plan_globals(
                             Some(defined(Place::Out(out), value.wrapping_add(offset)))
                         }
                         Def::Absolute(value) => Some(defined(Place::Absolute, value)),
+                        Def::Linker(_) if input.script.and_then(|s| s.symbol(id)).is_some() => {
+                            let definition = input.script.and_then(|s| s.symbol(id))?;
+                            script_global(context, input.script, definition, vis)
+                        }
                         Def::Linker(_) => {
                             let (_, expr) = defsyms.iter().find(|(d, _)| *d == id)?;
                             let (place, value, kind) = defsym_value(context, expr);
@@ -1353,6 +1644,57 @@ fn plan_globals(
         })
         .collect();
     Ok(globals.into_iter().flatten().collect())
+}
+
+/// The global symbol a linker script defines.
+fn script_global(
+    context: &Context<'_, '_, '_>,
+    script: Option<&RelocatableScript<'_>>,
+    definition: &ScriptDefinition,
+    visibility: u8,
+) -> Option<Global> {
+    let refs = context.refs;
+    let (place, value) = match definition.value {
+        ScriptValue::Absolute(value) => (Place::Absolute, value),
+        ScriptValue::Output(output, offset) => (
+            Place::Out(context.script_outs.get(output as usize).copied()?),
+            offset,
+        ),
+        ScriptValue::Input(section, offset) => {
+            let (file, index) = refs.sections.locate(section)?;
+            let (out, base) = context.placed(file, index)?;
+            (Place::Out(out), base.wrapping_add(offset))
+        }
+    };
+    // The type of the symbol the assignment copies, through other script
+    // symbols.
+    let mut kind = STT_NOTYPE;
+    let mut from = definition.type_from;
+    for _ in 0..8 {
+        let Some(other) = from else {
+            break;
+        };
+        if let Some(raw) = refs.global_target(other, false).raw {
+            kind = raw.kind();
+            break;
+        }
+        from = script
+            .and_then(|s| s.symbol(other))
+            .and_then(|d| d.type_from);
+    }
+    Some(Global {
+        id: definition.id,
+        place,
+        value,
+        size: 0,
+        info: (STB_GLOBAL << 4) | kind,
+        other: if definition.hidden {
+            STV_HIDDEN
+        } else {
+            visibility
+        },
+        default_version: false,
+    })
 }
 
 /// The place, value and type of a `--defsym` symbol: absolute for a
@@ -1416,6 +1758,14 @@ enum Chunk {
     Group(u32),
     Property,
     Member(u32, u32),
+    /// Padding between the members of an executable section: NOPs, as
+    /// GNU ld pads code (disassemblers such as objtool decode through it).
+    Nops,
+    /// The `.note.gnu.build-id` header; the hash is written last.
+    BuildId,
+    /// Bytes a linker script's data commands put into an output section:
+    /// the output section list index and the index of the data.
+    ScriptData(u32, u32),
     Rela(u32, u32),
     Symtab,
     Shndx,
@@ -1435,7 +1785,29 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
             OutKind::Property => {
                 chunks.push((ChunkRange::new(out.offset, out.size), Chunk::Property));
             }
+            OutKind::BuildId => {
+                chunks.push((ChunkRange::new(out.offset, out.size), Chunk::BuildId));
+            }
             OutKind::Content => {
+                let script = out
+                    .script
+                    .and_then(|i| input.script?.outputs.get(i as usize));
+                // What has bytes, for the gaps between them.
+                let mut covered: Vec<(u64, u64)> = Vec::new();
+                if let Some(script) = script
+                    && out.has_file_bytes()
+                {
+                    for (data_index, (offset, bytes)) in script.data.iter().enumerate() {
+                        let len = bytes.len() as u64;
+                        if len > 0 {
+                            chunks.push((
+                                ChunkRange::new(add(out.offset, *offset)?, len),
+                                Chunk::ScriptData(out_u32, index_u32(data_index)?),
+                            ));
+                            covered.push((*offset, len));
+                        }
+                    }
+                }
                 for (member_index, member) in out.members.iter().enumerate() {
                     let member_u32 = index_u32(member_index)?;
                     if out.has_file_bytes() {
@@ -1457,6 +1829,7 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
                                 ChunkRange::new(add(out.offset, member.offset)?, size),
                                 Chunk::Member(out_u32, member_u32),
                             ));
+                            covered.push((member.offset, section.header.sh_size));
                         }
                     }
                     if member.relocs > 0 {
@@ -1467,6 +1840,26 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
                             ),
                             Chunk::Rela(out_u32, member_u32),
                         ));
+                    }
+                }
+                // Code is padded with NOPs unless the script gives a fill.
+                let code = out.has_file_bytes()
+                    && out.flags & SHF_EXECINSTR != 0
+                    && script.is_none_or(|s| s.fill.is_none());
+                if code {
+                    covered.sort_unstable();
+                    let mut cursor = 0u64;
+                    for (offset, len) in covered {
+                        if offset > cursor {
+                            chunks.push((
+                                ChunkRange::new(
+                                    add(out.offset, cursor)?,
+                                    offset.saturating_sub(cursor),
+                                ),
+                                Chunk::Nops,
+                            ));
+                        }
+                        cursor = cursor.max(add(offset, len)?);
                     }
                 }
             }
@@ -1503,12 +1896,23 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
         ..OutputOptions::for_link(input.options)
     };
     let mut file = OutputFile::create(&path, plan.file_size, &options)?;
+    let build_id = plan
+        .outs
+        .iter()
+        .find(|o| o.kind == OutKind::BuildId)
+        .map(|o| o.offset.saturating_add(16));
+    if let Some(offset) = build_id {
+        file.reserve_build_id(&input.options.build_id, offset);
+    }
     file.write_chunks(&ranges, |index, out| {
         let Some(&(_, chunk)) = chunks.get(index) else {
             return Err(Error::Internal("chunk index out of range".into()));
         };
         write_chunk(input, plan, chunk, out)
     })?;
+    if let Some(offset) = build_id {
+        file.apply_build_id(&input.options.build_id, offset)?;
+    }
     file.finish()?;
     Ok(())
 }
@@ -1574,6 +1978,32 @@ fn write_chunk<'a>(
             }
             if let Some(dest) = out.get_mut(..data.len()) {
                 dest.copy_from_slice(data);
+            }
+            Ok(())
+        }
+        Chunk::Nops => {
+            plan.arch.write_nops(out);
+            Ok(())
+        }
+        Chunk::BuildId => {
+            crate::elf::synth::write_build_id_header(
+                out,
+                u64::try_from(out.len()).unwrap_or(0).saturating_sub(16),
+            );
+            Ok(())
+        }
+        Chunk::ScriptData(out_index, data) => {
+            let bytes = plan
+                .outs
+                .get(out_index as usize)
+                .and_then(|o| o.script)
+                .and_then(|i| input.script?.outputs.get(i as usize))
+                .and_then(|s| s.data.get(data as usize))
+                .map(|(_, bytes)| bytes);
+            if let Some(bytes) = bytes
+                && let Some(dest) = out.get_mut(..bytes.len())
+            {
+                dest.copy_from_slice(bytes);
             }
             Ok(())
         }
@@ -1703,6 +2133,7 @@ fn local_index(plan: &Plan<'_>, file: usize, symbol: u32) -> u32 {
         Ok(at) => u32::try_from(at)
             .ok()
             .and_then(|at| file_plan.base.checked_add(at))
+            .and_then(|at| at.checked_add(u32::from(file_plan.file_name.is_some())))
             .unwrap_or(0),
         Err(_) => 0,
     }
@@ -1863,9 +2294,12 @@ fn write_rela<'a>(
         assign: &plan.assign,
         offsets: &plan.offsets,
         kept: &plan.kept,
+        script_outs: &plan.script_outs,
     };
-    let mut entries = out.as_chunks_mut::<24>().0.iter_mut();
-    let mut written = 0u64;
+    // GNU ld sorts each output relocation section by offset, keeping the
+    // order of equal offsets (`elf_link_adjust_relocs`); members do not
+    // overlap, so sorting each member's relocations is enough.
+    let mut sorted: Vec<(u64, u64, i64)> = Vec::with_capacity(relas.len());
     for rel in relas.iter() {
         let Rewritten::Keep {
             symbol,
@@ -1885,22 +2319,21 @@ fn write_rela<'a>(
             Some(index) => (index, r_type, addend),
             None => (0, R_X86_64_NONE, 0),
         };
-        let Some(entry) = entries.next() else {
-            return Err(Error::Internal(
-                "relocatable output: more relocations than planned".into(),
-            ));
-        };
         let offset = rel.offset.wrapping_add(member.offset);
         let info = (u64::from(index) << 32) | u64::from(r_type);
-        entry[0..8].copy_from_slice(&offset.to_le_bytes());
-        entry[8..16].copy_from_slice(&info.to_le_bytes());
-        entry[16..24].copy_from_slice(&addend.to_le_bytes());
-        written = written.saturating_add(1);
+        sorted.push((offset, info, addend));
     }
-    if written != member.relocs {
+    sorted.sort_by_key(|&(offset, ..)| offset);
+    let entries = out.as_chunks_mut::<24>().0;
+    if sorted.len() as u64 != member.relocs || entries.len() < sorted.len() {
         return Err(Error::Internal(
             "relocatable output: relocation count changed after planning".into(),
         ));
+    }
+    for (entry, (offset, info, addend)) in entries.iter_mut().zip(sorted) {
+        entry[0..8].copy_from_slice(&offset.to_le_bytes());
+        entry[8..16].copy_from_slice(&info.to_le_bytes());
+        entry[16..24].copy_from_slice(&addend.to_le_bytes());
     }
     Ok(())
 }
@@ -1945,7 +2378,12 @@ fn split_symbols<'o>(
     let (first, mut rest) = out.split_at_mut(head.min(out.len()));
     let mut files = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
-        let len = file.locals.len().saturating_mul(width).min(rest.len());
+        let len = file
+            .locals
+            .len()
+            .saturating_add(usize::from(file.file_name.is_some()))
+            .saturating_mul(width)
+            .min(rest.len());
         let (this, tail) = std::mem::take(&mut rest).split_at_mut(len);
         files.push(this);
         rest = tail;
@@ -1963,6 +2401,7 @@ fn write_symtab<'a>(
         assign: &plan.assign,
         offsets: &plan.offsets,
         kept: &plan.kept,
+        script_outs: &plan.script_outs,
     };
     let (head, files, globals) = split_symbols(plan, out, 24);
     let mut entries = head.as_chunks_mut::<24>().0.iter_mut();
@@ -1988,7 +2427,16 @@ fn write_symtab<'a>(
             };
             let symbols = object.elf.symbols();
             let mut name = file_plan.names;
-            for (&index, entry) in file_plan.locals.iter().zip(out.as_chunks_mut::<24>().0) {
+            let mut entries = out.as_chunks_mut::<24>().0.iter_mut();
+            if let Some(file_name) = &file_plan.file_name
+                && let Some(entry) = entries.next()
+            {
+                put_sym(entry, name, (STB_LOCAL << 4) | STT_FILE, 0, SHN_ABS, 0, 0);
+                name = name
+                    .saturating_add(file_name.len() as u64)
+                    .saturating_add(1);
+            }
+            for (&index, entry) in file_plan.locals.iter().zip(entries) {
                 let Some(raw) = symbols.get_raw(index as usize) else {
                     continue;
                 };
@@ -2040,6 +2488,7 @@ fn write_shndx<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut 
         assign: &plan.assign,
         offsets: &plan.offsets,
         kept: &plan.kept,
+        script_outs: &plan.script_outs,
     };
     let (head, files, globals) = split_symbols(plan, out, 4);
     for (out_section, entry) in plan
@@ -2062,7 +2511,12 @@ fn write_shndx<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut 
                 return;
             };
             let symbols = object.elf.symbols();
-            for (&index, entry) in file_plan.locals.iter().zip(out.as_chunks_mut::<4>().0) {
+            let skip = usize::from(file_plan.file_name.is_some());
+            for (&index, entry) in file_plan
+                .locals
+                .iter()
+                .zip(out.as_chunks_mut::<4>().0.iter_mut().skip(skip))
+            {
                 let Some(raw) = symbols.get_raw(index as usize) else {
                     continue;
                 };
@@ -2119,6 +2573,9 @@ fn write_strtab<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut
             };
             let symbols = object.elf.symbols();
             let mut at = 0usize;
+            if let Some(file_name) = &file_plan.file_name {
+                at = put_bytes(out, at, file_name).saturating_add(1);
+            }
             for &index in &file_plan.locals {
                 let name = symbols
                     .get_raw(index as usize)

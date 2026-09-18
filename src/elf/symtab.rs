@@ -4,11 +4,14 @@
 //! their names go, so both sizes are known. [`write_symtab`] and
 //! [`write_strtab`] fill the tables after layout, in parallel.
 //!
-//! Local symbols of live sections come first, file by file, followed by
-//! global symbols with hidden or internal visibility (which an executable
-//! turns into locals, as GNU ld does), then the other globals by symbol ID.
-//! Section symbols and assembler temporaries (`.L*`) are dropped; `-x` drops
-//! every local and `-s` the whole table.
+//! Local symbols of live sections come first, file by file, each file's
+//! after a `STT_FILE` symbol (GNU ld adds one named after the input when
+//! the input has none). Global symbols GNU ld hides itself follow as
+//! locals (without visibility), after an unnamed `STT_FILE` symbol: the
+//! linker's and linker scripts' hidden symbols, and in shared objects every
+//! hidden symbol; other hidden symbols stay global. The other globals come
+//! last, by symbol ID. Section symbols and assembler temporaries (`.L*`)
+//! are dropped; `-x` drops every local and `-s` the whole table.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -38,6 +41,11 @@ pub const SYM_SIZE: usize = 24;
 pub struct SymtabPlan {
     /// Per file: local symbol indices kept.
     pub locals: Vec<Vec<u32>>,
+    /// Per file: the name of the `STT_FILE` symbol written before its
+    /// locals because the input has none (GNU ld's `elf_link_input_bfd`).
+    file_names: Vec<Option<Vec<u8>>>,
+    /// Whether an unnamed `STT_FILE` symbol precedes the hidden globals.
+    hidden_file: bool,
     /// Globals written as locals (hidden visibility).
     pub hidden: Vec<SymbolId>,
     /// Globals.
@@ -86,6 +94,29 @@ fn global_visibility(refs: &Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) 
         };
     }
     target.raw.map_or(STV_DEFAULT, |raw| raw.visibility())
+}
+
+/// Whether an input has a `STT_FILE` symbol.
+pub(crate) fn has_file_symbol(object: &super::object::ObjectInput<'_>) -> bool {
+    let symbols = object.elf.symbols();
+    (1..object.first_global).any(|index| {
+        symbols
+            .get_raw(index)
+            .is_some_and(|raw| raw.kind() == STT_FILE)
+    })
+}
+
+/// The name GNU ld gives the `STT_FILE` symbol it adds for an input without
+/// one: the file name without directories (for an archive member, the
+/// member's).
+pub(crate) fn file_symbol_name(file: &super::inputs::ElfInput<'_>) -> Option<Vec<u8>> {
+    let input = file.file?;
+    let name: &[u8] = match input.member() {
+        Some(member) => member.as_bytes(),
+        None => input.path().as_os_str().as_encoded_bytes(),
+    };
+    let base = name.rsplit(|&b| b == b'/').next().unwrap_or(name);
+    (!base.is_empty()).then(|| base.to_vec())
 }
 
 /// Which local symbols of `file` the relocations of its live sections
@@ -139,7 +170,8 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
         return SymtabPlan::default();
     }
     let discard = options.discard;
-    let per_file: Vec<(Vec<u32>, usize)> = refs
+    let shared = options.kind == crate::args::OutputKind::Shared;
+    let per_file: Vec<(Vec<u32>, usize, Option<Vec<u8>>)> = refs
         .files
         .par_iter()
         .enumerate()
@@ -147,7 +179,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
             let mut kept = Vec::new();
             let mut names = 0usize;
             let Some(object) = &file.object else {
-                return (kept, names);
+                return (kept, names, None);
             };
             if refs
                 .sections
@@ -155,7 +187,7 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                 .get(file_index)
                 .is_none_or(|&b| b == super::sections::NONE)
             {
-                return (kept, names);
+                return (kept, names, None);
             }
             let symbols = object.elf.symbols();
             // With --emit-relocs, locals that relocations name stay symbols.
@@ -191,7 +223,13 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                 kept.push(u32::try_from(index).unwrap_or(u32::MAX));
                 names = names.saturating_add(name.len()).saturating_add(1);
             }
-            (kept, names)
+            let file_name = (!kept.is_empty() && !has_file_symbol(object))
+                .then(|| file_symbol_name(file))
+                .flatten();
+            if let Some(name) = &file_name {
+                names = names.saturating_add(name.len()).saturating_add(1);
+            }
+            (kept, names, file_name)
         })
         .collect();
 
@@ -227,9 +265,18 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
                 return None;
             }
             let visibility = global_visibility(refs, linker, id);
-            let hidden = matches!(visibility, STV_HIDDEN | STV_INTERNAL)
-                && kind != DefinitionKind::Undefined
-                && kind != DefinitionKind::Lazy;
+            // GNU ld makes a hidden symbol local when it hides it itself:
+            // the linker's and scripts' hidden symbols always, and every
+            // hidden symbol of a shared object output. (In a PIE it also
+            // localizes the hidden functions that PLT32 relocations call,
+            // which qld does not track: they stay global and hidden.)
+            // Symbols a version script's `local:` or `--exclude-libs` hides
+            // are local too.
+            let defined = kind != DefinitionKind::Undefined && kind != DefinitionKind::Lazy;
+            let hidden = defined
+                && ((matches!(visibility, STV_HIDDEN | STV_INTERNAL)
+                    && (shared || matches!(refs.global_target(id, true).def, Def::Linker(_))))
+                    || symbols.flags(id).contains(super::export::FORCED_LOCAL));
             if hidden && discard == DiscardMode::All {
                 return None;
             }
@@ -242,15 +289,22 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
     let mut plan = SymtabPlan::default();
     let mut index = 1usize;
     let mut offset = 1usize;
-    for (kept, names) in per_file {
+    for (kept, names, file_name) in per_file {
         plan.local_base.push(index);
         plan.local_names.push(offset);
-        index = index.saturating_add(kept.len());
+        index = index
+            .saturating_add(kept.len())
+            .saturating_add(usize::from(file_name.is_some()));
         offset = offset.saturating_add(names);
         plan.locals.push(kept);
+        plan.file_names.push(file_name);
     }
     plan.hidden_base = index;
     plan.hidden_names = offset;
+    plan.hidden_file = selected.iter().any(|&(_, hidden, _)| hidden);
+    if plan.hidden_file {
+        index = index.saturating_add(1);
+    }
     for &(id, hidden, len) in &selected {
         if hidden {
             plan.hidden.push(id);
@@ -295,14 +349,21 @@ impl SymtabPlan {
     pub fn local_index(&self, file: usize, symbol: u32) -> Option<usize> {
         let kept = self.locals.get(file)?;
         let at = kept.binary_search(&symbol).ok()?;
-        self.local_base.get(file)?.checked_add(at)
+        let file_symbol = usize::from(self.file_names.get(file).is_some_and(Option::is_some));
+        self.local_base
+            .get(file)?
+            .checked_add(at)?
+            .checked_add(file_symbol)
     }
 
     /// The table index of global symbol `id`, if it is in the table.
     #[must_use]
     pub fn global_index(&self, id: SymbolId) -> Option<usize> {
         if let Ok(at) = self.hidden.binary_search(&id) {
-            return self.hidden_base.checked_add(at);
+            return self
+                .hidden_base
+                .checked_add(usize::from(self.hidden_file))?
+                .checked_add(at);
         }
         let at = self.globals.binary_search(&id).ok()?;
         self.first_global.checked_add(at)
@@ -434,13 +495,18 @@ pub fn write_symtab(
         .saturating_sub(1)
         .saturating_sub(plan.section_symbols);
     let (locals, rest) = rest.split_at_mut(local_count.min(rest.len()));
+    let (hidden_file, rest) = rest.split_at_mut(usize::from(plan.hidden_file).min(rest.len()));
+    for entry in hidden_file {
+        put_sym(entry, 0, (STB_LOCAL << 4) | STT_FILE, 0, SHN_ABS, 0, 0);
+    }
     let (hidden, globals) = rest.split_at_mut(plan.hidden.len().min(rest.len()));
 
     // File locals, per file in parallel.
     let mut slices = Vec::with_capacity(plan.locals.len());
     let mut remaining = locals;
-    for kept in &plan.locals {
-        let n = kept.len().min(remaining.len());
+    for (file, kept) in plan.locals.iter().enumerate() {
+        let file_symbol = usize::from(plan.file_names.get(file).is_some_and(Option::is_some));
+        let n = kept.len().saturating_add(file_symbol).min(remaining.len());
         let (head, tail) = std::mem::take(&mut remaining).split_at_mut(n);
         slices.push(head);
         remaining = tail;
@@ -455,6 +521,22 @@ pub fn write_symtab(
             let symbols = object.elf.symbols();
             let mut name_offset = plan.local_names.get(file_index).copied().unwrap_or(0);
             let kept = plan.locals.get(file_index).map_or(&[][..], Vec::as_slice);
+            let mut slice = slice;
+            if let Some(Some(name)) = plan.file_names.get(file_index)
+                && let Some((entry, rest)) = std::mem::take(&mut slice).split_first_mut()
+            {
+                put_sym(
+                    entry,
+                    name_offset,
+                    (STB_LOCAL << 4) | STT_FILE,
+                    0,
+                    SHN_ABS,
+                    0,
+                    0,
+                );
+                name_offset = name_offset.saturating_add(name.len()).saturating_add(1);
+                slice = rest;
+            }
             for (entry, &index) in slice.iter_mut().zip(kept) {
                 let index = index as usize;
                 let Some(raw) = symbols.get_raw(index) else {
@@ -529,7 +611,7 @@ pub fn write_symtab(
                     let absolute = refs.symbols.flags(id).contains(super::defined::ABSOLUTE);
                     (
                         STB_GLOBAL,
-                        STT_NOTYPE,
+                        super::defined::linker_type(refs, linker, id),
                         visibility,
                         if absolute {
                             SHN_ABS
@@ -568,7 +650,12 @@ pub fn write_symtab(
                     0,
                 ),
             };
-            let binding = if local { STB_LOCAL } else { binding };
+            // Globals made local lose their visibility, as in GNU ld.
+            let (binding, other) = if local {
+                (STB_LOCAL, other & !3)
+            } else {
+                (binding, other)
+            };
             let value = tls_relative(addresses, kind, value, shndx);
             put_sym(
                 entry,
@@ -652,6 +739,9 @@ pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
             };
             let symbols = object.elf.symbols();
             let mut cursor = 0usize;
+            if let Some(Some(name)) = plan.file_names.get(file_index) {
+                cursor = put_name(slice, cursor, name);
+            }
             for &index in kept {
                 let name = symbols
                     .get_raw(index as usize)

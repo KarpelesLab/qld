@@ -231,6 +231,10 @@ pub struct LayoutScript {
     /// Symbols the scripts read (for archive extraction and GC roots), and
     /// whether every read is on the right of a `PROVIDE`.
     pub referenced: Vec<(Vec<u8>, bool)>,
+    /// The symbols of [`LayoutScript::referenced`] whose value is read, not
+    /// only tested with `DEFINED` (which GNU ld does not count as a
+    /// reference).
+    pub value_reads: Vec<Vec<u8>>,
     /// `OVERWRITE_SECTIONS` descriptions, used for orphans of their name.
     pub overwrite: Vec<u32>,
 }
@@ -354,7 +358,7 @@ impl Builder {
                     });
                 }
                 CommandKind::Assert(assert) => {
-                    note_expr(&assert.expr, &mut self.plan.referenced, false);
+                    self.note_expr(&assert.expr, false);
                     pending.push(Statement::Assert {
                         assert: assert.clone(),
                         span,
@@ -395,10 +399,10 @@ impl Builder {
                     }
                 }
                 CommandKind::Version(nodes) => self.plan.version.extend(nodes.iter().cloned()),
-                CommandKind::Entry(name) => note_name(name, &mut self.plan.referenced, false),
+                CommandKind::Entry(name) => self.note_name(name, false),
                 CommandKind::Extern(names) => {
                     for name in names {
-                        note_name(name, &mut self.plan.referenced, false);
+                        self.note_name(name, false);
                     }
                 }
                 _ => {}
@@ -531,9 +535,9 @@ impl Builder {
             }
         }
         if assignment.op.binary().is_some() && !assignment.is_dot() {
-            note_name(&assignment.target, &mut self.plan.referenced, provide);
+            self.note_name(&assignment.target, provide);
         }
-        note_expr(&assignment.expr, &mut self.plan.referenced, provide);
+        self.note_expr(&assignment.expr, provide);
     }
 
     fn push_output(&mut self, output: OutputStmt) -> Result<u32> {
@@ -565,10 +569,10 @@ impl Builder {
                 });
             }
             SectionsCommandKind::Entry(name) => {
-                note_name(name, &mut self.plan.referenced, false);
+                self.note_name(name, false);
             }
             SectionsCommandKind::Assert(assert) => {
-                note_expr(&assert.expr, &mut self.plan.referenced, false);
+                self.note_expr(&assert.expr, false);
                 out.push(Statement::Assert {
                     assert: assert.clone(),
                     span,
@@ -616,7 +620,7 @@ impl Builder {
                     }
                 }
                 OutputSectionCommandKind::Data { size, expr } => {
-                    note_expr(expr, &mut self.plan.referenced, false);
+                    self.note_expr(expr, false);
                     Item::Data {
                         size: *size,
                         expr: expr.clone(),
@@ -627,7 +631,7 @@ impl Builder {
                 OutputSectionCommandKind::Asciz(text) => Item::Asciz(text.clone()),
                 OutputSectionCommandKind::LinkerVersion => Item::LinkerVersion,
                 OutputSectionCommandKind::Assert(assert) => {
-                    note_expr(&assert.expr, &mut self.plan.referenced, false);
+                    self.note_expr(&assert.expr, false);
                     Item::Assert {
                         assert: assert.clone(),
                         span,
@@ -656,7 +660,7 @@ impl Builder {
         .into_iter()
         .flatten()
         {
-            note_expr(expr, &mut self.plan.referenced, false);
+            self.note_expr(expr, false);
         }
         Ok(OutputStmt {
             name: section.name.clone(),
@@ -796,6 +800,25 @@ impl Builder {
             ));
         }
         Ok(())
+    }
+}
+
+impl Builder {
+    fn note_name(&mut self, name: &[u8], provide: bool) {
+        note_name(name, &mut self.plan.referenced, provide);
+        if name != b"." && !self.plan.value_reads.iter().any(|n| n == name) {
+            self.plan.value_reads.push(name.to_vec());
+        }
+    }
+
+    fn note_expr(&mut self, expr: &Expr, provide: bool) {
+        note_expr(expr, &mut self.plan.referenced, provide);
+        let reads = &mut self.plan.value_reads;
+        expr.for_each_value_symbol(&mut |name| {
+            if !reads.iter().any(|n| n == name) {
+                reads.push(name.to_vec());
+            }
+        });
     }
 }
 

@@ -198,6 +198,9 @@ struct Engine<'e, 'l, 'a> {
     dataseg: DataSeg,
     fill_patterns: Vec<Vec<u8>>,
     headers_size: u64,
+    /// Whether `headers_size` is GNU ld's first estimate, which the caller
+    /// corrects by laying out again when the headers outgrow it.
+    headers_estimated: bool,
     max_page: u64,
     common_page: u64,
     /// `-z relro`, dropped as GNU ld does when no section with contents
@@ -1327,26 +1330,145 @@ fn for_each_expr(script: &LayoutScript, placed: &ScriptPlacement, f: &mut dyn Fn
     }
 }
 
+/// GNU ld's `ldlang_nearby_section`: the output section (by position) a
+/// symbol defined in output `removed`, which is not output (empty and not
+/// kept), moves to: the kept neighbour that would share its segment,
+/// looking in the same memory region first.
+fn nearby_section(
+    engine: &Engine<'_, '_, '_>,
+    output_places: &[(u64, u64, u32)],
+    sections: &[OutSection<'_>],
+    removed: u32,
+    address: u64,
+) -> Option<u32> {
+    let statements = &engine.placed.statements;
+    let at = statements
+        .iter()
+        .position(|s| matches!(s, Statement::Output(i) if *i == removed))?;
+    let region_of = |output: u32| engine.outs.get(output as usize).and_then(|o| o.region);
+    let region = region_of(removed);
+    let kept = |statement: &Statement, same_region: bool| match statement {
+        Statement::Output(i) => {
+            let position = output_places.get(*i as usize).map(|p| p.2)?;
+            (position != NONE && (!same_region || region_of(*i) == region)).then_some(position)
+        }
+        _ => None,
+    };
+    // GNU section flags of an emitted section, and of the removed one
+    // (which never got SEC_LOAD).
+    let flags = |position: u32| {
+        sections
+            .get(position as usize)
+            .map_or(0, |s| gnu_flags(s.flags, s.sh_type, s.name))
+    };
+    let removed_flags = engine
+        .outs
+        .get(removed as usize)
+        .map_or(0, |o| o.input_flags & !sec::LOAD);
+    for same_region in [true, false] {
+        let prev = statements
+            .get(..at)?
+            .iter()
+            .rev()
+            .find_map(|s| kept(s, same_region));
+        let next = statements
+            .get(at.saturating_add(1)..)?
+            .iter()
+            .find_map(|s| kept(s, same_region));
+        let best = match (prev, next) {
+            (None, next) => next,
+            (Some(prev), None) => Some(prev),
+            (Some(prev), Some(next)) => {
+                let (pf, nf) = (flags(prev), flags(next));
+                let use_prev = if (pf ^ nf) & (sec::ALLOC | sec::THREAD_LOCAL | sec::LOAD) != 0 {
+                    (nf ^ removed_flags) & (sec::ALLOC | sec::THREAD_LOCAL) != 0
+                        || (pf & sec::LOAD != 0 && nf & sec::LOAD == 0)
+                } else if (pf ^ nf) & sec::READONLY != 0 {
+                    (nf ^ removed_flags) & sec::READONLY != 0
+                } else if (pf ^ nf) & sec::CODE != 0 {
+                    (nf ^ removed_flags) & sec::CODE != 0
+                } else {
+                    sections
+                        .get(next as usize)
+                        .is_some_and(|s| address < s.addr)
+                };
+                Some(if use_prev { prev } else { next })
+            }
+        };
+        if best.is_some() {
+            return best;
+        }
+    }
+    None
+}
+
 /// How the members matched by one description are ordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SortRule {
+pub(super) struct SortRule {
     mode: SortMode,
     reverse: bool,
-    files: bool,
+    /// `SORT(file)`: by file name first.
+    pub(super) files: bool,
+}
+
+/// The sort rule of input description `sub` of `stmt`, with
+/// `--sort-section` applied to descriptions that do not sort themselves;
+/// `None` keeps input order.
+pub(super) fn sort_rule(stmt: &OutputStmt, sub: u16, sort_section: SortMode) -> Option<SortRule> {
+    let description = stmt.items.iter().find_map(|item| match item {
+        Item::Input { description, index } if *index == sub => Some(description),
+        _ => None,
+    })?;
+    let specs = description.sections.as_deref().unwrap_or_default();
+    let mode = specs.first().map_or(SortMode::None, |s| s.sort);
+    let reverse = specs.first().is_some_and(|s| s.reverse);
+    if specs.iter().any(|s| s.sort != mode || s.reverse != reverse) {
+        return None;
+    }
+    let mode = if mode == SortMode::None {
+        sort_section
+    } else {
+        mode
+    };
+    let files = description.file.sort == SortMode::Name;
+    (mode != SortMode::None || files).then_some(SortRule {
+        mode,
+        reverse,
+        files,
+    })
+}
+
+/// The `--sort-section` mode.
+pub(super) fn sort_section_mode(options: &crate::args::LinkOptions) -> SortMode {
+    match options.sort_section.as_deref() {
+        Some("name") => SortMode::Name,
+        Some("alignment") => SortMode::Alignment,
+        _ => SortMode::None,
+    }
 }
 
 /// Information for sorting one input member.
-struct SortInfo<'n> {
-    class: u8,
-    file: &'n [u8],
-    member: &'n [u8],
-    name: &'n [u8],
-    align: u64,
-    id: u32,
+pub(super) struct SortInfo<'n> {
+    /// 1 for input sections; linker-generated ones sort around them.
+    pub(super) class: u8,
+    /// The file (archive) path.
+    pub(super) file: &'n [u8],
+    /// The archive member name, or empty.
+    pub(super) member: &'n [u8],
+    /// The section name.
+    pub(super) name: &'n [u8],
+    /// The alignment.
+    pub(super) align: u64,
+    /// The section ID, for input order.
+    pub(super) id: u32,
 }
 
 /// GNU's `compare_section`.
-fn compare_sections(rule: SortRule, a: &SortInfo<'_>, b: &SortInfo<'_>) -> core::cmp::Ordering {
+pub(super) fn compare_sections(
+    rule: SortRule,
+    a: &SortInfo<'_>,
+    b: &SortInfo<'_>,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     let by_name = || {
         if rule.reverse {
@@ -1398,11 +1520,7 @@ fn build_entries(
     let files = input.files;
     let count = placement.outputs.len();
     let mut lists: Vec<Vec<(Entry, SortInfo<'_>)>> = (0..count).map(|_| Vec::new()).collect();
-    let sort_section = match input.options.sort_section.as_deref() {
-        Some("name") => SortMode::Name,
-        Some("alignment") => SortMode::Alignment,
-        _ => SortMode::None,
-    };
+    let sort_section = sort_section_mode(input.options);
     // Sort rules by (output, sub), computed on first use.
     let mut rules: HashMap<(u32, u16), Option<SortRule>, foldhash::fast::FixedState> =
         HashMap::with_hasher(hasher());
@@ -1444,30 +1562,9 @@ fn build_entries(
             }
             let sub = placement.sub.get(id.index()).copied().unwrap_or(0);
             let (size, align) = member_size(input, member)?;
-            rules.entry((output, sub)).or_insert_with(|| {
-                let stmt = placed.stmt(script, output)?;
-                let description = stmt.items.iter().find_map(|item| match item {
-                    Item::Input { description, index } if *index == sub => Some(description),
-                    _ => None,
-                })?;
-                let specs = description.sections.as_deref().unwrap_or_default();
-                let mode = specs.first().map_or(SortMode::None, |s| s.sort);
-                let reverse = specs.first().is_some_and(|s| s.reverse);
-                if specs.iter().any(|s| s.sort != mode || s.reverse != reverse) {
-                    return None;
-                }
-                let mode = if mode == SortMode::None {
-                    sort_section
-                } else {
-                    mode
-                };
-                let files = description.file.sort == SortMode::Name;
-                (mode != SortMode::None || files).then_some(SortRule {
-                    mode,
-                    reverse,
-                    files,
-                })
-            });
+            rules
+                .entry((output, sub))
+                .or_insert_with(|| sort_rule(placed.stmt(script, output)?, sub, sort_section));
             if let Some(list) = lists.get_mut(output as usize) {
                 list.push((
                     Entry {
@@ -1703,7 +1800,8 @@ pub fn layout<'a>(
 ) -> Result<Layout<'a>> {
     let layout = layout_with(input, script, placed, None)?;
     // GNU ld lays out again when the program headers outgrow the space
-    // SIZEOF_HEADERS estimated.
+    // SIZEOF_HEADERS estimated (`ldelf_map_segments`); the first layout
+    // then does not fail for lack of room.
     let needed = EHDR_SIZE.saturating_add(
         PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(u64::MAX)),
     );
@@ -1965,6 +2063,7 @@ fn layout_with<'a>(
         dataseg: DataSeg::default(),
         fill_patterns: Vec::new(),
         headers_size,
+        headers_estimated: headers_override.is_none(),
         max_page,
         common_page,
         relro: relro_effective,
@@ -2487,6 +2586,9 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         regions: &section_regions,
         load_phdrs: engine_used_sizeof_headers(script, placed),
         reserved_headers: engine.headers_size.max(EHDR_SIZE),
+        defer_room_error: engine.headers_estimated
+            && phdr_specs.is_none()
+            && engine_used_sizeof_headers(script, placed),
         relro,
         exec_stack: input.exec_stack,
         stack_note: input
@@ -2624,7 +2726,16 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
                     ValueSection::Relative(output) => output_places
                         .get(output as usize)
                         .map(|p| p.2)
-                        .filter(|&p| p != NONE),
+                        .filter(|&p| p != NONE)
+                        .or_else(|| {
+                            nearby_section(
+                                &engine,
+                                &output_places,
+                                &out_sections,
+                                output,
+                                value.resolve(&engine),
+                            )
+                        }),
                     _ => None,
                 },
             },

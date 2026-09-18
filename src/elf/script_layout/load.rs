@@ -26,8 +26,11 @@ use std::sync::Arc;
 use crate::args::{InputFormat, InputKind, InputSpec, LinkOptions, MagicMode, OutputKind};
 use crate::error::{Error, Result};
 use crate::input::identify::FileFormat;
-use crate::input::{LibraryNaming, RealFileSystem, SearchContext};
-use crate::script::{CommandKind, FsReader, InputFile, InputName, Script, parse_script};
+use crate::input::source::InputProvider;
+use crate::input::{LibraryNaming, SearchContext};
+use crate::script::{
+    CommandKind, FsReader, InputFile, InputName, Script, ScriptReader, parse_script,
+};
 use crate::symbols::SymbolUse;
 
 use super::plan::{Builder, LayoutScript};
@@ -40,6 +43,10 @@ pub struct Prepared {
     pub options: LinkOptions,
     /// The layout plan, when scripts or options call for the script engine.
     pub script: Option<LayoutScript>,
+    /// For a relocatable link without `-T`: [`Prepared::script`] with the
+    /// built-in x86-64 relocatable layout ([`super::defaults::relocatable_script`])
+    /// added, which the driver uses when the inputs are x86-64.
+    pub relocatable_default: Option<LayoutScript>,
 }
 
 impl Prepared {
@@ -56,6 +63,7 @@ impl Prepared {
             // needs, so those names are not references.
             if *provide_only
                 || script.defined.contains(name)
+                || !script.value_reads.contains(name)
                 || names.iter().any(|(n, _)| n == name)
             {
                 continue;
@@ -112,12 +120,22 @@ fn looks_like_binary_input(path: &Path) -> bool {
     false
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>> {
+/// The files of a link: [`LinkOptions::input_provider`] first, then the
+/// file system.
+type Provider = Option<Arc<dyn InputProvider>>;
+
+fn read_file(provider: &Provider, path: &Path) -> Result<Vec<u8>> {
+    if let Some(data) = provider.as_ref().and_then(|p| p.read(path)) {
+        return Ok(data.to_vec());
+    }
     std::fs::read(path).map_err(|e| Error::io(path, e))
 }
 
 /// Reads up to 4 KiB of a file to identify it; `None` when unreadable.
-fn sniff(path: &Path) -> Option<FileFormat> {
+fn sniff(provider: &Provider, path: &Path) -> Option<FileFormat> {
+    if let Some(data) = provider.as_ref().and_then(|p| p.read(path)) {
+        return Some(crate::input::identify(data.get(..4096).unwrap_or(&data)));
+    }
     let mut file = std::fs::File::open(path).ok()?;
     let mut head = vec![0u8; 4096];
     let mut filled = 0usize;
@@ -212,6 +230,31 @@ fn input_list(keyword: &str, list: &[InputFile], out: &mut Vec<u8>) -> Result<()
     Ok(())
 }
 
+/// Reads `INCLUDE`d scripts from the link's input provider, then from the
+/// file system.
+struct IncludeReader {
+    provider: Provider,
+    files: FsReader,
+}
+
+impl ScriptReader for IncludeReader {
+    fn read_include(&mut self, name: &[u8], from: &Path) -> std::io::Result<(PathBuf, Vec<u8>)> {
+        if let Some(provider) = &self.provider {
+            let name = PathBuf::from(String::from_utf8_lossy(name).into_owned());
+            let mut candidates = vec![name.clone()];
+            if name.is_relative() {
+                candidates.extend(self.files.search_dirs.iter().map(|dir| dir.join(&name)));
+            }
+            for candidate in candidates {
+                if let Some(data) = provider.read(&candidate) {
+                    return Ok((candidate, data.to_vec()));
+                }
+            }
+        }
+        self.files.read_include(name, from)
+    }
+}
+
 struct Loader<'o> {
     options: &'o LinkOptions,
     out: LinkOptions,
@@ -224,8 +267,11 @@ struct Loader<'o> {
 
 impl Loader<'_> {
     fn parse(&self, data: &[u8], path: &Path) -> Result<Script> {
-        let mut reader = FsReader {
-            search_dirs: self.out.search_paths.clone(),
+        let mut reader = IncludeReader {
+            provider: self.options.input_provider.clone(),
+            files: FsReader {
+                search_dirs: self.out.search_paths.clone(),
+            },
         };
         parse_script(data, path, &mut reader).map_err(|e| Error::Script(Box::new(e)))
     }
@@ -306,7 +352,9 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
         startup: Vec::new(),
     };
     loader.out.inputs.clear();
-    let fs = RealFileSystem;
+    // Script lookup sees the input provider's files too.
+    let fs = crate::input::FileTable::for_link(options);
+    let provider = options.input_provider.clone();
     let mut specs: Vec<InputSpec> = options.inputs.clone();
     if let Some(default) = &options.default_script {
         let position = specs.last().map_or(0, |s| s.position.saturating_add(1));
@@ -331,7 +379,7 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
                 let found = search.find_script(path).ok_or_else(|| {
                     Error::NotFound(format!("cannot open linker script file {}", path.display()))
                 })?;
-                let data = read_file(&found)?;
+                let data = read_file(&provider, &found)?;
                 let script = loader.parse(&data, &found)?;
                 let named = literal_file_names(&script);
                 if !named.is_empty() {
@@ -349,7 +397,7 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
                 loader.scripts.push((script, true));
             }
             InputKind::File(path) if spec.attrs.format == InputFormat::Binary => {
-                let data = read_file(path)?;
+                let data = read_file(&provider, path)?;
                 let name = path.as_os_str().as_encoded_bytes().to_vec();
                 let object = crate::elf::binary_input::convert(&name, &data)?;
                 loader.out.inputs.push(InputSpec {
@@ -362,11 +410,11 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
             }
             InputKind::File(path)
                 if !looks_like_binary_input(path)
-                    && matches!(sniff(path), Some(FileFormat::Text(_))) =>
+                    && matches!(sniff(&provider, path), Some(FileFormat::Text(_))) =>
             {
                 // An implicit script. Scripts with only input lists are left
                 // to the input stage, which also reports syntax errors.
-                let data = read_file(path)?;
+                let data = read_file(&provider, path)?;
                 let Ok(script) = loader.parse(&data, path) else {
                     loader.out.inputs.push(spec.clone());
                     continue;
@@ -437,14 +485,31 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
         || options.magic != MagicMode::Normal
         || options.rodata_segment.is_some()
         || options.ldata_segment.is_some();
-    let script = if loader.scripts.is_empty() && !layout_options {
+    let relocatable = options.kind == OutputKind::Relocatable;
+    // `--defsym` assignments come first in GNU ld's statement list (they
+    // are read with the command line, before the default script). The
+    // script engine evaluates them when there is a script; without one,
+    // `crate::elf::defined` does after layout. Relocatable links evaluate
+    // them as a script of their own.
+    let defsyms = defsym_script(options)?;
+    let script = if loader.scripts.is_empty()
+        && (!layout_options || relocatable)
+        && !(relocatable && !options.defsym.is_empty())
+    {
         None
-    } else if options.kind == OutputKind::Relocatable && !loader.scripts.is_empty() {
-        return Err(Error::Unimplemented(
-            "linker scripts with -r (roadmap M3: relocatable output layout)".into(),
-        ));
+    } else if relocatable {
+        // Relocatable links have no default layout: sections no script
+        // statement takes are orphans of the relocatable writer, and
+        // addresses (`-Ttext`, ...) do not apply.
+        let mut builder = Builder::default();
+        builder.add(&defsyms)?;
+        for (script, _) in &loader.scripts {
+            builder.add(script)?;
+        }
+        Some(builder.finish()?)
     } else {
         let mut builder = Builder::default();
+        builder.add(&defsyms)?;
         if !explicit_override {
             let text = super::defaults::default_script(&loader.out);
             let default = parse_script(
@@ -460,10 +525,41 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
         }
         Some(builder.finish()?)
     };
+    let relocatable_default = if relocatable && loader.scripts.is_empty() {
+        let default = parse_script(
+            super::defaults::relocatable_script().as_bytes(),
+            Path::new("<default script>"),
+            &mut FsReader::default(),
+        )
+        .map_err(|e| Error::Internal(format!("built-in linker script: {e}")))?;
+        let mut builder = Builder::default();
+        builder.add(&defsyms)?;
+        builder.add(&default)?;
+        Some(builder.finish()?)
+    } else {
+        None
+    };
     Ok(Prepared {
         options: loader.out,
         script,
+        relocatable_default,
     })
+}
+
+/// The `--defsym` options as a script of assignments.
+fn defsym_script(options: &LinkOptions) -> Result<Script> {
+    let mut script = Script {
+        commands: Vec::with_capacity(options.defsym.len()),
+        files: vec![PathBuf::from("--defsym")],
+    };
+    for (name, expr) in &options.defsym {
+        let assignment = crate::elf::defined::defsym_assignment(name, expr)?;
+        script.commands.push(crate::script::Command {
+            span: crate::script::Span::default(),
+            kind: CommandKind::Assignment(assignment),
+        });
+    }
+    Ok(script)
 }
 
 #[cfg(test)]

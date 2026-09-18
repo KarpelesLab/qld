@@ -167,6 +167,19 @@ impl Pattern {
         self.kind == Kind::All
     }
 
+    /// Whether the pattern is exactly `*` without an `archive:member` part,
+    /// so that as a file pattern it matches every input file.
+    #[must_use]
+    pub fn matches_every_file(&self) -> bool {
+        self.kind == Kind::All && self.archive.is_none()
+    }
+
+    /// Whether the pattern matches exactly one name, its text.
+    #[must_use]
+    pub fn is_literal(&self) -> bool {
+        self.kind == Kind::Literal && self.archive.is_none()
+    }
+
     /// The literal bytes every match starts with. Callers can index patterns
     /// by this to avoid testing each one.
     #[must_use]

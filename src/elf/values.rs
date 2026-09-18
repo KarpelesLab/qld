@@ -12,9 +12,8 @@ use crate::args::LinkOptions;
 use crate::ids::{SectionId, SymbolId};
 
 use super::common::Commons;
-use super::defined::{LinkerSymbols, Value, defsym_expr};
+use super::defined::{LinkerSymbols, Value};
 use super::ehframe::EhFrames;
-use super::inputs::DefsymExpr;
 use super::layout::Layout;
 use super::merge::Merged;
 use super::object::SectionKind;
@@ -114,20 +113,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 *slot = address;
             }
         }
-        for (id, index) in defsyms {
-            let address = match defsym_expr(options, index) {
-                Some(DefsymExpr::Absolute(value)) => value,
-                Some(DefsymExpr::Symbol(name, offset)) => refs
-                    .symbols
-                    .lookup(&crate::symbols::SymbolName::new(name.as_bytes()))
-                    .and_then(|target| this.globals.get(target.index()).copied())
-                    .map_or(0, |v| v.wrapping_add_signed(offset)),
-                None => 0,
-            };
-            if let Some(slot) = this.globals.get_mut(id.index()) {
-                *slot = address;
-            }
-        }
+        super::defined::evaluate_defsyms(&mut this.globals, &refs, layout, options, &defsyms);
         this
     }
 

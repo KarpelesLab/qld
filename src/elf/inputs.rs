@@ -414,8 +414,8 @@ impl InternalNames {
             names.push((name.as_bytes().to_vec(), reference));
         }
         for (name, expr) in &options.defsym {
-            if let Some(target) = defsym_target(expr) {
-                names.push((target.as_bytes().to_vec(), reference));
+            for target in super::defined::defsym_references(name, expr) {
+                names.push((target, reference));
             }
             names.push((
                 name.as_bytes().to_vec(),
@@ -486,13 +486,6 @@ pub fn parse_defsym(expr: &str) -> Option<DefsymExpr> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'@'));
     valid.then(|| DefsymExpr::Symbol(symbol.to_string(), offset))
-}
-
-fn defsym_target(expr: &str) -> Option<String> {
-    match parse_defsym(expr)? {
-        DefsymExpr::Symbol(symbol, _) => Some(symbol),
-        DefsymExpr::Absolute(_) => None,
-    }
 }
 
 /// One entry of the expanded input list, before loading.

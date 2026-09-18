@@ -143,6 +143,9 @@ pub struct ScriptPlacement {
     /// For each of [`ScriptPlacement::symbol_names`]: whether every
     /// assignment is a `PROVIDE`, and whether the last one hides the symbol.
     pub symbol_kinds: Vec<(bool, bool)>,
+    /// For each of [`ScriptPlacement::symbol_names`], the symbol whose type
+    /// its last assignment copies ([`crate::script::Expr::type_source`]).
+    pub type_sources: Vec<Option<Vec<u8>>>,
     /// The symbols scripts read.
     pub referenced: Vec<Vec<u8>>,
     /// Filled in after placement by [`crate::elf::defined::register`].
@@ -281,6 +284,62 @@ struct Desc<'s> {
     description: &'s InputSectionDescription,
 }
 
+/// The descriptions in match order, indexed for lookup: descriptions that
+/// take literal section names from every file (most of a default script)
+/// are found by name; the others are tested in order.
+struct DescIndex<'s> {
+    /// Literal section name to the first such description that names it.
+    literal: hashbrown::HashMap<&'s [u8], usize, foldhash::fast::FixedState>,
+    /// Positions of the other descriptions, ascending.
+    general: Vec<usize>,
+}
+
+impl<'s> DescIndex<'s> {
+    fn new(descs: &[Desc<'s>]) -> Self {
+        let mut literal: hashbrown::HashMap<&'s [u8], usize, _> =
+            hashbrown::HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6465_7363));
+        let mut general = Vec::new();
+        for (position, desc) in descs.iter().enumerate() {
+            let d = desc.description;
+            let indexable = d.flags.is_empty()
+                && d.file.exclude.is_empty()
+                && d.file.pattern.matches_every_file()
+                && d.sections.as_ref().is_some_and(|specs| {
+                    specs
+                        .iter()
+                        .all(|s| s.pattern.is_literal() && s.exclude_files.is_empty())
+                });
+            match (&d.sections, indexable) {
+                (Some(specs), true) => {
+                    for spec in specs {
+                        literal.entry(spec.pattern.as_bytes()).or_insert(position);
+                    }
+                }
+                _ => general.push(position),
+            }
+        }
+        Self { literal, general }
+    }
+
+    /// The first description that `accept`s and matches the section, as a
+    /// linear scan of `descs` would find it.
+    fn find<'d>(
+        &self,
+        descs: &'d [Desc<'s>],
+        name: &[u8],
+        matches: impl Fn(&Desc<'s>) -> bool,
+    ) -> Option<&'d Desc<'s>> {
+        let literal = self.literal.get(name).copied();
+        let general = self
+            .general
+            .iter()
+            .copied()
+            .take_while(|&p| literal.is_none_or(|l| p < l))
+            .find(|&p| descs.get(p).is_some_and(&matches));
+        descs.get(general.or(literal)?)
+    }
+}
+
 /// The name a description sees for a file: the member name for archive
 /// members (with the archive path), else the path.
 fn file_names<'a>(file: &ElfInput<'a>) -> (&'a [u8], Option<&'a [u8]>) {
@@ -387,8 +446,13 @@ struct Orphan<'a> {
     /// A linker-generated section that may turn out empty: it gets a
     /// statement but does not steer later orphans.
     tentative: bool,
+    /// A COMDAT group member of a relocatable link: always a statement of
+    /// its own (GNU ld's `SPECIAL` constraint).
+    special: bool,
     what: OrphanWhat,
-    display: String,
+    /// The input file, for `--orphan-handling` messages (`None` for
+    /// linker-generated sections).
+    file: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -400,6 +464,9 @@ enum OrphanWhat {
 struct Placer<'p, 'a> {
     script: &'p LayoutScript,
     statements: Vec<Statement>,
+    /// The outputs of `statements` by name (orphan lookups by name would
+    /// otherwise scan every statement for every orphan section).
+    by_name: hashbrown::HashMap<Vec<u8>, Vec<u32>, foldhash::fast::FixedState>,
     orphans: Vec<OutputStmt>,
     orphan_names: Vec<&'a [u8]>,
     /// GNU flags of each output: from its inputs (0 when it has none).
@@ -414,6 +481,8 @@ struct Placer<'p, 'a> {
     /// Orphans added to existing statements get this `sub`.
     appended_sub: Vec<u16>,
     executable: bool,
+    /// A relocatable link (`-r`).
+    relocatable: bool,
     /// Largest input alignment of each output.
     aligns: Vec<u64>,
     /// GNU's `first_orphan_note`.
@@ -583,27 +652,34 @@ impl<'a> Placer<'_, 'a> {
     fn place(&mut self, orphan: &Orphan<'a>) -> (u32, u16) {
         use sec::*;
         let mut name = orphan.name;
-        if orphan.flags & ALLOC != 0 && matches!(orphan.sh_type, SHT_RELA | SHT_REL) {
+        if !self.relocatable
+            && orphan.flags & ALLOC != 0
+            && matches!(orphan.sh_type, SHT_RELA | SHT_REL)
+        {
             name = if orphan.sh_type == SHT_RELA {
                 b".rela.dyn"
             } else {
                 b".rel.dyn"
             };
         }
-        // An existing statement of this name with compatible flags.
-        let same_name: Vec<u32> = self
-            .statements
-            .iter()
-            .filter_map(|s| match s {
-                Statement::Output(i)
-                    if self.enabled.get(*i as usize).copied().unwrap_or(false)
-                        && self.name(*i) == name =>
-                {
-                    Some(*i)
-                }
-                _ => None,
-            })
-            .collect();
+        // An existing statement of this name with compatible flags, in
+        // statement order.
+        let mut same_name: Vec<u32> = if orphan.special {
+            Vec::new()
+        } else {
+            self.by_name
+                .get(name)
+                .map(|list| {
+                    list.iter()
+                        .copied()
+                        .filter(|&i| self.enabled.get(i as usize).copied().unwrap_or(false))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if same_name.len() > 1 {
+            same_name.sort_by_cached_key(|&i| self.position_of(i));
+        }
         for &output in &same_name {
             let f = self.flags.get(output as usize).copied().unwrap_or(0);
             let has_input = self
@@ -725,6 +801,7 @@ impl<'a> Placer<'_, 'a> {
         self.appended_sub.push(0);
         let at = at.min(self.statements.len());
         self.statements.insert(at, Statement::Output(index));
+        self.by_name.entry(name.to_vec()).or_default().push(index);
         if let Some(hold) = hold
             && let Some(slot) = self.last.get_mut(hold.index())
         {
@@ -859,6 +936,7 @@ pub fn place<'a>(
 ) -> Placement<'a> {
     let output_count = script.outputs.len();
     let total = sections.len();
+    let relocatable = options.kind == crate::args::OutputKind::Relocatable;
 
     // 1. Constraints: a statement whose patterns match a writable section
     // fails ONLY_IF_RO, one matching only read-only sections fails
@@ -895,10 +973,43 @@ pub fn place<'a>(
                 let Some(stmt) = script.outputs.get(output as usize) else {
                     return false;
                 };
+                // Statements that take literal section names from every file
+                // (the built-in scripts' `.eh_frame` and friends) only need
+                // the names compared.
+                let literal: Option<Vec<&[u8]>> = stmt
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Input { description, .. } => Some(description),
+                        _ => None,
+                    })
+                    .map(|d| {
+                        let plain = d.flags.is_empty()
+                            && d.file.exclude.is_empty()
+                            && d.file.pattern.matches_every_file();
+                        let specs = d.sections.as_ref().filter(|_| plain)?;
+                        specs
+                            .iter()
+                            .map(|s| {
+                                (s.pattern.is_literal() && s.exclude_files.is_empty())
+                                    .then(|| s.pattern.as_bytes())
+                            })
+                            .collect::<Option<Vec<&[u8]>>>()
+                    })
+                    .collect::<Option<Vec<Vec<&[u8]>>>>()
+                    .map(|names| names.concat());
                 files.iter().enumerate().any(|(file_index, file)| {
                     let Some(object) = &file.object else {
                         return false;
                     };
+                    if let Some(names) = &literal {
+                        return object.sections.iter().enumerate().any(|(index, section)| {
+                            section.header.sh_flags & SHF_WRITE != 0
+                                && names.contains(&section.name)
+                                && sections
+                                    .is_live_in(file_index, u32::try_from(index).unwrap_or(NONE))
+                        });
+                    }
                     let (fname, archive) = file_names(file);
                     object.sections.iter().enumerate().any(|(index, section)| {
                         section.header.sh_flags & SHF_WRITE != 0
@@ -963,6 +1074,7 @@ pub fn place<'a>(
     };
 
     // 3. Match input sections, per file in parallel.
+    let desc_index = DescIndex::new(&descs);
     let mut out = vec![NONE; total];
     let mut sub = vec![0u16; total];
     let mut keep = vec![false; total];
@@ -991,9 +1103,31 @@ pub fn place<'a>(
                         continue;
                     }
                     let header = &section.header;
-                    let found = descs.iter().find(|d| {
-                        matches_desc(d.description, fname, archive, section.name, header.sh_flags)
-                    });
+                    // In a relocatable link, COMDAT group members only match
+                    // `/DISCARD/` (GNU ld's `unique_section_p`).
+                    let unique = relocatable && section.group != 0;
+                    let found = if unique {
+                        descs.iter().find(|d| {
+                            discard_output(d.output)
+                                && matches_desc(
+                                    d.description,
+                                    fname,
+                                    archive,
+                                    section.name,
+                                    header.sh_flags,
+                                )
+                        })
+                    } else {
+                        desc_index.find(&descs, section.name, |d| {
+                            matches_desc(
+                                d.description,
+                                fname,
+                                archive,
+                                section.name,
+                                header.sh_flags,
+                            )
+                        })
+                    };
                     let flags_keep = header.sh_flags & SHF_GNU_RETAIN != 0
                         || header.sh_flags & SHF_ALLOC == 0
                         || header.sh_type == SHT_NOTE;
@@ -1082,6 +1216,23 @@ pub fn place<'a>(
             && !has_input.get(index).copied().unwrap_or(false)
         {
             *slot = statement_flags(stmt);
+            // A statement that makes a section without input sections (data
+            // commands, assignments, `FILL`) has an output section of ELF
+            // type 0 when orphans are placed, which matches no input's type
+            // (`bfd_elf_match_sections_by_type`).
+            let makes_section = stmt.items.iter().any(|item| {
+                matches!(
+                    item,
+                    Item::Data { .. }
+                        | Item::Asciz(_)
+                        | Item::LinkerVersion
+                        | Item::Assign { .. }
+                        | Item::Fill(_)
+                )
+            });
+            if makes_section && let Some(slot) = types.get_mut(index) {
+                *slot = Some(0);
+            }
         }
     }
 
@@ -1114,10 +1265,23 @@ pub fn place<'a>(
     }
 
     // 5. Orphans, in input order.
-    let executable = !matches!(options.kind, crate::args::OutputKind::Shared);
+    let executable = !matches!(
+        options.kind,
+        crate::args::OutputKind::Shared | crate::args::OutputKind::Relocatable
+    );
+    let mut by_name: hashbrown::HashMap<Vec<u8>, Vec<u32>, _> =
+        hashbrown::HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6e61_6d65));
+    for statement in &script.statements {
+        if let Statement::Output(i) = statement
+            && let Some(stmt) = script.outputs.get(*i as usize)
+        {
+            by_name.entry(stmt.name.clone()).or_default().push(*i);
+        }
+    }
     let mut placer = Placer {
         script,
         statements: script.statements.clone(),
+        by_name,
         orphans: Vec::new(),
         orphan_names: Vec::new(),
         flags,
@@ -1131,6 +1295,7 @@ pub fn place<'a>(
             .map(|o| u16::try_from(o.input_count()).unwrap_or(u16::MAX))
             .collect(),
         executable,
+        relocatable,
         aligns,
         first_orphan_note: None,
     };
@@ -1189,8 +1354,9 @@ pub fn place<'a>(
                 ),
                 align: section.header.sh_addralign.max(1),
                 tentative: false,
+                special: relocatable && section.group != 0,
                 what: OrphanWhat::Section(id),
-                display: file.display(),
+                file: Some(file_index),
             });
         }
         // Linker-generated sections belong to the first input object.
@@ -1228,8 +1394,9 @@ pub fn place<'a>(
                     flags: orphan.flags,
                     align: 8,
                     tentative: orphan.tentative,
+                    special: false,
                     what: orphan.what,
-                    display: String::new(),
+                    file: None,
                 }),
             }
         } else {
@@ -1243,15 +1410,16 @@ pub fn place<'a>(
             let output_name = String::from_utf8_lossy(placer.name(output)).into_owned();
             let section = String::from_utf8_lossy(orphan.name).into_owned();
             let error = handling == "error";
+            let display = orphan
+                .file
+                .and_then(|f| files.get(f))
+                .map_or_else(|| "<internal>".to_string(), ElfInput::display);
             let message = if error {
-                format!(
-                    "unplaced orphan section `{section}' from `{}'",
-                    orphan.display
-                )
+                format!("unplaced orphan section `{section}' from `{}'", display)
             } else {
                 format!(
                     "orphan section `{section}' from `{}' being placed in section `{output_name}'",
-                    orphan.display
+                    display
                 )
             };
             reports.push((message, error));
@@ -1314,9 +1482,11 @@ pub fn place<'a>(
     let input_flags = placer.flags.clone();
     let symbol_names = assigned_names(script, &placer.statements);
     let symbol_kinds = symbol_kinds(script, &placer.statements, &symbol_names);
+    let type_sources = type_sources(script, &placer.statements, &symbol_names);
     let script_placement = ScriptPlacement {
         symbol_names,
         symbol_kinds,
+        type_sources,
         referenced: script.referenced.iter().map(|(n, _)| n.clone()).collect(),
         resolved: std::sync::OnceLock::new(),
         statements: placer.statements,
@@ -1360,8 +1530,9 @@ fn push_synthetic_orphans<'a>(
             flags: gnu_flags(sh_flags, sh_type, name),
             align,
             tentative: !exists(kind),
+            special: false,
             what: OrphanWhat::Synthetic(kind),
-            display: "<internal>".to_string(),
+            file: None,
         });
     }
 }
@@ -1396,6 +1567,44 @@ fn assigned_names(script: &LayoutScript, statements: &[Statement]) -> Vec<Vec<u8
 
 /// For each assigned name: whether all its assignments are `PROVIDE`s, and
 /// whether the last one hides it.
+/// For each assigned symbol, the symbol whose type its last assignment
+/// copies.
+fn type_sources(
+    script: &LayoutScript,
+    statements: &[Statement],
+    names: &[Vec<u8>],
+) -> Vec<Option<Vec<u8>>> {
+    let mut sources = vec![None; names.len()];
+    let mut note = |assignment: &crate::script::Assignment| {
+        if let Some(slot) = names.iter().position(|n| *n == assignment.target)
+            && let Some(source) = sources.get_mut(slot)
+        {
+            *source = assignment
+                .op
+                .binary()
+                .is_none()
+                .then(|| assignment.expr.type_source().map(<[u8]>::to_vec))
+                .flatten();
+        }
+    };
+    for statement in statements {
+        match statement {
+            Statement::Assign { assignment, .. } => note(assignment),
+            Statement::Assert { .. } => {}
+            Statement::Output(index) => {
+                if let Some(stmt) = script.outputs.get(*index as usize) {
+                    for item in &stmt.items {
+                        if let Item::Assign { assignment, .. } = item {
+                            note(assignment);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sources
+}
+
 fn symbol_kinds(
     script: &LayoutScript,
     statements: &[Statement],

@@ -20,6 +20,10 @@
 //!
 //! Without scripts and layout options, the default rules and layout of
 //! [`crate::elf::rules`] and [`crate::elf::layout`] are used unchanged.
+//!
+//! Relocatable links (`-r`) with a script use [`relocatable`] instead of
+//! steps 3 and 4: sections are matched the same way, then laid out without
+//! addresses for [`crate::elf::relocatable`] to write.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -28,6 +32,7 @@ pub mod engine;
 pub mod load;
 pub mod matching;
 pub mod plan;
+pub mod relocatable;
 pub mod segments;
 
 pub use engine::{ScriptSymbol, layout};
