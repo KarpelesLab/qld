@@ -669,19 +669,6 @@ impl PartialEq for CancelToken {
 
 impl Eq for CancelToken {}
 
-/// The payload of the [`std::io::Error`] a cancelled link returns, so that
-/// [`CancelToken::is_cancellation`] does not depend on the message.
-#[derive(Debug)]
-struct Cancelled;
-
-impl std::fmt::Display for Cancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("link cancelled")
-    }
-}
-
-impl std::error::Error for Cancelled {}
-
 impl CancelToken {
     /// Creates a token that is not cancelled.
     #[must_use]
@@ -714,22 +701,16 @@ impl CancelToken {
         }
     }
 
-    /// The error a cancelled link returns: an [`Error::Io`](crate::Error::Io)
-    /// of kind [`std::io::ErrorKind::Interrupted`] that reads
-    /// `link cancelled`.
+    /// The error a cancelled link returns, [`Error::Cancelled`](crate::Error::Cancelled).
     #[must_use]
     pub fn error() -> crate::Error {
-        crate::Error::from(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            Cancelled,
-        ))
+        crate::Error::Cancelled
     }
 
     /// Whether `error` is the error of a cancelled link.
     #[must_use]
     pub fn is_cancellation(error: &crate::Error) -> bool {
-        matches!(error, crate::Error::Io { source, .. }
-            if source.get_ref().is_some_and(|inner| inner.is::<Cancelled>()))
+        matches!(error, crate::Error::Cancelled)
     }
 }
 
