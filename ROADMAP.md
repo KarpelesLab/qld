@@ -229,14 +229,16 @@ mold's and wild's on x86-64, on both 8-core and 64-core machines, with peak
 RSS no higher than lld's. Output is identical across 1, 2 and N threads for
 every benchmark.
 
-**Status (W24, 2026-09-15, 32-core Threadripper):** not met. qld beats GNU ld
-and lld at default threads on every large link, and mold on clang-debug
-(824 vs 1120 ms) and at default/64 threads on its own debug binary. wild is
-faster everywhere (clang: 102 vs 200 ms) and mold is faster at 8 threads.
-Peak RSS is below lld's on every benchmark, and output is identical across 1,
-2, 8 and 64 threads. Next: forking so the parent exits once the output is
-written (~30–150 ms of unmapping), scaling past 16 threads, faster symbol
-resolution, and single-threaded speed.
+**Status (W26, 2026-09-18, 32-core Threadripper):** met against mold at
+default and 64 threads on every benchmark (clang: qld 149–160 ms, mold
+180–210 ms; clang-debug: 692 vs 1170 ms), but not at 8 threads or on one
+thread. wild is still faster (clang: 101 ms) except on clang-debug at
+default/64 threads (a tie, ~640–700 ms). Peak RSS is below lld's, mold's and
+wild's on every large link, and output is identical across 1, 2, 8 and 64
+threads. Remaining: symbol resolution (35–45 ms on clang, wild ~15 ms; needs
+a new design that keeps symbol IDs stable), the dynamic and layout stages at
+8 threads, and single-threaded relocation processing and parsing. Full
+tables: [tests/projects/bench.md](tests/projects/bench.md).
 
 ---
 

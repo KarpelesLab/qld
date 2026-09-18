@@ -64,7 +64,7 @@ can work at the same time without colliding.
 | W24 | Benchmarks and performance (M5) | `benches/**`, `tests/projects/bench*`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**`, `src/input/**`, `src/debug/**` | W23 | merged |
 | W25 | Mach-O linking (M8) | `src/macho/**`, the ld64 front end in `src/args/`, `tests/macho_link*` | W15 | merged |
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | merged |
-| W26 | Performance round 2 (M5) | `src/main.rs` (fork on exit, agreed), `--fork`/`--no-fork` in `src/args/`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**` (except `hash/sha256.rs`), `src/input/**`, `src/debug/**`, `benches/**`, `tests/projects/bench*` | W24 | in progress |
+| W26 | Performance round 2 (M5) | `src/main.rs` (fork on exit, agreed), `--fork`/`--no-fork` in `src/args/`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**` (except `hash/sha256.rs`), `src/input/**`, `src/debug/**`, `benches/**`, `tests/projects/bench*` | W24 | merged |
 | W27 | Mach-O follow-ups (M8) | `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs` (moved from `src/macho/`), `tests/macho_link*` | W25 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -473,6 +473,15 @@ with `benches/run.py` and keeps output byte-identical.
 
 **Owns:** `src/main.rs`, the `--fork`/`--no-fork` options, performance
 changes in the ELF pipeline modules, `benches/**`, `tests/projects/bench*`.
+
+**Merged:** fork on exit (`LinkOptions::fork`, `on_output_complete`; the one
+`lib.rs` change runs the hook on success), the 16-thread nested pool,
+parallel archive member discovery, faster interning. M5 met against mold at
+default/64 threads. Open: a resolution design that matches wild's speed
+while keeping symbol IDs; dynamic and layout stages at 8 threads;
+single-thread relocation processing; parallel `madvise(MADV_DONTNEED)`
+teardown for `--no-fork` and library links; overlapping COMDAT claims with
+interning.
 
 ---
 

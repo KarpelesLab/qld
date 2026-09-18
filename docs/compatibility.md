@@ -180,7 +180,20 @@ succeed. The error message names the missing search path.
   of input (counting compressed debug sections at their inflated size), at
   most 16, because small links run faster on few threads. A
   library caller's own rayon pool is respected. Output never depends on the
-  thread count.
+  thread count. With more than 16 threads, every stage except the
+  relocation scan and section merging runs on a 16-thread pool, which is
+  faster on large machines.
+- **`--fork` (default on Unix).** As in mold and wild, `qld` links in a
+  child process (the same executable, started again with `QLD_FORK_CHILD`
+  in its environment) and returns as soon as the output is complete; the
+  child then frees memory and unmaps inputs. Output written to pipes is
+  relayed so callers see end of file at once. The child's stdin reads as end
+  of file. A link whose arguments name a path under `/dev` or `/proc` (such
+  as `-Map=/dev/stdout`) stays in process. A signal sent to the parent alone
+  lets the child finish; one sent to the process group stops both. If the
+  child dies before reporting, the parent exits with its status (128 + the
+  signal number when killed). `--no-fork` links in process; the library
+  never forks.
 - **TLS relaxation in executables.** Initial-exec accesses to thread-local
   symbols that the executable defines and exports are relaxed to local-exec;
   GNU ld keeps `R_X86_64_TPOFF64` dynamic relocations for them.

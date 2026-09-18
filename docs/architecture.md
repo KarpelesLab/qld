@@ -319,6 +319,17 @@ Who works where, and which files each task owns, is in
 - **Teardown**: the CLI exits without dropping the link state, as mold and
   lld do. The library API frees everything in the normal way.
 
+## Process model
+
+The `qld` binary forks by default on Unix (`src/main.rs`): the parent parses
+argv, starts the same executable as a child, relays pipes, and exits with
+the status the child reports through a socket on its stdin. The child links
+with an `OutputCompleteHook` (`LinkOptions::on_output_complete`) that the
+ELF driver runs once the output is renamed into place, the map is written
+and LTO cleanup has run, before it frees its data and unmaps the inputs;
+`qld::link` runs the hook on success if the driver did not. The library
+never forks.
+
 ## Concurrency toolkit
 
 | Need | Approach |
@@ -327,7 +338,7 @@ Who works where, and which files each task owns, is in
 | Graph traversal (GC, archive rounds) | `rayon::scope` with work-stealing; atomic visited bits |
 | Global symbol table | sharded `hashbrown` tables behind per-shard locks, shard chosen by precomputed hash |
 | Per-symbol flags | `AtomicU32` bitsets |
-| Deduplication (merge sections, ICF) | sharded concurrent maps; ties broken by input order |
+| Deduplication (merge sections, ICF) | pieces bucketed by shard in parallel, one task per shard fills its table in input order (lock-free); ties broken by input order |
 | Output writing | disjoint mutable slices of ~1 MiB region buffers, written with `pwrite` (or of one writable mapping) |
 
 Library users can run qld inside their own rayon pool
@@ -336,6 +347,17 @@ call made outside `install` uses (and lazily creates) rayon's global pool. The
 `link()` entry point will install a pool sized by `--threads` for its
 duration, so the CLI and library callers who don't bring a pool get the
 configured thread count.
+
+Scaling rules found by measurement (W24, W26; `tests/projects/bench.md`):
+- The default pool has one thread per 4 MiB of input, at most 16.
+- When the pool is larger than 16 threads, every stage except the
+  relocation scan and section merging runs in a nested 16-thread pool:
+  beyond that, idle stealing and system time cost more than they gain.
+- Links with at least 4 Mi merge pieces (large debug links) merge on every
+  core; section merging runs alongside the relocation scan.
+- Archive members are discovered in parallel before the input walk, and a
+  path named several times is mapped and indexed once.
+- A one-thread link interns symbols in order, without the batch machinery.
 
 ## Error handling and diagnostics
 
