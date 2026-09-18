@@ -27,8 +27,8 @@ pub mod table;
 pub use darwin::DarwinArgs;
 pub use options::{
     BuildId, ColorChoice, DiscardMode, DynamicFlags, ExecStack, Flavor, HashStyle, InputAttrs,
-    InputFormat, InputKind, InputSpec, LinkOptions, MagicMode, OutputKind, PeArgs, ReportLevel,
-    SeparateCode, StripMode, SymbolicMode, UnresolvedSymbols, X86Features,
+    InputFormat, InputKind, InputSpec, LinkOptions, MagicMode, OutputCompleteHook, OutputKind,
+    PeArgs, ReportLevel, SeparateCode, StripMode, SymbolicMode, UnresolvedSymbols, X86Features,
 };
 pub use parse::{
     ParseOutcome, parse_darwin, parse_darwin_with, parse_gnu, parse_gnu_with, select_flavor, usage,

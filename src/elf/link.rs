@@ -300,7 +300,9 @@ fn link_inputs<'a>(
             lap,
         )?;
         map::write_cref(options, cref.as_deref())?;
-        return lto.finish(diagnostics);
+        lto.finish(diagnostics)?;
+        options.output_complete();
+        return Ok(());
     }
 
     let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
@@ -686,7 +688,10 @@ fn link_inputs<'a>(
     })?;
     map::write(options, &addresses, &plan, cref.as_deref())?;
     lap("write");
-    lto.finish(diagnostics)
+    lto.finish(diagnostics)?;
+    // Freeing the link's data and unmapping the inputs come after this.
+    options.output_complete();
+    Ok(())
 }
 
 /// The rest of a relocatable (`-r`) link: `--gc-sections` when asked (GNU

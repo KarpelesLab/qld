@@ -165,6 +165,7 @@ const SETS_DEFAULT: &[&str] = &[
     "no-fatal-warnings",
     "demangle",
     "dependent-libraries",
+    "fork",
     // PE/COFF options whose value is the GNU ld `i386pep` default.
     "dynamicbase",
     "nxcompat",
@@ -650,6 +651,9 @@ fn value_parsing() {
     assert_eq!(link(&["--icf=all", "--icf=none", "a.o"]).icf, None);
     assert_eq!(link(&["--thread-count", "3", "a.o"]).threads, Some(3));
     assert_eq!(link(&["--no-threads", "a.o"]).threads, Some(1));
+    assert!(link(&["a.o"]).fork);
+    assert!(!link(&["--no-fork", "a.o"]).fork);
+    assert!(link(&["--no-fork", "--fork", "a.o"]).fork);
     assert_eq!(link(&["-O999", "a.o"]).optimize, u8::MAX);
     assert_eq!(
         link(&["--color-diagnostics", "a.o"]).color,
@@ -1279,10 +1283,8 @@ fn mold_rust_release() {
     assert_eq!(o.rpaths, [PathBuf::from("$ORIGIN/../lib")]);
     assert_eq!(o.new_dtags, Some(true));
     assert_eq!(o.inputs.last().unwrap().kind, file("-weird-name.o"));
-    assert_eq!(
-        o.ignored,
-        [OsString::from("--quick-exit"), OsString::from("--no-fork")]
-    );
+    assert_eq!(o.ignored, [OsString::from("--quick-exit")]);
+    assert!(!o.fork);
 }
 
 // ---------------------------------------------------------------------------

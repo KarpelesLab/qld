@@ -732,6 +732,7 @@ impl GnuParser {
                 };
             }
             Action::NoThreads => o.threads = Some(1),
+            Action::Fork(on) => o.fork = on,
             Action::MapFile => o.map_file = Some(path(m)?),
             Action::PrintMap => o.print_map = true,
             Action::Cref => o.cref = true,
