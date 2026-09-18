@@ -120,6 +120,7 @@ skip = "reason"              # disable the fixture everywhere
 requires_files = ["/usr/lib/llvm*/lib*/LLVMgold.so"]  # skip unless one path exists (`*` within a component)
 
 diff.ignore = ["dynamic: DEBUG"]  # differential: drop property lines containing these
+diff.ignore_arch.aarch64 = ["TLSDESC"]  # the same, only on that host architecture
 diff.skip = "reason"              # differential: skip this fixture
 ```
 

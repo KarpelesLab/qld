@@ -392,6 +392,12 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   `DT_TLSDESC_GOT`.
 - **BTI:** executables' PLT entries start with `bti c` when the output has the
   BTI property.
+- **`__bss_start__`, `_bss_end__`, `__bss_end__`, `__end__`** are defined as
+  in GNU ld's AArch64 default script (when referenced, and under
+  `-rdynamic`).
+- **Absolute symbols in PIEs:** a GOT slot for an absolute symbol (such as
+  static glibc's `_nl_current_LC_CTYPE_used`) keeps the constant; GNU ld adds
+  the load base with an `R_AARCH64_RELATIVE`.
 
 ## PE/COFF: i386 and ARM64
 
