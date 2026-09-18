@@ -1467,7 +1467,7 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
     let path = input.options.output_path();
     let options = OutputOptions {
         mode: FileMode::Regular,
-        ..OutputOptions::default()
+        ..OutputOptions::for_link(input.options)
     };
     let mut file = OutputFile::create(&path, plan.file_size, &options)?;
     file.write_chunks(&ranges, |index, out| {
