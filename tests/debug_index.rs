@@ -8,8 +8,9 @@
 //! and the two indexes must agree, with addresses compared by the symbol
 //! they fall in. When GDB is installed, it must load the index.
 //!
-//! Tests print `SKIPPED:` when a tool is missing, and fail instead when
-//! `QLD_REQUIRE_TOOLS` is set.
+//! Tests print `SKIPPED:` on a host whose toolchain does not build
+//! x86-64 ELF objects, and when a tool is missing; a missing compiler
+//! fails instead when `QLD_REQUIRE_TOOLS` is set.
 
 mod common;
 
@@ -57,12 +58,34 @@ fn qld(dir: &Path, args: &[&str]) -> Output {
 }
 
 /// The host C and C++ compilers (x86-64), or `None` after printing why.
+/// Whether the host builds and runs the x86-64 ELF objects these tests
+/// assemble, as the other ELF-only suites ask. A compiler that targets
+/// something else (the MinGW `cc` of a Windows runner) skips; a missing
+/// compiler is the caller's to report, so that `QLD_REQUIRE_TOOLS` still
+/// fails on Linux.
+fn elf_host() -> bool {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        skip("host is not x86-64 Linux");
+        return false;
+    }
+    match tools().host.as_ref() {
+        Some(host) if !(host.arch == "x86_64" && host.is_linux()) => {
+            skip(format!(
+                "the C compiler builds {host} objects, not x86-64 ELF"
+            ));
+            false
+        }
+        _ => true,
+    }
+}
+
 fn compilers() -> Option<(PathBuf, PathBuf)> {
+    if !elf_host() {
+        return None;
+    }
     let t = tools();
     match (&t.cc, &t.cxx) {
-        (Some(cc), Some(cxx)) if t.host.as_ref().is_some_and(|h| h.arch == "x86_64") => {
-            Some((cc.clone(), cxx.clone()))
-        }
+        (Some(cc), Some(cxx)) => Some((cc.clone(), cxx.clone())),
         _ => {
             assert!(!tools_required(), "no x86-64 C and C++ compilers");
             skip("no x86-64 C and C++ compilers");
@@ -412,8 +435,10 @@ fn gdb_index_rejects_relocatable_output() {
 /// Clang and clang++, which write `.debug_names` with `-gpubnames` (GCC
 /// does not), or `None` after printing why.
 fn clang() -> Option<(PathBuf, PathBuf)> {
+    if !elf_host() {
+        return None;
+    }
     let t = tools();
-    let host = t.host.as_ref().is_some_and(|h| h.arch == "x86_64");
     let pick = |configured: &Option<PathBuf>, name: &str| {
         configured
             .clone()
@@ -421,7 +446,7 @@ fn clang() -> Option<(PathBuf, PathBuf)> {
             .or_else(|| find_program(name))
     };
     match (pick(&t.cc, "clang"), pick(&t.cxx, "clang++")) {
-        (Some(cc), Some(cxx)) if host => Some((cc, cxx)),
+        (Some(cc), Some(cxx)) => Some((cc, cxx)),
         _ => {
             assert!(!tools_required(), "no x86-64 clang");
             skip("no x86-64 clang");
@@ -885,7 +910,8 @@ fn malformed_debug_info_never_crashes() {
     let object = fs::read(dir.join("b.o")).unwrap();
     // The file ranges of the debug sections and their relocations.
     let ranges: Vec<(usize, usize)> = {
-        let elf = ElfFile::<Elf64Le>::parse(&object, Source::new(Path::new("b.o"))).unwrap();
+        let elf = ElfFile::<Elf64Le>::parse(&object, Source::new(Path::new("b.o")))
+            .expect("the C++ compiler did not build an ELF object");
         elf.enumerate_sections()
             .filter(|(_, h)| {
                 elf.section_name(h)

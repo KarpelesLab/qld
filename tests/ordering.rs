@@ -4,8 +4,9 @@
 //! Inputs are assembled from source with the host C compiler driver, so the
 //! expected orders are exact. When lld is installed (`QLD_TEST_LLD`), the
 //! same links run through it and the resulting symbol address order must
-//! match. Tests print `SKIPPED:` when the compiler is missing, and fail
-//! then instead when `QLD_REQUIRE_TOOLS` is set.
+//! match. Tests print `SKIPPED:` on a host whose toolchain does not build
+//! x86-64 ELF objects, and when the compiler is missing; a missing
+//! compiler fails instead when `QLD_REQUIRE_TOOLS` is set.
 
 mod common;
 
@@ -53,10 +54,34 @@ fn qld(dir: &Path, args: &[&str]) -> Output {
 }
 
 /// The C compiler, or `None` (after printing why) when the test must skip.
+/// Whether the host builds and runs the x86-64 ELF objects these tests
+/// assemble, as the other ELF-only suites ask. A compiler that targets
+/// something else (the MinGW `cc` of a Windows runner) skips; a missing
+/// compiler is the caller's to report, so that `QLD_REQUIRE_TOOLS` still
+/// fails on Linux.
+fn elf_host() -> bool {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        skip("host is not x86-64 Linux");
+        return false;
+    }
+    match tools().host.as_ref() {
+        Some(host) if !(host.arch == "x86_64" && host.is_linux()) => {
+            skip(format!(
+                "the C compiler builds {host} objects, not x86-64 ELF"
+            ));
+            false
+        }
+        _ => true,
+    }
+}
+
 fn compiler() -> Option<PathBuf> {
+    if !elf_host() {
+        return None;
+    }
     match &tools().cc {
-        Some(cc) if tools().host.as_ref().is_some_and(|h| h.arch == "x86_64") => Some(cc.clone()),
-        _ => {
+        Some(cc) => Some(cc.clone()),
+        None => {
             assert!(!tools_required(), "no x86-64 C compiler");
             skip("no x86-64 C compiler");
             None
