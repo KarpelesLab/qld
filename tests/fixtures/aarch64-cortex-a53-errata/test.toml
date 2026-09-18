@@ -1,0 +1,19 @@
+# M4: the Cortex-A53 erratum workarounds. Two 843419 sequences (three and
+# four instructions, the `adrp` at page offsets 0xff8 and 0xffc) and one
+# 835769 sequence: the linker replaces the affected load and the
+# multiply-accumulate with branches to patches, which run them and branch
+# back. The exit code adds up what the moved instructions computed.
+description = "AArch64 Cortex-A53 erratum 843419 and 835769 patches"
+compile = ["cc -c errata.s"]
+link = "-static -e _start --fix-cortex-a53-843419 --fix-cortex-a53-835769 -o out errata.o"
+run = "./out"
+expect.stdout = "errata patches work\n"
+expect.exit = 24
+expect.readelf = [
+  "AArch64",
+  "EXEC (Executable file)",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]

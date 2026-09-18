@@ -17,6 +17,9 @@
 //!
 //! The stubs are private externs, so they are neither exported nor clash
 //! with another image's.
+//!
+//! The same object carries the selector references that relative method
+//! lists need and no input provides ([`super::objc::missing_selrefs`]).
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -25,8 +28,8 @@ use crate::macho::read::consts::{
     ARM64_RELOC_GOT_LOAD_PAGE21, ARM64_RELOC_GOT_LOAD_PAGEOFF12, ARM64_RELOC_PAGE21,
     ARM64_RELOC_PAGEOFF12, ARM64_RELOC_UNSIGNED, CPU_TYPE_ARM64, LC_SEGMENT_64, LC_SYMTAB,
     MH_MAGIC_64, MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, N_EXT, N_PEXT, N_SECT, N_UNDF,
-    S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_LITERAL_POINTERS,
-    X86_64_RELOC_GOT, X86_64_RELOC_SIGNED, X86_64_RELOC_UNSIGNED,
+    S_ATTR_NO_DEAD_STRIP, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS,
+    S_LITERAL_POINTERS, X86_64_RELOC_GOT, X86_64_RELOC_SIGNED, X86_64_RELOC_UNSIGNED,
 };
 
 use super::buf::{pad_to, push_name16, push16, push32, push64, to_u64};
@@ -70,31 +73,39 @@ fn relocation64(out: &mut Vec<u8>, address: u32, symbol: u32, r_type: u8) {
     push32(out, word);
 }
 
-/// Builds the object defining the stubs of `selectors` (names without the
-/// prefix, sorted and unique) for `arch`.
+/// Builds the object defining the stubs of `stubs` (names without the
+/// prefix, sorted and unique) for `arch`, with a selector reference for
+/// each, and the selector references of `selrefs` (names without stubs).
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
+pub fn object(arch: Arch, stubs: &[Vec<u8>], selrefs: &[Vec<u8>]) -> Vec<u8> {
     let arm64 = arch.cpu_type == CPU_TYPE_ARM64;
-    let count = u32::try_from(selectors.len()).unwrap_or(0);
+    let selectors: Vec<&Vec<u8>> = stubs.iter().chain(selrefs).collect();
+    let count = u32::try_from(stubs.len()).unwrap_or(0);
+    let refs = u32::try_from(selectors.len()).unwrap_or(0);
+    // Section ordinals: `__objc_stubs` only when there are stubs.
+    let with_stubs = count > 0;
+    let selrefs_ordinal: u8 = if with_stubs { 2 } else { 1 };
+    let names_ordinal = selrefs_ordinal.saturating_add(1);
+    let nsects = u32::from(names_ordinal);
     let stub_size: u32 = if arm64 { 32 } else { 13 };
 
     // Section contents, at object addresses: stubs at 0, then selector
     // references, then names.
     let stubs_size = count.saturating_mul(stub_size);
     let selrefs_addr = u64::from(stubs_size).next_multiple_of(8);
-    let selrefs_size = u64::from(count).saturating_mul(8);
+    let selrefs_size = u64::from(refs).saturating_mul(8);
     let names_addr = selrefs_addr.saturating_add(selrefs_size);
     let mut names = Vec::new();
     let mut name_offsets = Vec::new();
-    for selector in selectors {
+    for selector in &selectors {
         name_offsets.push(to_u64(names.len()));
         names.extend_from_slice(selector);
         names.push(0);
     }
 
-    // Symbols: local selector references first (0..count), then the stubs
-    // (count..2*count), then _objc_msgSend.
+    // Symbols: local selector references first (0..refs), then the stubs
+    // (refs..refs+count), then _objc_msgSend when there are stubs.
     let mut strings = vec![0u8];
     let mut symtab = Vec::new();
     let add_string = |strings: &mut Vec<u8>, name: &[u8]| {
@@ -108,14 +119,14 @@ pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
         let strx = add_string(&mut strings, name.as_bytes());
         push32(&mut symtab, strx);
         symtab.push(N_SECT);
-        symtab.push(2);
+        symtab.push(selrefs_ordinal);
         push16(&mut symtab, 0);
         push64(
             &mut symtab,
             selrefs_addr.saturating_add(to_u64(index).saturating_mul(8)),
         );
     }
-    for (index, selector) in selectors.iter().enumerate() {
+    for (index, selector) in stubs.iter().enumerate() {
         let mut name = PREFIX.to_vec();
         name.extend_from_slice(selector);
         let strx = add_string(&mut strings, &name);
@@ -128,13 +139,15 @@ pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
             to_u64(index).saturating_mul(u64::from(stub_size)),
         );
     }
-    let msgsend = count.saturating_mul(2);
-    let strx = add_string(&mut strings, b"_objc_msgSend");
-    push32(&mut symtab, strx);
-    symtab.push(N_UNDF | N_EXT);
-    symtab.push(0);
-    push16(&mut symtab, 0);
-    push64(&mut symtab, 0);
+    let msgsend = refs.saturating_add(count);
+    if count > 0 {
+        let strx = add_string(&mut strings, b"_objc_msgSend");
+        push32(&mut symtab, strx);
+        symtab.push(N_UNDF | N_EXT);
+        symtab.push(0);
+        push16(&mut symtab, 0);
+        push64(&mut symtab, 0);
+    }
     pad_to(&mut strings, 8);
 
     let mut code = Vec::new();
@@ -219,18 +232,18 @@ pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
     };
     for (index, offset) in name_offsets.iter().enumerate() {
         push64(&mut selrefs, names_addr.saturating_add(*offset));
-        // Section-relative, against section 3 (the names).
+        // Section-relative, against the names section.
         relocation64(
             &mut selref_relocs,
             u32::try_from(index.saturating_mul(8)).unwrap_or(0),
-            3,
+            u32::from(names_ordinal),
             unsigned,
         );
     }
 
     // Layout of the file: header, commands, contents, relocations, symbols.
     let header_size = 32u32;
-    let segment_size = 72u32.saturating_add(3u32.saturating_mul(80));
+    let segment_size = 72u32.saturating_add(nsects.saturating_mul(80));
     let commands_size = segment_size.saturating_add(24);
     let contents = header_size.saturating_add(commands_size);
     let stubs_off = contents;
@@ -265,7 +278,7 @@ pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
     push64(&mut out, vmsize);
     push32(&mut out, 7);
     push32(&mut out, 7);
-    push32(&mut out, 3);
+    push32(&mut out, nsects);
     push32(&mut out, 0);
     let sections = [
         SectionHeader {
@@ -287,8 +300,8 @@ pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
             offset: selrefs_off,
             align: 3,
             reloff: selref_relocs_off,
-            nreloc: count,
-            flags: S_LITERAL_POINTERS,
+            nreloc: refs,
+            flags: S_LITERAL_POINTERS | S_ATTR_NO_DEAD_STRIP,
         },
         SectionHeader {
             sectname: b"__objc_methname",
@@ -302,7 +315,7 @@ pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
             flags: S_CSTRING_LITERALS,
         },
     ];
-    for section in sections {
+    for section in sections.into_iter().skip(usize::from(!with_stubs)) {
         push_name16(&mut out, section.sectname);
         push_name16(&mut out, section.segname);
         push64(&mut out, section.addr);
@@ -319,7 +332,11 @@ pub fn object(arch: Arch, selectors: &[Vec<u8>]) -> Vec<u8> {
     push32(&mut out, LC_SYMTAB);
     push32(&mut out, 24);
     push32(&mut out, symoff);
-    push32(&mut out, count.saturating_mul(2).saturating_add(1));
+    push32(
+        &mut out,
+        refs.saturating_add(count)
+            .saturating_add(u32::from(count > 0)),
+    );
     push32(&mut out, stroff);
     push32(&mut out, u32::try_from(strings.len()).unwrap_or(0));
 
@@ -349,13 +366,17 @@ mod tests {
     #[test]
     fn parses_as_an_object() {
         for arch in [Arch::ARM64, Arch::X86_64] {
-            let bytes = object(arch, &[b"answer".to_vec(), b"initWithCount:".to_vec()]);
+            let bytes = object(
+                arch,
+                &[b"answer".to_vec(), b"initWithCount:".to_vec()],
+                &[b"only:".to_vec()],
+            );
             let object = ObjectFile::parse(&bytes, Source::new(Path::new("stubs.o"))).unwrap();
             assert_eq!(object.sections().len(), 3);
             let atoms = Atomization::new(&object).unwrap();
             assert_eq!(atoms.section_atoms(0).len(), 2);
-            assert_eq!(atoms.section_atoms(1).len(), 2);
-            assert_eq!(atoms.section_atoms(2).len(), 2);
+            assert_eq!(atoms.section_atoms(1).len(), 3);
+            assert_eq!(atoms.section_atoms(2).len(), 3);
             let names: Vec<Vec<u8>> = object
                 .symbols()
                 .iter()
@@ -375,5 +396,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn selector_references_alone() {
+        let bytes = object(Arch::ARM64, &[], &[b"load".to_vec(), b"value".to_vec()]);
+        let object = ObjectFile::parse(&bytes, Source::new(Path::new("refs.o"))).unwrap();
+        let names: Vec<&[u8]> = object.sections().iter().map(|s| s.sectname).collect();
+        assert_eq!(names, [b"__objc_selrefs".as_slice(), b"__objc_methname"]);
+        let selref = object.relocations(0).unwrap().get(1).unwrap();
+        assert_eq!(selref.target, RelocationTarget::Section(2));
+        assert_eq!(object.symbols().len(), 2);
+        let atoms = Atomization::new(&object).unwrap();
+        assert_eq!(atoms.section_atoms(0).len(), 2);
     }
 }

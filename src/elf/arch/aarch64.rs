@@ -1,5 +1,5 @@
-//! AArch64 relocations: classification, TLS relaxation and the PLT entry
-//! encodings.
+//! AArch64 relocations: classification, TLS and ADRP relaxation, and the
+//! PLT entry encodings.
 //!
 //! [`classify`] turns a relocation type into a [`Class`]: what the ABI says
 //! to compute ([`Kind`]), which GOT entry it reads ([`GotKind`]) and which
@@ -15,15 +15,25 @@
 //! (and the `nop` after it), which the `ADD_LO12_NC` of the sequence
 //! rewrites and which is then skipped.
 //!
+//! The ADRP relaxations are lld's, which GNU ld does not have: a GOT load
+//! of a non-preemptible symbol becomes `adrp; add`, and `adrp; add` becomes
+//! `nop; adr` when the target is within 1 MiB ([`relax_adrp_pairs`]). They
+//! need the next relocation, so the writer runs them over the relocated
+//! section afterwards; they never change a size, so layout is unaffected.
+//!
 //! The PLT is GNU ld's: a 32-byte header that saves `x16`/`x30` and jumps
-//! through `.got.plt[2]`, then one 16-byte entry per symbol. With BTI the
-//! header starts with `bti c`, because the entries reach it through
-//! `br x17`; the entries themselves are only reached by direct branches
-//! and keep their 16-byte form, as in GNU ld.
+//! through `.got.plt[2]`, then one 16-byte entry per symbol. With BTI (every
+//! input marked, or `-z force-bti`) the header starts with `bti c`, because
+//! the entries reach it through `br x17`; in an executable the entries do
+//! too, since an entry may be a function's canonical address, and grow to
+//! 24 bytes, while a shared object's keep their 16-byte form. `-z pac-plt`
+//! adds `autia1716` before the `br x17` of every entry (24 bytes). IFUNC
+//! stubs are ordinary entries.
 
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::arch::aarch64::{self as insn, Field, MovwCheck, NOP, page, read_insn, write_insn};
+use crate::elf::read::Relocation;
 use crate::elf::read::consts::aarch64::*;
 
 use super::{
@@ -498,6 +508,184 @@ pub fn relax_tls(
     }
 }
 
+/// Whether the relocated `adrp`/`ldr` pair at `adrp` and `adrp + 4` loads the
+/// GOT entry of a symbol at `target` in a way lld relaxes: the two
+/// relocations are adjacent, name the same symbol without an addend, and
+/// the instructions are `adrp xn` and a 64-bit `ldr xn, [xn, …]`, with
+/// `target` within ±4 GiB of the `adrp`.
+fn got_pair_is_relaxable(
+    out: &[u8],
+    base: u64,
+    adrp: &Relocation,
+    ldr: &Relocation,
+    target: u64,
+) -> bool {
+    if adrp.offset.checked_add(4) != Some(ldr.offset)
+        || adrp.symbol != ldr.symbol
+        || adrp.addend != 0
+        || ldr.addend != 0
+    {
+        return false;
+    }
+    let (Ok(first), Ok(second)) = (get(out, adrp.offset), get(out, ldr.offset)) else {
+        return false;
+    };
+    let register = insn::destination_register(first);
+    if !insn::is_adrp(first)
+        || !insn::is_load_store_unsigned(second)
+        || second >> 31 == 0
+        || insn::destination_register(second) != register
+        || insn::base_register(second) != register
+    {
+        return false;
+    }
+    let place = base.wrapping_add(adrp.offset);
+    let delta = (page(target) as i64).wrapping_sub(page(place) as i64);
+    insn::fits_signed(delta, 33)
+}
+
+/// Rewrites the `adrp xn; add xn, xn, …` at `offset` (`place` is its
+/// address) into `nop; adr xn, target` when `target` is within the ±1 MiB
+/// `adr` reaches from the second instruction.
+fn relax_adrp_add(out: &mut [u8], offset: u64, place: u64, target: u64) -> bool {
+    let Some(add_offset) = offset.checked_add(4) else {
+        return false;
+    };
+    let delta = (target as i64).wrapping_sub(place.wrapping_add(4) as i64);
+    if !(-insn::ADR_REACH..insn::ADR_REACH).contains(&delta) {
+        return false;
+    }
+    let Ok(first) = get(out, offset) else {
+        return false;
+    };
+    let Ok(adr) = Field::Adr21.encode(insn::adr(insn::destination_register(first)), delta) else {
+        return false;
+    };
+    put(out, offset, NOP).is_ok() && put(out, add_offset, adr).is_ok()
+}
+
+/// The ADRP relaxations lld performs, applied to `out`, the already
+/// relocated contents of a section at address `base` whose relocations
+/// `relocs` yields in order:
+///
+/// - `adrp xn, :got:sym; ldr xn, [xn, :got_lo12:sym]` becomes
+///   `adrp xn, sym; add xn, xn, :lo12:sym` when `got_target` gives the
+///   symbol's address (it is defined, not preemptible and not an IFUNC,
+///   and an absolute symbol only outside PIC). As in lld this is all or
+///   nothing for a symbol within a section, because a branch may target
+///   the `ldr` of a pair: one GOT access that cannot be relaxed keeps them
+///   all. The GOT entry itself stays, as in lld.
+/// - `adrp xn, sym; add xn, xn, :lo12:sym`, including one the first
+///   relaxation produced, becomes `nop; adr xn, sym` when the symbol is
+///   within 1 MiB. The address is read back from the relocated pair.
+///
+/// Both need the relocations of the pair to be adjacent, name the same
+/// symbol with a zero addend, and the instructions to use one register.
+/// A relocation at an offset in `patched` (sorted) no longer applies there,
+/// because a Cortex-A53 erratum patch moved its instruction: as in lld it
+/// counts as a branch, not as half of a pair.
+///
+/// GNU ld does neither; `--no-relax` turns both off, so the caller only
+/// runs this under `--relax`.
+pub fn relax_adrp_pairs(
+    out: &mut [u8],
+    relocs: impl Iterator<Item = Relocation>,
+    base: u64,
+    patched: &[u64],
+    got_target: &dyn Fn(u32) -> Option<u64>,
+) {
+    let kind = |r: &Relocation| {
+        if !patched.is_empty() && patched.binary_search(&r.offset).is_ok() {
+            R_AARCH64_JUMP26
+        } else {
+            r.r_type
+        }
+    };
+    // GOT pairs found relaxable, and symbols with a GOT access that is not:
+    // the pairs are rewritten once the whole section has been seen.
+    let mut pairs: Vec<(Relocation, u64)> = Vec::new();
+    let mut unrelaxable: Vec<u32> = Vec::new();
+    let mut relocs = relocs.peekable();
+    while let Some(rel) = relocs.next() {
+        match kind(&rel) {
+            R_AARCH64_ADR_GOT_PAGE => {
+                if let Some(next) = relocs.peek()
+                    && kind(next) == R_AARCH64_LD64_GOT_LO12_NC
+                    && let Some(target) = got_target(rel.symbol)
+                    && got_pair_is_relaxable(out, base, &rel, next, target)
+                {
+                    pairs.push((rel, target));
+                    relocs.next();
+                } else {
+                    unrelaxable.push(rel.symbol);
+                }
+            }
+            R_AARCH64_LD64_GOT_LO12_NC => unrelaxable.push(rel.symbol),
+            R_AARCH64_ADR_PREL_PG_HI21 => {
+                let Some(next) = relocs.peek() else { continue };
+                if kind(next) != R_AARCH64_ADD_ABS_LO12_NC
+                    || rel.offset.checked_add(4) != Some(next.offset)
+                    || rel.symbol != next.symbol
+                    || rel.addend != 0
+                    || next.addend != 0
+                {
+                    continue;
+                }
+                let (Ok(first), Ok(second)) = (get(out, rel.offset), get(out, next.offset)) else {
+                    continue;
+                };
+                let register = insn::destination_register(first);
+                if !insn::is_adrp(first)
+                    || !insn::is_add_imm64(second)
+                    || insn::destination_register(second) != register
+                    || insn::base_register(second) != register
+                {
+                    continue;
+                }
+                // The pair was relocated: `adrp` holds Page(S) - Page(P) and
+                // `add` the low 12 bits of S.
+                let place = base.wrapping_add(rel.offset);
+                let target = page(place)
+                    .wrapping_add_signed(insn::adrp_offset(first))
+                    .wrapping_add(insn::add_immediate(second));
+                if relax_adrp_add(out, rel.offset, place, target) {
+                    relocs.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    if pairs.is_empty() {
+        return;
+    }
+    unrelaxable.sort_unstable();
+    for (rel, target) in pairs {
+        if unrelaxable.binary_search(&rel.symbol).is_ok() {
+            continue;
+        }
+        let Ok(first) = get(out, rel.offset) else {
+            continue;
+        };
+        let register = insn::destination_register(first);
+        let place = base.wrapping_add(rel.offset);
+        let delta = (page(target) as i64).wrapping_sub(page(place) as i64);
+        let add_offset = rel.offset.wrapping_add(4);
+        if patch(out, rel.offset, insn::adrp(register), Field::Adrp21, delta).is_err()
+            || patch(
+                out,
+                add_offset,
+                insn::add_imm(register, register),
+                Field::Add12,
+                target as i64,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        relax_adrp_add(out, rel.offset, place, target);
+    }
+}
+
 /// Replaces a `bl`/`b` to an undefined weak symbol with a `nop`, as GNU ld
 /// does: the symbol has no address, so the call is skipped rather than
 /// branching to zero.
@@ -526,13 +714,16 @@ pub fn write_nops(out: &mut [u8]) {
 const STP_X16_X30: u32 = 0xa9bf_7bf0;
 
 /// Writes the sequence that loads `.got.plt` slot `slot` into `x17` and
-/// branches to it, at address `at` in `out` starting at `start`.
+/// branches to it (authenticating it first when `authenticate`), at
+/// address `at` in `out` starting at `start`, then pads with `nop` up to
+/// `end`.
 fn write_got_jump(
     out: &mut [u8],
     start: u64,
     at: u64,
     slot: u64,
     end: u64,
+    authenticate: bool,
 ) -> Result<(), ApplyError> {
     let delta = (page(slot) as i64).wrapping_sub(page(at) as i64);
     patch(out, start, insn::adrp(16), Field::Adrp21, delta)?;
@@ -553,8 +744,13 @@ fn write_got_jump(
         Field::Add12,
         slot as i64,
     )?;
-    put(out, start.wrapping_add(12), insn::BR_X17)?;
-    let mut pad = start.wrapping_add(16);
+    let mut next = start.wrapping_add(12);
+    if authenticate {
+        put(out, next, insn::AUTIA1716)?;
+        next = next.wrapping_add(4);
+    }
+    put(out, next, insn::BR_X17)?;
+    let mut pad = next.wrapping_add(4);
     while pad < end {
         put(out, pad, NOP)?;
         pad = pad.wrapping_add(4);
@@ -582,11 +778,56 @@ pub fn write_plt_header(
     put(out, at, STP_X16_X30)?;
     at = at.wrapping_add(4);
     let slot = got_plt.wrapping_add(16);
-    write_got_jump(out, at, plt.wrapping_add(at), slot, 32)
+    // The header jumps to the resolver unauthenticated, as in GNU ld: the
+    // `.got.plt` slot it reads is written by the dynamic linker unsigned.
+    write_got_jump(out, at, plt.wrapping_add(at), slot, 32, false)
+}
+
+/// The size of a `.plt`, `.plt.got` or IFUNC entry: 16 bytes, or GNU ld's
+/// 24 when it starts with `bti c` or authenticates with `autia1716`.
+#[must_use]
+pub fn plt_entry_size(flags: PltFlags) -> u64 {
+    if flags.entry_landing_pad || flags.authenticate {
+        24
+    } else {
+        16
+    }
+}
+
+/// The shape of a `.plt.got` entry. It jumps through an ordinary GOT
+/// entry, which `GLOB_DAT` fills with an unsigned address, so it never
+/// authenticates; only `.got.plt` slots are signed under `-z pac-plt`.
+#[must_use]
+pub fn plt_got_flags(flags: PltFlags) -> PltFlags {
+    PltFlags {
+        authenticate: false,
+        ..flags
+    }
+}
+
+/// `DT_AARCH64_BTI_PLT`: the PLT has BTI landing pads.
+pub const DT_AARCH64_BTI_PLT: i64 = 0x7000_0001;
+/// `DT_AARCH64_PAC_PLT`: PLT entries authenticate what they load.
+pub const DT_AARCH64_PAC_PLT: i64 = 0x7000_0003;
+
+/// The dynamic tags that describe a PLT of shape `flags` to the dynamic
+/// linker, as GNU ld writes them after `DT_RELAENT` when there is a PLT.
+pub fn plt_dynamic_tags(arch: super::Arch, flags: PltFlags) -> impl Iterator<Item = i64> {
+    let aarch64 = arch == super::Arch::AArch64;
+    [
+        (flags.landing_pad, DT_AARCH64_BTI_PLT),
+        (flags.authenticate, DT_AARCH64_PAC_PLT),
+    ]
+    .into_iter()
+    .filter(move |&(on, _)| on && aarch64)
+    .map(|(_, tag)| tag)
 }
 
 /// Writes a `.plt`, `.plt.got` or IFUNC entry at address `entry` that jumps
-/// through the GOT word at `slot`.
+/// through the GOT word at `slot`: GNU ld's `adrp x16; ldr x17; add x16;
+/// br x17`, preceded by `bti c` in an executable's BTI PLT and with
+/// `autia1716` before the branch under `-z pac-plt`, padded to
+/// [`plt_entry_size`] with `nop`.
 ///
 /// # Errors
 ///
@@ -602,8 +843,14 @@ pub fn write_plt_entry(
         put(out, at, insn::BTI_C)?;
         at = at.wrapping_add(4);
     }
-    let end = if flags.entry_landing_pad { 24 } else { 16 };
-    write_got_jump(out, at, entry.wrapping_add(at), slot, end)
+    write_got_jump(
+        out,
+        at,
+        entry.wrapping_add(at),
+        slot,
+        plt_entry_size(flags),
+        flags.authenticate,
+    )
 }
 
 #[cfg(test)]
@@ -796,6 +1043,94 @@ mod tests {
         assert_eq!(words, [0xd2a0_0000, 0xf280_0900]);
     }
 
+    fn insn_words(code: &[u8]) -> Vec<u32> {
+        code.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect()
+    }
+
+    fn rel(offset: u64, r_type: u32, symbol: u32) -> Relocation {
+        Relocation {
+            offset,
+            symbol,
+            r_type,
+            addend: 0,
+        }
+    }
+
+    /// The ADRP relaxations produce what lld 23 does for the same pairs.
+    #[test]
+    fn adrp_pairs_relax_like_lld() {
+        // At 0x10000: adrp x0, :got:a; ldr x0, [x0, #0x10] (GOT at 0x20010),
+        // adrp x1, b; add x1, x1, #0x40 (b at 0x20040),
+        // adrp x2, :got:c; ldr x2, [x2, #0x18] (c at 0x50_0000).
+        let mut code = Vec::new();
+        for word in [
+            0x9000_0080u32, // adrp x0, 0x20000
+            0xf940_0800,    // ldr x0, [x0, #0x10]
+            0x9000_0081,    // adrp x1, 0x20000
+            0x9101_0021,    // add x1, x1, #0x40
+            0x9000_0082,    // adrp x2, 0x20000
+            0xf940_0c42,    // ldr x2, [x2, #0x18]
+        ] {
+            code.extend_from_slice(&word.to_le_bytes());
+        }
+        let relocs = [
+            rel(0, R_AARCH64_ADR_GOT_PAGE, 1),
+            rel(4, R_AARCH64_LD64_GOT_LO12_NC, 1),
+            rel(8, R_AARCH64_ADR_PREL_PG_HI21, 2),
+            rel(12, R_AARCH64_ADD_ABS_LO12_NC, 2),
+            rel(16, R_AARCH64_ADR_GOT_PAGE, 3),
+            rel(20, R_AARCH64_LD64_GOT_LO12_NC, 3),
+        ];
+        let target = |symbol: u32| match symbol {
+            1 => Some(0x2_0100),
+            3 => Some(0x50_0000),
+            _ => None,
+        };
+        let mut relaxed = code.clone();
+        relax_adrp_pairs(&mut relaxed, relocs.into_iter(), 0x1_0000, &[], &target);
+        let words = insn_words(&relaxed);
+        // nop; adr x0, 0x20100 (from 0x10004).
+        assert_eq!(words[0], NOP);
+        assert_eq!(
+            words[1],
+            Field::Adr21
+                .encode(insn::adr(0), 0x2_0100 - 0x1_0004)
+                .unwrap()
+        );
+        // nop; adr x1, 0x20040.
+        assert_eq!(words[2], NOP);
+        assert_eq!(
+            words[3],
+            Field::Adr21
+                .encode(insn::adr(1), 0x2_0040 - 0x1_000c)
+                .unwrap()
+        );
+        // Out of `adr` range: adrp x2, 0x500000; add x2, x2, #0.
+        assert_eq!(
+            words[4],
+            Field::Adrp21
+                .encode(insn::adrp(2), 0x50_0000 - 0x1_0000)
+                .unwrap()
+        );
+        assert_eq!(words[5], insn::add_imm(2, 2));
+
+        // A patched `ldr` is not half of a pair, and makes its symbol's
+        // other GOT accesses in the section stay too.
+        let mut relocs = relocs;
+        relocs[4].symbol = 1;
+        relocs[5].symbol = 1;
+        let mut kept = code.clone();
+        relax_adrp_pairs(&mut kept, relocs.into_iter(), 0x1_0000, &[20], &target);
+        let kept_words = insn_words(&kept);
+        assert_eq!(kept_words[..2], insn_words(&code)[..2]);
+        assert_eq!(kept_words[2], NOP, "ADRP+ADD is independent");
+        assert_eq!(kept_words[4..], insn_words(&code)[4..]);
+    }
+
     /// The PLT GNU ld 2.45 writes for a dynamic executable whose `.plt` is
     /// at 0x5f0 and `.got.plt` at 0x1ffe8.
     #[test]
@@ -839,6 +1174,7 @@ mod tests {
             PltFlags {
                 landing_pad: true,
                 entry_landing_pad: true,
+                authenticate: false,
             },
         )
         .unwrap();
@@ -859,5 +1195,40 @@ mod tests {
                 NOP
             ]
         );
+        // `-z pac-plt`: `autia1716` before the branch, with or without BTI.
+        for (landing, expected) in [
+            (
+                false,
+                [
+                    0x9000_0110,
+                    0xf940_0211,
+                    0x9100_0210,
+                    0xd503_219f,
+                    0xd61f_0220,
+                    NOP,
+                ],
+            ),
+            (
+                true,
+                [
+                    0xd503_245f,
+                    0x9000_0110,
+                    0xf940_0211,
+                    0x9100_0210,
+                    0xd503_219f,
+                    0xd61f_0220,
+                ],
+            ),
+        ] {
+            let flags = PltFlags {
+                landing_pad: landing,
+                entry_landing_pad: landing,
+                authenticate: true,
+            };
+            assert_eq!(plt_entry_size(flags), 24);
+            let mut entry = [0u8; 24];
+            write_plt_entry(&mut entry, 0x6a0, 0x20000, flags).unwrap();
+            assert_eq!(insn_words(&entry), expected, "bti: {landing}");
+        }
     }
 }

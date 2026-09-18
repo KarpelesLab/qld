@@ -70,8 +70,8 @@ can work at the same time without colliding.
 | W29 | Debug and ordering outputs (M5) | new `src/debug/{gdb_index,debug_names}*`, new `src/elf/{ordering,separate_debug}*`, hooks in `src/elf/{layout,write,synth}.rs`, `tests/debug_index*`, `tests/ordering*` | W24 | in progress |
 | W30 | RISC-V 64 (M4) | `src/elf/arch/riscv*`, `src/arch/riscv*`, relaxation/shrinking hooks, `tests/riscv*`, `tests/fixtures/riscv64-*` | W20 | in progress |
 | W31 | PowerPC64 LE, ELFv2 (M4) | `src/elf/arch/ppc64*`, `src/arch/ppc64*`, `tests/ppc64*`, `tests/fixtures/ppc64-*` | W20 | in progress |
-| W32 | LoongArch64 (M4) | `src/elf/arch/loongarch*`, `src/arch/loongarch*`, `tests/loongarch*`, `tests/fixtures/loongarch64-*` | W20 | in progress |
-| W33 | PE i386 and ARM64 (M7) | `src/coff/**`, `tests/coff_link*` and its data | W21 | in progress |
+| W32 | LoongArch64 (M4) | `src/elf/arch/loongarch*`, `src/arch/loongarch*`, `tests/loongarch*`, `tests/fixtures/loongarch64-*` | W20 | merged |
+| W33 | PE i386 and ARM64 (M7) | `src/coff/**`, `tests/coff_link*` and its data | W21 | merged |
 | W34 | Mach-O completeness (M8) | `src/macho/**` except `lto*`, `src/args/darwin.rs`, `tests/macho_link*` | W27 | in progress |
 | W35 | Mach-O LTO through libLTO (M8) | new `src/plugin/liblto*`, `src/macho/lto*`, one hook in `src/macho/link.rs`, `tests/macho_lto*` | W17, W27 | merged |
 | W36 | Library API for 1.0 (M9) | `examples/**`, `tests/api*`, new `src/input/source*`, API-only changes in `src/args/options.rs`; proposals for `lib.rs` | — | merged |
@@ -571,6 +571,15 @@ links, distribution package recipes.
 ---
 
 ## Integration follow-ups
+
+- **W32 (LoongArch64):** shrinking relaxation on W30's framework;
+  `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis
+  in `-r`; move the `R_LARCH_*` constants to `src/elf/read/consts/`; remove
+  the per-relocation lookahead cost on x86-64/AArch64 (in progress).
+- **W33 (PE):** a BRANCH26 thunk test past ±128 MB; GNU's automatic DLL image
+  base; `__nm_` symbols in qld-written import libraries; export hints;
+  `--oformat pe-i386` without `-m` still selects ELF; import libraries and
+  `--output-def` bypass the output buffer.
 
 - **W25/W27 (Mach-O):** done: dispatch, the `macho-macos` job, SHA-256 in
   `output::hash`, `-r`, literal merging, `-init`, `-alias`,

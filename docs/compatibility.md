@@ -375,6 +375,39 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - **Data exports of a DLL linked directly** are recognized from the section's
   code/execute flags; GNU ld looks at the section name.
 
+## PE/COFF: i386 and ARM64
+
+- **SafeSEH** is a qld addition; GNU ld has none. It follows link.exe:
+  - `.sxdata` becomes a sorted handler table;
+  - a default link builds the table only when every object is SafeSEH-compatible;
+  - `--no-seh` sets `NO_SEH`;
+  - the library-only `PeOptions::safe_seh` rejects incompatible objects.
+- **Load-config directory size** follows GNU: the structure's own size, or 64
+  for i386 images with subsystem version 5.01 or older.
+- **ARM64 defaults** follow lld's MinGW driver: OS and subsystem version 6.0.
+  `--disable-dynamicbase` is refused on ARM64. ARM64EC and ARM64X are refused.
+- **Import libraries:** for a `.def` export bound to a stdcall-decorated
+  symbol by stdcall fixup (`StdFunc` → `_StdFunc@8`), qld's import library
+  names `_StdFunc`, where GNU writes `_StdFunc@8`.
+- **Pseudo-relocations** are also accepted for PC-relative x86 references
+  (REL32 auto-import).
+- **Linking:**
+  - archive members for another machine are skipped;
+  - x86 code padding is `nop`;
+  - DLLs use a fixed default image base, not GNU's automatic one.
+
+## LoongArch64
+
+- **Relaxation keeps code size:** relaxed sequences leave `nop`s, and
+  `R_LARCH_ALIGN` padding stays where it is, until shrinking is implemented.
+- **GOT relaxation:**
+  - only adjacent instruction pairs are relaxed;
+  - the GOT entry that becomes unused is dropped (lld keeps it);
+  - `--no-relax` also turns GOT relaxation off.
+- **Undefined weak branches:** a `b`/`bl` to an undefined weak symbol
+  branches to itself.
+- **`.got.plt[0]`** holds `_DYNAMIC`, where lld writes 0.
+
 ## ld64 flavor notes
 
 - Single-dash long options only (`-dylib`, `-framework Foo`, `-arch arm64`).

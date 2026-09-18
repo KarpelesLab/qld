@@ -186,7 +186,13 @@ and TLS models.
       ordering and synthesis, BE8, `R_ARM_V4BX`
 - [ ] **x32** (`elf32_x86_64`)
 - [ ] **PowerPC64 LE/BE** (ELFv2 / ELFv1 with OPDs, TOC, long-branch stubs)
-- [ ] **LoongArch64**, **s390x**
+- [~] **LoongArch64**: the relocation set (including the extreme code model
+      and ADD/SUB/ULEB128), PLT/GOT, all TLS models with TLSDESC and IE/TLSDESC
+      relaxation, size-preserving relaxation, `-r`; compared with lld by
+      meaning. Outstanding: shrinking relaxation (deleting `nop`s,
+      `R_LARCH_ALIGN`), B26 thunks, ALIGN synthesis in `-r`; the fixtures run
+      under qemu in CI
+- [ ] **s390x**
 - [ ] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths)
 
@@ -275,22 +281,22 @@ drops the FFI entirely).
 - [x] COFF object and archive parsing, `.drectve` linker directives
 - [x] Short import libraries (MSVC/LLVM style) and long import libraries
       (GNU dlltool `.idata$N` objects); linking directly against `.dll` files
-- [~] PE32+ (x86-64) done; PE32 (i386) and ARM64 not started
+- [x] PE32+ (x86-64), PE32 (i386) and ARM64 PE32+ (thunks, packed and unpacked `.pdata`); ARM64EC/ARM64X refused
 - [x] EXE and DLL output, `--out-implib`, `.def` files, `--export-all-symbols`,
       export and import tables, base relocations, TLS directory
-- [~] x86-64 SEH: `.pdata`/`.xdata` handling (sorted). i386 SafeSEH not started.
+- [x] x86-64 SEH: `.pdata`/`.xdata` handling (sorted); i386 SafeSEH (`.sxdata` handler table)
 - [x] Auto-import and runtime pseudo-relocations (`--enable-auto-import`,
       `__RUNTIME_PSEUDO_RELOC_LIST__`)
 - [x] Resources (`.rsrc` from windres objects), subsystem and OS version fields,
       `--dynamicbase`, `--nxcompat`, `--high-entropy-va`, deterministic timestamps
 - [x] DWARF in PE for MinGW debugging
 
-**Status:** qld links MinGW x86-64 console executables and DLLs end to end; a
-`-B` shim through `x86_64-w64-mingw32-gcc` produces a PE32+ image whose
-sections, data directories and relocated code match GNU ld's. Nothing has been
-executed yet: Wine is not installed here, so the `pe-windows` CI job runs the
-images on a Windows runner. The PE command-line options are being implemented
-(W22); until then only the plain console link works through the driver.
+**Status:** qld links MinGW x86-64 and i386 executables and DLLs (checked
+against GNU ld) and ARM64 images (checked against lld). The `pe-windows` CI
+job runs the x86-64 and i386 images on a Windows runner, including SafeSEH
+enforcement, and `pe-windows-arm64` runs the ARM64 images on Windows on ARM.
+PE links honour the library options for in-memory inputs, in-memory output
+and cancellation.
 
 **Exit criteria:** A MinGW-w64 GCC and a clang cross toolchain can use qld to
 build and run a C/C++ test suite under Wine and on a Windows CI runner. qld

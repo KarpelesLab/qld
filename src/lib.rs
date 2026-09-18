@@ -157,7 +157,12 @@ pub fn version_line() -> String {
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
     options.check_cancelled()?;
     let format = options.target.map(|target| target.format);
-    if options.output_buffer.is_some() && !matches!(format, None | Some(BinaryFormat::Elf)) {
+    if options.output_buffer.is_some()
+        && !matches!(
+            format,
+            None | Some(BinaryFormat::Elf | BinaryFormat::Pe | BinaryFormat::MachO)
+        )
+    {
         return Err(Error::Unimplemented(format!(
             "in-memory output for {format:?} links (roadmap M9)"
         )));
@@ -190,8 +195,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
 ///
 /// # Errors
 ///
-/// As [`link`]; [`Error::Unimplemented`] for PE and Mach-O targets, whose
-/// drivers cannot write to memory yet.
+/// As [`link`].
 pub fn link_to_memory(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<Vec<u8>> {
     let buffer = OutputBuffer::new();
     let mut options = options.clone();
