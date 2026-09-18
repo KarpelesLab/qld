@@ -300,8 +300,13 @@ impl<'a> GroupSlots<'a> {
         }
     }
 
-    /// The claim cell of `slot`, created on first use.
+    /// The claim cell of `slot`, created on first use. `slot` must have
+    /// come from [`slot`](Self::slot).
     fn cell(&self, slot: u32) -> &AtomicU64 {
+        debug_assert!(
+            slot < self.next.load(Ordering::Relaxed),
+            "slot {slot} never given out"
+        );
         // Segment k starts at SLOT_BASE * (2^k - 1).
         let scaled = slot as usize / SLOT_BASE + 1;
         let segment = (usize::BITS - 1 - scaled.leading_zeros()) as usize;

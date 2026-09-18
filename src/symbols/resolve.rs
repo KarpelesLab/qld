@@ -138,13 +138,12 @@ pub trait ResolveFile<'a>: Send + Sync {
     /// the file, and [`unload`](Self::unload) undoes it. The default is
     /// `false`.
     ///
-    /// When the hook keeps names ([`RoundHook::keeps_names`]), the driver
-    /// loads, right after the first round, every such member that the
-    /// rounds may extract, in one parallel pass, and reads its names and
-    /// the uses of its references before the round that makes it live (a
-    /// hook may change the uses of definitions only). The rounds then only
-    /// settle which of them become live. A load error is reported only if
-    /// the file becomes live.
+    /// With a [`LoadHook`], the driver loads, right after the first round,
+    /// every such member that the rounds may extract, in one parallel pass,
+    /// and (if the hook [keeps its names](LoadHook::keeps_names)) reads its
+    /// names and the uses of its references before the round that makes it
+    /// live. The rounds then only settle which of them become live. A load
+    /// error is reported only if the file becomes live.
     fn can_load_early(&self) -> bool {
         false
     }
@@ -163,6 +162,9 @@ pub struct RoundFile<'r, F> {
     pub id: FileId,
     /// The loaded file.
     pub file: &'r mut F,
+    /// The file's rank among all files ordered by input position, as given
+    /// to [`LoadHook::on_load`]; `None` when the driver uses no load hook.
+    pub rank: Option<u32>,
 }
 
 /// A backend hook into each round of [`resolve_symbols_with`].
@@ -205,18 +207,6 @@ pub struct RoundFile<'r, F> {
 ///
 /// The unit type `()` is the no-op hook [`resolve_symbols`] uses.
 pub trait RoundHook<F> {
-    /// Whether [`after_load`](Self::after_load) leaves every file's
-    /// [`symbol_names`](ResolveFile::symbol_names) as
-    /// [`load`](ResolveFile::load) (and [`LoadHook::on_load`]) made them;
-    /// it may still change [`symbol_use`](ResolveFile::symbol_use), except
-    /// for references. The driver then looks the names up while files load,
-    /// in the same parallel task, instead of in a pass of its own, and reads
-    /// them before `after_load`; see also
-    /// [`ResolveFile::can_load_early`]. The default is `false`.
-    fn keeps_names(&self) -> bool {
-        false
-    }
-
     /// Work to do on each newly live file right after it loads, in
     /// parallel with the loading of the round's other files; `None` (the
     /// default) for none. See [`LoadHook`].
@@ -238,11 +228,7 @@ pub trait RoundHook<F> {
     }
 }
 
-impl<F> RoundHook<F> for () {
-    fn keeps_names(&self) -> bool {
-        true
-    }
-}
+impl<F> RoundHook<F> for () {}
 
 /// Per-file work of a [`RoundHook`] that can run while files load, in
 /// parallel. Neither method may change the file's names or references
@@ -263,6 +249,16 @@ impl<F> RoundHook<F> for () {
 /// [`GroupSlots`](super::GroupSlots)), leaving `after_load` to settle the
 /// claims.
 pub trait LoadHook<F>: Sync {
+    /// Whether [`RoundHook::after_load`] leaves the
+    /// [`symbol_names`](ResolveFile::symbol_names) of this loaded file as
+    /// they are, and the uses of its references
+    /// ([`symbol_use`](ResolveFile::symbol_use)); it may still change the
+    /// uses of definitions. The driver then looks the names up while the
+    /// file loads, in the same parallel task, instead of in a pass of its
+    /// own after `after_load`, and may load the file early (see
+    /// [`ResolveFile::can_load_early`]).
+    fn keeps_names(&self, file: &F) -> bool;
+
     /// Called for file `id` right after it loads; see the [trait
     /// documentation](Self). The default does nothing.
     ///
@@ -545,14 +541,15 @@ where
         (0..count).partition(|&index| files[index].is_live_at_start());
     let mut extracted = Vec::new();
     // Members loaded ahead of their round: the number of their names the
-    // table did not hold then, or their load error.
-    let mut early: Vec<Option<Result<usize>>> = (0..count).map(|_| None).collect();
+    // table did not hold then (`None` if their names were not looked up),
+    // or their load error.
+    let mut early: Vec<Option<Result<Option<usize>>>> = (0..count).map(|_| None).collect();
     let mut loaded_early = Vec::new();
 
-    // Names are looked up while files load when the hook keeps them; the
-    // lookup's misses are then interned by position, which needs distinct
-    // positions (as input files always have).
-    // Each file's rank by position, when positions are distinct.
+    // Each file's rank by position, when positions are distinct (as input
+    // files' always are). The load hook, and so the lookups while files
+    // load (whose misses are interned by position) and loading members
+    // early, need them.
     let ranks: Option<Vec<u32>> = {
         let mut order: Vec<usize> = (0..count).collect();
         order.sort_unstable_by_key(|&index| files[index].position());
@@ -568,16 +565,16 @@ where
                 ranks
             })
     };
-    let look_up_on_load = hook.keeps_names() && ranks.is_some();
+    let with_load_hook = hook.load_hook().is_some() && ranks.is_some();
     let mut steps = Steps::new();
     for round in 0.. {
         // Round 0 fills an empty table: nothing to look up.
-        let looked_up = look_up_on_load && round > 0;
-        let misses = {
+        let looked_up = with_load_hook && round > 0;
+        let looked = {
             let mut loaded = select_mut(files, &load);
             let view = looked_up.then(|| table.lookup_view());
             let outputs = looked_up.then(|| select_mut(&mut symbol_ids, &load));
-            let misses = load_files(
+            let looked = load_files(
                 &mut loaded,
                 &load,
                 round,
@@ -592,12 +589,16 @@ where
                 .map(|(&index, file)| RoundFile {
                     id: FileId::new(index),
                     file,
+                    rank: ranks
+                        .as_ref()
+                        .filter(|_| with_load_hook)
+                        .map(|ranks| ranks[index]),
                 })
                 .collect();
             round_files.sort_by_key(|entry| (entry.file.position(), entry.id));
             hook.after_load(round, &mut round_files)?;
             steps.lap(round, Step::Hook);
-            misses
+            looked
         };
         for &index in &load {
             live[index] = true;
@@ -605,14 +606,27 @@ where
 
         let files_ref = &*files;
         if looked_up {
-            if misses > 0 {
+            // Names not found, and the names of files not looked up (the
+            // hook may have changed them), are interned now.
+            if looked
+                .iter()
+                .any(|looked| looked.is_none_or(|missing| missing > 0))
+            {
                 let mut jobs: Vec<InternJob<'a, '_>> = load
                     .iter()
                     .zip(select_mut(&mut symbol_ids, &load))
-                    .map(|(&index, ids)| InternJob {
-                        position: files_ref[index].position(),
-                        names: files_ref[index].symbol_names(),
-                        ids: ids.as_mut_slice(),
+                    .zip(&looked)
+                    .map(|((&index, ids), looked)| {
+                        let names = files_ref[index].symbol_names();
+                        if looked.is_none() {
+                            ids.clear();
+                            ids.resize(names.len(), LookupView::MISSING);
+                        }
+                        InternJob {
+                            position: files_ref[index].position(),
+                            names,
+                            ids: ids.as_mut_slice(),
+                        }
                     })
                     .collect();
                 table.try_intern_missing(&mut jobs)?;
@@ -665,11 +679,14 @@ where
         if members.is_empty() {
             break;
         }
-        if round == 0 && look_up_on_load {
+        if round == 0
+            && with_load_hook
+            && let Some(load_hook) = hook.load_hook()
+        {
             loaded_early = prefetch(
                 files,
                 table,
-                hook.load_hook().filter(|_| ranks.is_some()),
+                load_hook,
                 &live,
                 &members,
                 &mut symbol_ids,
@@ -727,19 +744,21 @@ where
 /// superset of what the rounds extract, since definitions only get better
 /// than lazy ones and lazy candidates enter the table in the first round
 /// only. Each member's names are looked up as it loads (the table does not
-/// change meanwhile); `early` receives the number of names not found, or
-/// the load error. Returns the members it loaded.
+/// change meanwhile), if the hook keeps them; `early` receives the number
+/// of names not found (`None` if not looked up; the references of such a
+/// member are not followed), or the load error. Returns the members it
+/// loaded.
 ///
 /// The set does not depend on scheduling, and it only decides which files
 /// are loaded early, not the resolution.
 fn prefetch<'a, F>(
     files: &mut [F],
     table: &mut SymbolTable<'a>,
-    load_hook: Option<&dyn LoadHook<F>>,
+    load_hook: &dyn LoadHook<F>,
     live: &[bool],
     start: &[usize],
     symbol_ids: &mut [Vec<SymbolId>],
-    early: &mut [Option<Result<usize>>],
+    early: &mut [Option<Result<Option<usize>>>],
 ) -> Vec<usize>
 where
     F: ResolveFile<'a>,
@@ -783,7 +802,7 @@ where
 type PrefetchSlot<'p, F> = Option<(
     &'p mut F,
     &'p mut Vec<SymbolId>,
-    &'p mut Option<Result<usize>>,
+    &'p mut Option<Result<Option<usize>>>,
 )>;
 
 /// The state of [`prefetch`]: each file, whether a task claimed it, and the
@@ -792,7 +811,7 @@ struct Prefetcher<'p, 'a, F> {
     slots: Vec<Mutex<PrefetchSlot<'p, F>>>,
     claimed: Vec<AtomicBool>,
     view: LookupView<'p, 'a>,
-    load_hook: Option<&'p dyn LoadHook<F>>,
+    load_hook: &'p dyn LoadHook<F>,
 }
 
 impl<'a, F> Prefetcher<'_, 'a, F>
@@ -809,18 +828,21 @@ where
         if !file.can_load_early() {
             return;
         }
-        let loaded = file.load().and_then(|()| match self.load_hook {
-            Some(load_hook) => load_hook.prepare(FileId::new(index), file),
-            None => Ok(()),
-        });
+        let loaded = file
+            .load()
+            .and_then(|()| self.load_hook.prepare(FileId::new(index), file));
         if let Err(error) = loaded {
             **early = Some(Err(error));
+            return;
+        }
+        if !self.load_hook.keeps_names(file) {
+            **early = Some(Ok(None));
             return;
         }
         let names = file.symbol_names();
         ids.clear();
         ids.resize(names.len(), SymbolId::from_u32(0));
-        **early = Some(Ok(self.view.find_all(names, ids)));
+        **early = Some(Ok(Some(self.view.find_all(names, ids))));
         for (symbol, &id) in ids.iter().enumerate() {
             if !LookupView::is_found(id)
                 || file.symbol_use(symbol) != (SymbolUse::Reference { weak: false })
@@ -848,17 +870,18 @@ where
 }
 
 /// Loads `files`, whose indices are `indices`, in parallel, running the
-/// load hook on each. With `lookup`, also looks each file's names up and
-/// writes their IDs (or placeholders, see [`LookupView::find_all`]) to the
-/// file's output. Returns the number of names not found.
+/// load hook on each. With `lookup`, also looks up the names of each file
+/// the hook keeps names of, and writes their IDs (or placeholders, see
+/// [`LookupView::find_all`]) to the file's output. Returns, per file, the
+/// number of names not found, or `None` if they were not looked up.
 fn load_files<'a, F: ResolveFile<'a>>(
     files: &mut [&mut F],
     indices: &[usize],
     round: usize,
     load_hook: Option<(&dyn LoadHook<F>, &[u32])>,
     lookup: Option<(&LookupView<'_, 'a>, Vec<&mut Vec<SymbolId>>)>,
-    early: Vec<&mut Option<Result<usize>>>,
-) -> Result<usize> {
+    early: Vec<&mut Option<Result<Option<usize>>>>,
+) -> Result<Vec<Option<usize>>> {
     let (view, outputs): (_, Vec<Option<&mut Vec<SymbolId>>>) = match lookup {
         Some((view, outputs)) => (Some(view), outputs.into_iter().map(Some).collect()),
         None => (None, (0..files.len()).map(|_| None).collect()),
@@ -866,32 +889,35 @@ fn load_files<'a, F: ResolveFile<'a>>(
     let one = |file: &mut F,
                index: usize,
                ids: Option<&mut Vec<SymbolId>>,
-               early: &mut Option<Result<usize>>|
-     -> Result<usize> {
+               early: &mut Option<Result<Option<usize>>>|
+     -> Result<Option<usize>> {
         let id = FileId::new(index);
-        if let Some(result) = early.take() {
-            // Loaded, prepared and looked up by `prefetch`.
-            let missing = result?;
-            if let Some((load_hook, ranks)) = load_hook {
-                load_hook.on_load(round, id, ranks[index], file)?;
+        let mut looked = match early.take() {
+            // Loaded and prepared (and maybe looked up) by `prefetch`.
+            Some(result) => result?,
+            None => {
+                file.load()?;
+                if let Some((load_hook, _)) = load_hook {
+                    load_hook.prepare(id, file)?;
+                }
+                None
             }
-            return Ok(missing);
-        }
-        file.load()?;
-        if let Some((load_hook, ranks)) = load_hook {
-            load_hook.prepare(id, file)?;
-            load_hook.on_load(round, id, ranks[index], file)?;
-        }
-        let mut missing = 0;
-        if let (Some(ids), Some(view)) = (ids, view) {
+        };
+        if looked.is_none()
+            && let (Some(ids), Some(view), Some((load_hook, _))) = (ids, view, load_hook)
+            && load_hook.keeps_names(file)
+        {
             let names = file.symbol_names();
             ids.clear();
             ids.resize(names.len(), SymbolId::from_u32(0));
-            missing = view.find_all(names, ids);
+            looked = Some(view.find_all(names, ids));
         }
-        Ok(missing)
+        if let Some((load_hook, ranks)) = load_hook {
+            load_hook.on_load(round, id, ranks[index], file)?;
+        }
+        Ok(looked)
     };
-    let results: Vec<(InputPosition, usize, Result<usize>)> = files
+    let results: Vec<(InputPosition, usize, Result<Option<usize>>)> = files
         .par_iter_mut()
         .zip(indices.par_iter())
         .zip(outputs)
@@ -900,11 +926,11 @@ fn load_files<'a, F: ResolveFile<'a>>(
             (file.position(), index, one(file, index, ids, early))
         })
         .collect();
-    let mut missing = 0usize;
+    let mut looked = Vec::with_capacity(results.len());
     let mut first_error: Option<(InputPosition, usize, Error)> = None;
     for (position, index, result) in results {
         match result {
-            Ok(count) => missing += count,
+            Ok(count) => looked.push(count),
             Err(error) => {
                 if first_error
                     .as_ref()
@@ -917,7 +943,7 @@ fn load_files<'a, F: ResolveFile<'a>>(
     }
     match first_error {
         Some((_, _, error)) => Err(error),
-        None => Ok(missing),
+        None => Ok(looked),
     }
 }
 
@@ -1591,10 +1617,20 @@ mod tests {
     }
 
     impl LoadHook<Mock> for EarlyHook {
+        fn keeps_names(&self, _: &Mock) -> bool {
+            true
+        }
+
+        fn prepare(&self, _: FileId, file: &mut Mock) -> Result<()> {
+            assert_eq!(file.loads, 1, "hook before load");
+            assert!(!file.hooked, "file prepared twice");
+            file.hooked = true;
+            Ok(())
+        }
+
         fn on_load(&self, round: usize, _: FileId, _: u32, file: &mut Mock) -> Result<()> {
             assert_eq!(round, self.rounds);
-            assert_eq!(file.loads, 1, "hook before load");
-            file.hooked = true;
+            assert!(file.hooked, "on_load before prepare");
             self.loaded
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
@@ -1602,10 +1638,6 @@ mod tests {
     }
 
     impl RoundHook<Mock> for EarlyHook {
-        fn keeps_names(&self) -> bool {
-            true
-        }
-
         fn load_hook(&self) -> Option<&dyn LoadHook<Mock>> {
             Some(self)
         }
@@ -1613,6 +1645,9 @@ mod tests {
         fn after_load(&mut self, round: usize, files: &mut [RoundFile<'_, Mock>]) -> Result<()> {
             assert_eq!(round, self.rounds);
             assert!(files.iter().all(|entry| entry.file.hooked));
+            // Ranks follow positions.
+            assert!(files.iter().all(|entry| entry.rank.is_some()));
+            assert!(files.windows(2).all(|pair| pair[0].rank < pair[1].rank));
             self.rounds += 1;
             Ok(())
         }

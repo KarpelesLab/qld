@@ -129,6 +129,11 @@ pub struct LookupView<'t, 'a> {
 }
 
 impl<'a> LookupView<'_, 'a> {
+    /// The placeholder [`find_all`](Self::find_all) writes for a name the
+    /// table does not hold, and that
+    /// [`SymbolTable::try_intern_missing`] interns.
+    pub const MISSING: SymbolId = SymbolId::from_u32(PENDING);
+
     /// The current definition of `id` (see [`SymbolTable::definition`]).
     ///
     /// # Panics
