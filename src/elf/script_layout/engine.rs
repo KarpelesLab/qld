@@ -1440,9 +1440,9 @@ pub(super) fn sort_rule(stmt: &OutputStmt, sub: u16, sort_section: SortMode) -> 
 
 /// The `--sort-section` mode.
 pub(super) fn sort_section_mode(options: &crate::args::LinkOptions) -> SortMode {
-    match options.sort_section.as_deref() {
-        Some("name") => SortMode::Name,
-        Some("alignment") => SortMode::Alignment,
+    match options.sort_section {
+        crate::args::SortSection::Name => SortMode::Name,
+        crate::args::SortSection::Alignment => SortMode::Alignment,
         _ => SortMode::None,
     }
 }
@@ -1608,8 +1608,8 @@ fn build_entries(
         let raw = input
             .options
             .output_format
-            .as_deref()
-            .is_some_and(|f| crate::elf::rawout::Format::from_name(f).is_some());
+            .as_ref()
+            .is_some_and(crate::args::OutputFormat::is_raw);
         if size == 0 || (raw && matches!(place.kind, Synthetic::GnuProperty | Synthetic::BuildId)) {
             continue;
         }
@@ -1914,10 +1914,12 @@ fn layout_with<'a>(
         }
     }
 
-    let raw_output = options
-        .output_format
-        .as_deref()
-        .is_some_and(|f| matches!(f, "binary" | "ihex" | "srec" | "symbolsrec" | "verilog"));
+    let raw_output = options.output_format.as_ref().is_some_and(|f| {
+        matches!(
+            f.name(),
+            "binary" | "ihex" | "srec" | "symbolsrec" | "verilog"
+        )
+    });
     let max_page = options
         .max_page_size
         .filter(|p| p.is_power_of_two())

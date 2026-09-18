@@ -1299,7 +1299,7 @@ pub fn place<'a>(
         aligns,
         first_orphan_note: None,
     };
-    let handling = options.orphan_handling.as_deref().unwrap_or("place");
+    let handling = options.orphan_handling;
     let mut reports = Vec::new();
     let mut discarded_all: Vec<SectionId> = Vec::new();
     let mut orphan_list: Vec<Orphan<'a>> = Vec::new();
@@ -1318,8 +1318,8 @@ pub fn place<'a>(
             has_properties
                 && !options
                     .output_format
-                    .as_deref()
-                    .is_some_and(|f| crate::elf::rawout::Format::from_name(f).is_some())
+                    .as_ref()
+                    .is_some_and(crate::args::OutputFormat::is_raw)
         }
         Synthetic::Hash
         | Synthetic::GnuHash
@@ -1373,7 +1373,7 @@ pub fn place<'a>(
             OrphanWhat::Synthetic(kind) => Some(kind),
             OrphanWhat::Section(_) => None,
         };
-        if handling == "discard" {
+        if handling == crate::args::OrphanHandling::Discard {
             match orphan.what {
                 OrphanWhat::Section(id) => discarded_all.push(id),
                 OrphanWhat::Synthetic(kind) => synthetic.push(SyntheticPlace {
@@ -1406,10 +1406,10 @@ pub fn place<'a>(
             // Linker-generated sections are reported at layout, where their
             // sizes are known; COMMON is never an orphan in GNU ld.
         }
-        if synthetic_kind.is_none() && handling != "place" {
+        if synthetic_kind.is_none() && handling != crate::args::OrphanHandling::Place {
             let output_name = String::from_utf8_lossy(placer.name(output)).into_owned();
             let section = String::from_utf8_lossy(orphan.name).into_owned();
-            let error = handling == "error";
+            let error = handling == crate::args::OrphanHandling::Error;
             let display = orphan
                 .file
                 .and_then(|f| files.get(f))

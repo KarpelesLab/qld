@@ -275,6 +275,148 @@ pub enum ReportLevel {
     Error,
 }
 
+/// `--icf=`: which identical sections are folded together.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IcfMode {
+    /// `--icf=none` (default): nothing is folded.
+    #[default]
+    None,
+    /// `--icf=safe`: fold only sections whose addresses cannot be observed.
+    Safe,
+    /// `--icf=all`: fold every identical section.
+    All,
+}
+
+/// `--orphan-handling=`: what happens to an input section that no output
+/// section description of a linker script claims.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OrphanHandling {
+    /// `place` (default): place it next to a section of the same kind.
+    #[default]
+    Place,
+    /// `warn`: place it and warn.
+    Warn,
+    /// `error`: report an error.
+    Error,
+    /// `discard`: drop it.
+    Discard,
+}
+
+/// `--sort-section=`: how the input sections of a wildcard are ordered.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortSection {
+    /// Not given (default): only the script's own `SORT_*` keywords sort.
+    #[default]
+    None,
+    /// `name`: sort by input section name.
+    Name,
+    /// `alignment`: sort by decreasing alignment.
+    Alignment,
+}
+
+/// `--compress-debug-sections=`: the compression applied to the output's
+/// `.debug_*` sections.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugCompression {
+    /// `none` (default): the debug sections are written uncompressed.
+    #[default]
+    None,
+    /// `zlib`: deflate, in the ELF gABI `SHF_COMPRESSED` form.
+    Zlib,
+    /// `zlib-gnu`: deflate, in the older `.zdebug_*` form.
+    ZlibGnu,
+    /// `zlib-gabi`: the same thing as `zlib`, spelled the way GNU ld spells
+    /// it.
+    ZlibGabi,
+    /// `zstd`: Zstandard, in the `SHF_COMPRESSED` form.
+    Zstd,
+}
+
+impl DebugCompression {
+    /// The spelling `--compress-debug-sections` takes.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Zlib => "zlib",
+            Self::ZlibGnu => "zlib-gnu",
+            Self::ZlibGabi => "zlib-gabi",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+/// An ELF symbol visibility, as `-z start-stop-visibility=` names one.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Visibility {
+    /// `default`: `STV_DEFAULT`.
+    #[default]
+    Default,
+    /// `internal`: `STV_INTERNAL`.
+    Internal,
+    /// `hidden`: `STV_HIDDEN`.
+    Hidden,
+    /// `protected`: `STV_PROTECTED`.
+    Protected,
+}
+
+/// `--oformat=`, or a script's `OUTPUT_FORMAT`: the BFD target name of the
+/// output.
+///
+/// The three raw formats have their own variants because the drivers act on
+/// them; every other BFD name, such as `elf64-x86-64`, is an
+/// [`OutputFormat::Bfd`], which the format driver checks against its own
+/// target.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// `binary`: the loadable image with no headers.
+    Binary,
+    /// `ihex`: Intel HEX text.
+    Ihex,
+    /// `srec`: Motorola S-records.
+    Srec,
+    /// A BFD target name, such as `elf64-x86-64` or `pei-x86-64`.
+    Bfd(String),
+}
+
+impl OutputFormat {
+    /// The format a BFD target name names. Unknown names become
+    /// [`OutputFormat::Bfd`]; the driver reports the ones it cannot write.
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "binary" => Self::Binary,
+            "ihex" => Self::Ihex,
+            "srec" => Self::Srec,
+            other => Self::Bfd(other.to_owned()),
+        }
+    }
+
+    /// The BFD target name, as it was written.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Binary => "binary",
+            Self::Ihex => "ihex",
+            Self::Srec => "srec",
+            Self::Bfd(name) => name,
+        }
+    }
+
+    /// Whether this is one of the raw formats, which carry no ELF headers
+    /// and no symbol table.
+    #[must_use]
+    pub fn is_raw(&self) -> bool {
+        !matches!(self, Self::Bfd(_))
+    }
+}
+
 /// How the inputs that follow `-b` / `--format` are interpreted.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -813,8 +955,8 @@ pub struct LinkOptions {
     pub endian: Option<Endianness>,
     /// Output path (`-o`). `None` means the flavor's default (`a.out`).
     pub output: Option<PathBuf>,
-    /// Output format name (`--oformat`), such as `binary` or `elf64-x86-64`.
-    pub output_format: Option<String>,
+    /// Output format (`--oformat`), such as `binary` or `elf64-x86-64`.
+    pub output_format: Option<OutputFormat>,
     /// What kind of output to produce.
     pub kind: OutputKind,
     /// Inputs, in command-line order.
@@ -868,9 +1010,8 @@ pub struct LinkOptions {
     pub gc_keep_exported: bool,
     /// `--why-live` symbol patterns.
     pub why_live: Vec<String>,
-    /// Identical code folding (`--icf`): `"all"` or `"safe"`. `None` means
-    /// no folding (`--icf=none`, the default).
-    pub icf: Option<String>,
+    /// Identical code folding (`--icf`).
+    pub icf: IcfMode,
     /// `--print-icf-sections`.
     pub print_icf_sections: bool,
     /// `--keep-unique` symbols, never folded by ICF.
@@ -965,9 +1106,9 @@ pub struct LinkOptions {
     pub dynamic_flags: DynamicFlags,
     /// `-z start-stop-gc` (`Some(true)`) / `-z nostart-stop-gc`.
     pub start_stop_gc: Option<bool>,
-    /// `-z start-stop-visibility=`: `default`, `internal`, `hidden` or
-    /// `protected`.
-    pub start_stop_visibility: Option<String>,
+    /// `-z start-stop-visibility=`. `None` when the keyword was not given,
+    /// which leaves the linker's own default.
+    pub start_stop_visibility: Option<Visibility>,
     /// `-z keep-text-section-prefix`.
     pub keep_text_section_prefix: bool,
     /// `-z dynamic-undefined-weak` (`Some(true)`) /
@@ -1017,13 +1158,12 @@ pub struct LinkOptions {
     pub rodata_segment: Option<u64>,
     /// `-Tldata-segment`.
     pub ldata_segment: Option<u64>,
-    /// `--orphan-handling=`: `place`, `warn`, `error` or `discard`.
-    pub orphan_handling: Option<String>,
-    /// `--sort-section=`: `name` or `alignment`.
-    pub sort_section: Option<String>,
-    /// `--compress-debug-sections=`: `none`, `zlib`, `zlib-gnu`,
-    /// `zlib-gabi` or `zstd`.
-    pub compress_debug_sections: Option<String>,
+    /// `--orphan-handling=`.
+    pub orphan_handling: OrphanHandling,
+    /// `--sort-section=`.
+    pub sort_section: SortSection,
+    /// `--compress-debug-sections=`.
+    pub compress_debug_sections: DebugCompression,
     /// `--package-metadata=`: contents of `.note.package`.
     pub package_metadata: Option<String>,
     /// `--symbol-ordering-file`: order input sections by the symbols listed

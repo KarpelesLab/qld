@@ -953,7 +953,7 @@ fn unimplemented_options_are_refused() {
     for (name, options) in [
         ("-r", with(|o| o.kind = qld::args::OutputKind::Relocatable)),
         ("--gc-sections", with(|o| o.gc_sections = true)),
-        ("--icf", with(|o| o.icf = Some("all".into()))),
+        ("--icf", with(|o| o.icf = qld::args::IcfMode::All)),
     ] {
         let pe = PeOptions::from_link_options(&options);
         let error = qld_link(&options, &pe).unwrap_err();

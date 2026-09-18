@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 
 use crate::args::emulation;
 use crate::args::options::{
-    BuildId, ColorChoice, HashStyle, InputAttrs, InputFormat, InputKind, LinkOptions, OutputKind,
-    ReportLevel, UnresolvedSymbols,
+    BuildId, ColorChoice, DebugCompression, HashStyle, IcfMode, InputAttrs, InputFormat, InputKind,
+    LinkOptions, OrphanHandling, OutputFormat, OutputKind, ReportLevel, SortSection,
+    UnresolvedSymbols, Visibility,
 };
 use crate::args::options::{CallGraphSort, Flavor};
 use crate::args::response::{self, FileReader, FsReader};
@@ -559,7 +560,7 @@ impl GnuParser {
                 }
             }
             Action::Endian(endian) => o.endian = Some(endian),
-            Action::OutputFormat => o.output_format = Some(text(m)?),
+            Action::OutputFormat => o.output_format = Some(OutputFormat::from_name(&text(m)?)),
             Action::Shared => {
                 self.shared = true;
                 if self.pie == Some(true) {
@@ -642,8 +643,9 @@ impl GnuParser {
             Action::WhyLive => o.why_live.push(text(m)?),
             Action::Icf => {
                 o.icf = match text(m)?.as_str() {
-                    "none" => None,
-                    mode @ ("all" | "safe") => Some(mode.to_owned()),
+                    "none" => IcfMode::None,
+                    "safe" => IcfMode::Safe,
+                    "all" => IcfMode::All,
                     other => return Err(bad_value(m, other)),
                 };
             }
@@ -677,9 +679,20 @@ impl GnuParser {
             Action::RodataSegment => o.rodata_segment = Some(hex(m)?),
             Action::LdataSegment => o.ldata_segment = Some(hex(m)?),
             Action::OrphanHandling => {
-                o.orphan_handling = Some(one_of(m, &["place", "warn", "error", "discard"])?);
+                o.orphan_handling =
+                    match one_of(m, &["place", "warn", "error", "discard"])?.as_str() {
+                        "warn" => OrphanHandling::Warn,
+                        "error" => OrphanHandling::Error,
+                        "discard" => OrphanHandling::Discard,
+                        _ => OrphanHandling::Place,
+                    };
             }
-            Action::SortSection => o.sort_section = Some(one_of(m, &["name", "alignment"])?),
+            Action::SortSection => {
+                o.sort_section = match one_of(m, &["name", "alignment"])?.as_str() {
+                    "alignment" => SortSection::Alignment,
+                    _ => SortSection::Name,
+                };
+            }
             Action::Rosegment(on) => o.rosegment = Some(on),
             Action::EhFrameHdr(on) => o.eh_frame_hdr = on,
             Action::BuildId => o.build_id = build_id(m)?,
@@ -692,8 +705,14 @@ impl GnuParser {
                 };
             }
             Action::CompressDebugSections => {
-                let kind = one_of(m, &["none", "zlib", "zlib-gnu", "zlib-gabi", "zstd"])?;
-                o.compress_debug_sections = (kind != "none").then_some(kind);
+                o.compress_debug_sections =
+                    match one_of(m, &["none", "zlib", "zlib-gnu", "zlib-gabi", "zstd"])?.as_str() {
+                        "zlib" => DebugCompression::Zlib,
+                        "zlib-gnu" => DebugCompression::ZlibGnu,
+                        "zlib-gabi" => DebugCompression::ZlibGabi,
+                        "zstd" => DebugCompression::Zstd,
+                        _ => DebugCompression::None,
+                    };
             }
             Action::PackageMetadata => {
                 o.package_metadata = match &m.value {
@@ -974,14 +993,13 @@ impl GnuParser {
             }
             ZAction::StartStopGc(on) => o.start_stop_gc = Some(on),
             ZAction::StartStopVisibility => {
-                let visibility = value.to_ascii_lowercase();
-                if !matches!(
-                    visibility.as_str(),
-                    "default" | "internal" | "hidden" | "protected"
-                ) {
-                    return Err(bad());
-                }
-                o.start_stop_visibility = Some(visibility);
+                o.start_stop_visibility = Some(match value.to_ascii_lowercase().as_str() {
+                    "default" => Visibility::Default,
+                    "internal" => Visibility::Internal,
+                    "hidden" => Visibility::Hidden,
+                    "protected" => Visibility::Protected,
+                    _ => return Err(bad()),
+                });
             }
             ZAction::KeepTextSectionPrefix(on) => o.keep_text_section_prefix = on,
             ZAction::Ibt => o.x86.ibt = true,

@@ -120,7 +120,7 @@ fn relocatable_output_to_memory() {
 fn raw_binary_output_to_memory() {
     let dir = scratch("raw");
     let mut options = in_memory_options(3);
-    options.output_format = Some("binary".into());
+    options.output_format = Some(qld::args::OutputFormat::Binary);
     options.output = Some(dir.join("image.bin"));
     let image = link_to_memory(&mut options).unwrap();
     assert!(!dir.join("image.bin").exists());

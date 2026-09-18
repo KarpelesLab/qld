@@ -227,17 +227,14 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     };
     if let Some(format) = &options.output_format
         && !matches!(
-            format.as_str(),
+            format.name(),
             "elf64-x86-64" | "elf64-x86_64" | "binary" | "ihex" | "srec"
         )
     {
-        return unimplemented(&format!("--oformat {format}"), "M4");
+        return unimplemented(&format!("--oformat {}", format.name()), "M4");
     }
     if options.kind == OutputKind::Relocatable
-        && options
-            .compress_debug_sections
-            .as_deref()
-            .is_some_and(|c| c != "none")
+        && options.compress_debug_sections != crate::args::DebugCompression::None
     {
         return unimplemented("--compress-debug-sections with -r", "M5");
     }
@@ -265,8 +262,8 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
         && (options.kind == OutputKind::Relocatable
             || options
                 .output_format
-                .as_deref()
-                .is_some_and(|f| super::rawout::Format::from_name(f).is_some()))
+                .as_ref()
+                .is_some_and(crate::args::OutputFormat::is_raw))
     {
         return Err(Error::Option(
             "--separate-debug-file needs an ELF executable or shared object output".into(),
@@ -378,8 +375,8 @@ fn link_inputs<'a>(
     }
     if options
         .output_format
-        .as_deref()
-        .is_some_and(|f| super::rawout::Format::from_name(f).is_some())
+        .as_ref()
+        .is_some_and(crate::args::OutputFormat::is_raw)
     {
         // Raw formats link through BFD's generic linker, which copies
         // property notes rather than merging them.
@@ -580,9 +577,9 @@ fn link_inputs<'a>(
     let merged = merged?;
     lap("merge");
     options.check_cancelled()?;
-    let icf_mode = match options.icf.as_deref() {
-        Some("all") => Some(IcfMode::All),
-        Some("safe") => Some(IcfMode::Safe),
+    let icf_mode = match options.icf {
+        crate::args::IcfMode::All => Some(IcfMode::All),
+        crate::args::IcfMode::Safe => Some(IcfMode::Safe),
         _ => None,
     };
     if let Some(icf_mode) = icf_mode {
@@ -772,17 +769,17 @@ fn link_inputs<'a>(
     // --compress-debug-sections: render and compress the debug sections
     // with the final addresses, then lay out again with their new sizes
     // (they follow every allocated section, so no address moves).
-    let compression = options
-        .compress_debug_sections
-        .as_deref()
-        .and_then(|value| {
-            let level = if options.optimize >= 2 {
-                crate::debug::compress::deflate::Level::DEFAULT
-            } else {
-                crate::debug::compress::deflate::Level::FASTEST
-            };
-            crate::debug::section::OutputCompression::from_option(value, level)
-        });
+    let compression = {
+        let level = if options.optimize >= 2 {
+            crate::debug::compress::deflate::Level::DEFAULT
+        } else {
+            crate::debug::compress::deflate::Level::FASTEST
+        };
+        crate::debug::section::OutputCompression::from_option(
+            options.compress_debug_sections,
+            level,
+        )
+    };
     let mut prerendered = Vec::new();
     if let Some(compression) = compression {
         let addresses = Addresses::new(

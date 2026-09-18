@@ -271,12 +271,13 @@ impl OutputCompression {
     /// Parses a `--compress-debug-sections` value: `zlib`, `zlib-gabi`,
     /// `zlib-gnu` or `zstd`. `none` (and anything else) returns `None`.
     #[must_use]
-    pub fn from_option(value: &str, level: Level) -> Option<Self> {
+    pub fn from_option(value: crate::args::DebugCompression, level: Level) -> Option<Self> {
+        use crate::args::DebugCompression as Choice;
         match value {
-            "zlib" | "zlib-gabi" => Some(Self::Zlib(level)),
-            "zlib-gnu" => Some(Self::ZlibGnu(level)),
-            "zstd" => Some(Self::Zstd),
-            _ => None,
+            Choice::Zlib | Choice::ZlibGabi => Some(Self::Zlib(level)),
+            Choice::ZlibGnu => Some(Self::ZlibGnu(level)),
+            Choice::Zstd => Some(Self::Zstd),
+            Choice::None => None,
         }
     }
 
@@ -425,7 +426,9 @@ mod tests {
     #[test]
     fn zdebug_header() {
         let data = b"some debug info".repeat(40);
-        let gnu = OutputCompression::from_option("zlib-gnu", Level::DEFAULT).unwrap();
+        let gnu =
+            OutputCompression::from_option(crate::args::DebugCompression::ZlibGnu, Level::DEFAULT)
+                .unwrap();
         assert!(!gnu.is_gabi());
         let contents = compress_section::<Elf64Le>(&data, gnu, 1);
         assert_eq!(&contents[..4], ZDEBUG_MAGIC);
