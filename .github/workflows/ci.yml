@@ -70,14 +70,17 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_TOOLS: "1"
-      QLD_TEST_LLD: ld.lld
+      QLD_TEST_LLD: ld.lld-22
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # the comparisons were made against lld 23; noble's lld 18 differs
       - run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y lld-22
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
       - run: cargo test --all-features --test ppc64 -- --nocapture
 
   loongarch64:
