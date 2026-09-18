@@ -138,6 +138,7 @@ build_sqlite() {
   unzip -qo "$(fetch "https://www.sqlite.org/$SQLITE_YEAR/$name.zip")"
   flags="-O2 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_ENABLE_MATH_FUNCTIONS"
   # Compiled once, linked by qld and (in reference/) by Apple's linker.
+  set -x
   $CC $flags -c "$name/sqlite3.c" -o sqlite3.o
   $CC $flags -c "$name/shell.c" -o shell.o
   $CC sqlite3.o shell.o -o sqlite3
@@ -146,6 +147,7 @@ build_sqlite() {
   $CC shell.o -L. -lsqlite3 -Wl,-rpath,@executable_path -o sqlite3-shared
   mkdir -p reference
   $APPLE_CC sqlite3.o shell.o -o reference/sqlite3
+  set +x
   for shell in reference/sqlite3 sqlite3 sqlite3-dead-strip sqlite3-shared; do
     out="$(echo "$shell" | tr / -).out"
     rm -f test.db test.db-wal test.db-shm
