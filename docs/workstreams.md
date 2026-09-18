@@ -78,6 +78,8 @@ can work at the same time without colliding.
 | W37 | AArch64 completeness (M4) | `src/elf/arch/aarch64.rs`, `src/arch/aarch64.rs`, `tests/aarch64*`, `tests/fixtures/aarch64-*` | W20 | merged |
 | W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | merged |
 | W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | merged |
+| W40 | ELF32 and big-endian ELF (M4) | the ELF reader/writer generics in `src/elf/**`, `src/elf/arch/{i386,arm}*`, `src/arch/{i386,arm}*`, `tests/elf32*`, `tests/fixtures/{i386,arm,s390x,ppc64be}-*` | W30, W31, W32, W37 | in progress |
+| W41 | Library API decisions for 1.0 (M9) | `src/args/options.rs`, `examples/**`, `tests/api*`, `tests/projects/api-review.md`; proposals for `lib.rs` | W36 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -567,6 +569,22 @@ programs verified.
 
 **Goal:** release workflow with prebuilt binaries, `ld.qld`/`ld64.qld`
 links, distribution package recipes.
+
+---
+
+## W40: ELF32 and big-endian ELF (M4)
+
+**Goal:** one generic ELF path that handles 32-bit and big-endian output as
+well as it handles LP64 little-endian, monomorphized so the common case
+costs nothing, then i386 on top of it. It unlocks 32-bit ARM, RV32, x32,
+PowerPC64 BE (ELFv1) and s390x.
+
+## W41: Library API decisions for 1.0 (M9)
+
+**Goal:** settle the 1.0 blockers in
+[api-review.md](../tests/projects/api-review.md): `Default` versus `new()`,
+string-typed options, `darwin.inputs`, printing and environment reads inside
+the library, and nested thread pools.
 
 ---
 
