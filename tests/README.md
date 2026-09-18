@@ -101,11 +101,15 @@ driver = "cc"
 link = ["-shared -o libfoo.so foo.o", "-o out main.o -L. -lfoo -Wl,-rpath,$ORIGIN"]
 
 output = "out"               # file for expect.readelf; default: last link's -o
-run = "./out"                # shell command; under qemu-<arch> for cross targets
+run = "./out"                # shell command; under qemu-<arch> for cross targets,
+                             # each program of an &&, || or ; chain gets qemu
 expect.stdout = "42\n"       # exact match; """multi-line strings""" are handy
 expect.exit = 0              # default 0
 expect.readelf = ["PT_TLS", "!R_X86_64_TPOFF64"]  # substrings; "!" = must not appear
 expect.readelf_files."libfoo.so" = ["Library soname: [libfoo.so]"]
+# Only when linking for that architecture (named as in Triple::arch):
+expect.readelf_arch.x86_64 = ["R_X86_64_RELATIVE"]
+expect.readelf_arch.aarch64."libfoo.so" = ["R_AARCH64_TLSDESC"]
 expect.readelf_args = "-a"   # arguments after `readelf -W` (default -a)
 
 targets = ["x86_64-linux-gnu"]  # default: the host, if it is Linux

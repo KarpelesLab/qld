@@ -24,7 +24,8 @@ driver  = "cc"                          # link through the compiler driver,
 link    = "-static -o out main.o tls.o" # which adds crt files and libc
 run     = "./out"
 expect.stdout = "42\n"
-expect.readelf = ["PT_TLS", "!R_X86_64_TPOFF64"]  # must / must-not appear
+expect.readelf = ["PT_TLS"]                       # must / must-not ("!") appear
+expect.readelf_arch.x86_64 = ["!R_X86_64_TPOFF64"] # only when linking for x86-64
 targets = ["x86_64-linux-gnu", "aarch64-linux-gnu"]
 ```
 
