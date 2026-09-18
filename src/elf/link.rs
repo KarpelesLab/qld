@@ -240,9 +240,6 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
             "-r and --gdb-index may not be used together".into(),
         ));
     }
-    if options.debug_names {
-        return unimplemented("--debug-names", "M5");
-    }
     if options.separate_debug_file.is_some() {
         return unimplemented("--separate-debug-file", "M5");
     }
@@ -650,7 +647,7 @@ fn link_inputs<'a>(
     options.check_cancelled()?;
 
     let plan = narrow.run(|| symtab::plan(&refs, &linker, options));
-    let trailers = TrailerSizes {
+    let mut trailers = TrailerSizes {
         symtab: plan.symtab_size(),
         strtab: if plan.is_empty() {
             0
@@ -660,6 +657,7 @@ fn link_inputs<'a>(
         first_global: u32::try_from(plan.first_global).unwrap_or(0),
         debug_names: debug_indexes.debug_names_size(),
         gdb_index: debug_indexes.gdb_index_size(),
+        ..TrailerSizes::default()
     };
     let exec_stack = files
         .iter()
@@ -791,8 +789,13 @@ fn link_inputs<'a>(
                 })
             })
             .collect();
+        // The merged `.debug_names` is compressed too.
+        if let Some(gnu) = debug_indexes.compress(&addresses, compression)? {
+            trailers.debug_names = debug_indexes.debug_names_size();
+            trailers.debug_names_compressed = Some(gnu);
+        }
         drop(addresses);
-        if !sizes.is_empty() {
+        if !sizes.is_empty() || trailers.debug_names_compressed.is_some() {
             layout = layout::layout(&LayoutInput {
                 options,
                 refs,

@@ -17,6 +17,7 @@
 //! - [`dwarf`]: lazy `file:line` lookup for diagnostics.
 //! - [`gdb_index`]: `--gdb-index` (W29), and the object DWARF reader the
 //!   index builders share.
+//! - [`debug_names`]: `--debug-names` (W29).
 //!
 //! # Using it from a format backend
 //!
@@ -47,6 +48,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 pub mod compress;
+pub mod debug_names;
 pub mod dwarf;
 pub mod gdb_index;
 pub mod section;

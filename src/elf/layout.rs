@@ -233,6 +233,9 @@ pub struct TrailerSizes {
     pub debug_names: u64,
     /// `--gdb-index`: the `.gdb_index` size (0: none).
     pub gdb_index: u64,
+    /// Whether `.debug_names` is compressed: `Some(true)` for the gABI
+    /// formats (`SHF_COMPRESSED`), `Some(false)` for `zlib-gnu`.
+    pub debug_names_compressed: Option<bool>,
 }
 
 /// The finished layout.
@@ -1367,15 +1370,31 @@ pub(crate) fn add_trailers(
         (&b".debug_names"[..], input.trailers.debug_names, 4),
         (&b".gdb_index"[..], input.trailers.gdb_index, 1),
     ] {
-        if size > 0 {
-            out_sections.push(trailer(
-                name,
-                Trailer::Generated,
-                crate::elf::read::consts::SHT_PROGBITS,
-                size,
-                align,
-            ));
+        if size == 0 {
+            continue;
         }
+        let mut section = trailer(
+            name,
+            Trailer::Generated,
+            crate::elf::read::consts::SHT_PROGBITS,
+            size,
+            align,
+        );
+        if name == b".debug_names" {
+            match input.trailers.debug_names_compressed {
+                Some(true) => {
+                    section.flags |= crate::elf::read::consts::SHF_COMPRESSED;
+                    section.align = 8;
+                }
+                Some(false) => {
+                    section.name_prefix = b".z";
+                    section.name = b"debug_names";
+                    section.align = 1;
+                }
+                None => {}
+            }
+        }
+        out_sections.push(section);
     }
     if input.trailers.symtab > 0 {
         out_sections.push(trailer(

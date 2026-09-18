@@ -15,11 +15,17 @@ use crate::ids::FileId;
 use crate::symbols::Resolution;
 
 use super::GdbIndex;
+use crate::debug::debug_names::DebugNames;
+use crate::debug::section::{OutputCompression, compress_section};
+use crate::elf::read::Elf64Le;
 
 /// The debug indexes of a link, planned before layout.
 #[derive(Debug, Default)]
 pub struct DebugIndexes<'a> {
     gdb_index: Option<GdbIndex<'a>>,
+    debug_names: Option<DebugNames>,
+    /// `.debug_names` compressed for `--compress-debug-sections`.
+    compressed_names: Option<Vec<u8>>,
 }
 
 impl<'a> DebugIndexes<'a> {
@@ -38,12 +44,17 @@ impl<'a> DebugIndexes<'a> {
         options: &LinkOptions,
     ) -> Result<Self> {
         let mut this = Self::default();
-        if !options.gdb_index {
+        if !options.gdb_index && !options.debug_names {
             return Ok(this);
         }
         let objects = live_objects(files, resolution);
         let live = |file: usize, section: u32| sections.is_present_in(file, section);
-        this.gdb_index = Some(GdbIndex::build(&objects, &live)?);
+        if options.gdb_index {
+            this.gdb_index = Some(GdbIndex::build(&objects, &live)?);
+        }
+        if options.debug_names {
+            this.debug_names = Some(DebugNames::build(&objects, &live)?);
+        }
         Ok(this)
     }
 
@@ -56,6 +67,24 @@ impl<'a> DebugIndexes<'a> {
         sections: &mut Sections,
         diagnostics: &dyn DiagnosticSink,
     ) {
+        // The merged `.debug_names` replaces the inputs'.
+        if let Some(names) = &self.debug_names {
+            for (file, object) in live_objects(files, resolution) {
+                for (index, section) in object.sections.iter().enumerate() {
+                    if section.name == b".debug_names"
+                        && !section.is_alloc()
+                        && let Some(id) =
+                            sections.id(file, u32::try_from(index).unwrap_or(u32::MAX))
+                        && let Some(slot) = sections.live.get_mut(id.index())
+                    {
+                        *slot = false;
+                    }
+                }
+            }
+            if names.is_empty() {
+                self.debug_names = None;
+            }
+        }
         let Some(index) = &self.gdb_index else {
             return;
         };
@@ -93,7 +122,39 @@ impl<'a> DebugIndexes<'a> {
     /// The size of `.debug_names` (0: none).
     #[must_use]
     pub fn debug_names_size(&self) -> u64 {
-        0
+        if let Some(bytes) = &self.compressed_names {
+            return bytes.len() as u64;
+        }
+        self.debug_names.as_ref().map_or(0, DebugNames::size)
+    }
+
+    /// Renders and compresses `.debug_names` for `--compress-debug-sections`
+    /// (its contents depend only on offsets within other debug sections,
+    /// which compression does not change). Returns whether it is gABI
+    /// compressed (`Some(true)`) or `zlib-gnu` (`Some(false)`), or `None`
+    /// when there is no section or compression would not make it smaller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Limit`] for oversized sections.
+    pub fn compress(
+        &mut self,
+        addresses: &Addresses<'_, '_>,
+        compression: OutputCompression,
+    ) -> Result<Option<bool>> {
+        let Some(names) = &self.debug_names else {
+            return Ok(None);
+        };
+        let offset = |file: usize, section: u32, value: u64| {
+            addresses.section_offset_address(file, section, value)
+        };
+        let bytes = names.render(&offset)?;
+        let compressed = compress_section::<Elf64Le>(&bytes, compression, 4);
+        if compressed.len() >= bytes.len() {
+            return Ok(None);
+        }
+        self.compressed_names = Some(compressed);
+        Ok(Some(compression.is_gabi()))
     }
 
     /// The size of `.gdb_index` (0: none).
@@ -112,6 +173,21 @@ impl<'a> DebugIndexes<'a> {
         addresses: &Addresses<'_, '_>,
         prerendered: &mut Vec<Prerendered>,
     ) -> Result<()> {
+        if let Some(names) = &self.debug_names {
+            let position = generated_position(addresses, b".debug_names")?;
+            let offset = |file: usize, section: u32, value: u64| {
+                addresses.section_offset_address(file, section, value)
+            };
+            let (bytes, compressed) = match &self.compressed_names {
+                Some(bytes) => (bytes.clone(), true),
+                None => (names.render(&offset)?, false),
+            };
+            prerendered.push(Prerendered {
+                position,
+                bytes,
+                compressed,
+            });
+        }
         let Some(index) = &self.gdb_index else {
             return Ok(());
         };
@@ -146,7 +222,10 @@ fn generated_position(addresses: &Addresses<'_, '_>, name: &[u8]) -> Result<u32>
         .layout
         .sections
         .iter()
-        .position(|s| s.trailer == Trailer::Generated && s.name == name)
+        .position(|s| {
+            s.trailer == Trailer::Generated
+                && (s.name == name || (s.name_prefix == b".z" && name.get(1..) == Some(s.name)))
+        })
         .and_then(|p| u32::try_from(p).ok())
         .ok_or_else(|| {
             crate::Error::Internal(format!(
