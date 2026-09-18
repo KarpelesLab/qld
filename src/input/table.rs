@@ -232,21 +232,76 @@ impl FileTable {
     ///
     /// Successful sources get consecutive [`FileId`]s in source order, no
     /// matter which file finished mapping first.
+    ///
+    /// A path named more than once (a library repeated on the command line)
+    /// is mapped once: each occurrence still gets an entry of its own, and
+    /// the entries share the bytes. So do the members of an archive named
+    /// twice, and the symbol names read from them.
     pub fn load_all(&self, sources: &[Source]) -> Vec<Result<FileId>> {
-        let loaded: Vec<Result<InputFile>> = sources
+        let mut first: std::collections::HashMap<&Path, usize> = std::collections::HashMap::new();
+        let repeat_of: Vec<Option<usize>> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| match source {
+                Source::Path(path) => match first.get(path.as_path()) {
+                    Some(&earlier) => Some(earlier),
+                    None => {
+                        first.insert(path, index);
+                        None
+                    }
+                },
+                Source::Bytes { .. } => None,
+            })
+            .collect();
+        let loaded: Vec<Option<Result<InputFile>>> = sources
             .par_iter()
-            .map(|source| match source {
-                Source::Path(path) => map::load(path)
-                    .map(|backing| self.whole(path.clone(), backing))
-                    .map_err(|error| Error::io(path, error)),
-                Source::Bytes { name, data } => {
-                    Ok(self.whole(name.clone(), Backing::Shared(Arc::clone(data))))
-                }
+            .zip(&repeat_of)
+            .map(|(source, repeat)| {
+                repeat.is_none().then(|| match source {
+                    Source::Path(path) => map::load(path)
+                        .map(|backing| self.whole(path.clone(), backing))
+                        .map_err(|error| Error::io(path, error)),
+                    Source::Bytes { name, data } => {
+                        Ok(self.whole(name.clone(), Backing::Shared(Arc::clone(data))))
+                    }
+                })
+            })
+            .collect();
+        let copy = |file: &InputFile| InputFile {
+            path: file.path.clone(),
+            member: None,
+            parent: None,
+            backing: Arc::clone(&file.backing),
+            start: file.start,
+            end: file.end,
+            format: file.format,
+        };
+        let copies: Vec<Option<Result<InputFile>>> = repeat_of
+            .iter()
+            .zip(sources)
+            .map(|(repeat, source)| {
+                let earlier = loaded.get((*repeat)?)?.as_ref()?;
+                Some(match (earlier, source) {
+                    (Ok(file), _) => Ok(copy(file)),
+                    // Loading again reports the same problem.
+                    (Err(_), Source::Path(path)) => map::load(path)
+                        .map(|backing| self.whole(path.clone(), backing))
+                        .map_err(|error| Error::io(path, error)),
+                    (Err(_), Source::Bytes { .. }) => {
+                        Err(Error::Internal("repeated in-memory input".into()))
+                    }
+                })
             })
             .collect();
         loaded
             .into_iter()
-            .map(|file| file.and_then(|file| self.push(file)))
+            .zip(copies)
+            .map(|(loaded, copy)| {
+                loaded
+                    .or(copy)
+                    .unwrap_or_else(|| Err(Error::Internal("input not loaded".into())))
+                    .and_then(|file| self.push(file))
+            })
             .collect()
     }
 
@@ -342,6 +397,28 @@ pub struct MemberEntry(InputFile);
 mod tests {
     use super::*;
     use crate::input::identify::TextKind;
+
+    #[test]
+    fn a_repeated_path_is_mapped_once() {
+        let table = FileTable::new();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such-file");
+        let sources = [
+            Source::Path(manifest.clone()),
+            Source::Path(missing.clone()),
+            Source::Path(manifest.clone()),
+            Source::Path(missing),
+        ];
+        let ids = table.load_all(&sources);
+        let first = *ids[0].as_ref().unwrap();
+        let again = *ids[2].as_ref().unwrap();
+        assert_ne!(first, again, "each occurrence has its own entry");
+        let (a, b) = (table.get(first).unwrap(), table.get(again).unwrap());
+        assert_eq!(a.path(), manifest);
+        assert_eq!(b.path(), manifest);
+        assert!(std::ptr::eq(a.data(), b.data()), "one mapping");
+        assert!(ids[1].is_err() && ids[3].is_err());
+    }
 
     #[test]
     fn bytes_inputs_and_lookup() {
