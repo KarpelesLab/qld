@@ -220,6 +220,19 @@ fn decode(format: u16, raw: u64, base: u64, imports: &[(String, i64)]) -> (Point
     }
 }
 
+/// Whether clang signed the object's pointers
+/// (`ARM64_RELOC_AUTHENTICATED_POINTER`). Upstream clang does for arm64e
+/// from LLVM 19; older versions emit plain pointers.
+fn has_authenticated_pointers(object: &Path) -> bool {
+    let data = std::fs::read(object).unwrap();
+    let file = qld::macho::read::ObjectFile::parse(&data, Source::new(object)).unwrap();
+    (0..file.sections().len()).any(|index| {
+        file.paired_relocations(index)
+            .unwrap()
+            .any(|r| r.unwrap().relocation.r_type == 11)
+    })
+}
+
 fn compile_arm64e(dir: &Path, source: &str, target: &str) -> std::path::PathBuf {
     let input = super::data_dir().join(source);
     let stem = Path::new(source).file_stem().unwrap().to_str().unwrap();
@@ -311,6 +324,13 @@ fn arm64e_pointer_authentication() {
     for (version, format) in [("13.0", 12u16), ("11.0", 1)] {
         let target = format!("arm64e-apple-macos{version}");
         let compiled = compile_arm64e(&dir, "ptrauth.cpp", &target);
+        if !has_authenticated_pointers(&compiled) {
+            skip(
+                "arm64e_pointer_authentication",
+                "clang does not sign pointers for arm64e (LLVM 19 or later, or Apple clang, does)",
+            );
+            return;
+        }
         // The object, and the same through `-r`, which keeps the
         // authenticated pointers and their relocations.
         let relocatable = dir.join(format!("ptrauth-{version}-r.o"));
@@ -568,8 +588,9 @@ fn arm64e_universal_binary() {
         return;
     }
     let lipo = tool("lipo");
-    if !tool_works(&lipo, &["-version"]) {
-        skip("arm64e_universal_binary", "llvm-lipo is not installed");
+    // Xcode's lipo has no -version: only check that it runs.
+    if Command::new(&lipo).output().is_err() {
+        skip("arm64e_universal_binary", "lipo is not installed");
         return;
     }
     let dir = scratch("arm64e_fat");
