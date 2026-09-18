@@ -144,7 +144,7 @@ const AARCH64_EXTRA: &[(&str, Value)] = &[
 /// The linker symbols a link defines even when nothing refers to them, as
 /// GNU ld does: its default scripts for executables assign `_edata`,
 /// `__bss_start` and `_end` outside `PROVIDE` (on AArch64 also the
-/// [`AARCH64_EXTRA`] boundary symbols), and its ELF backend defines
+/// `AARCH64_EXTRA` boundary symbols), and its ELF backend defines
 /// `_DYNAMIC` whenever it creates dynamic sections. They are in `.symtab`
 /// (`_DYNAMIC` as a local), and in `.dynsym` only when exported.
 #[must_use]
