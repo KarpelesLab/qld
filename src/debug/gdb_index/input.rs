@@ -9,6 +9,8 @@
 //! addend` and reports the section the symbol is defined in, as lld's
 //! `LLDDwarfObj` does, so that an address becomes (section index, offset).
 
+use std::cell::Cell;
+
 use crate::elf::object::ObjectInput;
 use crate::elf::read::consts::SHF_GROUP;
 use crate::elf::read::{Elf64Le, Relocation, Relocations, SectionIndex};
@@ -22,6 +24,35 @@ pub struct Section<'a> {
     /// Contents (decompressed).
     pub data: &'a [u8],
     relocs: Relocs<'a>,
+    /// Where the last lookup ended: readers mostly go forward, so the next
+    /// relocation is usually at or just after it.
+    hint: Cell<usize>,
+}
+
+impl Section<'_> {
+    /// Index of the first relocation at or after `offset`: a few steps
+    /// forward from the last lookup, else a binary search.
+    fn find(&self, offset: u64) -> usize {
+        let hint = self.hint.get();
+        let before = |i: usize| self.relocs.get(i).is_some_and(|r| r.offset < offset);
+        let at = if hint == 0 || before(hint.saturating_sub(1)) {
+            let mut at = hint;
+            let mut steps = 0u32;
+            while steps < 8 && before(at) {
+                at = at.saturating_add(1);
+                steps = steps.saturating_add(1);
+            }
+            if before(at) {
+                self.relocs.lower_bound(offset)
+            } else {
+                at
+            }
+        } else {
+            self.relocs.lower_bound(offset)
+        };
+        self.hint.set(at);
+        at
+    }
 }
 
 /// The relocations of a section, searchable by offset.
@@ -208,6 +239,7 @@ impl<'o, 'a> DebugObject<'o, 'a> {
                 index,
                 data: &[],
                 relocs: Relocs::None,
+                hint: Cell::new(0),
             });
         };
         let data = object.section_data(section)?;
@@ -241,6 +273,7 @@ impl<'o, 'a> DebugObject<'o, 'a> {
             index,
             data,
             relocs,
+            hint: Cell::new(0),
         })
     }
 
@@ -261,7 +294,7 @@ impl<'o, 'a> DebugObject<'o, 'a> {
         let Ok(offset) = u64::try_from(offset) else {
             return (raw, None);
         };
-        let at = section.relocs.lower_bound(offset);
+        let at = section.find(offset);
         let Some(reloc) = section.relocs.get(at).filter(|r| r.offset == offset) else {
             return (raw, None);
         };

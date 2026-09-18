@@ -30,7 +30,7 @@ const DW_FORM_REF_UDATA: u64 = 0x15;
 const DW_FORM_INDIRECT: u64 = 0x16;
 const DW_FORM_SEC_OFFSET: u64 = 0x17;
 const DW_FORM_EXPRLOC: u64 = 0x18;
-const DW_FORM_FLAG_PRESENT: u64 = 0x19;
+pub(crate) const DW_FORM_FLAG_PRESENT: u64 = 0x19;
 const DW_FORM_STRX: u64 = 0x1a;
 pub(crate) const DW_FORM_ADDRX: u64 = 0x1b;
 const DW_FORM_REF_SUP4: u64 = 0x1c;
@@ -474,6 +474,31 @@ pub(crate) fn read_value<'a>(
         DW_FORM_FLAG_PRESENT => Value::Unsigned(1, None),
         DW_FORM_IMPLICIT_CONST => Value::Signed(implicit),
         _ => return Err(r.error("attribute form (unknown)")),
+    })
+}
+
+/// The size of a value of `form` in `unit`, when it does not depend on the
+/// value.
+pub(crate) fn fixed_size(form: u64, unit: &UnitHeader) -> Option<u64> {
+    Some(match form {
+        DW_FORM_FLAG_PRESENT | DW_FORM_IMPLICIT_CONST => 0,
+        DW_FORM_DATA1 | DW_FORM_REF1 | DW_FORM_FLAG | DW_FORM_STRX1 | DW_FORM_ADDRX1 => 1,
+        DW_FORM_DATA2 | DW_FORM_REF2 | DW_FORM_STRX2 | DW_FORM_ADDRX2 => 2,
+        DW_FORM_STRX3 | DW_FORM_ADDRX3 => 3,
+        DW_FORM_DATA4 | DW_FORM_REF4 | DW_FORM_REF_SUP4 | DW_FORM_STRX4 | DW_FORM_ADDRX4 => 4,
+        DW_FORM_DATA8 | DW_FORM_REF8 | DW_FORM_REF_SIG8 | DW_FORM_REF_SUP8 => 8,
+        DW_FORM_DATA16 => 16,
+        DW_FORM_ADDR => unit.address_size as u64,
+        DW_FORM_STRP | DW_FORM_LINE_STRP | DW_FORM_SEC_OFFSET | DW_FORM_STRP_SUP
+        | DW_FORM_GNU_REF_ALT | DW_FORM_GNU_STRP_ALT => unit.offset_size as u64,
+        DW_FORM_REF_ADDR => {
+            if unit.version <= 2 {
+                unit.address_size as u64
+            } else {
+                unit.offset_size as u64
+            }
+        }
+        _ => return None,
     })
 }
 

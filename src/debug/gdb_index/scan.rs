@@ -354,6 +354,85 @@ fn is_cplusplus(language: u64) -> bool {
     matches!(language, 0x04 | 0x19 | 0x1a | 0x21 | 0x2a | 0x2b)
 }
 
+/// What reading a DIE does with one attribute.
+#[derive(Clone, Copy)]
+enum Step {
+    /// Skip this many bytes (runs of fixed-size attributes).
+    Skip(u64),
+    /// Skip a value of this variable-size form.
+    Skip1(u64),
+    /// Read an attribute the scan uses: (attribute, form, implicit value).
+    Read(u64, u64, i64),
+    /// Read a type signature (a `DW_FORM_ref_sig8` of any attribute).
+    Signature,
+}
+
+/// How to read the DIEs of one abbreviation.
+struct Plan {
+    tag: u64,
+    children: bool,
+    steps: Vec<Step>,
+    abstract_origin: bool,
+    declaration: bool,
+    external: bool,
+}
+
+/// Compiles abbreviation `abbrev` for `unit`: attributes the scan does not
+/// use are skipped, fixed-size runs at once.
+fn plan(abbrev: &unit::Abbrev, unit: &UnitHeader) -> Plan {
+    let mut plan = Plan {
+        tag: abbrev.tag,
+        children: abbrev.children,
+        steps: Vec::with_capacity(abbrev.attrs.len()),
+        abstract_origin: false,
+        declaration: false,
+        external: false,
+    };
+    let mut run = 0u64;
+    let flush = |steps: &mut Vec<Step>, run: &mut u64| {
+        if *run > 0 {
+            steps.push(Step::Skip(*run));
+            *run = 0;
+        }
+    };
+    for &(at, form, implicit) in &abbrev.attrs {
+        let wanted = matches!(
+            at,
+            DW_AT_NAME | DW_AT_SPECIFICATION | DW_AT_LOCATION | DW_AT_SIGNATURE
+        );
+        if at == DW_AT_ABSTRACT_ORIGIN {
+            plan.abstract_origin = true;
+        }
+        if matches!(at, DW_AT_DECLARATION | DW_AT_EXTERNAL) {
+            if form == unit::DW_FORM_FLAG_PRESENT {
+                if at == DW_AT_DECLARATION {
+                    plan.declaration = true;
+                } else {
+                    plan.external = true;
+                }
+                continue;
+            }
+            flush(&mut plan.steps, &mut run);
+            plan.steps.push(Step::Read(at, form, implicit));
+            continue;
+        }
+        if wanted {
+            flush(&mut plan.steps, &mut run);
+            plan.steps.push(Step::Read(at, form, implicit));
+        } else if form == unit::DW_FORM_REF_SIG8 {
+            flush(&mut plan.steps, &mut run);
+            plan.steps.push(Step::Signature);
+        } else if let Some(size) = unit::fixed_size(form, unit) {
+            run = run.saturating_add(size);
+        } else {
+            flush(&mut plan.steps, &mut run);
+            plan.steps.push(Step::Skip1(form));
+        }
+    }
+    flush(&mut plan.steps, &mut run);
+    plan
+}
+
 /// Reads the DIEs of a unit after the unit DIE.
 fn read_dies<'a>(
     obj: &DebugObject<'_, 'a>,
@@ -366,6 +445,8 @@ fn read_dies<'a>(
     let mut r = Reader::at(data, start);
     let mut dies: Vec<Die<'a>> = Vec::new();
     let mut signatures = Vec::new();
+    // Compiled abbreviations, by code (codes are small and dense).
+    let mut plans: Vec<Option<Plan>> = Vec::new();
     // Parents of the DIEs being read; the unit DIE is NONE.
     let mut stack: Vec<u32> = vec![NONE];
     while !r.is_empty() {
@@ -378,24 +459,50 @@ fn read_dies<'a>(
             }
             continue;
         }
-        let abbrev = abbrevs
-            .get(code)
-            .ok_or_else(|| r.error("abbreviation code (not found)"))?;
+        let slot = usize::try_from(code).ok().filter(|&c| c < 1 << 16);
+        let compiled;
+        let plan = match slot {
+            Some(slot) => {
+                if plans.len() <= slot {
+                    plans.resize_with(slot.saturating_add(1), || None);
+                }
+                let entry = plans
+                    .get_mut(slot)
+                    .ok_or_else(|| r.error("abbreviation code"))?;
+                if entry.is_none() {
+                    let abbrev = abbrevs
+                        .get(code)
+                        .ok_or_else(|| r.error("abbreviation code (not found)"))?;
+                    *entry = Some(plan(abbrev, unit));
+                }
+                entry.as_ref().ok_or_else(|| r.error("abbreviation code"))?
+            }
+            None => {
+                let abbrev = abbrevs
+                    .get(code)
+                    .ok_or_else(|| r.error("abbreviation code (not found)"))?;
+                compiled = plan(abbrev, unit);
+                &compiled
+            }
+        };
         let mut die = Die {
             offset,
             parent: stack.last().copied().unwrap_or(NONE),
-            tag: abbrev.tag,
+            tag: plan.tag,
             name: None,
             spec: None,
             signature: None,
-            abstract_origin: false,
-            declaration: false,
-            external: false,
+            abstract_origin: plan.abstract_origin,
+            declaration: plan.declaration,
+            external: plan.external,
             static_location: false,
         };
-        for &(at, form, implicit) in &abbrev.attrs {
-            match at {
-                DW_AT_NAME | DW_AT_SPECIFICATION | DW_AT_LOCATION | DW_AT_SIGNATURE => {
+        for &step in &plan.steps {
+            match step {
+                Step::Skip(n) => r.skip(n)?,
+                Step::Skip1(form) => unit::skip_value(&mut r, form, unit)?,
+                Step::Signature => signatures.push(r.uint(8)?),
+                Step::Read(at, form, implicit) => {
                     let value = unit::read_value(obj, info, &mut r, form, implicit, unit)?;
                     match (at, value) {
                         (DW_AT_NAME, _) => die.name = Some(value),
@@ -423,29 +530,21 @@ fn read_dies<'a>(
                                 )
                             );
                         }
+                        (DW_AT_DECLARATION, _) => {
+                            die.declaration = value.unsigned().is_some_and(|v| v != 0);
+                        }
+                        (DW_AT_EXTERNAL, _) => {
+                            die.external = value.unsigned().is_some_and(|v| v != 0);
+                        }
                         _ => {}
                     }
                 }
-                DW_AT_ABSTRACT_ORIGIN => {
-                    die.abstract_origin = true;
-                    unit::skip_value(&mut r, form, unit)?;
-                }
-                DW_AT_DECLARATION | DW_AT_EXTERNAL => {
-                    let value = unit::read_value(obj, info, &mut r, form, implicit, unit)?;
-                    let set = value.unsigned().is_some_and(|v| v != 0);
-                    if at == DW_AT_DECLARATION {
-                        die.declaration = set;
-                    } else {
-                        die.external = set;
-                    }
-                }
-                _ if form == unit::DW_FORM_REF_SIG8 => signatures.push(r.uint(8)?),
-                _ => unit::skip_value(&mut r, form, unit)?,
             }
         }
         let index = u32::try_from(dies.len()).map_err(|_| r.error("too many DIEs"))?;
+        let children = plan.children;
         dies.push(die);
-        if abbrev.children {
+        if children {
             stack.push(index);
         }
     }
