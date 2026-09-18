@@ -1,9 +1,27 @@
-# Library API (planned)
+# Library API
 
 The `qld` crate exposes the linker as a library for build tools, compilers,
 JIT/AOT pipelines, test harnesses and packagers. The API will be unstable
 until 1.0 (M9). This document records the intended shape so that internal
 design choices don't close it off.
+
+**Status (W36):**
+- **Documented surface:** the crate root, `args`, `diag`, `error` and
+  `target`. Every other module is `#[doc(hidden)]`: it is public for qld's own
+  tests and tools, and is not covered by semantic versioning.
+- **In-memory I/O and cancellation (ELF links only so far):**
+  - `InputKind::bytes(name, data)` passes an input as bytes.
+  - `MemoryFiles` / `InputProvider` (`LinkOptions::input_provider`) serve
+    files by path, ahead of the disk. This covers `-l` search, scripts and
+    thin archive members.
+  - `link_to_memory` or `OutputBuffer` (`LinkOptions::output_buffer`) return
+    the output image.
+  - A `CancelToken` (`LinkOptions::cancel`) makes the link return
+    `Error::Cancelled`, leaving no output behind.
+- **Examples:** `examples/` has `link_argv`, `in_memory`, `custom_sink`,
+  `rayon_pool` and `cancel`.
+- **Review:** [tests/projects/api-review.md](../tests/projects/api-review.md)
+  lists every public item, the 1.0 blockers and the semver policy.
 
 ## Requirements
 

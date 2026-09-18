@@ -30,9 +30,7 @@ use crate::error::{Error, Result};
 use crate::ids::FileId;
 use crate::input::archive::Member;
 use crate::input::identify::FileFormat;
-use crate::input::{
-    FileTable, InputFile, LibraryNaming, MemberEntry, RealFileSystem, SearchContext, Source,
-};
+use crate::input::{FileTable, InputFile, LibraryNaming, MemberEntry, SearchContext, Source};
 use crate::script::{self, CommandKind, InputName};
 use crate::symbols::{DefinitionKind, InputPosition, ResolveFile, SymbolName, SymbolUse};
 use crate::target::Target;
@@ -511,7 +509,8 @@ pub fn collect<'a>(
     internal: &'a InternalNames,
     config: ParseConfig<'a>,
 ) -> Result<Inputs<'a>> {
-    let fs = RealFileSystem;
+    // The file table looks in `options.input_provider` first.
+    let fs = table;
     let search = SearchContext {
         search_paths: &options.search_paths,
         sysroot: options.sysroot.as_deref(),
@@ -1044,7 +1043,7 @@ impl<'a> Walker<'a, '_> {
             }
             InputName::Path(path) => {
                 let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
-                let fs = RealFileSystem;
+                let fs = self.table;
                 // GNU ld: an absolute path in a script that itself lies in
                 // the sysroot is looked up under the sysroot. Without this a
                 // cross link picks up the host's `/lib64/libc.so.6`.
@@ -1135,7 +1134,7 @@ pub fn add_after_lto<'a>(
         .chain(&options.search_paths)
         .cloned()
         .collect();
-    let fs = RealFileSystem;
+    let fs = table;
     let static_output = matches!(
         options.kind,
         crate::args::OutputKind::StaticExecutable | crate::args::OutputKind::StaticPie

@@ -60,6 +60,9 @@ pub enum Error {
     ///
     /// Every use of this must name the roadmap milestone that will remove it.
     Unimplemented(String),
+    /// The link was cancelled through
+    /// [`LinkOptions::cancel`](crate::args::LinkOptions::cancel).
+    Cancelled,
 }
 
 impl Error {
@@ -110,6 +113,7 @@ impl fmt::Display for Error {
             Self::Reported { errors } if *errors == 1 => write!(f, "1 error"),
             Self::Reported { errors } => write!(f, "{errors} errors"),
             Self::Unimplemented(what) => write!(f, "not implemented yet: {what}"),
+            Self::Cancelled => f.write_str("link cancelled"),
         }
     }
 }

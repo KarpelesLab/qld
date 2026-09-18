@@ -377,10 +377,10 @@ fn join_root(root: &Path, path: &Path) -> PathBuf {
 }
 
 impl SearchPaths {
-    /// The search directories of `options`, as lld computes them: each `-L`
-    /// and `-F` directory under every root where it exists (or as given
-    /// when it exists under none), then the default directories under each
-    /// root unless `-Z`.
+    /// The search directories of `options`, as ld64 and lld compute them:
+    /// each absolute `-L` and `-F` directory under every root where it
+    /// exists (or as given when it exists under none), relative ones as
+    /// given, then the default directories under each root unless `-Z`.
     #[must_use]
     pub fn new(options: &LinkOptions) -> Self {
         let darwin = &options.darwin;
@@ -396,7 +396,8 @@ impl SearchPaths {
             for path in given {
                 let mut found = false;
                 for root in &roots {
-                    if root.as_os_str().is_empty() {
+                    // `-L.` is the current directory, not the SDK's root.
+                    if root.as_os_str().is_empty() || !path.has_root() {
                         continue;
                     }
                     let candidate = join_root(root, path);
