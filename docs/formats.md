@@ -123,6 +123,14 @@ every output format:
 | Determinism | fixed timestamp unless `--insert-timestamp` is given |
 | Resources | `.rsrc` from GNU windres objects, `.rsrc$01`/`.rsrc$02` from `cvtres`/`llvm-windres` |
 
+## ELF32 output
+
+32-bit targets (i386) write REL relocations: `.rel.dyn` and `.rel.plt` with
+`DT_REL`, `DT_RELSZ`, `DT_RELENT` and `DT_PLTREL = DT_REL`, with addends
+stored in the patched words. The class and byte order are a type parameter
+of the whole ELF pipeline (`ElfFormat`), chosen once per link, so the 64-bit
+path carries no run-time checks.
+
 ## Mach-O output (M8, ld64 flavor)
 
 | Item | Scope |

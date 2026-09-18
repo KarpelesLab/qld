@@ -42,11 +42,25 @@ jobs:
             gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu \
             binutils-powerpc64le-linux-gnu \
             gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+            gcc-i686-linux-gnu g++-i686-linux-gnu binutils-i686-linux-gnu \
             qemu-user-static
           # noble ships only the versioned LoongArch compiler names
           sudo ln -sf /usr/bin/loongarch64-linux-gnu-gcc-14 /usr/local/bin/loongarch64-linux-gnu-gcc
           sudo ln -sf /usr/bin/loongarch64-linux-gnu-g++-14 /usr/local/bin/loongarch64-linux-gnu-g++
       - run: cargo test --all-features --test fixtures -- --ignored --nocapture
+
+  i386:
+    name: i386 links compared with GNU ld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_I386_TOOLS: "1"
+      QLD_REQUIRE_I386_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
+      - run: cargo test --all-features --test i386 -- --nocapture
 
   debug-indexes:
     name: Debug indexes and section ordering compared with lld

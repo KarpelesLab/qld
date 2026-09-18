@@ -187,7 +187,7 @@ and TLS models.
       compared with lld symbolically, fixtures run under qemu in CI. RV32
       waits for ELF32; `DT_RISCV_VARIANT_CC` and `PT_RISCV_ATTRIBUTES` under
       linker scripts are open
-- [ ] **i386**: GOT-relative relocations, `-z ibtplt`, TLS GNU dialect
+- [x] **i386**: GOT-relative relocations with GNU ld's GOT32X relaxations, `-z ibtplt`, the GNU TLS models and TLS descriptors with their relaxations, PLT and IFUNC; compared with GNU ld 2.46 and run natively
 - [ ] **ARM (32-bit)**: Thumb/ARM interworking, veneers, `.ARM.exidx`
       ordering and synthesis, BE8, `R_ARM_V4BX`
 - [ ] **x32** (`elf32_x86_64`)
@@ -207,8 +207,11 @@ and TLS models.
       `R_LARCH_ALIGN`), B26 thunks, ALIGN synthesis in `-r`; the fixtures run
       under qemu in CI
 - [ ] **s390x**
-- [ ] Big-endian ELF and ELF32 handled through the same generic code
-      (monomorphized, no run-time endianness checks on hot paths)
+- [~] Big-endian ELF and ELF32 handled through the same generic code
+      (monomorphized, no run-time endianness checks on hot paths): the
+      pipeline is generic over `ElfFormat` and chosen once in `elf::link`.
+      ELF32 and ELF64 little-endian are built; big-endian is encoded and
+      decoded in unit tests but has no architecture yet (PowerPC64 BE, s390x)
 
 **Status:** AArch64 is the second architecture. Validation without an arm64
 machine: every fixture links with qld and with `aarch64-unknown-linux-gnu-ld`,

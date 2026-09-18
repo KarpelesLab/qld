@@ -480,6 +480,20 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   - `-r` does not synthesize `R_RISCV_ALIGN` as lld does.
 - **Endianness:** big-endian RISC-V (`elf64briscv`) is rejected.
 
+## i386 ELF
+
+- Relaxing TLS general-dynamic or descriptor code to initial-exec uses a
+  negative TPOFF entry, as lld does; GNU ld uses a positive `TPOFF32` with
+  `subl`/`negl`.
+- `R_386_TLS_LE` in a shared object is an error; GNU ld accepts it with text
+  relocations.
+- `-l` reports an error for a library built for another machine, class or
+  byte order instead of skipping it and searching on.
+- Initial-exec TLS uses GNU's `addl` form, and GOT32X relaxations are done
+  as in GNU ld (lld does neither).
+- Inputs for another machine, class or byte order are rejected with GNU's
+  "is incompatible with" wording.
+
 ## PowerPC64 LE
 
 - Call stubs for PLT calls are in `.plt.sec`, not placed near callers (lld)

@@ -78,7 +78,7 @@ can work at the same time without colliding.
 | W37 | AArch64 completeness (M4) | `src/elf/arch/aarch64.rs`, `src/arch/aarch64.rs`, `tests/aarch64*`, `tests/fixtures/aarch64-*` | W20 | merged |
 | W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | merged |
 | W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | merged |
-| W40 | ELF32 and big-endian ELF (M4) | the ELF reader/writer generics in `src/elf/**`, `src/elf/arch/{i386,arm}*`, `src/arch/{i386,arm}*`, `tests/elf32*`, `tests/fixtures/{i386,arm,s390x,ppc64be}-*` | W30, W31, W32, W37 | in progress |
+| W40 | ELF32 and big-endian ELF (M4) | the ELF reader/writer generics in `src/elf/**`, `src/elf/arch/{i386,arm}*`, `src/arch/{i386,arm}*`, `tests/elf32*`, `tests/fixtures/{i386,arm,s390x,ppc64be}-*` | W30, W31, W32, W37 | merged |
 | W41 | Library API decisions for 1.0 (M9) | `src/args/options.rs`, `examples/**`, `tests/api*`, `tests/projects/api-review.md`; proposals for `lib.rs` | W36 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -594,6 +594,13 @@ the library, and nested thread pools.
   `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis
   in `-r`; move the `R_LARCH_*` constants to `src/elf/read/consts/`; remove
   the per-relocation lookahead cost on x86-64/AArch64 (in progress).
+- **W40 (ELF32/big-endian):** next architectures, smallest first: x32 (the
+  x86-64 PLT and 8-byte GOT with 4-byte `RELATIVE`, its own TLS forms), RV32
+  (RV64 code with a word-size parameter), s390x (testable in CI with qemu),
+  PowerPC64 BE ELFv1 (`.opd`), then 32-bit ARM (Thumb interworking,
+  `.ARM.exidx`, BE8). `-l` should skip libraries for another machine, as GNU
+  ld does. Big-endian output has not been exercised end to end yet. The
+  second pipeline copy grows the release binary.
 - **W28 (resolution):** `mallopt(M_TOP_PAD)` at startup is worth ~3 ms on
   clang but needs an `unsafe extern` call and a frozen-file change; slimmer
   `ObjectInput`/`InputSection`; COMDAT slots keyed by symbol ID.

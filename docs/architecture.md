@@ -270,6 +270,15 @@ them into a universal binary. Per architecture:
    tables, STABS debug map), then the header, `LC_UUID` and the ad-hoc code
    signature.
 
+### ELF class and byte order
+
+The ELF pipeline is generic over `F: ElfFormat` (class and byte order).
+`elf::link` picks the format once from the target, so ELF64 and ELF32
+little-endian are two monomorphized copies of the pipeline. Run-time
+dispatch on the format in readers cost 5.8% on the clang link, and
+target-only checks inside the hottest relocation code cost up to 8%, so
+both are kept out of the per-relocation paths.
+
 ## Module layout
 
 qld is a **single crate**. It builds as one library plus one binary, and the
