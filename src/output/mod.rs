@@ -6,8 +6,10 @@
 //!   are written with positional writes by default ([`Backing::Written`]);
 //!   mapping the file ([`Backing::Mapped`]) and an in-memory buffer
 //!   ([`Backing::Memory`], also used for pipes, devices and library callers
-//!   who want bytes back) are the alternatives. `QLD_OUTPUT_BACKING`
-//!   overrides the choice for benchmarking.
+//!   who want bytes back) are the alternatives.
+//!   [`LinkOptions::output_backing`](crate::args::LinkOptions::output_backing)
+//!   overrides the choice for benchmarking; the `qld` binary sets it from
+//!   `QLD_OUTPUT_BACKING`.
 //! - Hand out disjoint `&mut [u8]` chunks so sections can be copied and
 //!   relocated in parallel.
 //! - Post-write steps: build-id (hash blocks in parallel, then combine),
