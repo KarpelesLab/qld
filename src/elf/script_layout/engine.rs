@@ -1568,10 +1568,24 @@ fn build_entries(
     let mut result = Vec::with_capacity(count);
     for (output, mut list) in lists.into_iter().enumerate() {
         let output = u32::try_from(output).unwrap_or(NONE);
+        // `--symbol-ordering-file`: ordered sections first in their
+        // description (`crate::elf::ordering`).
+        let order = input.order.filter(|_| {
+            placement
+                .outputs
+                .get(output as usize)
+                .is_some_and(|o| crate::elf::ordering::reorders(o.name))
+        });
+        let ordered = |s: &SortInfo<'_>| (s.class == 1).then(|| SectionId::from_u32(s.id));
         list.sort_by(|(ea, sa), (eb, sb)| {
             ea.sub
                 .cmp(&eb.sub)
                 .then((sa.class >= 2).cmp(&(sb.class >= 2)))
+                .then_with(|| {
+                    order.map_or(core::cmp::Ordering::Equal, |o| {
+                        o.compare(ordered(sa), ordered(sb))
+                    })
+                })
                 .then_with(|| {
                     let rule = rules.get(&(output, ea.sub)).copied().flatten();
                     if sa.class != 1 || sb.class != 1 {

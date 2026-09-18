@@ -101,6 +101,10 @@ pub enum Trailer {
     /// `--emit-relocs`: the input relocations of the output section at this
     /// position in [`Layout::sections`].
     Rela(u32),
+    /// A section whose contents the driver renders after layout and hands
+    /// to the writer as [`Prerendered`](super::write::Prerendered)
+    /// (`.debug_names`, `.gdb_index`).
+    Generated,
 }
 
 /// An output section after layout.
@@ -229,6 +233,15 @@ pub struct TrailerSizes {
     pub strtab: u64,
     /// Index of the first global symbol.
     pub first_global: u32,
+    /// `--debug-names`: the merged `.debug_names` size (0: none).
+    pub debug_names: u64,
+    /// `--gdb-index`: the `.gdb_index` size (0: none).
+    pub gdb_index: u64,
+    /// Whether `.debug_names` is compressed: `Some(true)` for the gABI
+    /// formats (`SHF_COMPRESSED`), `Some(false)` for `zlib-gnu`.
+    pub debug_names_compressed: Option<bool>,
+    /// `--separate-debug-file`: the `.gnu_debuglink` size (0: none).
+    pub debuglink: u64,
 }
 
 /// The finished layout.
@@ -364,6 +377,9 @@ pub struct LayoutInput<'l, 'a> {
     pub mode: Mode,
     /// Output sections written compressed (`--compress-debug-sections`).
     pub compressed: &'l [CompressedOutput],
+    /// Section priorities from `--symbol-ordering-file` or
+    /// `--call-graph-profile-sort` ([`super::ordering`]).
+    pub order: Option<&'l super::ordering::SectionOrder>,
     /// The linker relaxation edits to lay out with; set by
     /// [`crate::elf::arch::shrink::layout`] while it iterates.
     pub relax: Option<&'l Relaxation>,
@@ -587,6 +603,29 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
                                 .then(a.id.cmp(&b.id))
                         });
                     }
+                }
+            }
+            if let Some(order) = input.order.filter(|o| !o.is_empty())
+                && let Some(output) = output.filter(|o| super::ordering::reorders(o.name))
+            {
+                let spacing = if output.flags & SHF_EXECINSTR != 0 {
+                    super::ordering::thunk_spacing(input.synth.arch)
+                } else {
+                    0
+                };
+                let id = |k: &Key| match k.member {
+                    Member::Input(id) => Some(id),
+                    _ => None,
+                };
+                let size = |k: &Key| member_size(input, k.member).map_or(0, |(size, _)| size);
+                // Sections sorted by init priority keep that order first.
+                if rule.is_some_and(|r| r.inputs.iter().any(|i| i.sort == SortMode::InitPriority)) {
+                    for run in keys.chunk_by_mut(|a, b| a.sub == b.sub && a.priority == b.priority)
+                    {
+                        order.arrange(run, id, spacing, size);
+                    }
+                } else {
+                    order.arrange(&mut keys, id, spacing, size);
                 }
             }
             let synthetic = output.map_or(Synthetic::None, |o| o.synthetic);
@@ -1399,6 +1438,39 @@ pub(crate) fn add_trailers(
             rela.info = u32::try_from(position.saturating_add(1)).unwrap_or(0);
             out_sections.push(rela);
         }
+    }
+    // Linker-generated debug indexes follow the other non-allocated
+    // sections, as lld's synthetic sections do.
+    for (name, size, align) in [
+        (&b".debug_names"[..], input.trailers.debug_names, 4),
+        (&b".gdb_index"[..], input.trailers.gdb_index, 1),
+        (&b".gnu_debuglink"[..], input.trailers.debuglink, 4),
+    ] {
+        if size == 0 {
+            continue;
+        }
+        let mut section = trailer(
+            name,
+            Trailer::Generated,
+            crate::elf::read::consts::SHT_PROGBITS,
+            size,
+            align,
+        );
+        if name == b".debug_names" {
+            match input.trailers.debug_names_compressed {
+                Some(true) => {
+                    section.flags |= crate::elf::read::consts::SHF_COMPRESSED;
+                    section.align = 8;
+                }
+                Some(false) => {
+                    section.name_prefix = b".z";
+                    section.name = b"debug_names";
+                    section.align = 1;
+                }
+                None => {}
+            }
+        }
+        out_sections.push(section);
     }
     if input.trailers.symtab > 0 {
         out_sections.push(trailer(

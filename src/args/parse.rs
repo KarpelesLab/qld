@@ -13,11 +13,11 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::args::emulation;
-use crate::args::options::Flavor;
 use crate::args::options::{
     BuildId, ColorChoice, HashStyle, InputAttrs, InputFormat, InputKind, LinkOptions, OutputKind,
     ReportLevel, UnresolvedSymbols,
 };
+use crate::args::options::{CallGraphSort, Flavor};
 use crate::args::response::{self, FileReader, FsReader};
 use crate::args::table::{
     self, Action, ArgKind, DynFlag, OptionDef, PeAction, PeFlag, Status, ZAction, ZArg,
@@ -699,6 +699,32 @@ impl GnuParser {
                 o.package_metadata = match &m.value {
                     Some(_) => Some(text(m)?),
                     None => None,
+                };
+            }
+            Action::SymbolOrderingFile => o.symbol_ordering_file = Some(path(m)?),
+            Action::WarnSymbolOrdering(on) => o.no_warn_symbol_ordering = !on,
+            Action::CallGraphProfileSort => {
+                o.call_graph_profile_sort = Some(match &m.value {
+                    // The flag alone (lld 16 and older) meant hfsort.
+                    None => CallGraphSort::Hfsort,
+                    Some(_) => match text(m)?.as_str() {
+                        "none" => CallGraphSort::None,
+                        "hfsort" => CallGraphSort::Hfsort,
+                        "cdsort" => CallGraphSort::Cdsort,
+                        other => return Err(bad_value(m, other)),
+                    },
+                });
+            }
+            Action::NoCallGraphProfileSort => o.call_graph_profile_sort = Some(CallGraphSort::None),
+            Action::CallGraphOrderingFile => o.call_graph_ordering_file = Some(path(m)?),
+            Action::PrintSymbolOrder => o.print_symbol_order = Some(path(m)?),
+            Action::GdbIndex(on) => o.gdb_index = on,
+            Action::DebugNames(on) => o.debug_names = on,
+            Action::SeparateDebugFile(on) => {
+                o.separate_debug_file = match (&m.value, on) {
+                    (_, false) => None,
+                    (None, true) => Some(None),
+                    (Some(_), true) => Some(Some(path(m)?)),
                 };
             }
             Action::PackDynRelocs => {

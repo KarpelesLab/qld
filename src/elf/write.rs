@@ -227,6 +227,12 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                     Chunk::EmitRelocs(target),
                 ));
             }
+            Trailer::Generated => {
+                return Err(Error::Internal(format!(
+                    "{} was not rendered before the write",
+                    String::from_utf8_lossy(section.name)
+                )));
+            }
             Trailer::None => {
                 let position32 = u32::try_from(position).unwrap_or(u32::MAX);
                 // The block of erratum patches starts at the first one.
