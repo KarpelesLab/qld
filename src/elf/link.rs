@@ -235,8 +235,10 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     {
         return unimplemented("--compress-debug-sections with -r", "M5");
     }
-    if options.gdb_index {
-        return unimplemented("--gdb-index", "M5");
+    if options.gdb_index && options.kind == OutputKind::Relocatable {
+        return Err(Error::Option(
+            "-r and --gdb-index may not be used together".into(),
+        ));
     }
     if options.debug_names {
         return unimplemented("--debug-names", "M5");
@@ -564,6 +566,15 @@ fn link_inputs<'a>(
         lap("icf");
         options.check_cancelled()?;
     }
+    let debug_indexes = narrow.run(|| {
+        crate::debug::gdb_index::elf::DebugIndexes::plan(
+            files,
+            &resolution,
+            &mut sections,
+            options,
+            diagnostics,
+        )
+    })?;
     let refs = Refs {
         files,
         symbols: &symbols,
@@ -641,6 +652,8 @@ fn link_inputs<'a>(
             u64::try_from(plan.strtab_size).unwrap_or(u64::MAX)
         },
         first_global: u32::try_from(plan.first_global).unwrap_or(0),
+        debug_names: debug_indexes.debug_names_size(),
+        gdb_index: debug_indexes.gdb_index_size(),
     };
     let exec_stack = files
         .iter()
@@ -801,6 +814,7 @@ fn link_inputs<'a>(
         )
     });
     let entry = entry_address(&addresses, options, mode, diagnostics);
+    narrow.run(|| debug_indexes.render(&addresses, &mut prerendered))?;
     narrow.run(|| {
         write::write(&WriteInput {
             options,

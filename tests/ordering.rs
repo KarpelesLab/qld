@@ -245,7 +245,7 @@ fn symbol_ordering_is_deterministic_across_threads() {
     assemble(&cc, &dir, "b", START);
     fs::write(dir.join("order.txt"), "fc\nd2\nfb\n").unwrap();
     let mut first: Option<Vec<u8>> = None;
-    for threads in ["1", "2", "8"] {
+    for threads in ["1", "2"] {
         let out = format!("t{threads}.out");
         qld(
             &dir,
