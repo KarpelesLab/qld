@@ -58,6 +58,40 @@ pub enum Referent {
     },
 }
 
+/// The signing schema of an arm64e authenticated pointer
+/// (`ARM64_RELOC_AUTHENTICATED_POINTER`), which dyld signs when it fixes
+/// the pointer up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PtrAuth {
+    /// The key: 0 IA, 1 IB, 2 DA, 3 DB.
+    pub key: u8,
+    /// The address of the pointer is blended into the discriminator.
+    pub address_diversity: bool,
+    /// The constant discriminator.
+    pub diversity: u16,
+}
+
+impl PtrAuth {
+    /// The schema of `__auth_got` slots: key IA with address diversity.
+    pub const AUTH_GOT: Self = Self {
+        key: 0,
+        address_diversity: true,
+        diversity: 0,
+    };
+
+    /// Decodes the signing schema an object stores in an authenticated
+    /// pointer (bits 32–47 the discriminator, bit 48 address diversity, bits
+    /// 49–50 the key), whose low 32 bits are the addend.
+    #[must_use]
+    pub fn from_stored(stored: u64) -> Self {
+        Self {
+            key: ((stored >> 49) & 3) as u8,
+            address_diversity: (stored >> 48) & 1 != 0,
+            diversity: ((stored >> 32) & 0xffff) as u16,
+        }
+    }
+}
+
 /// A decoded relocation.
 #[derive(Clone, Copy, Debug)]
 pub struct Decoded {
@@ -78,6 +112,8 @@ pub struct Decoded {
     /// The file of the relocation (whose symbol table `Referent::Local`
     /// indexes).
     pub file: usize,
+    /// For an arm64e authenticated pointer, how dyld signs it.
+    pub auth: Option<PtrAuth>,
 }
 
 /// The extra PC offset of x86_64 `SIGNED_n` relocations.
@@ -167,6 +203,7 @@ pub fn decode(
     };
 
     let embedded = stored(data, at, reloc.length);
+    let mut auth = None;
     let (referent, addend) = if arm64 {
         match reloc.r_type {
             ARM64_RELOC_UNSIGNED => match symbol_referent(reloc.target)? {
@@ -207,7 +244,24 @@ pub fn decode(
                 None => return Err(fail("section-relative page relocation")),
             },
             ARM64_RELOC_AUTHENTICATED_POINTER => {
-                return Err(fail("pointer authentication (arm64e) is not supported"));
+                if reloc.length != 3 || relocation.subtractor.is_some() {
+                    return Err(fail("authenticated pointer that is not 64-bit"));
+                }
+                // The low 32 bits are the addend (or, against a section,
+                // the target's address); the high bits the signing schema.
+                let stored = embedded as u64;
+                auth = Some(PtrAuth::from_stored(stored));
+                let low = i64::from(stored as u32 as i32);
+                match symbol_referent(reloc.target)? {
+                    Some(referent) => (referent, low),
+                    None => (
+                        Referent::Address {
+                            section: section_of(reloc.target)?,
+                            address: stored & 0xffff_ffff,
+                        },
+                        0,
+                    ),
+                }
             }
             ARM64_RELOC_SUBTRACTOR | ARM64_RELOC_ADDEND => {
                 return Err(fail("unpaired relocation"));
@@ -268,6 +322,7 @@ pub fn decode(
         addend,
         subtrahend,
         file,
+        auth,
     })
 }
 
@@ -431,6 +486,8 @@ pub struct Fixup {
     pub address: u64,
     /// What to do.
     pub kind: FixupKind,
+    /// arm64e: dyld signs the pointer with this schema.
+    pub auth: Option<PtrAuth>,
 }
 
 /// The value a relocation computes, after indirection.
@@ -554,10 +611,20 @@ pub fn apply(
         };
     }
 
-    let is_unsigned = (arm64 && decoded.r_type == ARM64_RELOC_UNSIGNED)
+    let is_unsigned = (arm64
+        && matches!(
+            decoded.r_type,
+            ARM64_RELOC_UNSIGNED | ARM64_RELOC_AUTHENTICATED_POINTER
+        ))
         || (!arm64 && decoded.r_type == X86_64_RELOC_UNSIGNED);
     if is_unsigned {
+        let auth = decoded.auth;
         let mut value = resolve.value(target, addend)?;
+        if auth.is_some() && matches!(value, Value::Absolute(_)) {
+            return Err(Error::Limit(format!(
+                "authenticated pointer at {place_address:#x} to an absolute value"
+            )));
+        }
         // The offset field of a thread-local variable descriptor.
         if section_type == S_THREAD_LOCAL_VARIABLES && decoded.offset % 24 == 16 {
             let address = address_of(value, "thread-local offset", place_address)?;
@@ -579,6 +646,7 @@ pub fn apply(
                 Ok(Some(Fixup {
                     address: place_address,
                     kind: FixupKind::Rebase(address),
+                    auth,
                 }))
             }
             (3, Value::Import(import, addend)) => {
@@ -591,6 +659,7 @@ pub fn apply(
                 Ok(Some(Fixup {
                     address: place_address,
                     kind: FixupKind::Bind { import, addend },
+                    auth,
                 }))
             }
             (2, Value::Absolute(v)) => {
@@ -700,6 +769,7 @@ pub fn apply(
                     return Ok(Some(Fixup {
                         address: place_address,
                         kind: FixupKind::Rebase(slot),
+                        auth: None,
                     }));
                 } else {
                     return Err(Error::Limit(format!(
@@ -894,7 +964,11 @@ pub fn needs(arm64: bool, r_type: u8) -> Needs {
 pub fn is_pointer(arm64: bool, decoded: &Decoded) -> bool {
     decoded.subtrahend.is_none()
         && decoded.length == 3
-        && ((arm64 && decoded.r_type == ARM64_RELOC_UNSIGNED)
+        && ((arm64
+            && matches!(
+                decoded.r_type,
+                ARM64_RELOC_UNSIGNED | ARM64_RELOC_AUTHENTICATED_POINTER
+            ))
             || (!arm64 && decoded.r_type == X86_64_RELOC_UNSIGNED))
 }
 

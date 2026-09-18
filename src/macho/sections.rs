@@ -68,13 +68,24 @@ pub fn write(
                 SectionKind::Stubs => write_stubs(addresses, section, out).map(|()| Vec::new()),
                 SectionKind::Got => {
                     let mut fixups =
-                        write_pointers(addresses, section, &addresses.synthetic.got, out)?;
+                        write_pointers(addresses, section, &addresses.synthetic.got, None, out)?;
                     fixups.extend(write_local_pointers(addresses, section, out)?);
                     Ok(fixups)
                 }
-                SectionKind::ThreadPtrs => {
-                    write_pointers(addresses, section, &addresses.synthetic.thread_ptrs, out)
-                }
+                SectionKind::AuthGot => write_pointers(
+                    addresses,
+                    section,
+                    &addresses.synthetic.auth_got,
+                    Some(reloc::PtrAuth::AUTH_GOT),
+                    out,
+                ),
+                SectionKind::ThreadPtrs => write_pointers(
+                    addresses,
+                    section,
+                    &addresses.synthetic.thread_ptrs,
+                    None,
+                    out,
+                ),
                 SectionKind::Sectcreate(i) => {
                     if let Some(data) = sectcreate.get(i)
                         && let Some(slot) = out.get_mut(..data.len())
@@ -226,6 +237,7 @@ fn write_fields(
                     fixups.push(Fixup {
                         address: place,
                         kind,
+                        auth: field.target.auth,
                     });
                 }
             }
@@ -255,11 +267,31 @@ fn write_stubs(addresses: &Addresses<'_, '_>, section: &OutSection, out: &mut [u
         let stub = section
             .addr
             .saturating_add(size.saturating_mul(u64::try_from(index).unwrap_or(0)));
-        let got = addresses
-            .got(id)
-            .ok_or_else(|| Error::Internal("stub without a GOT slot".into()))?;
+        let arm64e = addresses.link.config.is_arm64e();
+        let got = if arm64e {
+            addresses.auth_got(id)
+        } else {
+            addresses.got(id)
+        }
+        .ok_or_else(|| Error::Internal("stub without a GOT slot".into()))?;
         let at = to_usize(stub.saturating_sub(section.addr));
-        if arm64 {
+        if arm64e {
+            // ld64's arm64e stub: the slot's address is the discriminator.
+            //   adrp x17, slot@PAGE; add x17, x17, slot@PAGEOFF
+            //   ldr x16, [x17]; braa x16, x17
+            let pages = ((got & !0xfff) as i64).wrapping_sub((stub & !0xfff) as i64);
+            let adrp = aarch64::Field::Adrp21
+                .encode(aarch64::adrp(17), pages)
+                .map_err(|_| Error::Limit("stub out of range of its GOT slot".into()))?;
+            let add = 0x9100_0231 | (u32::try_from(got & 0xfff).unwrap_or(0) << 10);
+            for (i, insn) in [adrp, add, 0xf940_0230, 0xd71f_0a11]
+                .into_iter()
+                .enumerate()
+            {
+                aarch64::write_insn(out, at.saturating_add(i.saturating_mul(4)), insn)
+                    .ok_or_else(|| Error::Internal("stub outside __auth_stubs".into()))?;
+            }
+        } else if arm64 {
             let pages = ((got & !0xfff) as i64).wrapping_sub((stub & !0xfff) as i64);
             let adrp = aarch64::Field::Adrp21
                 .encode(aarch64::adrp(16), pages)
@@ -312,6 +344,7 @@ fn write_local_pointers(
             fixups.push(Fixup {
                 address,
                 kind: FixupKind::Rebase(written),
+                auth: None,
             });
         }
     }
@@ -322,6 +355,7 @@ fn write_pointers(
     addresses: &Addresses<'_, '_>,
     section: &OutSection,
     symbols: &[crate::ids::SymbolId],
+    auth: Option<reloc::PtrAuth>,
     out: &mut [u8],
 ) -> Result<Vec<Fixup>> {
     let mut fixups = Vec::with_capacity(symbols.len());
@@ -342,7 +376,11 @@ fn write_pointers(
         put64(out, offset, written)
             .ok_or_else(|| Error::Internal("pointer outside its section".into()))?;
         if let Some(kind) = kind {
-            fixups.push(Fixup { address, kind });
+            fixups.push(Fixup {
+                address,
+                kind,
+                auth,
+            });
         }
     }
     Ok(fixups)

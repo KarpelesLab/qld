@@ -39,6 +39,8 @@ use qld::macho::read::consts::{
 use qld::macho::read::{ChainedFixups, MachOFile, Source};
 use qld::output::hash::Sha256;
 
+#[path = "macho_link/arm64e.rs"]
+mod arm64e;
 #[path = "macho_link/library.rs"]
 mod library;
 #[path = "macho_link/namespace.rs"]

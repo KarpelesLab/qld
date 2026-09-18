@@ -849,6 +849,12 @@ pub const DYLD_CHAINED_IMPORT_ADDEND64: u32 = 3;
 pub const DYLD_CHAINED_SYMBOL_UNCOMPRESSED: u32 = 0;
 /// Symbol names are zlib-compressed.
 pub const DYLD_CHAINED_SYMBOL_ZLIB: u32 = 1;
+/// arm64e chained pointers with an 8-byte stride, 16-bit bind ordinals,
+/// and unslid addresses as the targets of plain rebases.
+pub const DYLD_CHAINED_PTR_ARM64E: u16 = 1;
+/// arm64e chained pointers with an 8-byte stride, 24-bit bind ordinals,
+/// and image-relative targets.
+pub const DYLD_CHAINED_PTR_ARM64E_USERLAND24: u16 = 12;
 /// `dyld_chained_ptr_64_rebase` / `_bind` with unslid address targets.
 pub const DYLD_CHAINED_PTR_64: u16 = 2;
 /// `dyld_chained_ptr_64_rebase` / `_bind` with image-relative targets.

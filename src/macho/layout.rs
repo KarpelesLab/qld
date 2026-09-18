@@ -51,6 +51,8 @@ pub enum SectionKind {
     Stubs,
     /// `__got`.
     Got,
+    /// `__auth_got` (arm64e): the signed pointers `__auth_stubs` load.
+    AuthGot,
     /// `__thread_ptrs`.
     ThreadPtrs,
     /// `__common`: tentative definitions.
@@ -181,6 +183,8 @@ pub struct SyntheticSizes {
     pub stubs: u64,
     /// `__got` entries.
     pub got: u64,
+    /// `__auth_got` entries (arm64e).
+    pub auth_got: u64,
     /// `__thread_ptrs` entries.
     pub thread_ptrs: u64,
     /// `__unwind_info` bytes.
@@ -367,7 +371,7 @@ fn section_order(section: &OutSection) -> (i64, usize) {
     let order = match section.segname.as_slice() {
         b"__TEXT" => match section.sectname.as_slice() {
             b"__text" => -5,
-            b"__stubs" => -4,
+            b"__stubs" | b"__auth_stubs" => -4,
             b"__stub_helper" => -3,
             b"__unwind_info" => big.saturating_sub(1),
             b"__eh_frame" => big,
@@ -380,6 +384,7 @@ fn section_order(section: &OutSection) -> (i64, usize) {
             S_ZEROFILL => big,
             _ => match section.sectname.as_slice() {
                 b"__got" => -3,
+                b"__auth_got" => -2,
                 b"__la_symbol_ptr" => -2,
                 b"__const" => -1,
                 _ => 0,
@@ -653,7 +658,11 @@ pub fn plan(
             &mut builder,
             input_sections,
             b"__TEXT",
-            b"__stubs",
+            if config.is_arm64e() {
+                b"__auth_stubs"
+            } else {
+                b"__stubs"
+            },
             S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
             SectionKind::Stubs,
             synthetic.stubs.saturating_mul(config.stub_size()),
@@ -672,6 +681,18 @@ pub fn plan(
             S_NON_LAZY_SYMBOL_POINTERS,
             SectionKind::Got,
             synthetic.got.saturating_mul(8),
+            3,
+        );
+    }
+    if synthetic.auth_got > 0 {
+        synthetic_section(
+            &mut builder,
+            input_sections,
+            got_segment,
+            b"__auth_got",
+            S_NON_LAZY_SYMBOL_POINTERS,
+            SectionKind::AuthGot,
+            synthetic.auth_got.saturating_mul(8),
             3,
         );
     }

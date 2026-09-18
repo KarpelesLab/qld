@@ -240,7 +240,13 @@ pub fn write(
 
     // The header.
     let mut header = Vec::with_capacity(to_usize(header_size));
-    let (cpu_type, cpu_subtype) = if arm64 {
+    let (cpu_type, cpu_subtype) = if link.config.is_arm64e() {
+        (
+            CPU_TYPE_ARM64,
+            crate::macho::read::consts::CPU_SUBTYPE_ARM64E
+                | crate::macho::read::consts::CPU_SUBTYPE_PTRAUTH_ABI,
+        )
+    } else if arm64 {
         (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
     } else {
         (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)

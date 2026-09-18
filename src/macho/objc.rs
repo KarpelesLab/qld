@@ -64,6 +64,8 @@ pub struct Target {
     pub place: Place,
     /// The addend, for a [`Place::Symbol`] (other places fold it in).
     pub addend: i64,
+    /// arm64e: how the pointer is signed.
+    pub auth: Option<reloc::PtrAuth>,
 }
 
 /// How a [`Field`] is written.
@@ -200,7 +202,11 @@ fn pointers(link: &Link<'_>, live_only: bool) -> Result<Pointers> {
                     out.push((
                         link.atom_id(file, relocation.atom),
                         within,
-                        Target { place, addend },
+                        Target {
+                            place,
+                            addend,
+                            auth: decoded.auth,
+                        },
                     ));
                 }
             }
@@ -640,6 +646,7 @@ fn build(link: &Link<'_>) -> Result<(Plan, Vec<usize>)> {
                             offset: 0,
                         },
                         addend: 0,
+                        auth: pointers.at(atom, offset).and_then(|t| t.auth),
                     },
                 });
             }
@@ -657,6 +664,7 @@ fn build(link: &Link<'_>) -> Result<(Plan, Vec<usize>)> {
                         offset: i64::try_from(at).unwrap_or(0),
                     },
                     addend: 0,
+                    auth: pointers.at(atom, 0).and_then(|t| t.auth),
                 },
             });
         }
@@ -784,6 +792,7 @@ fn relative_method_list(
                     offset: 0,
                 },
                 addend: 0,
+                auth: None,
             },
             method.types?,
             method.imp?,

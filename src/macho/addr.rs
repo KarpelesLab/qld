@@ -76,6 +76,16 @@ impl Addresses<'_, '_> {
         }
     }
 
+    /// The `__auth_got` slot of a symbol (arm64e stubs).
+    #[must_use]
+    pub fn auth_got(&self, id: SymbolId) -> Option<u64> {
+        slot(
+            self.layout.find(SectionKind::AuthGot),
+            *self.synthetic.auth_got_index.get(id.index())?,
+            8,
+        )
+    }
+
     /// The address of this image's own definition of an exported weak
     /// symbol that references bind through weak lookup.
     #[must_use]
