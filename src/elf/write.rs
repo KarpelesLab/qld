@@ -849,7 +849,7 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         .unwrap_or_default();
     let range = || Error::Internal("PLT slot out of range".into());
     if !synth.dynamic() {
-        let size = arch.iplt_entry_size();
+        let size = arch.iplt_entry_size(flags);
         let step = usize::try_from(size).unwrap_or(16);
         for (index, entry) in out
             .chunks_exact_mut(step)
@@ -858,7 +858,8 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         {
             let stub = base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(size));
             let slot = addresses.igot_address(index).unwrap_or(0);
-            arch.write_iplt(entry, stub, slot).map_err(|_| range())?;
+            arch.write_iplt(entry, stub, slot, flags)
+                .map_err(|_| range())?;
         }
         return Ok(());
     }

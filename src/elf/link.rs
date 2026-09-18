@@ -570,6 +570,10 @@ fn link_inputs<'a>(
         .saturating_add(8)
         .saturating_mul(8);
     synth.ibt = synth::plan_ibt(files, options);
+    synth.pac_plt = synth::plan_pac_plt(files, options);
+    for warning in synth::force_bti_warnings(files, options) {
+        diagnostics.emit(warning);
+    }
     synth.build_id = synth::plan_build_id(options);
     synth.property_note = synth::plan_property_note(files, options);
     synth.interp = synth::plan_interp(options, mode, context.arch);

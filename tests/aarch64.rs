@@ -554,6 +554,138 @@ int exported_qld(int n) { return imported_qld(n); }
         section_size(&tools, &dir, &gnu, ".plt"),
         "BTI .plt sizes differ"
     );
+    let dynamic = run_ok(&dir, &tools.readelf, &["-dW", &ours]);
+    assert!(dynamic.contains("AARCH64_BTI_PLT"), "{dynamic}");
+}
+
+/// The mnemonics of section `section` of `file`, in order.
+fn section_mnemonics(tools: &Tools, dir: &Path, file: &str, section: &str) -> Vec<String> {
+    let text = run_ok(dir, &tools.objdump, &["-d", "-j", section, file]);
+    text.lines()
+        .filter(|line| line.starts_with(' ') && line.contains(":\t"))
+        .filter_map(|line| line.split('\t').nth(2))
+        .map(|m| m.trim().to_string())
+        .collect()
+}
+
+/// An executable calling a shared library, built from `source` with
+/// `flags`, and the library.
+fn plt_executable(tools: &Tools, dir: &Path, flags: &[&str]) {
+    compile(
+        tools,
+        dir,
+        "imp",
+        "int imported_qld(int n) { return n; }\n",
+        &["-O2", "-fPIC"],
+    );
+    run_ok(dir, &tools.ld, &["-shared", "-o", "libimp.so", "imp.o"]);
+    let source = r#"
+extern int imported_qld(int);
+int main(void) { return imported_qld(1); }
+int (*address_qld(void))(int) { return imported_qld; }
+"#;
+    let mut all = vec!["-O2", "-fno-PIC"];
+    all.extend_from_slice(flags);
+    compile(tools, dir, "exe", source, &all);
+}
+
+/// BTI in an executable: GNU ld gives the entries a landing pad too (an
+/// entry can be a function's canonical address), 24 bytes each, and
+/// `DT_AARCH64_BTI_PLT`. `-z force-bti` does the same for unmarked inputs,
+/// with a warning for each, and marks the output.
+#[test]
+fn bti_plt_in_an_executable() {
+    let tools = require!();
+    for (name, flags, z) in [
+        ("marked", &["-mbranch-protection=bti"][..], &[][..]),
+        ("forced", &[][..], &["-z", "force-bti"][..]),
+    ] {
+        let dir = scratch(&format!("bti-exe-{name}"));
+        plt_executable(&tools, &dir, flags);
+        let mut args = vec!["exe.o", "libimp.so", "-e", "main"];
+        args.extend_from_slice(z);
+        let gnu_err = run(&dir, &tools.ld, &[&["-o", "out.gnu"], &args[..]].concat());
+        let ours = qld(&dir, &[&["-o", "out.qld"], &args[..]].concat());
+        assert!(ours.status.success(), "{name}: qld failed");
+        let plt = section_mnemonics(&tools, &dir, "out.qld", ".plt");
+        assert_eq!(
+            plt,
+            section_mnemonics(&tools, &dir, "out.gnu", ".plt"),
+            "{name}: the PLT differs from GNU ld's"
+        );
+        assert_eq!(plt.iter().filter(|m| *m == "bti").count(), 2, "{plt:?}");
+        let dynamic = run_ok(&dir, &tools.readelf, &["-dW", "out.qld"]);
+        assert!(dynamic.contains("AARCH64_BTI_PLT"), "{name}: {dynamic}");
+        let notes = run_ok(&dir, &tools.readelf, &["-nW", "out.qld"]);
+        assert!(notes.contains("BTI"), "{name}: {notes}");
+        let warning = "BTI is required by -z force-bti";
+        let ours_warn = String::from_utf8_lossy(&ours.stderr).contains(warning);
+        let gnu_warn = String::from_utf8_lossy(&gnu_err.stderr).contains(warning);
+        assert_eq!(ours_warn, gnu_warn, "{name}: warnings differ");
+        assert_eq!(ours_warn, name == "forced");
+    }
+}
+
+/// `-z pac-plt`: every entry authenticates with `autia1716` before its
+/// `br x17` (24 bytes), the header does not, and `DT_AARCH64_PAC_PLT` is
+/// set; with BTI the entry keeps its landing pad. The shapes are GNU ld's.
+#[test]
+fn pac_plt_authenticates_entries() {
+    let tools = require!();
+    for (name, flags) in [
+        ("plain", &[][..]),
+        ("bti", &["-mbranch-protection=bti"][..]),
+    ] {
+        let dir = scratch(&format!("pac-plt-{name}"));
+        plt_executable(&tools, &dir, flags);
+        let args = ["exe.o", "libimp.so", "-e", "main", "-z", "pac-plt"];
+        let (gnu, ours) = link_both(&tools, &dir, &args);
+        let plt = section_mnemonics(&tools, &dir, &ours, ".plt");
+        assert_eq!(
+            plt,
+            section_mnemonics(&tools, &dir, &gnu, ".plt"),
+            "{name}: the PLT differs from GNU ld's"
+        );
+        assert_eq!(
+            plt.iter().filter(|m| *m == "autia1716").count(),
+            1,
+            "{name}: {plt:?}"
+        );
+        let dynamic = run_ok(&dir, &tools.readelf, &["-dW", &ours]);
+        assert!(dynamic.contains("AARCH64_PAC_PLT"), "{name}: {dynamic}");
+        assert_same_code(&tools, &dir, &gnu, &ours);
+    }
+}
+
+/// A static executable's IFUNC stubs are PLT entries, so they get the BTI
+/// landing pad (and `-z pac-plt`) too.
+#[test]
+fn bti_ifunc_stubs_in_a_static_executable() {
+    let tools = require!();
+    let dir = scratch("bti-iplt");
+    let source = r#"
+static int impl_qld(void) { return 42; }
+static void *resolve_qld(void) { return (void *)impl_qld; }
+int ifunc_qld(void) __attribute__((ifunc("resolve_qld")));
+int main(void) { return ifunc_qld(); }
+int (*take_qld(void))(void) { return ifunc_qld; }
+"#;
+    compile(
+        &tools,
+        &dir,
+        "ifunc",
+        source,
+        &["-O2", "-mbranch-protection=standard"],
+    );
+    for z in [&[][..], &["-z", "pac-plt"][..]] {
+        let mut args = vec!["ifunc.o", "-static", "-e", "main"];
+        args.extend_from_slice(z);
+        let (gnu, ours) = link_both(&tools, &dir, &args);
+        let plt = section_mnemonics(&tools, &dir, &ours, ".plt");
+        assert_eq!(plt, section_mnemonics(&tools, &dir, &gnu, ".plt"), "{z:?}");
+        assert_eq!(plt.first().map(String::as_str), Some("bti"), "{plt:?}");
+        assert_same_code(&tools, &dir, &gnu, &ours);
+    }
 }
 
 /// `--gc-sections` keeps what is reachable from the entry point.

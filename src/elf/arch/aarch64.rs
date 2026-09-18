@@ -22,10 +22,13 @@
 //! section afterwards; they never change a size, so layout is unaffected.
 //!
 //! The PLT is GNU ld's: a 32-byte header that saves `x16`/`x30` and jumps
-//! through `.got.plt[2]`, then one 16-byte entry per symbol. With BTI the
-//! header starts with `bti c`, because the entries reach it through
-//! `br x17`; the entries themselves are only reached by direct branches
-//! and keep their 16-byte form, as in GNU ld.
+//! through `.got.plt[2]`, then one 16-byte entry per symbol. With BTI (every
+//! input marked, or `-z force-bti`) the header starts with `bti c`, because
+//! the entries reach it through `br x17`; in an executable the entries do
+//! too, since an entry may be a function's canonical address, and grow to
+//! 24 bytes, while a shared object's keep their 16-byte form. `-z pac-plt`
+//! adds `autia1716` before the `br x17` of every entry (24 bytes). IFUNC
+//! stubs are ordinary entries.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -711,13 +714,16 @@ pub fn write_nops(out: &mut [u8]) {
 const STP_X16_X30: u32 = 0xa9bf_7bf0;
 
 /// Writes the sequence that loads `.got.plt` slot `slot` into `x17` and
-/// branches to it, at address `at` in `out` starting at `start`.
+/// branches to it (authenticating it first when `authenticate`), at
+/// address `at` in `out` starting at `start`, then pads with `nop` up to
+/// `end`.
 fn write_got_jump(
     out: &mut [u8],
     start: u64,
     at: u64,
     slot: u64,
     end: u64,
+    authenticate: bool,
 ) -> Result<(), ApplyError> {
     let delta = (page(slot) as i64).wrapping_sub(page(at) as i64);
     patch(out, start, insn::adrp(16), Field::Adrp21, delta)?;
@@ -738,8 +744,13 @@ fn write_got_jump(
         Field::Add12,
         slot as i64,
     )?;
-    put(out, start.wrapping_add(12), insn::BR_X17)?;
-    let mut pad = start.wrapping_add(16);
+    let mut next = start.wrapping_add(12);
+    if authenticate {
+        put(out, next, insn::AUTIA1716)?;
+        next = next.wrapping_add(4);
+    }
+    put(out, next, insn::BR_X17)?;
+    let mut pad = next.wrapping_add(4);
     while pad < end {
         put(out, pad, NOP)?;
         pad = pad.wrapping_add(4);
@@ -767,11 +778,56 @@ pub fn write_plt_header(
     put(out, at, STP_X16_X30)?;
     at = at.wrapping_add(4);
     let slot = got_plt.wrapping_add(16);
-    write_got_jump(out, at, plt.wrapping_add(at), slot, 32)
+    // The header jumps to the resolver unauthenticated, as in GNU ld: the
+    // `.got.plt` slot it reads is written by the dynamic linker unsigned.
+    write_got_jump(out, at, plt.wrapping_add(at), slot, 32, false)
+}
+
+/// The size of a `.plt`, `.plt.got` or IFUNC entry: 16 bytes, or GNU ld's
+/// 24 when it starts with `bti c` or authenticates with `autia1716`.
+#[must_use]
+pub fn plt_entry_size(flags: PltFlags) -> u64 {
+    if flags.entry_landing_pad || flags.authenticate {
+        24
+    } else {
+        16
+    }
+}
+
+/// The shape of a `.plt.got` entry. It jumps through an ordinary GOT
+/// entry, which `GLOB_DAT` fills with an unsigned address, so it never
+/// authenticates; only `.got.plt` slots are signed under `-z pac-plt`.
+#[must_use]
+pub fn plt_got_flags(flags: PltFlags) -> PltFlags {
+    PltFlags {
+        authenticate: false,
+        ..flags
+    }
+}
+
+/// `DT_AARCH64_BTI_PLT`: the PLT has BTI landing pads.
+pub const DT_AARCH64_BTI_PLT: i64 = 0x7000_0001;
+/// `DT_AARCH64_PAC_PLT`: PLT entries authenticate what they load.
+pub const DT_AARCH64_PAC_PLT: i64 = 0x7000_0003;
+
+/// The dynamic tags that describe a PLT of shape `flags` to the dynamic
+/// linker, as GNU ld writes them after `DT_RELAENT` when there is a PLT.
+pub fn plt_dynamic_tags(arch: super::Arch, flags: PltFlags) -> impl Iterator<Item = i64> {
+    let aarch64 = arch == super::Arch::AArch64;
+    [
+        (flags.landing_pad, DT_AARCH64_BTI_PLT),
+        (flags.authenticate, DT_AARCH64_PAC_PLT),
+    ]
+    .into_iter()
+    .filter(move |&(on, _)| on && aarch64)
+    .map(|(_, tag)| tag)
 }
 
 /// Writes a `.plt`, `.plt.got` or IFUNC entry at address `entry` that jumps
-/// through the GOT word at `slot`.
+/// through the GOT word at `slot`: GNU ld's `adrp x16; ldr x17; add x16;
+/// br x17`, preceded by `bti c` in an executable's BTI PLT and with
+/// `autia1716` before the branch under `-z pac-plt`, padded to
+/// [`plt_entry_size`] with `nop`.
 ///
 /// # Errors
 ///
@@ -787,8 +843,14 @@ pub fn write_plt_entry(
         put(out, at, insn::BTI_C)?;
         at = at.wrapping_add(4);
     }
-    let end = if flags.entry_landing_pad { 24 } else { 16 };
-    write_got_jump(out, at, entry.wrapping_add(at), slot, end)
+    write_got_jump(
+        out,
+        at,
+        entry.wrapping_add(at),
+        slot,
+        plt_entry_size(flags),
+        flags.authenticate,
+    )
 }
 
 #[cfg(test)]
@@ -981,7 +1043,7 @@ mod tests {
         assert_eq!(words, [0xd2a0_0000, 0xf280_0900]);
     }
 
-    fn words(code: &[u8]) -> Vec<u32> {
+    fn insn_words(code: &[u8]) -> Vec<u32> {
         code.as_chunks::<4>()
             .0
             .iter()
@@ -1030,7 +1092,7 @@ mod tests {
         };
         let mut relaxed = code.clone();
         relax_adrp_pairs(&mut relaxed, relocs.into_iter(), 0x1_0000, &[], &target);
-        let words = words(&relaxed);
+        let words = insn_words(&relaxed);
         // nop; adr x0, 0x20100 (from 0x10004).
         assert_eq!(words[0], NOP);
         assert_eq!(
@@ -1063,10 +1125,10 @@ mod tests {
         relocs[5].symbol = 1;
         let mut kept = code.clone();
         relax_adrp_pairs(&mut kept, relocs.into_iter(), 0x1_0000, &[20], &target);
-        let kept_words = self::words(&kept);
-        assert_eq!(kept_words[..2], self::words(&code)[..2]);
+        let kept_words = insn_words(&kept);
+        assert_eq!(kept_words[..2], insn_words(&code)[..2]);
         assert_eq!(kept_words[2], NOP, "ADRP+ADD is independent");
-        assert_eq!(kept_words[4..], self::words(&code)[4..]);
+        assert_eq!(kept_words[4..], insn_words(&code)[4..]);
     }
 
     /// The PLT GNU ld 2.45 writes for a dynamic executable whose `.plt` is
@@ -1112,6 +1174,7 @@ mod tests {
             PltFlags {
                 landing_pad: true,
                 entry_landing_pad: true,
+                authenticate: false,
             },
         )
         .unwrap();
@@ -1132,5 +1195,40 @@ mod tests {
                 NOP
             ]
         );
+        // `-z pac-plt`: `autia1716` before the branch, with or without BTI.
+        for (landing, expected) in [
+            (
+                false,
+                [
+                    0x9000_0110,
+                    0xf940_0211,
+                    0x9100_0210,
+                    0xd503_219f,
+                    0xd61f_0220,
+                    NOP,
+                ],
+            ),
+            (
+                true,
+                [
+                    0xd503_245f,
+                    0x9000_0110,
+                    0xf940_0211,
+                    0x9100_0210,
+                    0xd503_219f,
+                    0xd61f_0220,
+                ],
+            ),
+        ] {
+            let flags = PltFlags {
+                landing_pad: landing,
+                entry_landing_pad: landing,
+                authenticate: true,
+            };
+            assert_eq!(plt_entry_size(flags), 24);
+            let mut entry = [0u8; 24];
+            write_plt_entry(&mut entry, 0x6a0, 0x20000, flags).unwrap();
+            assert_eq!(insn_words(&entry), expected, "bti: {landing}");
+        }
     }
 }

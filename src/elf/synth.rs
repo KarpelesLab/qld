@@ -26,6 +26,7 @@
 use rayon::prelude::*;
 
 use crate::args::{BuildId, LinkOptions};
+use crate::diag::Diagnostic;
 use crate::elf::read::consts::{
     GNU_PROPERTY_1_NEEDED, GNU_PROPERTY_AARCH64_FEATURE_1_AND, GNU_PROPERTY_AARCH64_FEATURE_1_BTI,
     GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_FEATURE_1_IBT,
@@ -152,6 +153,8 @@ pub struct Synth {
     pub dynrelro: (u64, u64),
     /// IBT-enabled PLT (x86-64), or BTI-enabled PLT header (AArch64).
     pub ibt: bool,
+    /// AArch64 `-z pac-plt`: PLT entries authenticate what they load.
+    pub pac_plt: bool,
     /// Reserved words at the start of `.got.plt`.
     pub got_plt_reserved: u64,
     /// Dynamic relocations in `.rela.dyn` that come from GOT entries and
@@ -212,12 +215,15 @@ impl Synth {
     }
 
     /// The shape of PLT entries: landing pads for x86-64 IBT or AArch64
-    /// BTI. On AArch64 only the header needs one.
+    /// BTI, and AArch64 pointer authentication. An AArch64 shared object's
+    /// entries need no landing pad, only the header does (GNU ld).
     #[must_use]
     pub fn plt_flags(&self) -> PltFlags {
+        let executable = self.mode.is_none_or(|m| m.executable());
         PltFlags {
             landing_pad: self.ibt,
-            entry_landing_pad: self.ibt && self.arch == Arch::X86_64,
+            entry_landing_pad: self.ibt && (self.arch == Arch::X86_64 || executable),
+            authenticate: self.pac_plt && self.arch == Arch::AArch64,
         }
     }
 
@@ -591,7 +597,7 @@ impl Synth {
                     }
                 } else {
                     (
-                        count(&self.iplt).saturating_mul(self.arch.iplt_entry_size()),
+                        count(&self.iplt).saturating_mul(self.arch.iplt_entry_size(flags)),
                         align,
                     )
                 }
@@ -813,11 +819,48 @@ pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
 #[must_use]
 pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
     if Arch::of_files(files) == Some(Arch::AArch64) {
-        return input_features(files) & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
+        return options.aarch64.force_bti
+            || input_features(files) & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
     }
     options.x86.ibtplt
         || options.x86.ibt
         || input_features(files) & GNU_PROPERTY_X86_FEATURE_1_IBT != 0
+}
+
+/// Whether PLT entries authenticate the addresses they load: AArch64
+/// `-z pac-plt`.
+#[must_use]
+pub fn plan_pac_plt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+    options.aarch64.pac_plt && Arch::of_files(files) == Some(Arch::AArch64)
+}
+
+/// The warnings `-z force-bti` gives, as GNU ld does: one for each input
+/// object without the BTI property.
+#[must_use]
+pub fn force_bti_warnings(files: &[ElfInput<'_>], options: &LinkOptions) -> Vec<Diagnostic> {
+    if !options.aarch64.force_bti || Arch::of_files(files) != Some(Arch::AArch64) {
+        return Vec::new();
+    }
+    files
+        .iter()
+        .filter(|file| {
+            file.object.as_ref().is_some_and(|object| {
+                let features = object
+                    .properties
+                    .unwrap_or_default()
+                    .aarch64_feature_1_and
+                    .unwrap_or(0);
+                features & GNU_PROPERTY_AARCH64_FEATURE_1_BTI == 0
+            })
+        })
+        .map(|file| {
+            Diagnostic::warning(format!(
+                "{}: BTI is required by -z force-bti, but this input object file lacks the necessary property note",
+                file.display()
+            ))
+            .order(file.position.raw())
+        })
+        .collect()
 }
 
 /// Merges the inputs' GNU properties into the output note, as GNU ld does:
@@ -864,6 +907,12 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     }
     let features = input_features(files);
     if aarch64 {
+        // `-z force-bti` marks the output even when an input is not.
+        let features = if options.aarch64.force_bti {
+            features | GNU_PROPERTY_AARCH64_FEATURE_1_BTI
+        } else {
+            features
+        };
         // AArch64 has one feature word; the x86 properties do not apply.
         let properties: Vec<(u32, u32)> = [
             (GNU_PROPERTY_1_NEEDED, needed_1),
