@@ -112,11 +112,12 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     // In a larger pool (`--threads` above MAX_DEFAULT_THREADS, or a
     // caller's pool), the stages that get slower with more threads run in a
     // pool of MAX_DEFAULT_THREADS; see `Narrow`.
-    let narrow = Narrow(
-        (!own_pools && rayon::current_num_threads() > MAX_DEFAULT_THREADS)
+    let mut narrow = Narrow {
+        pool: (!own_pools && rayon::current_num_threads() > MAX_DEFAULT_THREADS)
             .then(|| thread_pool(MAX_DEFAULT_THREADS))
             .transpose()?,
-    );
+        widen: None,
+    };
     let mut inputs = if own_pools {
         let threads = available_threads().min(INPUT_THREADS);
         thread_pool(threads)?.install(|| inputs::collect(options, &table, &internal, config))?
@@ -125,7 +126,14 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     };
     lap("inputs");
 
-    match input_sized_threads(options, &table, own_pools) {
+    let threads = input_sized_threads(options, &table, own_pools);
+    if own_pools
+        && threads == Some(MAX_DEFAULT_THREADS)
+        && available_threads() > MAX_DEFAULT_THREADS
+    {
+        narrow.widen = Some(available_threads());
+    }
+    match threads {
         Some(threads) => thread_pool(threads)?.install(|| {
             link_inputs(
                 options,
@@ -166,12 +174,20 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
 /// 64), so they keep it. With this, `--threads=64` links as fast as 16
 /// threads or faster: clang 155 ms against 203 before, clang with debug
 /// information 670 against 771, `libclang-cpp` 121 against 189.
-struct Narrow(Option<rayon::ThreadPool>);
+///
+/// The other way round, a large link in qld's own pool of 16 threads merges
+/// sections in a pool of one thread per core when there are many pieces
+/// (`widen`, see [`merge::merge`]).
+struct Narrow {
+    pool: Option<rayon::ThreadPool>,
+    /// Threads for section merging, when they are more than the link's.
+    widen: Option<usize>,
+}
 
 impl Narrow {
     /// Runs `op` in the narrow pool, if there is one.
     fn run<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
-        match &self.0 {
+        match &self.pool {
             Some(pool) => pool.install(op),
             None => op(),
         }
@@ -498,7 +514,13 @@ fn link_inputs<'a>(
     lap("scan");
 
     let commons = narrow.run(|| common::allocate(&refs));
-    let merged = merge::merge(files, &sections, &placement, options.optimize >= 2)?;
+    let merged = merge::merge(
+        files,
+        &sections,
+        &placement,
+        options.optimize >= 2,
+        narrow.widen,
+    )?;
     lap("merge");
     let icf_mode = match options.icf.as_deref() {
         Some("all") => Some(IcfMode::All),
