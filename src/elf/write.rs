@@ -820,6 +820,7 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     };
     let tls = addresses.layout.tls.unwrap_or_default();
     let mode = synth.mode;
+    let rel = synth.arch.uses_rel();
     let size = <F::Word as RawRecord>::SIZE;
     let size64 = u64::try_from(size).unwrap_or(8).max(1);
     let mut put = |address: u64, value: u64| {
@@ -863,6 +864,9 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
                 GotKind::TpOff => {
                     let word = match relocs[0] {
                         SlotReloc::None => value.wrapping_sub(tls.tp(synth.arch)),
+                        // `SHT_REL`: the offset in the module's block is the
+                        // addend, so it is in the word.
+                        SlotReloc::Module(_) if rel => value.wrapping_sub(tls.start),
                         _ => 0,
                     };
                     put(address, word);
@@ -872,12 +876,23 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
                     let (module, offset) = match relocs {
                         [SlotReloc::None, SlotReloc::None] => (1, dtpoff),
                         [_, SlotReloc::None] => (0, dtpoff),
+                        [_, SlotReloc::Module(_)] if rel => (0, dtpoff),
                         _ => (0, 0),
                     };
                     put(address, module);
                     put(address.wrapping_add(size64), offset);
                 }
-                GotKind::TlsDesc | GotKind::TlsLd => {
+                GotKind::TlsDesc => {
+                    // `SHT_REL`: the descriptor's argument word holds the
+                    // addend, the offset of a local variable in its block.
+                    let argument = match relocs[0] {
+                        SlotReloc::Module(_) if rel => value.wrapping_sub(tls.start),
+                        _ => 0,
+                    };
+                    put(address, 0);
+                    put(address.wrapping_add(size64), argument);
+                }
+                GotKind::TlsLd => {
                     put(address, 0);
                     put(address.wrapping_add(size64), 0);
                 }
@@ -1118,7 +1133,11 @@ fn collect_dyn_relocs<F: crate::elf::read::ElfFormat>(
                 .into_iter()
                 .enumerate()
             {
-                let at = address.wrapping_add(if word == 0 { 0 } else { 8 });
+                let at = address.wrapping_add(if word == 0 {
+                    0
+                } else {
+                    arch.kind().word_size()
+                });
                 match reloc {
                     SlotReloc::None => {}
                     SlotReloc::Relative => {

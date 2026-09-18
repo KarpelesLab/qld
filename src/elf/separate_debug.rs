@@ -192,7 +192,7 @@ pub fn to_debug_file(layout: &mut Layout<'_>) -> Result<()> {
         section.offset = offset;
         offset = layout::add(offset, section.size)?;
     }
-    layout.shoff = layout::align_up(offset, 8)?;
+    layout.shoff = layout::align_up(offset, layout.kind.word_size())?;
     layout.file_size = layout::add(
         layout.shoff,
         layout

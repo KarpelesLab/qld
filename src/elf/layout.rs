@@ -1110,7 +1110,7 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         }
         placed_thunks.sort_unstable();
     }
-    let end = align_up(dot, 8)?;
+    let end = align_up(dot, kind.word_size())?;
     place_empty_until(NONE, dot, &mut output_places);
 
     // Non-allocated sections.
@@ -1134,7 +1134,7 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         section.lma = section.addr;
     }
     let shnum = u64::try_from(out_sections.len().saturating_add(1)).unwrap_or(u64::MAX);
-    let shoff = align_up(file_end, 8)?;
+    let shoff = align_up(file_end, kind.word_size())?;
     let file_size = add(shoff, shnum.saturating_mul(kind.shdr_size()))?;
 
     // Program headers, in GNU ld's order.
@@ -1643,7 +1643,14 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
             .collect();
         for kind in kinds {
             match kind {
-                Synthetic::GnuHash => section.link = dynsym,
+                Synthetic::GnuHash => {
+                    section.link = dynsym;
+                    // Every word of the ELF32 table is 32 bits; the ELF64
+                    // bloom filter mixes sizes, so it has no entry size.
+                    if class.is_32() {
+                        section.entsize = 4;
+                    }
+                }
                 Synthetic::Hash => {
                     section.link = dynsym;
                     section.entsize = 4;
@@ -1685,6 +1692,8 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
                     section.link = dynstr;
                     section.entsize = class.dyn_size();
                 }
+                // GNU ld gives the i386 `.plt` an entry size of 4.
+                Synthetic::Plt if synth.arch == super::arch::Arch::I386 => section.entsize = 4,
                 Synthetic::Plt | Synthetic::PltSec => section.entsize = 16,
                 Synthetic::PltGot => section.entsize = if synth.ibt { 16 } else { 8 },
                 _ => {}

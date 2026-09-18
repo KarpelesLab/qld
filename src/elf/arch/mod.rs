@@ -1145,7 +1145,7 @@ impl Arch {
         context: ClassifyContext,
     ) -> Result<Class, ClassifyError> {
         match self {
-            Self::I386 => i386::classify(r_type, data, offset, context),
+            Self::I386 => i386::classify(r_type, addend, data, offset, context),
             Self::X86_64 => x86_64::classify(r_type, addend, data, offset, context),
             Self::AArch64 => aarch64::classify(r_type, context),
             Self::RiscV64 => riscv::classify(r_type, context),
@@ -1253,6 +1253,13 @@ impl Arch {
     #[must_use]
     pub fn plt_align(self) -> u64 {
         16
+    }
+
+    /// Alignment of a static executable's `.plt`, which holds only IFUNC
+    /// stubs: GNU ld's i386 stubs are 8 bytes and aligned to 8.
+    #[must_use]
+    pub fn iplt_align(self) -> u64 {
+        if self == Self::I386 { 8 } else { 16 }
     }
 
     /// Size of an IFUNC stub in a static executable.

@@ -166,9 +166,13 @@ impl DynamicPlan {
                 self.kind.word_size(),
             ),
             (Synthetic::DynStr, len(&self.dynstr), 1),
-            (Synthetic::GnuHash, len(&self.gnu_hash), 8),
-            // GNU ld aligns the ELF64 `.hash` to 8.
-            (Synthetic::Hash, len(&self.sysv_hash), 8),
+            (
+                Synthetic::GnuHash,
+                len(&self.gnu_hash),
+                self.kind.word_size(),
+            ),
+            // GNU ld aligns the ELF64 `.hash` to 8 (the ELF32 one to 4).
+            (Synthetic::Hash, len(&self.sysv_hash), self.kind.word_size()),
             (
                 Synthetic::VerSym,
                 u64::try_from(self.versym.len())
@@ -176,8 +180,12 @@ impl DynamicPlan {
                     .saturating_mul(2),
                 2,
             ),
-            (Synthetic::VerNeed, len(&self.verneed), 8),
-            (Synthetic::VerDef, len(&self.verdef), 8),
+            (
+                Synthetic::VerNeed,
+                len(&self.verneed),
+                self.kind.word_size(),
+            ),
+            (Synthetic::VerDef, len(&self.verdef), self.kind.word_size()),
             (
                 Synthetic::Dynamic,
                 u64::try_from(self.dynamic.len())

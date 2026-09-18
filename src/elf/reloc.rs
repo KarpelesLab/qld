@@ -162,7 +162,7 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
     };
     ClassifyContext {
         relax_got: context.relax
-            && p.defined
+            && (p.defined || i386_weak_zero(context, p))
             && !p.preemptible
             && !p.local_ifunc
             && !(p.absolute && mode.pic),
@@ -175,6 +175,13 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
         },
         code: false,
     }
+}
+
+/// Whether an i386 GOT load of `p` may become the constant 0: GNU ld turns
+/// `R_386_GOT32X` loads of (and branches to) an undefined weak symbol into
+/// immediates in position-dependent output, where the symbol is 0.
+fn i386_weak_zero(context: &Context, p: Props) -> bool {
+    context.arch == super::arch::Arch::I386 && p.undefined_weak && !context.mode.pic
 }
 
 /// Decides how relocation `rel` of a section with flags `section_flags`

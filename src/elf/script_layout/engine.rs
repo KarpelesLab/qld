@@ -2640,7 +2640,7 @@ fn assemble<'a, F: crate::elf::read::ElfFormat>(
         }
     }
     let shnum = u64::try_from(out_sections.len().saturating_add(1)).unwrap_or(u64::MAX);
-    let shoff = crate::elf::layout::align_up(file_end, 8)?;
+    let shoff = crate::elf::layout::align_up(file_end, input.kind().word_size())?;
     let file_size = shoff
         .checked_add(shnum.saturating_mul(input.kind().shdr_size()))
         .ok_or_else(|| Error::Limit("output larger than the address space".into()))?;

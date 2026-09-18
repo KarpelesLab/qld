@@ -66,6 +66,9 @@ pub enum Value {
     RelaIpltEnd,
     /// `_DYNAMIC`: the `.dynamic` section.
     Dynamic,
+    /// `_TLS_MODULE_BASE_`: the start of the output's TLS block, which
+    /// local-dynamic TLS descriptor code takes offsets from.
+    TlsModuleBase,
     /// RISC-V `__global_pointer$`: 0x800 past the start of `.sdata`, or of
     /// the image when there is none (lld's definition).
     GlobalPointer,
@@ -93,6 +96,7 @@ pub fn is_hidden(value: Value) -> bool {
             | Value::RelaIpltEnd
             | Value::GotBase
             | Value::Dynamic
+            | Value::TlsModuleBase
             | Value::Script { hidden: true, .. }
     )
 }
@@ -128,6 +132,7 @@ const FIXED: &[(&str, Value)] = &[
     ("__rel_iplt_start", Value::RelaIpltStart),
     ("__rel_iplt_end", Value::RelaIpltEnd),
     ("_DYNAMIC", Value::Dynamic),
+    ("_TLS_MODULE_BASE_", Value::TlsModuleBase),
 ];
 
 /// Symbols an executable always defines, as GNU ld's default script
@@ -530,7 +535,7 @@ pub fn linker_type<F: crate::elf::read::ElfFormat>(
     linker: &LinkerSymbols,
     id: SymbolId,
 ) -> u8 {
-    use crate::elf::read::consts::{STT_NOTYPE, STT_OBJECT};
+    use crate::elf::read::consts::{STT_NOTYPE, STT_OBJECT, STT_TLS};
     // GNU ld's ELF backend defines these as objects.
     if linker
         .entries
@@ -538,6 +543,13 @@ pub fn linker_type<F: crate::elf::read::ElfFormat>(
         .any(|(i, v)| *i == id && matches!(v, Value::GotBase | Value::Dynamic))
     {
         return STT_OBJECT;
+    }
+    if linker
+        .entries
+        .iter()
+        .any(|(i, v)| *i == id && *v == Value::TlsModuleBase)
+    {
+        return STT_TLS;
     }
     let mut id = id;
     // A chain of copies ends at an input's symbol; cycles stop.

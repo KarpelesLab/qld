@@ -639,7 +639,7 @@ impl Synth {
                 } else {
                     (
                         count(&self.iplt).saturating_mul(self.arch.iplt_entry_size(flags)),
-                        align,
+                        self.arch.iplt_align(),
                     )
                 }
             }
@@ -673,7 +673,7 @@ impl Synth {
                 self.property_note
                     .as_ref()
                     .map_or(0, |n| u64::try_from(n.len()).unwrap_or(0)),
-                8,
+                word.word_size(),
             ),
             Synthetic::Got => (
                 self.got_words().saturating_mul(word.word_size()),
@@ -981,7 +981,7 @@ pub fn plan_property_note<F: crate::elf::read::ElfFormat>(
         .into_iter()
         .filter(|&(_, value)| value != 0)
         .collect();
-        return encode_property_note(&properties);
+        return encode_property_note(&properties, F::WORD_SIZE);
     }
     let mut features = features;
     if options.x86.ibt {
@@ -1008,15 +1008,18 @@ pub fn plan_property_note<F: crate::elf::read::ElfFormat>(
     .into_iter()
     .filter(|&(_, value)| value != 0)
     .collect();
-    encode_property_note(&properties)
+    encode_property_note(&properties, F::WORD_SIZE)
 }
 
 /// Encodes `.note.gnu.property` from `(type, value)` pairs, in type order.
-fn encode_property_note(properties: &[(u32, u32)]) -> Option<Vec<u8>> {
+/// Each property's data is padded to the class's word size (`word`): 16
+/// bytes a property in ELF64, 12 in ELF32.
+fn encode_property_note(properties: &[(u32, u32)], word: usize) -> Option<Vec<u8>> {
     if properties.is_empty() {
         return None;
     }
-    let descsz = u32::try_from(properties.len().saturating_mul(16)).ok()?;
+    let entry = 8usize.saturating_add(4usize.next_multiple_of(word.max(1)));
+    let descsz = u32::try_from(properties.len().saturating_mul(entry)).ok()?;
     let mut note = Vec::with_capacity(16usize.saturating_add(descsz as usize));
     note.extend_from_slice(&4u32.to_le_bytes());
     note.extend_from_slice(&descsz.to_le_bytes());
@@ -1026,7 +1029,7 @@ fn encode_property_note(properties: &[(u32, u32)]) -> Option<Vec<u8>> {
         note.extend_from_slice(&kind.to_le_bytes());
         note.extend_from_slice(&4u32.to_le_bytes());
         note.extend_from_slice(&value.to_le_bytes());
-        note.extend_from_slice(&[0; 4]);
+        note.resize(note.len().next_multiple_of(word.max(1)), 0);
     }
     Some(note)
 }

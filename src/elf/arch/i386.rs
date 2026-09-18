@@ -101,6 +101,7 @@ fn has_base(data: &[u8], offset: u64) -> bool {
 /// [`ClassifyError`] for unsupported types and unrecognized TLS code.
 pub fn classify(
     r_type: u32,
+    addend: i64,
     data: &[u8],
     offset: u64,
     context: ClassifyContext,
@@ -129,16 +130,24 @@ pub fn classify(
             let op = byte_before(data, offset, 2);
             let modrm = byte_before(data, offset, 1);
             let base = has_base(data, offset);
-            let relax = context.relax_got && context.code;
+            // As GNU ld: only a zero addend, and only in code.
+            let relax = context.relax_got && context.code && addend == 0;
             match (op, modrm) {
+                // mov foo@GOT[(%reg)], %reg2 -> mov $foo, %reg2 in
+                // position-dependent output
+                (Some(0x8b), _) if relax && !context.pic => class(K::RelaxGotPcNoPic, W::Any32),
                 // mov foo@GOT(%reg), %reg2 -> lea foo@GOTOFF(%reg), %reg2
                 (Some(0x8b), _) if relax && base => class(K::RelaxGotOff, W::Any32),
-                // mov foo@GOT, %reg -> mov $foo, %reg (no base register:
-                // only position-dependent code reads the GOT this way)
-                (Some(0x8b), _) if relax && !context.pic => class(K::RelaxGotPcNoPic, W::Any32),
                 // call/jmp *foo@GOT(%reg) -> addr32 call foo / jmp foo; nop
                 (Some(0xff), Some(m)) if relax && matches!(m & 0x38, 0x10 | 0x20) => {
                     class(K::RelaxGotPc, W::Any32)
+                }
+                // test %reg, foo@GOT(%reg2) and binop foo@GOT(%reg2), %reg ->
+                // the immediate forms, in position-dependent output
+                (Some(0x85 | 0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 | 0x3b), _)
+                    if relax && !context.pic =>
+                {
+                    class(K::RelaxGotPcNoPic, W::Any32)
                 }
                 _ if base => class(K::GotSlotRel, W::Any32),
                 _ => class(K::GotAbs, W::Any32),
@@ -249,9 +258,21 @@ pub fn relax_got(out: &mut [u8], offset: u64, kind: Kind, value: i64) -> Result<
             write_u32(out, offset, value)
         }
         (Kind::RelaxGotPcNoPic, 0x8b) => {
-            // mov foo@GOT, %reg -> mov $foo, %reg
+            // mov foo@GOT[(%reg)], %reg2 -> mov $foo, %reg2
             put(out, offset, -2, 0xc7)?;
             put(out, offset, -1, 0xc0 | ((modrm >> 3) & 7))?;
+            write_u32(out, offset, value)
+        }
+        (Kind::RelaxGotPcNoPic, 0x85) => {
+            // test %reg, foo@GOT(%reg2) -> test $foo, %reg
+            put(out, offset, -2, 0xf7)?;
+            put(out, offset, -1, 0xc0 | ((modrm >> 3) & 7))?;
+            write_u32(out, offset, value)
+        }
+        (Kind::RelaxGotPcNoPic, op) if op | 0x38 == 0x3b => {
+            // binop foo@GOT(%reg2), %reg -> binop $foo, %reg
+            put(out, offset, -2, 0x81)?;
+            put(out, offset, -1, 0xc0 | ((modrm >> 3) & 7) | (op & 0x3c))?;
             write_u32(out, offset, value)
         }
         (Kind::RelaxGotPc, 0xff) if modrm & 0x38 == 0x10 => {
@@ -520,21 +541,17 @@ pub fn write_plt_jump(
 }
 
 /// Size of an IFUNC PLT stub.
-pub const IPLT_ENTRY_SIZE: u64 = 16;
+pub const IPLT_ENTRY_SIZE: u64 = 8;
 
-/// Writes an IFUNC stub that jumps through the GOT slot at `slot`, padded
-/// with `nop`s.
+/// Writes an IFUNC stub of a static executable that jumps through the GOT
+/// slot at `slot`: GNU ld's non-lazy entry, `jmp *slot` and `xchg %ax,%ax`.
 ///
 /// # Errors
 ///
 /// [`ApplyError::OutOfBounds`] when `out` is too small.
 pub fn write_iplt(out: &mut [u8], slot: u64, got: u64, pic: bool) -> Result<(), ApplyError> {
     put_bytes(out, 0, &jump_through(slot, got, pic))?;
-    put_bytes(
-        out,
-        6,
-        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x44],
-    )
+    put_bytes(out, 6, &[0x66, 0x90])
 }
 
 #[cfg(test)]
@@ -564,7 +581,7 @@ mod tests {
     fn relaxes_general_dynamic_to_local_exec() {
         // leal x@tlsgd(,%ebx,1),%eax; call ___tls_get_addr@plt
         let mut code = vec![0x8d, 0x04, 0x1d, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0];
-        let class = classify(R_386_TLS_GD, &code, 3, context(TlsMode::LocalExec)).unwrap();
+        let class = classify(R_386_TLS_GD, 0, &code, 3, context(TlsMode::LocalExec)).unwrap();
         assert_eq!(class.kind, Kind::GdToLe);
         assert!(class.skip_next);
         let values = RelaxValues {
@@ -583,7 +600,7 @@ mod tests {
     fn relaxes_general_dynamic_to_initial_exec() {
         // leal x@tlsgd(%ebx),%eax; call *___tls_get_addr@GOT(%ebx)
         let mut code = vec![0x8d, 0x83, 0, 0, 0, 0, 0xff, 0x93, 0, 0, 0, 0];
-        let class = classify(R_386_TLS_GD, &code, 2, context(TlsMode::InitialExec)).unwrap();
+        let class = classify(R_386_TLS_GD, 0, &code, 2, context(TlsMode::InitialExec)).unwrap();
         assert_eq!(class.kind, Kind::GdToIe);
         let values = RelaxValues {
             got: 0x2010,
@@ -598,7 +615,7 @@ mod tests {
     fn relaxes_local_dynamic_to_local_exec() {
         // leal x@tlsldm(%ebx),%eax; call ___tls_get_addr@plt
         let mut code = vec![0x8d, 0x83, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0];
-        let class = classify(R_386_TLS_LDM, &code, 2, context(TlsMode::LocalExec)).unwrap();
+        let class = classify(R_386_TLS_LDM, 0, &code, 2, context(TlsMode::LocalExec)).unwrap();
         assert_eq!(class.kind, Kind::LdToLe);
         relax_tls(
             &mut code,
@@ -633,15 +650,35 @@ mod tests {
 
     #[test]
     fn relaxes_got32x() {
-        // movl foo@GOT(%ebx),%eax -> leal foo@GOTOFF(%ebx),%eax
+        // movl foo@GOT(%ebx),%eax -> leal foo@GOTOFF(%ebx),%eax (PIC)
         let mut code = vec![0x8b, 0x83, 0, 0, 0, 0];
-        let class = classify(R_386_GOT32X, &code, 2, context(TlsMode::LocalExec)).unwrap();
+        let pic = ClassifyContext {
+            pic: true,
+            ..context(TlsMode::LocalExec)
+        };
+        let class = classify(R_386_GOT32X, 0, &code, 2, pic).unwrap();
         assert_eq!(class.kind, Kind::RelaxGotOff);
         relax_got(&mut code, 2, Kind::RelaxGotOff, 0x40).unwrap();
         assert_eq!(code, [0x8d, 0x83, 0x40, 0, 0, 0]);
+        // ... -> movl $foo,%eax in position-dependent output
+        let mut code = vec![0x8b, 0x83, 0, 0, 0, 0];
+        let class = classify(R_386_GOT32X, 0, &code, 2, context(TlsMode::LocalExec)).unwrap();
+        assert_eq!(class.kind, Kind::RelaxGotPcNoPic);
+        relax_got(&mut code, 2, Kind::RelaxGotPcNoPic, 0x0804_9000).unwrap();
+        assert_eq!(code, [0xc7, 0xc0, 0x00, 0x90, 0x04, 0x08]);
+        // cmpl foo@GOT(%ecx),%esi -> cmpl $foo,%esi
+        let mut code = vec![0x3b, 0xb1, 0, 0, 0, 0];
+        let class = classify(R_386_GOT32X, 0, &code, 2, context(TlsMode::LocalExec)).unwrap();
+        assert_eq!(class.kind, Kind::RelaxGotPcNoPic);
+        relax_got(&mut code, 2, Kind::RelaxGotPcNoPic, 0x10).unwrap();
+        assert_eq!(code, [0x81, 0xfe, 0x10, 0, 0, 0]);
+        // A non-zero addend keeps the GOT load.
+        let code = vec![0x8b, 0x83, 4, 0, 0, 0];
+        let class = classify(R_386_GOT32X, 4, &code, 2, pic).unwrap();
+        assert_eq!(class.kind, Kind::GotSlotRel);
         // call *foo@GOT(%ebx) -> addr32 call foo
         let mut code = vec![0xff, 0x93, 0, 0, 0, 0];
-        let class = classify(R_386_GOT32X, &code, 2, context(TlsMode::LocalExec)).unwrap();
+        let class = classify(R_386_GOT32X, 0, &code, 2, context(TlsMode::LocalExec)).unwrap();
         assert_eq!(class.kind, Kind::RelaxGotPc);
         relax_got(&mut code, 2, Kind::RelaxGotPc, 0x104).unwrap();
         assert_eq!(code, [0x67, 0xe8, 0x00, 0x01, 0, 0]);
@@ -649,7 +686,7 @@ mod tests {
         let code = vec![0x8b, 0x83, 0, 0, 0, 0];
         let mut dynamic = context(TlsMode::Dynamic);
         dynamic.relax_got = false;
-        let class = classify(R_386_GOT32X, &code, 2, dynamic).unwrap();
+        let class = classify(R_386_GOT32X, 0, &code, 2, dynamic).unwrap();
         assert_eq!(class.kind, Kind::GotSlotRel);
     }
 

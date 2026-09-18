@@ -191,6 +191,7 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
             Value::Dynamic => layout
                 .synthetic(Synthetic::Dynamic)
                 .map_or(0, |(addr, ..)| addr),
+            Value::TlsModuleBase => layout.tls.map_or(0, |tls| tls.start),
             Value::GlobalPointer => placement
                 .outputs
                 .iter()
