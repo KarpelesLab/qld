@@ -115,6 +115,8 @@ def run_one(argv, cwd, env):
         "stderr": stderr.decode(errors="replace"),
         "wall": wall,
         "cpu": usage.ru_utime + usage.ru_stime,
+        "sys": usage.ru_stime,
+        "minflt": usage.ru_minflt,
         "rss_kib": usage.ru_maxrss,
         "load": load,
     }
@@ -319,6 +321,8 @@ def laps(o, linkers, specs):
                         values["· " + m.group(1)] = values.get("· " + m.group(1), 0.0) + float(m.group(2))
                 values["wall"] = r["wall"] * 1000
                 values["CPU"] = r["cpu"] * 1000
+                values["CPU in the kernel"] = r["sys"] * 1000
+                values["page faults (k)"] = r["minflt"] / 1000
                 if o.perf:
                     with open(stat) as f:
                         for line in f:
