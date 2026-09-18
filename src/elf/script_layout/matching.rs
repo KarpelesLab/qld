@@ -387,6 +387,9 @@ struct Orphan<'a> {
     /// A linker-generated section that may turn out empty: it gets a
     /// statement but does not steer later orphans.
     tentative: bool,
+    /// A COMDAT group member of a relocatable link: always a statement of
+    /// its own (GNU ld's `SPECIAL` constraint).
+    special: bool,
     what: OrphanWhat,
     display: String,
 }
@@ -414,6 +417,8 @@ struct Placer<'p, 'a> {
     /// Orphans added to existing statements get this `sub`.
     appended_sub: Vec<u16>,
     executable: bool,
+    /// A relocatable link (`-r`).
+    relocatable: bool,
     /// Largest input alignment of each output.
     aligns: Vec<u64>,
     /// GNU's `first_orphan_note`.
@@ -583,7 +588,10 @@ impl<'a> Placer<'_, 'a> {
     fn place(&mut self, orphan: &Orphan<'a>) -> (u32, u16) {
         use sec::*;
         let mut name = orphan.name;
-        if orphan.flags & ALLOC != 0 && matches!(orphan.sh_type, SHT_RELA | SHT_REL) {
+        if !self.relocatable
+            && orphan.flags & ALLOC != 0
+            && matches!(orphan.sh_type, SHT_RELA | SHT_REL)
+        {
             name = if orphan.sh_type == SHT_RELA {
                 b".rela.dyn"
             } else {
@@ -596,7 +604,8 @@ impl<'a> Placer<'_, 'a> {
             .iter()
             .filter_map(|s| match s {
                 Statement::Output(i)
-                    if self.enabled.get(*i as usize).copied().unwrap_or(false)
+                    if !orphan.special
+                        && self.enabled.get(*i as usize).copied().unwrap_or(false)
                         && self.name(*i) == name =>
                 {
                     Some(*i)
@@ -859,6 +868,7 @@ pub fn place<'a>(
 ) -> Placement<'a> {
     let output_count = script.outputs.len();
     let total = sections.len();
+    let relocatable = options.kind == crate::args::OutputKind::Relocatable;
 
     // 1. Constraints: a statement whose patterns match a writable section
     // fails ONLY_IF_RO, one matching only read-only sections fails
@@ -991,8 +1001,18 @@ pub fn place<'a>(
                         continue;
                     }
                     let header = &section.header;
+                    // In a relocatable link, COMDAT group members only match
+                    // `/DISCARD/` (GNU ld's `unique_section_p`).
+                    let unique = relocatable && section.group != 0;
                     let found = descs.iter().find(|d| {
-                        matches_desc(d.description, fname, archive, section.name, header.sh_flags)
+                        (!unique || discard_output(d.output))
+                            && matches_desc(
+                                d.description,
+                                fname,
+                                archive,
+                                section.name,
+                                header.sh_flags,
+                            )
                     });
                     let flags_keep = header.sh_flags & SHF_GNU_RETAIN != 0
                         || header.sh_flags & SHF_ALLOC == 0
@@ -1082,6 +1102,23 @@ pub fn place<'a>(
             && !has_input.get(index).copied().unwrap_or(false)
         {
             *slot = statement_flags(stmt);
+            // A statement that makes a section without input sections (data
+            // commands, assignments, `FILL`) has an output section of ELF
+            // type 0 when orphans are placed, which matches no input's type
+            // (`bfd_elf_match_sections_by_type`).
+            let makes_section = stmt.items.iter().any(|item| {
+                matches!(
+                    item,
+                    Item::Data { .. }
+                        | Item::Asciz(_)
+                        | Item::LinkerVersion
+                        | Item::Assign { .. }
+                        | Item::Fill(_)
+                )
+            });
+            if makes_section && let Some(slot) = types.get_mut(index) {
+                *slot = Some(0);
+            }
         }
     }
 
@@ -1114,7 +1151,10 @@ pub fn place<'a>(
     }
 
     // 5. Orphans, in input order.
-    let executable = !matches!(options.kind, crate::args::OutputKind::Shared);
+    let executable = !matches!(
+        options.kind,
+        crate::args::OutputKind::Shared | crate::args::OutputKind::Relocatable
+    );
     let mut placer = Placer {
         script,
         statements: script.statements.clone(),
@@ -1131,6 +1171,7 @@ pub fn place<'a>(
             .map(|o| u16::try_from(o.input_count()).unwrap_or(u16::MAX))
             .collect(),
         executable,
+        relocatable,
         aligns,
         first_orphan_note: None,
     };
@@ -1189,6 +1230,7 @@ pub fn place<'a>(
                 ),
                 align: section.header.sh_addralign.max(1),
                 tentative: false,
+                special: relocatable && section.group != 0,
                 what: OrphanWhat::Section(id),
                 display: file.display(),
             });
@@ -1228,6 +1270,7 @@ pub fn place<'a>(
                     flags: orphan.flags,
                     align: 8,
                     tentative: orphan.tentative,
+                    special: false,
                     what: orphan.what,
                     display: String::new(),
                 }),
@@ -1360,6 +1403,7 @@ fn push_synthetic_orphans<'a>(
             flags: gnu_flags(sh_flags, sh_type, name),
             align,
             tentative: !exists(kind),
+            special: false,
             what: OrphanWhat::Synthetic(kind),
             display: "<internal>".to_string(),
         });

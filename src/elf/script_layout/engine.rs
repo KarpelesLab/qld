@@ -1329,24 +1329,71 @@ fn for_each_expr(script: &LayoutScript, placed: &ScriptPlacement, f: &mut dyn Fn
 
 /// How the members matched by one description are ordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SortRule {
+pub(super) struct SortRule {
     mode: SortMode,
     reverse: bool,
-    files: bool,
+    /// `SORT(file)`: by file name first.
+    pub(super) files: bool,
+}
+
+/// The sort rule of input description `sub` of `stmt`, with
+/// `--sort-section` applied to descriptions that do not sort themselves;
+/// `None` keeps input order.
+pub(super) fn sort_rule(stmt: &OutputStmt, sub: u16, sort_section: SortMode) -> Option<SortRule> {
+    let description = stmt.items.iter().find_map(|item| match item {
+        Item::Input { description, index } if *index == sub => Some(description),
+        _ => None,
+    })?;
+    let specs = description.sections.as_deref().unwrap_or_default();
+    let mode = specs.first().map_or(SortMode::None, |s| s.sort);
+    let reverse = specs.first().is_some_and(|s| s.reverse);
+    if specs.iter().any(|s| s.sort != mode || s.reverse != reverse) {
+        return None;
+    }
+    let mode = if mode == SortMode::None {
+        sort_section
+    } else {
+        mode
+    };
+    let files = description.file.sort == SortMode::Name;
+    (mode != SortMode::None || files).then_some(SortRule {
+        mode,
+        reverse,
+        files,
+    })
+}
+
+/// The `--sort-section` mode.
+pub(super) fn sort_section_mode(options: &crate::args::LinkOptions) -> SortMode {
+    match options.sort_section.as_deref() {
+        Some("name") => SortMode::Name,
+        Some("alignment") => SortMode::Alignment,
+        _ => SortMode::None,
+    }
 }
 
 /// Information for sorting one input member.
-struct SortInfo<'n> {
-    class: u8,
-    file: &'n [u8],
-    member: &'n [u8],
-    name: &'n [u8],
-    align: u64,
-    id: u32,
+pub(super) struct SortInfo<'n> {
+    /// 1 for input sections; linker-generated ones sort around them.
+    pub(super) class: u8,
+    /// The file (archive) path.
+    pub(super) file: &'n [u8],
+    /// The archive member name, or empty.
+    pub(super) member: &'n [u8],
+    /// The section name.
+    pub(super) name: &'n [u8],
+    /// The alignment.
+    pub(super) align: u64,
+    /// The section ID, for input order.
+    pub(super) id: u32,
 }
 
 /// GNU's `compare_section`.
-fn compare_sections(rule: SortRule, a: &SortInfo<'_>, b: &SortInfo<'_>) -> core::cmp::Ordering {
+pub(super) fn compare_sections(
+    rule: SortRule,
+    a: &SortInfo<'_>,
+    b: &SortInfo<'_>,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     let by_name = || {
         if rule.reverse {
@@ -1398,11 +1445,7 @@ fn build_entries(
     let files = input.files;
     let count = placement.outputs.len();
     let mut lists: Vec<Vec<(Entry, SortInfo<'_>)>> = (0..count).map(|_| Vec::new()).collect();
-    let sort_section = match input.options.sort_section.as_deref() {
-        Some("name") => SortMode::Name,
-        Some("alignment") => SortMode::Alignment,
-        _ => SortMode::None,
-    };
+    let sort_section = sort_section_mode(input.options);
     // Sort rules by (output, sub), computed on first use.
     let mut rules: HashMap<(u32, u16), Option<SortRule>, foldhash::fast::FixedState> =
         HashMap::with_hasher(hasher());
@@ -1444,30 +1487,9 @@ fn build_entries(
             }
             let sub = placement.sub.get(id.index()).copied().unwrap_or(0);
             let (size, align) = member_size(input, member)?;
-            rules.entry((output, sub)).or_insert_with(|| {
-                let stmt = placed.stmt(script, output)?;
-                let description = stmt.items.iter().find_map(|item| match item {
-                    Item::Input { description, index } if *index == sub => Some(description),
-                    _ => None,
-                })?;
-                let specs = description.sections.as_deref().unwrap_or_default();
-                let mode = specs.first().map_or(SortMode::None, |s| s.sort);
-                let reverse = specs.first().is_some_and(|s| s.reverse);
-                if specs.iter().any(|s| s.sort != mode || s.reverse != reverse) {
-                    return None;
-                }
-                let mode = if mode == SortMode::None {
-                    sort_section
-                } else {
-                    mode
-                };
-                let files = description.file.sort == SortMode::Name;
-                (mode != SortMode::None || files).then_some(SortRule {
-                    mode,
-                    reverse,
-                    files,
-                })
-            });
+            rules
+                .entry((output, sub))
+                .or_insert_with(|| sort_rule(placed.stmt(script, output)?, sub, sort_section));
             if let Some(list) = lists.get_mut(output as usize) {
                 list.push((
                     Entry {

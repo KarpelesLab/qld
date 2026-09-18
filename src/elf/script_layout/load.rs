@@ -437,12 +437,18 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
         || options.magic != MagicMode::Normal
         || options.rodata_segment.is_some()
         || options.ldata_segment.is_some();
-    let script = if loader.scripts.is_empty() && !layout_options {
+    let relocatable = options.kind == OutputKind::Relocatable;
+    let script = if loader.scripts.is_empty() && (!layout_options || relocatable) {
         None
-    } else if options.kind == OutputKind::Relocatable && !loader.scripts.is_empty() {
-        return Err(Error::Unimplemented(
-            "linker scripts with -r (roadmap M3: relocatable output layout)".into(),
-        ));
+    } else if relocatable {
+        // Relocatable links have no default layout: sections no script
+        // statement takes are orphans of the relocatable writer, and
+        // addresses (`-Ttext`, ...) do not apply.
+        let mut builder = Builder::default();
+        for (script, _) in &loader.scripts {
+            builder.add(script)?;
+        }
+        Some(builder.finish()?)
     } else {
         let mut builder = Builder::default();
         if !explicit_override {

@@ -379,6 +379,7 @@ fn link_inputs<'a>(
             &resolution,
             sections,
             internal,
+            script,
             lap,
         )?;
         map::write_cref(options, cref.as_deref())?;
@@ -813,8 +814,13 @@ fn link_relocatable<'a>(
     resolution: &crate::symbols::Resolution<'a>,
     mut sections: Sections,
     internal: &InternalNames,
+    script: Option<&'a super::script_layout::LayoutScript>,
     lap: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
+    // A linker script places sections (`/DISCARD/` removes them) before
+    // garbage collection, whose `KEEP` roots it gives.
+    let script_placement =
+        script.map(|s| super::script_layout::relocatable::place(s, files, &mut sections, options));
     if options.gc_sections {
         if options.entry.is_none() && options.undefined.is_empty() {
             return Err(Error::Option(
@@ -822,7 +828,14 @@ fn link_relocatable<'a>(
             ));
         }
         let rule_set = RuleSet::default_rules();
-        let placement = place::place(&rule_set, files, &sections, options);
+        let default_placement;
+        let placement = match &script_placement {
+            Some(placement) => placement,
+            None => {
+                default_placement = place::place(&rule_set, files, &sections, options);
+                &default_placement
+            }
+        };
         let eh_frames = ehframe::split(files, &sections)?;
         let refs = Refs {
             files,
@@ -833,7 +846,7 @@ fn link_relocatable<'a>(
         let linker = defined::LinkerSymbols::default();
         let why_live = !options.why_live.is_empty();
         let (removed, graph) =
-            gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live)?;
+            gc::collect(&refs, placement, &eh_frames, &linker, internal, why_live)?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
@@ -861,10 +874,17 @@ fn link_relocatable<'a>(
         sections: &sections,
     };
     let commons = options.define_common.then(|| common::allocate(&refs));
+    let script_layout = match (script, &script_placement) {
+        (Some(script), Some(placement)) => Some(super::script_layout::relocatable::layout(
+            script, placement, files, &sections, symbols, options,
+        )?),
+        _ => None,
+    };
     relocatable::write(&relocatable::RelocatableInput {
         options,
         refs,
         commons: commons.as_ref(),
+        script: script_layout.as_ref(),
     })?;
     lap("write");
     Ok(())
