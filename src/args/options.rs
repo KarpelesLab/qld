@@ -289,6 +289,11 @@ pub enum InputFormat {
 
 /// Attributes that positional options attach to the input files that follow
 /// them on the command line.
+///
+/// Build one with [`InputAttrs::default`] and set the fields you need: the
+/// struct is `#[non_exhaustive]`, because later milestones keep adding
+/// positional options.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InputAttrs {
     /// `--whole-archive` was in effect.
@@ -358,6 +363,10 @@ impl InputKind {
 }
 
 /// One input, with the positional state that applied to it.
+///
+/// [`LinkOptions::push_input`] is how an input joins a link;
+/// [`InputSpec::new`] builds one on its own.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSpec {
     /// What the input is.
@@ -366,7 +375,22 @@ pub struct InputSpec {
     pub attrs: InputAttrs,
     /// Zero-based position on the command line. Used for precedence decisions
     /// and to order diagnostics deterministically.
+    ///
+    /// [`LinkOptions::push_input`] assigns it; setting it by hand only makes
+    /// sense for a spec that is not in a [`LinkOptions::inputs`] list.
     pub position: usize,
+}
+
+impl InputSpec {
+    /// One input at position 0, outside any input list.
+    #[must_use]
+    pub fn new(kind: InputKind, attrs: InputAttrs) -> Self {
+        Self {
+            kind,
+            attrs,
+            position: 0,
+        }
+    }
 }
 
 /// The PE/COFF options of GNU ld's MinGW emulations (`i386pep`, `i386pe`,
@@ -768,7 +792,17 @@ impl CancelToken {
 ///
 /// Fields typed `Option<bool>` distinguish "not given" (`None`, meaning the
 /// target's or output kind's default applies) from an explicit choice.
-#[derive(Clone, Debug, Default)]
+///
+/// [`LinkOptions::default`] is [`LinkOptions::new`]: both describe the link
+/// GNU ld performs when the command line says nothing, so the ten options
+/// GNU ld has on by default (`-z relro`, `--demangle`, `--relax`, …) are on
+/// in both.
+///
+/// The struct is `#[non_exhaustive]`: qld adds fields as it implements more
+/// options, so build one with [`LinkOptions::new`] and assign the fields you
+/// need.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
 pub struct LinkOptions {
     /// Command-line dialect this was parsed from.
     pub flavor: Flavor,
@@ -1097,8 +1131,16 @@ pub struct LinkOptions {
     pub warnings: Vec<String>,
 }
 
+impl Default for LinkOptions {
+    /// Identical to [`LinkOptions::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinkOptions {
-    /// Creates options with every field at its default.
+    /// Creates the options of a link whose command line said nothing: every
+    /// field at the default GNU ld uses.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1113,7 +1155,158 @@ impl LinkOptions {
             relax_gp: false,
             dependent_libraries: true,
             fork: true,
-            ..Self::default()
+            ..Self::blank()
+        }
+    }
+
+    /// Every field at its own type's default, which is not the same thing:
+    /// the options GNU ld has on by default are off here. Only
+    /// [`LinkOptions::new`] uses it, and it is private so that no caller can
+    /// build the half-off options a derived `Default` would have given.
+    ///
+    /// A new field has to be listed here, which is where its default is
+    /// decided; add it to `new` above as well when GNU ld has it on.
+    fn blank() -> Self {
+        Self {
+            flavor: Default::default(),
+            target: Default::default(),
+            endian: Default::default(),
+            output: Default::default(),
+            output_format: Default::default(),
+            kind: Default::default(),
+            inputs: Default::default(),
+            search_paths: Default::default(),
+            nostdlib: Default::default(),
+            sysroot: Default::default(),
+            default_script: Default::default(),
+            entry: Default::default(),
+            soname: Default::default(),
+            dynamic_linker: Default::default(),
+            no_dynamic_linker: Default::default(),
+            rpaths: Default::default(),
+            rpath_links: Default::default(),
+            new_dtags: Default::default(),
+            undefined: Default::default(),
+            undefined_glob: Default::default(),
+            require_defined: Default::default(),
+            defsym: Default::default(),
+            wrap: Default::default(),
+            init: Default::default(),
+            fini: Default::default(),
+            auxiliary: Default::default(),
+            filter: Default::default(),
+            gc_sections: Default::default(),
+            print_gc_sections: Default::default(),
+            gc_keep_exported: Default::default(),
+            why_live: Default::default(),
+            icf: Default::default(),
+            print_icf_sections: Default::default(),
+            keep_unique: Default::default(),
+            ignore_data_address_equality: Default::default(),
+            ignore_function_address_equality: Default::default(),
+            strip: Default::default(),
+            discard: Default::default(),
+            retain_symbols_file: Default::default(),
+            build_id: Default::default(),
+            hash_style: Default::default(),
+            eh_frame_hdr: Default::default(),
+            export_dynamic: Default::default(),
+            export_dynamic_symbols: Default::default(),
+            export_dynamic_symbol_lists: Default::default(),
+            dynamic_lists: Default::default(),
+            exclude_libs: Default::default(),
+            version_scripts: Default::default(),
+            undefined_version: Default::default(),
+            default_symver: Default::default(),
+            symbolic: Default::default(),
+            no_undefined: Default::default(),
+            allow_shlib_undefined: Default::default(),
+            unresolved_symbols: Default::default(),
+            warn_unresolved_symbols: Default::default(),
+            ignore_unresolved_symbols: Default::default(),
+            allow_multiple_definition: Default::default(),
+            warn_common: Default::default(),
+            warn_backrefs: Default::default(),
+            warn_backrefs_exclude: Default::default(),
+            warn_textrel: Default::default(),
+            error_textrel: Default::default(),
+            bind_now: Default::default(),
+            relro: Default::default(),
+            separate_code: Default::default(),
+            rosegment: Default::default(),
+            exec_stack: Default::default(),
+            gnu_stack: Default::default(),
+            stack_size: Default::default(),
+            max_page_size: Default::default(),
+            common_page_size: Default::default(),
+            copy_relocs: Default::default(),
+            combine_relocs: Default::default(),
+            pack_relative_relocs: Default::default(),
+            apply_dynamic_relocs: Default::default(),
+            dynamic_flags: Default::default(),
+            start_stop_gc: Default::default(),
+            start_stop_visibility: Default::default(),
+            keep_text_section_prefix: Default::default(),
+            dynamic_undefined_weak: Default::default(),
+            extern_protected_data: Default::default(),
+            mark_plt: Default::default(),
+            section_header: Default::default(),
+            memory_seal: Default::default(),
+            dead_reloc_in_nonalloc: Default::default(),
+            x86: Default::default(),
+            fix_cortex_a53_843419: Default::default(),
+            aarch64: Default::default(),
+            spare_dynamic_tags: Default::default(),
+            emit_relocs: Default::default(),
+            define_common: Default::default(),
+            magic: Default::default(),
+            relax: Default::default(),
+            relax_gp: Default::default(),
+            image_base: Default::default(),
+            section_starts: Default::default(),
+            text_segment: Default::default(),
+            rodata_segment: Default::default(),
+            ldata_segment: Default::default(),
+            orphan_handling: Default::default(),
+            sort_section: Default::default(),
+            compress_debug_sections: Default::default(),
+            package_metadata: Default::default(),
+            symbol_ordering_file: Default::default(),
+            no_warn_symbol_ordering: Default::default(),
+            call_graph_profile_sort: Default::default(),
+            call_graph_ordering_file: Default::default(),
+            print_symbol_order: Default::default(),
+            gdb_index: Default::default(),
+            debug_names: Default::default(),
+            separate_debug_file: Default::default(),
+            dependency_file: Default::default(),
+            dependent_libraries: Default::default(),
+            optimize: Default::default(),
+            threads: Default::default(),
+            map_file: Default::default(),
+            print_map: Default::default(),
+            cref: Default::default(),
+            trace: Default::default(),
+            trace_symbols: Default::default(),
+            verbose: Default::default(),
+            demangle: Default::default(),
+            fatal_warnings: Default::default(),
+            no_warnings: Default::default(),
+            error_limit: Default::default(),
+            color: Default::default(),
+            noinhibit_exec: Default::default(),
+            pe: Default::default(),
+            darwin: Default::default(),
+            plugins: Default::default(),
+            plugin_save_temps: Default::default(),
+            exit_on_plugin_fatal: Default::default(),
+            fork: Default::default(),
+            on_output_complete: Default::default(),
+            input_provider: Default::default(),
+            output_buffer: Default::default(),
+            cancel: Default::default(),
+            ignored: Default::default(),
+            warnings: Default::default(),
         }
     }
 
@@ -1248,6 +1441,28 @@ mod tests {
         assert!(options.relax);
         assert!(options.is_dynamic());
         assert!(!options.is_pic());
+    }
+
+    /// `Default` must not be a second, half-configured constructor: a
+    /// caller who writes `LinkOptions::default()` gets the same link as one
+    /// who writes `LinkOptions::new()`.
+    #[test]
+    fn default_is_new() {
+        assert_eq!(
+            format!("{:?}", LinkOptions::default()),
+            format!("{:?}", LinkOptions::new())
+        );
+        let options = LinkOptions::default();
+        assert!(options.relro);
+        assert!(options.demangle);
+        assert!(options.relax);
+        assert!(options.gnu_stack);
+        assert!(options.copy_relocs);
+        assert!(options.combine_relocs);
+        assert!(options.extern_protected_data);
+        assert!(options.section_header);
+        assert!(options.dependent_libraries);
+        assert!(options.fork);
     }
 
     #[test]
