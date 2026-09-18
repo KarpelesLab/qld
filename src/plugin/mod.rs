@@ -7,6 +7,10 @@
 //! toolchain. The module is gated by the `plugin` cargo feature, on by
 //! default. See `docs/optimizations.md` ("LTO").
 //!
+//! The crate-private `liblto` module is the other LTO interface: the libLTO
+//! C API that Apple's ld64 uses, loaded the same way, which
+//! [`crate::macho::lto`] drives for Mach-O links.
+//!
 //! # Using it
 //!
 //! A [`Session`] drives one link's plugins:
@@ -84,6 +88,8 @@ mod dl;
 mod format;
 #[cfg(unix)]
 mod host;
+#[cfg(unix)]
+pub(crate) mod liblto;
 pub mod options;
 mod session;
 mod types;

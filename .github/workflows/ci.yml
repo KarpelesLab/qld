@@ -74,6 +74,20 @@ jobs:
       # x86_64 slices of the fixtures run under Rosetta on the arm64 runner.
       - run: softwareupdate --install-rosetta --agree-to-license || true
       - run: cargo test --all-features --test macho_link -- --nocapture
+      - run: cargo test --all-features --test macho_lto -- --nocapture
+      - name: Real projects with -fuse-ld=qld (zlib, Lua, SQLite, {fmt})
+        if: success() || failure()
+        run: |
+          cargo build --release
+          tests/projects/macos-suite.sh target/release/qld "$RUNNER_TEMP/macos-suite"
+      - name: Keep the suite's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-suite-logs
+          path: |
+            ${{ runner.temp }}/macos-suite/build/*/*.log
+            ${{ runner.temp }}/macos-suite/links.log
 
   pe-windows:
     name: PE images run on Windows
