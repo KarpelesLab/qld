@@ -848,6 +848,20 @@ void _start(void) {
 }
 "#;
 
+const IFUNC_C: &str = r#"
+static int impl_one(void) { return 1; }
+static int impl_two(void) { return 2; }
+static void *resolve_pick(void) { return (void *)impl_two; }
+int pick(void) __attribute__((ifunc("resolve_pick")));
+int (*pointer)(void) = pick;
+static int unused_one(void) { return impl_one(); }
+int (*keep)(void) = unused_one;
+void _start(void) {
+  int r = pick() + pointer();
+  for (;;) __asm__ volatile("" :: "r"(r));
+}
+"#;
+
 #[test]
 fn dynamic_links_match_lld() {
     let tools = require!();
@@ -872,6 +886,7 @@ fn dynamic_links_match_lld() {
         &["-fPIE", "-mtls-dialect=desc"],
     );
     compile(tools, &dir, "exe.c", EXE_C, "exe-nopic.o", &["-fno-pic"]);
+    compile(tools, &dir, "ifunc.c", IFUNC_C, "ifunc.o", &["-fPIE"]);
     compile(
         tools,
         &dir,
@@ -957,6 +972,8 @@ fn dynamic_links_match_lld() {
             "static-desc",
             &["-static", "exe-desc.o", "dep.o", "lib-desc.o"],
         ),
+        ("static-ifunc", &["-static", "ifunc.o"]),
+        ("pie-ifunc", &["-pie", "ifunc.o"]),
     ] {
         let (lld, ours) = link_both(tools, &dir, name, args);
         assert_same(tools, &dir, &lld, &ours);

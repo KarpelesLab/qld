@@ -1,0 +1,20 @@
+# M4: a dynamic RISC-V PIE against glibc. Covers the psABI PLT header and
+# entries, `.got.plt` slots that point back at the header for lazy binding
+# (two reserved words), JUMP_SLOT and RELATIVE relocations, and the LP64D
+# program interpreter.
+description = "dynamic PIE hello world in C, for RISC-V 64"
+compile = ["cc -O2 -fPIE -c hello.c"]
+driver = "cc"
+link = "-pie -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, dynamic world (20)\n"
+expect.readelf = [
+  "RISC-V",
+  "DYN (",
+  "INTERP",
+  "ld-linux-riscv64-lp64d.so.1",
+  "R_RISCV_JUMP_SLOT",
+  "R_RISCV_RELATIVE",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true
