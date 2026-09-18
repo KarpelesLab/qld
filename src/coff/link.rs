@@ -322,7 +322,21 @@ fn link_once<'a>(
         }
         let (contents, applied) = write::render(&addresses, &generated);
         let encoded = if emit_relocs {
-            reloc::encode_base_relocs(&applied.base_relocs)
+            // The loader never maps the debugging sections, so their
+            // addresses are not rebased (GNU ld writes none for them).
+            let loaded: Vec<reloc::BaseReloc> = applied
+                .base_relocs
+                .iter()
+                .copied()
+                .filter(|site| {
+                    !plan.sections.iter().any(|section| {
+                        layout::is_debug_section(&section.name)
+                            && site.rva >= section.rva
+                            && site.rva.wrapping_sub(section.rva) < section.virtual_size
+                    })
+                })
+                .collect();
+            reloc::encode_base_relocs(&loaded)
         } else {
             Vec::new()
         };

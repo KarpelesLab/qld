@@ -15,6 +15,7 @@
 //! | `.tls` | `.tls$AAA`, `.tls`, `.tls$*`, `.tls$ZZZ` |
 //! | `.rsrc` | `.rsrc`, `.rsrc$*` |
 //! | `.reloc` | the base relocations |
+//! | `.stab`, `.debug_*` | after `.reloc`, in the script's order |
 //!
 //! Sections with a `$` in their name are *grouped sections*: the output name
 //! is the part before the `$`, and the contributions are ordered by the whole
@@ -566,7 +567,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                 }
                 None => {
                     let base = orphan_name(name);
-                    let at = build.section(base, RANK_ORPHAN);
+                    let at = build.section(base, orphan_rank(base));
                     let sort = if base.len() == name.len() {
                         Sort::None
                     } else {
@@ -823,6 +824,68 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
 const RANK_ORPHAN: u32 = 1000;
 /// Rank of the sections in [`TRAILING`], which close the image.
 const RANK_TRAILING: u32 = 2000;
+/// Rank of the debugging sections, which follow `.reloc` in the order of
+/// [`DEBUG_ORDER`].
+const RANK_DEBUG: u32 = 3000;
+
+/// The non-loaded sections GNU `ld`'s PE scripts place after `.reloc`, in
+/// the scripts' order. A debugging section not listed follows them.
+const DEBUG_ORDER: &[&[u8]] = &[
+    b".stab",
+    b".stabstr",
+    b".debug_aranges",
+    b".debug_pubnames",
+    b".debug_info",
+    b".debug_abbrev",
+    b".debug_line",
+    b".debug_frame",
+    b".debug_str",
+    b".debug_loc",
+    b".debug_macinfo",
+    b".debug_weaknames",
+    b".debug_funcnames",
+    b".debug_typenames",
+    b".debug_varnames",
+    b".debug_pubtypes",
+    b".debug_ranges",
+    b".debug_types",
+    b".debug_addr",
+    b".debug_line_str",
+    b".debug_loclists",
+    b".debug_macro",
+    b".debug_names",
+    b".debug_rnglists",
+    b".debug_str_offsets",
+    b".debug_sup",
+    b".debug_gdb_scripts",
+];
+
+/// Whether an output section holds debugging information (DWARF or
+/// STABS), which the loader does not map.
+#[must_use]
+pub fn is_debug_section(name: &[u8]) -> bool {
+    name.starts_with(b".debug") || name.starts_with(b".zdebug") || name.starts_with(b".stab")
+}
+
+/// The rank of an orphan output section: debugging sections go after
+/// `.reloc` in GNU `ld`'s order (`.zdebug_*` next to its `.debug_*`), the
+/// rest after the sections the recipe names.
+fn orphan_rank(name: &[u8]) -> u32 {
+    let plain = match name.strip_prefix(b".z") {
+        Some(rest) if rest.starts_with(b"debug") => [b".".as_slice(), rest].concat(),
+        _ => name.to_vec(),
+    };
+    if let Some(index) = DEBUG_ORDER
+        .iter()
+        .position(|known| *known == plain.as_slice())
+    {
+        return RANK_DEBUG.saturating_add(u32::try_from(index).unwrap_or(0));
+    }
+    if plain.starts_with(b".debug") {
+        return RANK_DEBUG.saturating_add(u32::try_from(DEBUG_ORDER.len()).unwrap_or(0));
+    }
+    RANK_ORPHAN
+}
 
 /// The output sections under construction, with their ordering keys.
 #[derive(Default)]
@@ -959,6 +1022,16 @@ mod tests {
         assert_eq!(align_up32(16, 16), 16);
         assert_eq!(align_up32(u32::MAX, 16), u32::MAX);
         assert_eq!(align_up64(513, 512), 1024);
+    }
+
+    #[test]
+    fn debugging_sections_follow_reloc_in_gnu_order() {
+        assert!(orphan_rank(b".debug_aranges") < orphan_rank(b".debug_info"));
+        assert!(orphan_rank(b".debug_line_str") < orphan_rank(b".debug_rnglists"));
+        assert_eq!(orphan_rank(b".zdebug_info"), orphan_rank(b".debug_info"));
+        assert!(orphan_rank(b".debug_info") > RANK_TRAILING);
+        assert!(orphan_rank(b".debug_unknown") > orphan_rank(b".debug_gdb_scripts"));
+        assert_eq!(orphan_rank(b".mysection"), RANK_ORPHAN);
     }
 
     #[test]
