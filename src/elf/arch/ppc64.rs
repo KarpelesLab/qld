@@ -104,6 +104,7 @@ pub fn classify(
     use Kind as K;
     let tls = context.tls;
     let tls_ld = context.tls_ld;
+    let r_type = base_type(r_type);
     Ok(match r_type {
         R_PPC64_NONE
         | R_PPC64_TOCSAVE
@@ -337,11 +338,34 @@ fn patch(
     put(out, offset, encoded)
 }
 
-/// Whether a `R_PPC64_TLSGD`/`R_PPC64_TLSLD` marker belongs to the
-/// PC-relative sequence, whose call carries `R_PPC64_REL24_NOTOC` (and has
-/// no `nop` after it to rewrite).
-fn marks_pcrel_call(values: RelaxValues) -> bool {
-    values.next_type == Some(R_PPC64_REL24_NOTOC)
+/// The ABI version the output's `e_flags` records: ELFv2.
+pub const ABI_VERSION: u32 = 2;
+
+/// Set in the type of an `R_PPC64_TLSGD`/`R_PPC64_TLSLD` marker (by
+/// [`annotate`]) whose `__tls_get_addr` call is PC-relative
+/// (`R_PPC64_REL24_NOTOC`): that call has no `nop` after it to rewrite.
+pub const PCREL_CALL_HINT: u32 = 1 << 31;
+
+/// The type without [`PCREL_CALL_HINT`].
+#[must_use]
+pub const fn base_type(r_type: u32) -> u32 {
+    r_type & !PCREL_CALL_HINT
+}
+
+/// `rel` with [`PCREL_CALL_HINT`] set when it is a `__tls_get_addr` marker
+/// on a PC-relative call, which the relocation that follows (`next`)
+/// tells.
+#[must_use]
+pub fn annotate(rel: Relocation, next: Option<&Relocation>) -> Relocation {
+    if matches!(rel.r_type, R_PPC64_TLSGD | R_PPC64_TLSLD)
+        && next.is_some_and(|next| next.r_type == R_PPC64_REL24_NOTOC)
+    {
+        return Relocation {
+            r_type: rel.r_type | PCREL_CALL_HINT,
+            ..rel
+        };
+    }
+    rel
 }
 
 /// Rewrites one instruction of a relaxed TLS sequence.
@@ -359,8 +383,8 @@ pub fn relax_tls(
     values: RelaxValues,
 ) -> Result<(), ApplyError> {
     let tpoff = values.tpoff;
-    let pcrel = marks_pcrel_call(values);
-    match (kind, r_type) {
+    let pcrel = r_type & PCREL_CALL_HINT != 0;
+    match (kind, base_type(r_type)) {
         (Kind::GdToLe, R_PPC64_GOT_TLSGD16_HA)
         | (Kind::LdToLe, R_PPC64_GOT_TLSLD16_HA)
         | (Kind::IeToLe, R_PPC64_GOT_TPREL16_HA) => put(out, offset, NOP),
@@ -876,12 +900,20 @@ mod tests {
         assert_eq!(words(&code), [NOP, ADDI_R3_R3_4096]);
 
         // The PC-relative call has no nop after it to rewrite.
-        let pcrel = RelaxValues {
-            next_type: Some(R_PPC64_REL24_NOTOC),
-            ..values
+        let marker = Relocation {
+            offset: 0,
+            symbol: 1,
+            r_type: R_PPC64_TLSGD,
+            addend: 0,
         };
+        let call = Relocation {
+            r_type: R_PPC64_REL24_NOTOC,
+            ..marker
+        };
+        let pcrel = annotate(marker, Some(&call)).r_type;
+        assert_eq!(base_type(pcrel), R_PPC64_TLSGD);
         let mut code = bytes(&[0x4800_0001, 0x7c63_1a14]);
-        relax_tls(&mut code, 0, Kind::GdToLe, R_PPC64_TLSGD, pcrel).unwrap();
+        relax_tls(&mut code, 0, Kind::GdToLe, pcrel, values).unwrap();
         assert_eq!(words(&code), [NOP, 0x7c63_1a14]);
     }
 

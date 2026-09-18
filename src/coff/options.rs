@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::error::{Error, Result};
 
+use super::machine::Machine;
 use super::read::consts::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_SUBSYSTEM_NATIVE, IMAGE_SUBSYSTEM_WINDOWS_CUI,
     IMAGE_SUBSYSTEM_WINDOWS_GUI,
@@ -155,21 +156,50 @@ pub struct PeOptions {
     pub exports: Vec<Vec<u8>>,
     /// `--warn-duplicate-exports`.
     pub warn_duplicate_exports: bool,
+    /// SafeSEH on i386: the table of registered exception handlers the
+    /// load configuration points at.
+    ///
+    /// `None` (the default, and what the command line gives) builds the
+    /// table when the image refers to `___safe_se_handler_table` and every
+    /// object is SafeSEH-compatible, as `link.exe` does; otherwise the
+    /// table symbols are 0. `Some(true)` is `link.exe`'s `/SAFESEH`: an
+    /// incompatible object is an error. `Some(false)` is `/SAFESEH:NO`.
+    pub safe_seh: Option<bool>,
 }
 
 impl Default for PeOptions {
     fn default() -> Self {
+        Self::for_machine(IMAGE_FILE_MACHINE_AMD64)
+    }
+}
+
+impl PeOptions {
+    /// GNU `ld`'s defaults for an image of `machine`: `i386pep` for
+    /// x86-64, `i386pe` for i386 and `arm64pe` for ARM64.
+    ///
+    /// They differ in the version fields and in `LARGE_ADDRESS_AWARE`:
+    /// `i386pe` writes image version 1.0 and subsystem version 4.0 and
+    /// leaves a 32-bit image limited to 2 GiB unless asked; `arm64pe`
+    /// follows lld's MinGW driver (the one llvm-mingw uses) with operating
+    /// system and subsystem versions 6.0, the oldest Windows on ARM64.
+    #[must_use]
+    pub fn for_machine(machine: u16) -> Self {
+        let target = Machine::or_default(machine);
+        let (os_version, image_version, subsystem_version) = match target {
+            Machine::Amd64 => (Version::new(4, 0), Version::new(0, 0), Version::new(5, 2)),
+            Machine::I386 => (Version::new(4, 0), Version::new(1, 0), Version::new(4, 0)),
+            Machine::Arm64 => (Version::new(6, 0), Version::new(0, 0), Version::new(6, 0)),
+        };
         Self {
-            machine: IMAGE_FILE_MACHINE_AMD64,
+            machine,
             dll: false,
             image_base: None,
             section_alignment: DEFAULT_SECTION_ALIGNMENT,
             file_alignment: DEFAULT_FILE_ALIGNMENT,
             subsystem: None,
-            // GNU ld's `i386pep` defaults: subsystem 5.02, OS 4.0, image 0.0.
-            subsystem_version: Version::new(5, 2),
-            os_version: Version::new(4, 0),
-            image_version: Version::new(0, 0),
+            subsystem_version,
+            os_version,
+            image_version,
             stack: (DEFAULT_STACK_RESERVE, DEFAULT_STACK_COMMIT),
             heap: (DEFAULT_HEAP_RESERVE, DEFAULT_HEAP_COMMIT),
             dynamicbase: true,
@@ -181,7 +211,7 @@ impl Default for PeOptions {
             no_isolation: false,
             no_bind: false,
             wdmdriver: false,
-            large_address_aware: true,
+            large_address_aware: !target.is_pe32(),
             disable_reloc_section: false,
             insert_timestamp: false,
             out_implib: None,
@@ -201,11 +231,18 @@ impl Default for PeOptions {
             implib_dll_name: None,
             exports: Vec::new(),
             warn_duplicate_exports: false,
+            safe_seh: None,
         }
     }
-}
 
-impl PeOptions {
+    /// The machine, as the backend's [`Machine`].
+    ///
+    /// A value [`validate`](Self::validate) rejects reads as x86-64.
+    #[must_use]
+    pub fn target(&self) -> Machine {
+        Machine::or_default(self.machine)
+    }
+
     /// The PE options a command line asks for.
     ///
     /// Everything comes from [`LinkOptions`]: the MinGW options from
@@ -219,19 +256,38 @@ impl PeOptions {
         let pe = &options.pe;
         let dll = options.kind == OutputKind::Shared;
         let names = |list: &[String]| list.iter().map(|name| name.as_bytes().to_vec()).collect();
+        let machine = options
+            .target
+            .and_then(|target| super::machine_for(target.arch))
+            .unwrap_or(IMAGE_FILE_MACHINE_AMD64);
+        // The emulation's default where the command line said nothing.
+        let base = Self::for_machine(machine);
+        let explicit = pe.explicit;
+        let pick = |given: bool, value: Version, default: Version| {
+            if given { value } else { default }
+        };
         Self {
-            machine: options
-                .target
-                .and_then(|target| super::machine_for(target.arch))
-                .unwrap_or(IMAGE_FILE_MACHINE_AMD64),
+            machine,
             dll,
             image_base: options.image_base,
             section_alignment: pe.section_alignment,
             file_alignment: pe.file_alignment,
             subsystem: pe.subsystem,
-            subsystem_version: Version::new(pe.major_subsystem_version, pe.minor_subsystem_version),
-            os_version: Version::new(pe.major_os_version, pe.minor_os_version),
-            image_version: Version::new(pe.major_image_version, pe.minor_image_version),
+            subsystem_version: pick(
+                explicit.subsystem_version,
+                Version::new(pe.major_subsystem_version, pe.minor_subsystem_version),
+                base.subsystem_version,
+            ),
+            os_version: pick(
+                explicit.os_version,
+                Version::new(pe.major_os_version, pe.minor_os_version),
+                base.os_version,
+            ),
+            image_version: pick(
+                explicit.image_version,
+                Version::new(pe.major_image_version, pe.minor_image_version),
+                base.image_version,
+            ),
             stack: pe.stack,
             heap: pe.heap,
             dynamicbase: pe.dynamicbase,
@@ -243,7 +299,11 @@ impl PeOptions {
             no_isolation: pe.no_isolation,
             no_bind: pe.no_bind,
             wdmdriver: pe.wdmdriver,
-            large_address_aware: pe.large_address_aware,
+            large_address_aware: if explicit.large_address_aware {
+                pe.large_address_aware
+            } else {
+                base.large_address_aware
+            },
             disable_reloc_section: !pe.reloc_section,
             insert_timestamp: pe.insert_timestamp,
             out_implib: pe.out_implib.clone(),
@@ -267,17 +327,15 @@ impl PeOptions {
             implib_dll_name: None,
             exports: names(&pe.exports),
             warn_duplicate_exports: pe.warn_duplicate_exports,
+            safe_seh: None,
         }
     }
 
     /// The image base: `--image-base`, or the default for the output kind.
     #[must_use]
     pub fn effective_image_base(&self) -> u64 {
-        self.image_base.unwrap_or(if self.dll {
-            DEFAULT_IMAGE_BASE_DLL
-        } else {
-            DEFAULT_IMAGE_BASE_EXE
-        })
+        self.image_base
+            .unwrap_or_else(|| self.target().default_image_base(self.dll))
     }
 
     /// Rejects alignments PE cannot express.
@@ -307,6 +365,17 @@ impl PeOptions {
         }
         if !self.effective_image_base().is_multiple_of(0x1_0000) {
             return Err(bad("--image-base", self.effective_image_base()));
+        }
+        let machine = Machine::from_coff(self.machine)?;
+        if machine.is_pe32() && u32::try_from(self.effective_image_base()).is_err() {
+            return Err(bad("--image-base", self.effective_image_base()));
+        }
+        // Windows refuses to load an ARM64 image that cannot be relocated,
+        // and lld rejects the combination for the same reason.
+        if machine == Machine::Arm64 && !self.dynamicbase {
+            return Err(Error::Option(
+                "--disable-dynamicbase is not compatible with ARM64".into(),
+            ));
         }
         Ok(())
     }

@@ -625,7 +625,7 @@ pub fn collect<'a>(
     }
     walker.finish()?;
     let target = walker.target.unwrap_or(Target::X86_64_LINUX);
-    if crate::elf::arch::Arch::from_target(target).is_none() {
+    if super::arch::Arch::from_target(target).is_none() {
         return Err(Error::Unimplemented(format!(
             "linking for {:?} (roadmap M4: more ELF architectures)",
             target.arch

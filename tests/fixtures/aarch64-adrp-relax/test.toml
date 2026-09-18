@@ -1,0 +1,20 @@
+# M4: the ADRP relaxations (lld's; GNU ld has none). GOT loads of
+# variables the program defines become ADRP+ADD, and ADRP+ADD becomes
+# NOP+ADR within 1 MiB. The same objects are linked relaxed (the default),
+# with --no-relax, and statically: all three must print the same thing.
+description = "AArch64 ADRP+LDR and ADRP+ADD relaxations, against --no-relax"
+compile = ["cc -O2 -fPIC -c main.c", "cc -O2 -fPIC -c data.c"]
+driver = "cc"
+link = [
+  "-pie -o out-norelax main.o data.o -Wl,--no-relax",
+  "-static -o out-static main.o data.o",
+  "-pie -o out main.o data.o",
+]
+run = "./out && ./out-norelax && ./out-static"
+expect.stdout = "sum 33 same\nsum 33 same\nsum 33 same\n"
+expect.readelf = [
+  "AArch64",
+  "DYN (",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

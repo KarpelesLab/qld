@@ -8,8 +8,8 @@ license = "MIT"
 repository = "https://github.com/KarpelesLab/qld"
 authors = ["Karpelès Lab Inc."]
 keywords = ["linker", "elf", "macho", "pe", "lto"]
-categories = ["development-tools::build-utils"]
-exclude = ["/tests/scratch", "/benches/corpus", "/.github"]
+categories = ["development-tools::build-utils", "command-line-utilities"]
+exclude = ["/.github", "/benches", "/packaging", "/tests/projects", "/tests/scratch", "/deny.toml"]
 
 [lib]
 name = "qld"

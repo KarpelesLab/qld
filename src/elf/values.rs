@@ -404,7 +404,7 @@ pub fn iplt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<
     }
     let index = u64::try_from(synth.iplt.index(owner)?).ok()?;
     let (base, ..) = layout.synthetic(Synthetic::Plt)?;
-    base.checked_add(index.checked_mul(synth.arch.iplt_entry_size())?)
+    base.checked_add(index.checked_mul(synth.arch.iplt_entry_size(synth.plt_flags()))?)
 }
 
 /// The address code jumps to for `owner`'s PLT entry: `.plt.sec` with IBT,

@@ -1,0 +1,36 @@
+# M4: BTI and PAC PLTs. Everything is built with branch protection, so
+# when the system's startup files are too, the executable is marked BTI and
+# its PLT entries start with `bti c` (GNU ld's 24-byte BTI entries); the
+# indirect call through the canonical PLT entry then lands on a landing
+# pad on BTI hardware. `-z force-bti` marks the output whatever the inputs,
+# and `-z pac-plt` adds `autia1716` to every entry; those two are only
+# inspected, not run: a PAC PLT needs a dynamic linker that signs
+# `.got.plt`, which glibc does not.
+description = "AArch64 BTI PLT in an executable, -z force-bti and -z pac-plt"
+compile = [
+  "cc -O2 -fPIC -mbranch-protection=standard -c imp.c",
+  "cc -O2 -fno-PIC -mbranch-protection=standard -c main.c",
+]
+driver = "cc"
+link = [
+  "-shared -o libimp.so imp.o",
+  "-no-pie -o out-forced main.o -L. -limp -Wl,-rpath,$ORIGIN -Wl,-z,force-bti",
+  "-no-pie -o out-pac main.o -L. -limp -Wl,-rpath,$ORIGIN -Wl,-z,pac-plt",
+  "-no-pie -o out main.o -L. -limp -Wl,-rpath,$ORIGIN",
+]
+run = "./out"
+expect.stdout = "direct 2 indirect 3\n"
+expect.readelf = [
+  "AArch64",
+  "EXEC (Executable file)",
+  "R_AARCH64_JUMP_SLOT",
+]
+expect.readelf_files."out-forced" = [
+  "AARCH64_BTI_PLT",
+  "AArch64 feature: BTI",
+]
+expect.readelf_files."out-pac" = [
+  "AARCH64_PAC_PLT",
+]
+targets = ["aarch64-linux-gnu"]
+determinism = true

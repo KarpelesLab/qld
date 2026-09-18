@@ -353,6 +353,8 @@ struct Plan<'a> {
     os_abi: u8,
     /// `e_machine` of the output, taken from the inputs.
     machine: u16,
+    /// `e_flags` of the output, taken from the inputs.
+    flags: u32,
 }
 
 fn align_to(value: u64, align: u64) -> Result<u64> {
@@ -404,9 +406,9 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
     let mut file_groups: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
     let mut file_plans: Vec<FilePlan> = (0..files.len()).map(|_| FilePlan::default()).collect();
     let mut os_abi = 0u8;
-    let machine = crate::elf::arch::Arch::of_files(files)
-        .unwrap_or_default()
-        .machine();
+    let arch = crate::elf::arch::Arch::of_files(files).unwrap_or_default();
+    let machine = arch.machine();
+    let flags = arch.output_flags(files);
     let mut kept: KeptGroups<'a> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6b65_7074));
     for (file_index, file) in files.iter().enumerate() {
@@ -880,6 +882,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         file_size,
         os_abi,
         machine,
+        flags,
     })
 }
 
@@ -1571,8 +1574,7 @@ fn write_header(plan: &Plan<'_>, out: &mut [u8]) {
     header[18..20].copy_from_slice(&plan.machine.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[40..48].copy_from_slice(&plan.shoff.to_le_bytes());
-    let e_flags = crate::elf::arch::Arch::from_machine(plan.machine).map_or(0, |a| a.e_flags());
-    header[48..52].copy_from_slice(&e_flags.to_le_bytes());
+    header[48..52].copy_from_slice(&plan.flags.to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());
     header[58..60].copy_from_slice(&64u16.to_le_bytes());
     let (shnum, shstrndx) = if plan.section_count >= u32::from(SHN_LORESERVE) {

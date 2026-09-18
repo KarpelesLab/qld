@@ -237,6 +237,18 @@ pub struct X86Features {
     pub isa_level: u8,
 }
 
+/// AArch64 branch protection and erratum options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Aarch64Features {
+    /// `-z force-bti`: BTI landing pads in the PLT, and the output marked
+    /// BTI-compatible, even when an input is not.
+    pub force_bti: bool,
+    /// `-z pac-plt`: PLT entries authenticate the address they load.
+    pub pac_plt: bool,
+    /// `--fix-cortex-a53-835769`.
+    pub fix_cortex_a53_835769: bool,
+}
+
 /// Severity for the `-z *-report=` keywords.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -439,6 +451,27 @@ pub struct PeArgs {
     pub exports: Vec<String>,
     /// `--warn-duplicate-exports`.
     pub warn_duplicate_exports: bool,
+    /// Which options with a per-emulation default the command line set.
+    ///
+    /// The fields above start at the `i386pep` defaults; `i386pe` and
+    /// `arm64pe` differ in a few of them, and the PE backend applies the
+    /// target's own default where the command line said nothing.
+    pub explicit: PeExplicit,
+}
+
+/// The PE options whose default depends on the emulation, and whether the
+/// command line set each of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeExplicit {
+    /// `--large-address-aware` or `--disable-large-address-aware`.
+    pub large_address_aware: bool,
+    /// `--major-os-version` or `--minor-os-version`.
+    pub os_version: bool,
+    /// `--major-image-version` or `--minor-image-version`.
+    pub image_version: bool,
+    /// `--major-subsystem-version`, `--minor-subsystem-version`, or a
+    /// version in `--subsystem`.
+    pub subsystem_version: bool,
 }
 
 impl Default for PeArgs {
@@ -482,6 +515,7 @@ impl Default for PeArgs {
             runtime_pseudo_reloc: true,
             exports: Vec::new(),
             warn_duplicate_exports: false,
+            explicit: PeExplicit::default(),
         }
     }
 }
@@ -909,6 +943,8 @@ pub struct LinkOptions {
     pub x86: X86Features,
     /// `--fix-cortex-a53-843419`.
     pub fix_cortex_a53_843419: bool,
+    /// AArch64 BTI, PAC and erratum options.
+    pub aarch64: Aarch64Features,
     /// `--spare-dynamic-tags`.
     pub spare_dynamic_tags: Option<u64>,
     /// `-q` / `--emit-relocs`: keep relocations in the output.

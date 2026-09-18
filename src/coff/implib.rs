@@ -25,12 +25,58 @@ use std::path::Path;
 use crate::error::{Error, Result};
 
 use super::edata::Exports;
+use super::machine::Machine;
 use super::read::consts::{
-    IMAGE_FILE_MACHINE_AMD64, IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_CNT_CODE,
-    IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_CNT_UNINITIALIZED_DATA, IMAGE_SCN_MEM_EXECUTE,
-    IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_STATIC,
+    IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA,
+    IMAGE_SCN_CNT_UNINITIALIZED_DATA, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
+    IMAGE_SCN_MEM_WRITE, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_STATIC,
     amd64::{IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_AMD64_REL32},
+    arm64::{
+        IMAGE_REL_ARM64_ADDR32NB, IMAGE_REL_ARM64_PAGEBASE_REL21, IMAGE_REL_ARM64_PAGEOFFSET_12L,
+    },
+    i386::{IMAGE_REL_I386_DIR32, IMAGE_REL_I386_DIR32NB},
 };
+
+/// The relocation type of a 32-bit RVA (`ADDR32NB`) on `machine`.
+fn rva_reloc(machine: u16) -> u16 {
+    match Machine::or_default(machine) {
+        Machine::Amd64 => IMAGE_REL_AMD64_ADDR32NB,
+        Machine::I386 => IMAGE_REL_I386_DIR32NB,
+        Machine::Arm64 => IMAGE_REL_ARM64_ADDR32NB,
+    }
+}
+
+/// The jump thunk through `__imp_<symbol>` (symbol 2 of an import member)
+/// and its relocations, as `dlltool` and lld write them:
+///
+/// - x86-64: `jmp *__imp_<symbol>(%rip)`;
+/// - i386: `jmp *__imp_<symbol>`, an absolute address;
+/// - ARM64: `adrp x16, __imp_<symbol>; ldr x16, [x16, :lo12:]; br x16`.
+fn jump_thunk(machine: u16) -> (Vec<u8>, Vec<(u32, u32, u16)>) {
+    match Machine::or_default(machine) {
+        Machine::Amd64 => (
+            vec![0xff, 0x25, 0, 0, 0, 0, 0x90, 0x90],
+            vec![(2, 2, IMAGE_REL_AMD64_REL32)],
+        ),
+        Machine::I386 => (
+            vec![0xff, 0x25, 0, 0, 0, 0, 0x90, 0x90],
+            vec![(2, 2, IMAGE_REL_I386_DIR32)],
+        ),
+        Machine::Arm64 => {
+            let mut code = Vec::with_capacity(12);
+            for word in [0x9000_0010u32, 0xf940_0210, 0xd61f_0200] {
+                code.extend_from_slice(&word.to_le_bytes());
+            }
+            (
+                code,
+                vec![
+                    (0, 2, IMAGE_REL_ARM64_PAGEBASE_REL21),
+                    (4, 2, IMAGE_REL_ARM64_PAGEOFFSET_12L),
+                ],
+            )
+        }
+    }
+}
 
 /// Writes the import library for `exports` to `path`.
 ///
@@ -66,8 +112,10 @@ pub fn build(path: &Path, exports: &Exports, machine: u16) -> Result<Vec<u8>> {
         if export.private {
             continue;
         }
+        // The import library knows the exported name only: GNU `ld` makes
+        // the member's symbols from it, decorated for the machine.
         let import = Import {
-            symbol: export.name.clone(),
+            symbol: Machine::or_default(machine).decorate(&export.name),
             name: if export.noname {
                 ImportName::Ordinal(export.ordinal)
             } else {
@@ -314,9 +362,9 @@ fn head_member(machine: u16, head_symbol: &[u8], iname_symbol: &[u8]) -> Result<
         b".idata$2",
         vec![0u8; 20],
         vec![
-            (0, 0, IMAGE_REL_AMD64_ADDR32NB),
-            (12, 3, IMAGE_REL_AMD64_ADDR32NB),
-            (16, 1, IMAGE_REL_AMD64_ADDR32NB),
+            (0, 0, rva_reloc(machine)),
+            (12, 3, rva_reloc(machine)),
+            (16, 1, rva_reloc(machine)),
         ],
     ));
     sections.push(idata(b".idata$5", Vec::new(), Vec::new()));
@@ -333,8 +381,9 @@ fn head_member(machine: u16, head_symbol: &[u8], iname_symbol: &[u8]) -> Result<
 /// The tail member: the null terminators and the DLL name.
 fn tail_member(machine: u16, iname_symbol: &[u8], dll_name: &[u8]) -> Result<Vec<u8>> {
     let mut sections = boilerplate();
-    sections.push(idata(b".idata$4", vec![0u8; 8], Vec::new()));
-    sections.push(idata(b".idata$5", vec![0u8; 8], Vec::new()));
+    let entry = Machine::or_default(machine).pointer_size() as usize;
+    sections.push(idata(b".idata$4", vec![0u8; entry], Vec::new()));
+    sections.push(idata(b".idata$5", vec![0u8; entry], Vec::new()));
     let mut name = dll_name.to_vec();
     name.push(0);
     while !name.len().is_multiple_of(4) {
@@ -402,20 +451,23 @@ pub fn import_member(machine: u16, import: &Import, head_symbol: &[u8]) -> Resul
     sections.push(idata(
         b".idata$7",
         vec![0u8; 4],
-        vec![(0, 3, IMAGE_REL_AMD64_ADDR32NB)],
+        vec![(0, 3, rva_reloc(machine))],
     ));
+    let width = Machine::or_default(machine).pointer_size() as usize;
     let (entry, entry_relocs) = match &import.name {
         ImportName::Ordinal(ordinal) => {
             // The high bit marks an ordinal import, and the ordinal is
             // stored in the entry itself.
-            let mut bytes = vec![0u8; 8];
-            let value = (1u64 << 63) | u64::from(*ordinal);
-            if let Some(slot) = bytes.first_chunk_mut::<8>() {
-                *slot = value.to_le_bytes();
-            }
+            let bytes = if width == 4 {
+                (0x8000_0000u32 | u32::from(*ordinal))
+                    .to_le_bytes()
+                    .to_vec()
+            } else {
+                ((1u64 << 63) | u64::from(*ordinal)).to_le_bytes().to_vec()
+            };
             (bytes, Vec::new())
         }
-        ImportName::Name { .. } => (vec![0u8; 8], vec![(0u32, 0u32, IMAGE_REL_AMD64_ADDR32NB)]),
+        ImportName::Name { .. } => (vec![0u8; width], vec![(0u32, 0u32, rva_reloc(machine))]),
     };
     sections.push(idata(b".idata$5", entry.clone(), entry_relocs.clone()));
     sections.push(idata(b".idata$4", entry, entry_relocs));
@@ -430,10 +482,9 @@ pub fn import_member(machine: u16, import: &Import, head_symbol: &[u8]) -> Resul
         sections.push(idata(b".idata$6", bytes, Vec::new()));
     }
     if !import.data {
-        // `jmp *__imp_<symbol>(%rip)`, relocated against the address table.
+        // A jump through the address table entry.
         if let Some(text) = sections.first_mut() {
-            text.data = vec![0xff, 0x25, 0, 0, 0, 0, 0x90, 0x90];
-            text.relocs = vec![(2, 2, IMAGE_REL_AMD64_REL32)];
+            (text.data, text.relocs) = jump_thunk(machine);
         }
     }
     let idata6_section = if matches!(import.name, ImportName::Ordinal(_)) {
@@ -619,10 +670,11 @@ pub fn write_def(path: &Path, exports: &Exports) -> Result<()> {
     })
 }
 
-/// The machine an import library is written for; only x86-64 is supported.
+/// Whether qld writes import libraries for `machine`: x86-64, i386 and
+/// ARM64.
 #[must_use]
 pub fn supported_machine(machine: u16) -> bool {
-    machine == IMAGE_FILE_MACHINE_AMD64
+    Machine::from_coff(machine).is_ok()
 }
 
 #[cfg(test)]
@@ -631,6 +683,7 @@ mod tests {
 
     use super::*;
     use crate::coff::edata::Export;
+    use crate::coff::read::consts::IMAGE_FILE_MACHINE_AMD64;
     use crate::coff::read::{CoffFile, Source};
     use crate::input::Archive;
 

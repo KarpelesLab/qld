@@ -10,9 +10,10 @@ use crate::error::{Error, Result};
 use crate::macho::read::Arch;
 use crate::macho::read::commands::PackedVersion;
 use crate::macho::read::consts::{
-    CPU_TYPE_ARM64, CPU_TYPE_X86_64, PLATFORM_DRIVERKIT, PLATFORM_IOS, PLATFORM_IOSSIMULATOR,
-    PLATFORM_MACCATALYST, PLATFORM_MACOS, PLATFORM_TVOS, PLATFORM_TVOSSIMULATOR, PLATFORM_WATCHOS,
-    PLATFORM_WATCHOSSIMULATOR, PLATFORM_XROS, PLATFORM_XROS_SIMULATOR,
+    CPU_TYPE_ARM64, CPU_TYPE_X86_64, PLATFORM_BRIDGEOS, PLATFORM_DRIVERKIT, PLATFORM_IOS,
+    PLATFORM_IOSSIMULATOR, PLATFORM_MACCATALYST, PLATFORM_MACOS, PLATFORM_TVOS,
+    PLATFORM_TVOSSIMULATOR, PLATFORM_WATCHOS, PLATFORM_WATCHOSSIMULATOR, PLATFORM_XROS,
+    PLATFORM_XROS_SIMULATOR,
 };
 
 /// Everything one slice's link needs to know.
@@ -62,6 +63,13 @@ pub struct Config {
     pub oso_prefix: Option<PathBuf>,
     /// `-flat_namespace`: imports are bound by name in any image.
     pub flat_namespace: bool,
+    /// `-force_flat_namespace`: `MH_FORCE_FLAT`.
+    pub force_flat_namespace: bool,
+    /// Objective-C method lists in the relative form
+    /// (`-objc_relative_method_lists`).
+    pub relative_method_lists: bool,
+    /// `-objc_category_merging`.
+    pub objc_category_merging: bool,
 }
 
 /// The first deployment target of each platform where ld64 defaults to
@@ -73,6 +81,21 @@ fn chained_fixups_by_default(platform: &PlatformVersion) -> bool {
         PLATFORM_IOSSIMULATOR | PLATFORM_TVOSSIMULATOR => PackedVersion::new(15, 0, 0),
         PLATFORM_WATCHOS | PLATFORM_WATCHOSSIMULATOR => PackedVersion::new(8, 0, 0),
         PLATFORM_XROS | PLATFORM_XROS_SIMULATOR | PLATFORM_DRIVERKIT => PackedVersion::new(1, 0, 0),
+        _ => return false,
+    };
+    platform.min.0 >= min.0
+}
+
+/// Whether Objective-C method lists are relative by default: from macOS 11,
+/// iOS and tvOS 14, watchOS 7, bridgeOS 5 and visionOS 1, as in ld64 and
+/// lld (not in the simulators).
+fn relative_method_lists_by_default(platform: &PlatformVersion) -> bool {
+    let min = match platform.platform {
+        PLATFORM_MACOS => PackedVersion::new(10, 16, 0),
+        PLATFORM_IOS | PLATFORM_TVOS => PackedVersion::new(14, 0, 0),
+        PLATFORM_WATCHOS => PackedVersion::new(7, 0, 0),
+        PLATFORM_BRIDGEOS => PackedVersion::new(5, 0, 0),
+        PLATFORM_XROS => PackedVersion::new(1, 0, 0),
         _ => return false,
     };
     platform.min.0 >= min.0
@@ -211,6 +234,11 @@ impl Config {
             debug_map: options.strip == crate::args::StripMode::None,
             oso_prefix: darwin.oso_prefix.clone(),
             flat_namespace: darwin.flat_namespace,
+            force_flat_namespace: darwin.force_flat_namespace,
+            relative_method_lists: darwin
+                .objc_relative_method_lists
+                .unwrap_or_else(|| relative_method_lists_by_default(&platform)),
+            objc_category_merging: darwin.objc_category_merging && !relocatable,
         })
     }
 

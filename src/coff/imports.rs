@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::input::FileTable;
 
 use super::implib::{self, Import, ImportName};
+use super::machine::Machine;
 use super::read::{ExportTarget, PeImage, ShortImport};
 
 /// The imports of one DLL, collected while the inputs are walked.
@@ -141,7 +142,16 @@ impl Groups {
     ///
     /// Returns [`crate::Error::Malformed`] if the export
     /// directory cannot be read.
-    pub fn add_dll(&mut self, image: &PeImage<'_>, position: u32, fallback: &[u8]) -> Result<()> {
+    ///
+    /// The DLL's export names are C names; the symbols the image refers to
+    /// are decorated for `machine`.
+    pub fn add_dll(
+        &mut self,
+        image: &PeImage<'_>,
+        position: u32,
+        fallback: &[u8],
+        machine: Machine,
+    ) -> Result<()> {
         let Some(directory) = image.exports()? else {
             return Ok(());
         };
@@ -169,7 +179,7 @@ impl Groups {
                 dll,
                 position,
                 Import {
-                    symbol: name.to_vec(),
+                    symbol: machine.decorate(name),
                     name: ImportName::Name {
                         hint: 0,
                         name: name.to_vec(),
@@ -260,13 +270,14 @@ pub fn generate(table: &FileTable, groups: &Groups, machine: u16) -> Result<Vec<
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unimplemented`] for anything but x86-64.
+/// Returns [`Error::Unimplemented`] for anything but x86-64, i386 and
+/// ARM64.
 pub fn check_machine(machine: u16) -> Result<()> {
-    if machine == super::read::consts::IMAGE_FILE_MACHINE_AMD64 {
+    if super::implib::supported_machine(machine) {
         return Ok(());
     }
     Err(Error::Unimplemented(format!(
-        "short import libraries for machine {machine:#x} (roadmap M7: x86-64 first)"
+        "short import libraries for machine {machine:#x}"
     )))
 }
 

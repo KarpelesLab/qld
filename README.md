@@ -83,8 +83,12 @@ can link programs in-process.
 Today (x86-64 Linux ELF):
 
 ```sh
-# gcc: -B points at a directory whose `ld` is a symlink to qld
-gcc -B/opt/qld/bin hello.c -o hello
+# gcc: -B points at a directory whose `ld` is qld (packages install
+# <prefix>/libexec/qld/ld; gcc has no -fuse-ld=qld)
+gcc -B/usr/libexec/qld hello.c -o hello
+
+# clang: finds ld.qld (ld64.qld on macOS) in PATH
+clang -fuse-ld=qld hello.c -o hello
 
 # clang
 clang --ld-path=/opt/qld/bin/ld hello.c -o hello

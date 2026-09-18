@@ -1092,6 +1092,12 @@ fn dynamic_entries(
     if text {
         entries.push((DT_TEXTREL, Value(0)));
     }
+    if synth.plt_entries() > 0 || !synth.plt_got.is_empty() {
+        entries.extend(
+            crate::elf::arch::aarch64::plt_dynamic_tags(synth.arch, synth.plt_flags())
+                .map(|tag| (tag, Value(0))),
+        );
+    }
     let symbolic = options.symbolic == crate::args::SymbolicMode::All && mode.shared;
     if symbolic {
         entries.push((DT_SYMBOLIC, Value(0)));
