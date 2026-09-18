@@ -372,13 +372,11 @@ pub fn scan(
 
 /// The exported weak definitions, which references bind through dyld's
 /// weak lookup so that one definition wins across images (as in ld64 and
-/// lld). Only chained fixups express this; the legacy form uses the
-/// definitions directly.
+/// lld). Chained fixups bind them to a weak-lookup import; the legacy
+/// form rebases them to the local definition and lists them in the weak
+/// binding stream ([`fixups::opcodes`](super::fixups::opcodes)).
 fn weak_bound(link: &Link<'_>, filter: &ExportFilter) -> Vec<bool> {
     let mut out = vec![false; link.symbols.len()];
-    if !link.config.chained_fixups {
-        return out;
-    }
     for (index, slot) in out.iter_mut().enumerate() {
         let Some(SymbolDef::Object { file, symbol }) = link.defs.get(index) else {
             continue;

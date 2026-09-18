@@ -36,6 +36,9 @@ use qld::macho::read::consts::{
 use qld::macho::read::{ChainedFixups, MachOFile, Source};
 use qld::output::hash::Sha256;
 
+#[path = "macho_link/weak_binding.rs"]
+mod weak_binding;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
