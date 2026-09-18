@@ -490,12 +490,16 @@ implementation into `src/output/hash`.
 
 ## Integration follow-ups
 
-- **W25:** `link()` dispatch for Mach-O and the `macho-macos` CI job are done.
-  Open: move `src/macho/sha256.rs` into `src/output/hash`;
-  `-r`, `-bundle_loader`, `-init`, `-alias`, `-flat_namespace`, arm64e and
-  LTO are rejected by name; cstring deduplication and ObjC relative method
-  lists are missing; legacy (pre-chained-fixups) output binds everything at
-  load time; `-v` with inputs prints a note instead of the version on stdout.
+- **W25/W27 (Mach-O):** done: dispatch, the `macho-macos` job, SHA-256 in
+  `output::hash`, `-r`, literal merging, `-init`, `-alias`,
+  `-bundle_loader`, `-flat_namespace`, Rust binaries. Open: arm64e; LTO via
+  libLTO; ObjC relative method lists and category merging; DWARF,
+  data-in-code and LOHs in `-r`; `-force_flat_namespace`, `-alias_list`;
+  undefined symbols reported before dead stripping; legacy dyld-info output
+  binds everything at load time; `-v` with inputs prints a note instead of
+  the version on stdout; a broader `-fuse-ld` suite for the M8 exit
+  criterion. The `src/output/hash/mod.rs` doc comment could mention SHA-256
+  (code signatures).
 
 Changes requested by merged workstreams that need a frozen shared file, or
 that cross workstream boundaries. The integrator does these between merges.

@@ -307,8 +307,9 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 - [x] Compact unwind (`__unwind_info`) synthesis, `__eh_frame`
 - [x] Ad-hoc code signature (`LC_CODE_SIGNATURE`), which arm64 macOS requires
 - [x] STABS debug map (`N_OSO`) so `dsymutil` can find DWARF in object files
-- [~] Objective-C / Swift sections handled correctly (basic handling done; category merging and relative method lists later)
-- [ ] `-r`, arm64e, LTO through `libLTO`
+- [~] Objective-C / Swift sections handled correctly (basic handling and selector stubs done; category merging and relative method lists later)
+- [x] `-r` (relocatable output; DWARF sections not carried over yet), C string and literal merging, `-init`, `-alias`, `-bundle_loader`, `-flat_namespace`
+- [ ] arm64e, LTO through `libLTO`
 - [x] **Universal (fat) binaries**: link each slice in parallel from multiple
       `-arch` values and write the `fat_header`; accept fat objects, archives
       and dylibs as inputs by selecting the matching slice
@@ -318,12 +319,13 @@ test suite on arm64 and x86_64 CI runners with `-fuse-ld=qld`. A Rust
 `aarch64-apple-darwin` binary runs. A universal binary passes `lipo -info`
 and runs natively on both architectures.
 
-**Status:** everything above except `-r`, arm64e and LTO is implemented.
+**Status:** everything above except arm64e and LTO is implemented.
 `tests/macho_link.rs` compares against `ld64.lld` on Linux, and the
-`macho-macos` CI job (green since 7d6e198) links C, C++ (exceptions, TLV) and
-Objective-C fixtures with Apple clang against the real SDK and runs them on
-arm64 and, under Rosetta, x86_64. Still open for the exit criteria: a broader
-test suite through `-fuse-ld`, and a Rust `aarch64-apple-darwin` binary.
+`macho-macos` CI job links C, C++ (exceptions, TLV), Objective-C and Rust
+(std: threads, unwinding, TLS) programs with Apple clang and rustc against
+the real SDK and runs them on arm64 and, under Rosetta, x86_64, including a
+universal binary. `-r` output is checked against Apple's `ld -r` there.
+Still open for the exit criteria: a broader test suite through `-fuse-ld`.
 
 ---
 

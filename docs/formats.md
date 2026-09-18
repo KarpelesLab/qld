@@ -148,6 +148,16 @@ every output format:
   `adrp`/`add`/`br x16` thunk in the island nearest its caller, one thunk
   per far target per island. Layout repeats until the thunk sets stop
   growing.
+- **Literals:** `S_CSTRING_LITERALS` and 4/8/16-byte literal sections are
+  deduplicated; the first occurrence in input order is kept.
+- **Local GOT slots:** `__got` entries are also created for local symbols
+  (`POINTER_TO_GOT` in C++ exception tables for internal-linkage types).
+- **`-init`** writes `LC_ROUTINES_64`. **`-flat_namespace`** drops
+  `MH_TWOLEVEL` and binds with flat lookup. **`-bundle_loader`** binds the
+  host executable's symbols with the main-executable ordinal.
+- **`-r`** writes an `MH_OBJECT` with one segment, sections in input order,
+  relocations rewritten against output symbols, and labels for symbol-less
+  atoms so `.subsections_via_symbols` stays valid.
 - **Determinism:** `LC_UUID` is an MD5 of the output (version-3 UUID). The
   ad-hoc code signature is computed last, over the finished image.
 

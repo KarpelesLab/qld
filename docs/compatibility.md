@@ -376,11 +376,21 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   timestamps.
 - `-order_file` accepts ld64's syntax: one symbol per line, optional
   `arch:` and `object.o:` prefixes, `#` comments.
-- Known differences: no cstring deduplication; no Objective-C relative
-  method lists; unused CIEs in `__eh_frame` are dropped; legacy
-  (`LC_DYLD_INFO_ONLY`) output binds every import at load time and does not
-  use weak binding.
-- Not supported yet, rejected with an error: `-r`, `-alias`,
-  `-bundle_loader`, `-init`, `-flat_namespace`, arm64e, and LTO/bitcode.
+- Known differences: no Objective-C relative method lists; unused CIEs in
+  `__eh_frame` are dropped; legacy (`LC_DYLD_INFO_ONLY`) output binds every
+  import at load time and does not use weak binding. Undefined symbols are
+  reported before dead stripping, where ld64 reports only those reached from
+  live code.
+- Weak definitions marked "can be hidden" in every object are hidden, as in
+  ld64 and lld.
+- `-r` keeps `.subsections_via_symbols`, compact unwind, `__eh_frame`,
+  linker options, and merges weak definitions and literals. DWARF sections
+  are dropped with a warning (link the original objects for debug info),
+  data-in-code and linker optimization hints are dropped, and export lists
+  and `N_INDR` symbols are rejected. ld64.lld has no `-r`; qld's output is
+  compared with Apple's `ld -r` in CI.
+- `-init` is an error unless `-dylib`, as in ld64 (ld64.lld ignores it).
+- Not supported yet, rejected with an error: `-force_flat_namespace`,
+  `-alias_list`, arm64e, and LTO/bitcode.
 - `-lto_library` is accepted. Mach-O LTO uses `libLTO` through the plugin
   layer, not the GNU plugin API. See [optimizations.md](optimizations.md#lto).
