@@ -93,6 +93,9 @@ pub struct WriteInput<'i, 'a> {
     pub emit_base_relocs: bool,
     /// The image's COFF symbol table, appended after the sections.
     pub symbols: &'i super::symtab::SymbolTable,
+    /// How the output file is created: an in-memory buffer and a
+    /// cancellation token come from the link's options.
+    pub output: OutputOptions,
 }
 
 /// The result of writing: the base relocations the pass found, so the caller
@@ -261,7 +264,7 @@ pub fn write(input: &WriteInput<'_, '_>, contents: &[Vec<u8>]) -> Result<()> {
         size,
         &OutputOptions {
             mode: FileMode::Executable,
-            ..OutputOptions::default()
+            ..input.output.clone()
         },
     )?;
     {

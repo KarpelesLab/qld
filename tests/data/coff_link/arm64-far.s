@@ -38,3 +38,10 @@ far_function:
 	.seh_endepilogue
 	ret
 	.seh_endproc
+
+// The entry point when this file is linked as a DLL on its own.
+	.globl	DllMainCRTStartup
+	.p2align 2
+DllMainCRTStartup:
+	mov	w0, #1
+	ret

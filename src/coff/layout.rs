@@ -24,6 +24,12 @@
 //!
 //! Anything a rule does not match is an orphan: it gets an output section
 //! named after the part before its `$`, placed after the known sections.
+//!
+//! `i386pe`'s script differs in three places, which the recipe follows for
+//! PE32 images: the constructor lists start and end with 4-byte rather than
+//! 8-byte words, and `.text`, `.rdata` and `.idata` have no 8-byte
+//! alignments. The i386 SafeSEH table goes at the end of `.rdata`, and an
+//! ARM64 input section may be followed by its range-extension thunks.
 
 #![deny(clippy::arithmetic_side_effects)]
 

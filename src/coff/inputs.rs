@@ -22,7 +22,7 @@ use crate::args::{InputAttrs, InputKind, LinkOptions};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
 use crate::input::identify::FileFormat;
-use crate::input::{FileTable, InputFile, LibraryNaming, RealFileSystem, SearchContext, Source};
+use crate::input::{FileTable, InputFile, LibraryNaming, SearchContext, Source};
 use crate::symbols::{InputPosition, ResolveFile, SymbolName, SymbolUse};
 
 use super::imports::{self, Groups};
@@ -222,7 +222,8 @@ pub fn collect<'a>(
     internal: &'a InternalNames,
     machine: u16,
 ) -> Result<Inputs<'a>> {
-    let fs = RealFileSystem;
+    // The file table looks in `options.input_provider` first.
+    let fs = table;
     let search = SearchContext {
         search_paths: &options.search_paths,
         sysroot: options.sysroot.as_deref(),

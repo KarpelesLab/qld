@@ -93,7 +93,7 @@ pub fn link_with(
     // both of which change what resolution must find.
     let prescan = {
         let empty = InternalNames::default();
-        let table = FileTable::new();
+        let table = FileTable::for_link(options);
         let scan = inputs::collect(options, &table, &empty, pe.machine)?;
         let mut directives = Directives::default();
         let mut files = scan.files;
@@ -121,7 +121,7 @@ pub fn link_with(
     // so their import library members were never extracted. The first
     // attempt finds them; the second links with them as roots.
     for attempt in 0..2u32 {
-        let table = FileTable::new();
+        let table = FileTable::for_link(options);
         let extra = link_once(options, pe, diagnostics, &table, &internal)?;
         if extra.is_empty() {
             return Ok(());
@@ -160,6 +160,7 @@ fn link_once<'a>(
     let mut hook = ComdatHook::default();
     let resolution = resolve_symbols_with(&mut symbols, &rules, files, &mut hook)?;
     let files = &inputs.files;
+    options.check_cancelled()?;
 
     let mut errors = super::resolve::report_conflicts(&hook.table.conflicts, files, diagnostics);
     errors = errors.saturating_add(report_duplicates(&resolution, files, options, diagnostics));
@@ -248,6 +249,7 @@ fn link_once<'a>(
     let mut thunks = Thunks::default();
     let mut attempt = 0u32;
     loop {
+        options.check_cancelled()?;
         let mut synthetic: Vec<(Vec<u8>, u32, u32)> = Vec::new();
         if export_size > 0 {
             synthetic.push((b".edata".to_vec(), export_size, 4));
@@ -400,6 +402,7 @@ fn link_once<'a>(
                 generated: &generated,
                 emit_base_relocs: emit_relocs,
                 symbols: &symbols,
+                output: crate::output::OutputOptions::for_link(options),
             },
             &contents,
         )?;

@@ -25,9 +25,12 @@
 //! | [`write`](mod@write) | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
 //!
-//! Not implemented yet: `-r`, `--gc-sections`, local symbols in the output
-//! symbol table, auto-import of PC-relative references, and architectures
-//! other than x86-64.
+//! Machines: x86-64 and ARM64 (PE32+) and i386 (PE32), the emulations
+//! `i386pep`, `arm64pe` and `i386pe`; [`machine`] lists what differs.
+//! ARM64EC, ARM64X and 32-bit ARM are refused.
+//!
+//! Not implemented yet: `-r`, `--gc-sections`, and local symbols in the
+//! output symbol table.
 
 pub mod arm64;
 pub mod defined;
