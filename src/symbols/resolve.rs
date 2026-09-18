@@ -669,7 +669,6 @@ where
             loaded_early = prefetch(
                 files,
                 table,
-                resolver,
                 hook.load_hook().filter(|_| ranks.is_some()),
                 &live,
                 &members,
@@ -723,8 +722,8 @@ where
 /// Loads, right after the first round, the members that later rounds may
 /// extract (see [`ResolveFile::can_load_early`]), in one parallel pass that
 /// follows references as members load: from `start` (the members the first
-/// round extracts), every lazy member that a non-weak reference of a loaded
-/// file would extract under the first round's definitions. That is a
+/// round extracts), every member whose lazy definition is the first
+/// round's best for a non-weak reference of a loaded file. That is a
 /// superset of what the rounds extract, since definitions only get better
 /// than lazy ones and lazy candidates enter the table in the first round
 /// only. Each member's names are looked up as it loads (the table does not
@@ -733,11 +732,9 @@ where
 ///
 /// The set does not depend on scheduling, and it only decides which files
 /// are loaded early, not the resolution.
-#[allow(clippy::too_many_arguments)]
-fn prefetch<'a, F, R>(
+fn prefetch<'a, F>(
     files: &mut [F],
     table: &mut SymbolTable<'a>,
-    resolver: &R,
     load_hook: Option<&dyn LoadHook<F>>,
     live: &[bool],
     start: &[usize],
@@ -746,7 +743,6 @@ fn prefetch<'a, F, R>(
 ) -> Vec<usize>
 where
     F: ResolveFile<'a>,
-    R: Resolver + ?Sized,
 {
     let claimed: Vec<AtomicBool> = live.iter().map(|&live| AtomicBool::new(live)).collect();
     let prefetcher = Prefetcher {
@@ -758,7 +754,6 @@ where
             .collect(),
         claimed,
         view: table.lookup_view(),
-        resolver,
         load_hook,
     };
     rayon::scope(|scope| {
@@ -793,18 +788,16 @@ type PrefetchSlot<'p, F> = Option<(
 
 /// The state of [`prefetch`]: each file, whether a task claimed it, and the
 /// table.
-struct Prefetcher<'p, 'a, F, R: ?Sized> {
+struct Prefetcher<'p, 'a, F> {
     slots: Vec<Mutex<PrefetchSlot<'p, F>>>,
     claimed: Vec<AtomicBool>,
     view: LookupView<'p, 'a>,
-    resolver: &'p R,
     load_hook: Option<&'p dyn LoadHook<F>>,
 }
 
-impl<'a, F, R> Prefetcher<'_, 'a, F, R>
+impl<'a, F> Prefetcher<'_, 'a, F>
 where
     F: ResolveFile<'a>,
-    R: Resolver + ?Sized,
 {
     fn visit<'s>(&'s self, index: usize, scope: &rayon::Scope<'s>) {
         let mut slot = self.slots[index]
@@ -834,11 +827,15 @@ where
             {
                 continue;
             }
-            let definition = self.view.definition(id);
-            if !definition.is_defined() || !self.resolver.extracts(&definition) {
+            // Lazy definitions are the ones that extract under the
+            // default `Resolver::extracts`; with another rule, loading a
+            // member early that is not extracted costs only time, and a
+            // member extracted without being loaded early loads in its
+            // round.
+            let Some(member) = self.view.lazy_file(id) else {
                 continue;
-            }
-            let member = definition.file.index();
+            };
+            let member = member.index();
             if self
                 .claimed
                 .get(member)
@@ -1008,21 +1005,17 @@ fn repeated_lazy_files<'a, F: ResolveFile<'a>>(files: &[F], lazy: &[usize]) -> V
             && a.version().map(<[u8]>::as_ptr) == b.version().map(<[u8]>::as_ptr)
             && a.version().map(<[u8]>::len) == b.version().map(<[u8]>::len)
     };
+    // Candidates by the first name's address and the count, then a full
+    // check of each, in parallel (84,500 names for clang).
     let mut first: hashbrown::HashMap<(usize, usize), usize> = hashbrown::HashMap::new();
-    lazy.iter()
+    let candidates: Vec<Option<usize>> = lazy
+        .iter()
         .map(|&index| {
             let names = files[index].lazy_names();
             let head = names.first()?;
             let key = (names.len(), head.bytes().as_ptr() as usize);
             match first.get(&key) {
-                Some(&original)
-                    if files[original].position() < files[index].position()
-                        && files[original]
-                            .lazy_names()
-                            .iter()
-                            .zip(names)
-                            .all(|(a, b)| same(a, b)) =>
-                {
+                Some(&original) if files[original].position() < files[index].position() => {
                     Some(original)
                 }
                 Some(_) => None,
@@ -1031,6 +1024,19 @@ fn repeated_lazy_files<'a, F: ResolveFile<'a>>(files: &[F], lazy: &[usize]) -> V
                     None
                 }
             }
+        })
+        .collect();
+    candidates
+        .into_par_iter()
+        .zip(lazy.par_iter())
+        .map(|(candidate, &index)| {
+            candidate.filter(|&original| {
+                files[original]
+                    .lazy_names()
+                    .iter()
+                    .zip(files[index].lazy_names())
+                    .all(|(a, b)| same(a, b))
+            })
         })
         .collect()
 }

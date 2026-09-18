@@ -49,8 +49,9 @@ use super::{
     get_mut, low32, overflow, shard_of, table_hash,
 };
 use crate::error::Result;
+use crate::ids::FileId;
 use crate::ids::SymbolId;
-use crate::symbols::definition::Definition;
+use crate::symbols::definition::{Definition, DefinitionKind};
 use crate::symbols::name::SymbolName;
 
 /// The partitioning passes split the sequence into chunks of at least this
@@ -139,6 +140,20 @@ impl<'a> LookupView<'_, 'a> {
         self.definitions.get(id.index())
     }
 
+    /// The file of the definition of `id`, if it is lazy: two loads,
+    /// where [`definition`](Self::definition) reads five fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` was not issued by the table.
+    #[inline]
+    #[must_use]
+    pub fn lazy_file(&self, id: SymbolId) -> Option<FileId> {
+        let index = id.index();
+        (self.definitions.kind[index].load(Ordering::Relaxed) == DefinitionKind::Lazy as u8)
+            .then(|| FileId::from_u32(self.definitions.file[index].load(Ordering::Relaxed)))
+    }
+
     /// Whether `id` is an ID [`find_all`](Self::find_all) found, rather
     /// than its placeholder for a name the table does not hold.
     #[inline]
@@ -171,6 +186,46 @@ impl<'a> LookupView<'_, 'a> {
             *id = SymbolId::from_u32(value);
         }
         missing
+    }
+}
+
+/// The new names of a numbered sequence, by rank: bit `g` of `words` is
+/// set when name `g` is new, and `before[w]` counts the bits set before
+/// word `w`.
+struct NewNames<'n, 's, 'a> {
+    words: &'n [u64],
+    before: &'n [u32],
+    sequence: &'n Sequence<'s, 'a>,
+}
+
+impl<'a> NewNames<'_, '_, 'a> {
+    /// The new name of rank `rank`. `at` caches the rank after the last
+    /// call's and the index of its name, so that consecutive ranks cost a
+    /// bit scan instead of a search.
+    fn name(&self, rank: usize, at: &mut Option<(usize, usize)>) -> SymbolName<'a> {
+        let g = match *at {
+            Some((next, g)) if next == rank => {
+                // The next set bit after `g`.
+                let mut word = g / 64;
+                let mut bits = self.words[word] & (u64::MAX << (g % 64)).wrapping_shl(1);
+                while bits == 0 {
+                    word += 1;
+                    bits = self.words[word];
+                }
+                word * 64 + bits.trailing_zeros() as usize
+            }
+            _ => {
+                // The word holding the name, then the bit within it.
+                let word = self.before.partition_point(|&b| b as usize <= rank) - 1;
+                let mut bits = self.words[word];
+                for _ in 0..rank - self.before[word] as usize {
+                    bits &= bits - 1;
+                }
+                word * 64 + bits.trailing_zeros() as usize
+            }
+        };
+        *at = Some((rank + 1, g));
+        *self.sequence.name(g)
     }
 }
 
@@ -582,12 +637,21 @@ impl<'a> SymbolTable<'a> {
                 );
             },
             || {
-                names.reserve(new_count);
-                sequence.for_each(0..total, |g, name| {
-                    if words[g / 64] & (1u64 << (g % 64)) != 0 {
-                        names.push(*name);
-                    }
-                });
+                // In parallel, each task walking its range of new names
+                // from one bitmap search: pushing 150,000 names on one
+                // thread (clang's first round) took 1.5 ms, mostly page
+                // faults.
+                let new_names = NewNames {
+                    words: &words,
+                    before: &before,
+                    sequence,
+                };
+                names.par_extend(
+                    (0..new_count)
+                        .into_par_iter()
+                        .with_min_len(MIN_CHUNK)
+                        .map_init(|| None, |at, rank| new_names.name(rank, at)),
+                );
             },
         );
         self.grow_state(new_count);
