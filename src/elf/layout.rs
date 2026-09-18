@@ -31,12 +31,13 @@ use crate::args::{ExecStack, LinkOptions, SeparateCode};
 use crate::elf::read::consts::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_RELRO, PT_GNU_STACK,
     PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE,
-    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
+    SHT_NOBITS, SHT_NOTE, SHT_PROGBITS, SHT_RISCV_ATTRIBUTES, SHT_STRTAB, SHT_SYMTAB,
 };
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 
 use super::arch::Arch;
+use super::arch::shrink::Relaxation;
 use super::arch::thunk::{self, Thunks};
 use super::ehframe::EhFrames;
 use super::export::Mode;
@@ -204,6 +205,9 @@ impl Tls {
     /// alignment ([`Arch::tcb_size`]).
     #[must_use]
     pub fn tp(&self, arch: Arch) -> u64 {
+        if let Some(offset) = arch.tp_past_tls_start() {
+            return self.start.wrapping_add(offset);
+        }
         let align = self.align.max(1);
         if arch.tls_variant1() {
             let tcb = arch
@@ -296,9 +300,13 @@ pub struct Layout<'a> {
     /// `NOCROSSREFS` lists: output section names, and whether the list is
     /// `NOCROSSREFS_TO` (only references to the first section are checked).
     pub nocrossrefs: Vec<(bool, Vec<Vec<u8>>)>,
-    /// Range-extension thunks with their addresses, sorted by output
-    /// section and destination.
+    /// Range-extension thunks and Cortex-A53 erratum patches with their
+    /// addresses, sorted by output section and destination (for a patch,
+    /// the instruction it replaces).
     pub thunks: Vec<thunk::Placed>,
+    /// Linker relaxation edits ([`super::arch::shrink`]): the bytes deleted
+    /// from each code section, which symbol addresses and the writer follow.
+    pub relax: Relaxation,
 }
 
 impl Layout<'_> {
@@ -323,9 +331,13 @@ impl Layout<'_> {
     pub fn thunk_for(&self, output: u32, target: u64) -> Option<u64> {
         let at = self
             .thunks
-            .binary_search_by_key(&(output, target), |t| (t.output, t.target))
-            .ok()?;
-        self.thunks.get(at).map(|t| t.address)
+            .partition_point(|t| (t.output, t.target) < (output, target));
+        self.thunks
+            .get(at..)?
+            .iter()
+            .take_while(|t| (t.output, t.target) == (output, target))
+            .find(|t| t.patch.is_none())
+            .map(|t| t.address)
     }
 
     /// The output section (its index in `Placement::outputs`) that holds
@@ -368,6 +380,9 @@ pub struct LayoutInput<'l, 'a> {
     /// Section priorities from `--symbol-ordering-file` or
     /// `--call-graph-profile-sort` ([`super::ordering`]).
     pub order: Option<&'l super::ordering::SectionOrder>,
+    /// The linker relaxation edits to lay out with; set by
+    /// [`crate::elf::arch::shrink::layout`] while it iterates.
+    pub relax: Option<&'l Relaxation>,
 }
 
 /// The compressed size of an output section.
@@ -426,7 +441,11 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 /// Returns [`Error::Limit`] when the image does not fit the address space.
 pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     input.synth.arch.check_options(input.options)?;
+    if input.relax.is_none() && input.synth.arch.relaxes() {
+        return super::arch::shrink::layout(input, &|input| layout(input));
+    }
     if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
+        input.synth.arch.check_script_options(input.options)?;
         return crate::elf::script_layout::layout(input, script, placed);
     }
     if !input.synth.arch.needs_thunks() {
@@ -859,6 +878,11 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
     let has_property = input.synth.property_note.is_some();
     let has_eh_hdr = input.synth.eh_frame_hdr && input.synth.fde_count > 0;
     let gnu_stack = input.options.gnu_stack;
+    // RISC-V: `PT_RISCV_ATTRIBUTES` covers `.riscv.attributes`.
+    let has_attributes = input.synth.arch == Arch::RiscV64
+        && out_sections
+            .iter()
+            .any(|s| s.sh_type == SHT_RISCV_ATTRIBUTES);
     let phnum = load_count
         .saturating_add(usize::from(has_interp).saturating_mul(2))
         .saturating_add(usize::from(has_dynamic))
@@ -867,7 +891,8 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         .saturating_add(usize::from(has_property))
         .saturating_add(usize::from(has_eh_hdr))
         .saturating_add(usize::from(gnu_stack))
-        .saturating_add(usize::from(has_relro));
+        .saturating_add(usize::from(has_relro))
+        .saturating_add(usize::from(has_attributes));
     let phnum_u64 = u64::try_from(phnum).unwrap_or(u64::MAX);
 
     // 4. Addresses. Each new PT_LOAD starts on a page boundary; a writable
@@ -880,7 +905,11 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         .max_page_size
         .filter(|p| p.is_power_of_two())
         .unwrap_or_else(|| input.synth.arch.default_max_page());
-    let default_base = if mode.pic { 0 } else { DEFAULT_BASE };
+    let default_base = if mode.pic {
+        0
+    } else {
+        input.synth.arch.default_base()
+    };
     let base = input
         .options
         .text_segment
@@ -1039,6 +1068,33 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
                 output: entry.output,
                 target: entry.target,
                 address: section.addr.wrapping_add(entry.offset),
+                patch: None,
+            });
+        }
+        // Erratum patches: one block after the thunks, which the writer
+        // fills once the patched sections are relocated.
+        for section in &mut out_sections {
+            let size = thunks.patch_bytes(section.output);
+            if let Some(first) = thunks
+                .patches
+                .iter()
+                .find(|p| p.site.output == section.output)
+                && size > 0
+            {
+                section
+                    .data
+                    .push((first.offset, vec![0; usize::try_from(size).unwrap_or(0)]));
+            }
+        }
+        for patch in &thunks.patches {
+            let Some(section) = out_sections.iter().find(|s| s.output == patch.site.output) else {
+                continue;
+            };
+            placed_thunks.push(thunk::Placed {
+                output: patch.site.output,
+                target: patch.site.address,
+                address: section.addr.wrapping_add(patch.offset),
+                patch: Some((patch.site.section, patch.site.offset)),
             });
         }
         placed_thunks.sort_unstable();
@@ -1233,6 +1289,22 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
             align: 1,
         });
     }
+    if has_attributes
+        && let Some(section) = out_sections
+            .iter()
+            .find(|s| s.sh_type == SHT_RISCV_ATTRIBUTES)
+    {
+        segments.push(Segment {
+            p_type: super::arch::riscv::PT_RISCV_ATTRIBUTES,
+            flags: PF_R,
+            offset: section.offset,
+            vaddr: 0,
+            paddr: None,
+            filesz: section.size,
+            memsz: section.size,
+            align: 1,
+        });
+    }
     if segments.len() != phnum {
         return Err(Error::Internal(format!(
             "program header count changed during layout ({phnum} planned, {} made)",
@@ -1297,6 +1369,7 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
     Ok(Layout {
         sections: out_sections,
         thunks: placed_thunks,
+        relax: Relaxation::default(),
         output_places,
         section_addr,
         section_shndx,
@@ -1688,7 +1761,23 @@ pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result
                     .map_or(0, |s| s.size);
                 return Ok((size, 1));
             }
-            (section.header.sh_size, section.header.sh_addralign)
+            // RISC-V: the merged `.riscv.attributes` takes the place of the
+            // first input section; the others are empty.
+            if section.header.sh_type == SHT_RISCV_ATTRIBUTES
+                && let Some(merged) = &input.synth.riscv_attributes
+            {
+                let size = if merged.first == id {
+                    u64::try_from(merged.bytes.len()).unwrap_or(u64::MAX)
+                } else {
+                    0
+                };
+                return Ok((size, 1));
+            }
+            let removed = input.relax.map_or(0, |relax| relax.removed(id));
+            (
+                section.header.sh_size.saturating_sub(removed),
+                section.header.sh_addralign,
+            )
         }
         Member::Merge(group) => {
             let merged = input

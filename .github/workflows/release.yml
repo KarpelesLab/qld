@@ -1,0 +1,310 @@
+# Release builds: prebuilt qld binaries for Linux, macOS and Windows.
+#
+# - A pushed `v*` tag builds every target and publishes a GitHub release for
+#   that tag, with the archives, one .sha256 file per archive and SHA256SUMS.
+# - `workflow_dispatch` with a `tag` (an existing tag) does the same for
+#   that tag, e.g. to redo a release after fixing this workflow. Without a
+#   tag it builds from the chosen branch and keeps the archives as workflow
+#   artifacts only: nothing is published.
+#
+# Nothing else triggers this workflow, so pushes to branches never publish.
+#
+# Archive layout (packaging/dist.sh): qld-VERSION-TARGET/{bin/qld,
+# bin/ld.qld, bin/ld64.qld, libexec/qld/ld, LICENSE, README.md}; links are
+# symlinks in the .tar.gz archives and copies in the Windows .zip ones.
+# Linux gnu and musl binaries are linked by qld itself when that works
+# (packaging/release-build.sh), and by the system linker otherwise.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v0.1.0). Leave empty to build without publishing."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The release profile keeps line tables (debug = 1) for profiling; the
+  # shipped binaries do not need them: 5 MB instead of 60 MB.
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.plan.outputs.ref }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags only resolve with history; small repository, so fetch it all.
+          fetch-depth: 0
+      - id: plan
+        name: Decide what to build and whether to publish
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag=
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
+            tag=$REF_NAME
+          elif [ "$EVENT" = workflow_dispatch ] && [ -n "$INPUT_TAG" ]; then
+            tag=$INPUT_TAG
+          fi
+
+          if [ -n "$tag" ]; then
+            case "$tag" in
+              v[0-9]*) ;;
+              *) echo "::error::$tag is not a version tag (v*)"; exit 1 ;;
+            esac
+            if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "::error::tag $tag does not exist"; exit 1
+            fi
+            git checkout -q "refs/tags/$tag"
+          fi
+
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then
+            echo "::error::cannot read the version from Cargo.toml"; exit 1
+          fi
+
+          if [ -n "$tag" ]; then
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::tag $tag does not match Cargo.toml version $version"; exit 1
+            fi
+            ref=refs/tags/$tag
+            publish=true
+          else
+            # An unpublished build: name it after the commit.
+            version=$version-dev.$(git rev-parse --short=10 HEAD)
+            ref=$GITHUB_SHA
+            publish=false
+          fi
+
+          # Pre-1.0 and pre-release versions are marked as pre-releases.
+          case "$version" in
+            0.* | *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+
+          {
+            echo "ref=$ref"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "ref=$ref tag=${tag:-none} version=$version publish=$publish prerelease=$prerelease"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: built natively on each architecture, on the oldest
+          # supported runner so that the gnu binaries need an older glibc
+          # (2.35; the LTO plugin support needs 2.34). musl binaries are
+          # static and run on any Linux, but cannot dlopen LTO plugins.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, dogfood: true, smoke: linux }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, dogfood: true, smoke: linux }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, dogfood: true, smoke: linux }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm, dogfood: true, smoke: linux }
+          # macOS: both built on the arm64 runner; x86_64 is cross-compiled
+          # (and smoke-tested under Rosetta).
+          - { target: aarch64-apple-darwin, os: macos-latest, dogfood: false, smoke: macos }
+          - { target: x86_64-apple-darwin, os: macos-latest, dogfood: false, smoke: version }
+          # Windows: MSVC targets, so the binaries need no MinGW runtime.
+          # aarch64 is cross-compiled and not run.
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, dogfood: false, smoke: version }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, dogfood: false, smoke: none }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          # For the commit time, which dist.sh uses as the archive mtime.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install Rosetta
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Build
+        id: build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          DOGFOOD: ${{ matrix.dogfood }}
+        run: |
+          set -euo pipefail
+          # The binary's path is the last line of the script's output.
+          if [ "$DOGFOOD" = true ]; then
+            sh packaging/release-build.sh --dogfood "$TARGET" | tee build.out
+          else
+            sh packaging/release-build.sh "$TARGET" | tee build.out
+          fi
+          echo "binary=$(tail -n1 build.out)" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          BINARY: ${{ steps.build.outputs.binary }}
+        run: |
+          set -euo pipefail
+          archive=$(sh packaging/dist.sh "$BINARY" "$TARGET" "$VERSION" dist)
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          ls -l dist
+          cat dist/*.sha256
+
+      - name: Smoke test (--version and flavors)
+        if: matrix.smoke != 'none'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          # A relative directory: RUNNER_TEMP is a D:\ path on Windows,
+          # which bash globs do not handle.
+          mkdir -p smoke
+          case "$ARCHIVE" in
+            *.zip) 7z x -y -bso0 -osmoke "$ARCHIVE" ;;
+            *) tar -xzf "$ARCHIVE" -C smoke ;;
+          esac
+          bin=$(echo smoke/qld-*/bin)
+          exe=; case "$TARGET" in *windows*) exe=.exe ;; esac
+          "$bin/qld$exe" --version
+          "$bin/ld.qld$exe" --version
+          # ld64.qld takes the ld64 command line; ld.qld does not.
+          "$bin/ld64.qld$exe" -arch arm64 -v
+          if "$bin/ld.qld$exe" -arch arm64 -v 2>/dev/null; then
+            echo "::error::ld.qld accepted an ld64-only option"; exit 1
+          fi
+
+      - name: Smoke test (compiler drivers find qld)
+        if: matrix.smoke == 'linux' || matrix.smoke == 'macos'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          # Checks the archive: extract it into a temporary prefix, then
+          # link hello world with gcc -B and clang -fuse-ld=qld.
+          sh tests/projects/packaging.sh --archive "$ARCHIVE" "$RUNNER_TEMP/packaging"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qld-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-universal:
+    name: universal-apple-darwin
+    needs: [plan, build]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qld-*-apple-darwin
+          path: in
+          merge-multiple: true
+      - name: Combine the two macOS binaries
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in aarch64 x86_64; do
+            mkdir -p "x/$arch"
+            tar -xzf "in/qld-$VERSION-$arch-apple-darwin.tar.gz" -C "x/$arch"
+          done
+          lipo -create -output qld \
+            "x/aarch64/qld-$VERSION-aarch64-apple-darwin/bin/qld" \
+            "x/x86_64/qld-$VERSION-x86_64-apple-darwin/bin/qld"
+          lipo -info qld
+          ./qld --version
+          sh packaging/dist.sh qld universal-apple-darwin "$VERSION" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qld-universal-apple-darwin
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish
+    needs: [plan, build, macos-universal]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qld-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -c ./*.sha256
+          cat ./*.sha256 | LC_ALL=C sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          pre=--prerelease=false
+          if [ "$PRERELEASE" = true ]; then pre=--prerelease; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run: replace the assets, keep the notes.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            # Created as a draft with every asset, then published, so that
+            # nobody sees a release with half of its files.
+            gh release create "$TAG" dist/* --draft --verify-tag \
+              --title "qld $VERSION" --generate-notes "$pre"
+            gh release edit "$TAG" --draft=false
+          fi

@@ -22,6 +22,7 @@ use crate::symbols::{Resolution, SymbolName, SymbolTable};
 
 use super::inputs::CoffInput;
 use super::layout::Layout;
+use super::machine::Machine;
 use super::object::{GlobalKind, RecordTarget};
 use super::read::consts::amd64::{
     IMAGE_REL_AMD64_ABSOLUTE, IMAGE_REL_AMD64_ADDR32, IMAGE_REL_AMD64_ADDR32NB,
@@ -29,6 +30,11 @@ use super::read::consts::amd64::{
     IMAGE_REL_AMD64_REL32_2, IMAGE_REL_AMD64_REL32_3, IMAGE_REL_AMD64_REL32_4,
     IMAGE_REL_AMD64_REL32_5, IMAGE_REL_AMD64_SECREL, IMAGE_REL_AMD64_SECREL7,
     IMAGE_REL_AMD64_SECTION,
+};
+use super::read::consts::arm64::IMAGE_REL_ARM64_ADDR64;
+use super::read::consts::i386::{
+    IMAGE_REL_I386_ABSOLUTE, IMAGE_REL_I386_DIR32, IMAGE_REL_I386_DIR32NB, IMAGE_REL_I386_REL32,
+    IMAGE_REL_I386_SECREL, IMAGE_REL_I386_SECREL7, IMAGE_REL_I386_SECTION,
 };
 use super::read::consts::relocation_name;
 
@@ -262,6 +268,9 @@ pub struct Applied {
     pub base_relocs: Vec<BaseReloc>,
     /// Sites the MinGW runtime relocator must fix up.
     pub pseudo_relocs: Vec<PseudoReloc>,
+    /// ARM64 branches that cannot reach their destination and have no
+    /// range-extension thunk yet, as `(file, section, target)`.
+    pub thunk_requests: Vec<(u32, u32, super::arm64::ThunkTarget)>,
     /// Problems found, as diagnostics.
     pub errors: Vec<Diagnostic>,
 }
@@ -296,26 +305,22 @@ pub fn apply(
             .and_then(Value::rva);
         if let Some(slot) = auto {
             let site = rva.wrapping_add(offset);
-            let bits = match r_type {
-                IMAGE_REL_AMD64_ADDR64 => 64,
-                IMAGE_REL_AMD64_ADDR32 => 32,
-                _ => {
-                    out.errors.push(
-                        Diagnostic::error(format!(
-                            "auto-import cannot fix up a {} relocation; declare the symbol \
+            let Some(bits) = pseudo_reloc_bits(machine, r_type) else {
+                out.errors.push(
+                    Diagnostic::error(format!(
+                        "auto-import cannot fix up a {} relocation; declare the symbol \
                              `__declspec(dllimport)`",
-                            relocation_name(machine, r_type)
-                                .map_or_else(|| format!("{r_type:#x}"), str::to_string)
-                        ))
-                        .at(location(
-                            addresses,
-                            file,
-                            &input.name,
-                            u64::from(offset),
-                        )),
-                    );
-                    return;
-                }
+                        relocation_name(machine, r_type)
+                            .map_or_else(|| format!("{r_type:#x}"), str::to_string)
+                    ))
+                    .at(location(
+                        addresses,
+                        file,
+                        &input.name,
+                        u64::from(offset),
+                    )),
+                );
+                return;
             };
             out.pseudo_relocs.push(PseudoReloc {
                 sym: slot,
@@ -340,8 +345,14 @@ pub fn apply(
             );
             return;
         };
-        if let Err(problem) = write_field(addresses, data, offset, rva, r_type, value, machine, out)
-        {
+        let site = Site {
+            file: u32::try_from(file).unwrap_or(u32::MAX),
+            section,
+            offset,
+            section_rva: rva,
+            record,
+        };
+        if let Err(problem) = write_field(addresses, data, site, r_type, value, machine, out) {
             out.errors.push(Diagnostic::error(problem).at(location(
                 addresses,
                 file,
@@ -389,13 +400,69 @@ fn location(addresses: &Addresses<'_, '_>, file: usize, section: &[u8], offset: 
     }
 }
 
+/// Where a relocation applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Site {
+    /// Index of the input file.
+    pub file: u32,
+    /// The 1-based COFF section number.
+    pub section: u32,
+    /// Offset of the field in the section.
+    pub offset: u32,
+    /// RVA the section was placed at.
+    pub section_rva: u32,
+    /// The symbol record the relocation refers to.
+    pub record: u32,
+}
+
+impl Site {
+    /// RVA of the relocated field.
+    #[must_use]
+    pub fn rva(self) -> u32 {
+        self.section_rva.wrapping_add(self.offset)
+    }
+
+    /// The field's index in the section's bytes.
+    #[must_use]
+    pub fn at(self) -> usize {
+        self.offset as usize
+    }
+}
+
+/// The width in bits of the field a runtime pseudo-relocation fixes up for
+/// relocation `r_type`, or `None` when auto-import cannot handle it.
+///
+/// Absolute addresses and x86 PC-relative displacements work: the
+/// version 2 relocator subtracts the import address table slot's address
+/// from the field and adds the imported address, which is right for both.
+/// ARM64 instruction fields cannot be patched that way, which is why
+/// Clang reaches external data through `.refptr` pointers there.
+fn pseudo_reloc_bits(machine: u16, r_type: u16) -> Option<u32> {
+    match Machine::from_coff(machine).ok()? {
+        Machine::Amd64 => match r_type {
+            IMAGE_REL_AMD64_ADDR64 => Some(64),
+            IMAGE_REL_AMD64_ADDR32
+            | IMAGE_REL_AMD64_REL32
+            | IMAGE_REL_AMD64_REL32_1
+            | IMAGE_REL_AMD64_REL32_2
+            | IMAGE_REL_AMD64_REL32_3
+            | IMAGE_REL_AMD64_REL32_4
+            | IMAGE_REL_AMD64_REL32_5 => Some(32),
+            _ => None,
+        },
+        Machine::I386 => match r_type {
+            IMAGE_REL_I386_DIR32 | IMAGE_REL_I386_REL32 => Some(32),
+            _ => None,
+        },
+        Machine::Arm64 => (r_type == IMAGE_REL_ARM64_ADDR64).then_some(64),
+    }
+}
+
 /// Applies one relocation to `data`.
-#[allow(clippy::too_many_arguments)]
 fn write_field(
     addresses: &Addresses<'_, '_>,
     data: &mut [u8],
-    offset: u32,
-    section_rva: u32,
+    site: Site,
     r_type: u16,
     value: Value,
     machine: u16,
@@ -407,113 +474,187 @@ fn write_field(
             relocation_name(machine, r_type).map_or_else(|| format!("{r_type:#x}"), str::to_string)
         )
     };
-    let site = section_rva.wrapping_add(offset);
-    let at = offset as usize;
-    let read32 = |data: &[u8]| -> u32 {
-        data.get(at..)
-            .and_then(<[u8]>::first_chunk::<4>)
-            .map_or(0, |bytes| u32::from_le_bytes(*bytes))
+    let field = Field {
+        addresses,
+        site,
+        value,
     };
-    match r_type {
-        IMAGE_REL_AMD64_ABSOLUTE => Ok(()),
-        IMAGE_REL_AMD64_ADDR64 => {
-            let slot = data
-                .get_mut(at..)
-                .and_then(<[u8]>::first_chunk_mut::<8>)
-                .ok_or_else(|| "relocation past the end of the section".to_string())?;
-            let addend = u64::from_le_bytes(*slot);
-            let target = match value {
-                Value::Address { rva, .. } => addresses
-                    .image_base
-                    .wrapping_add(u64::from(rva))
-                    .wrapping_add(addend),
-                Value::Absolute(number) => number.wrapping_add(addend),
-            };
-            *slot = target.to_le_bytes();
-            if matches!(value, Value::Address { .. }) {
-                out.base_relocs.push(BaseReloc {
-                    rva: site,
-                    kind: IMAGE_REL_BASED_DIR64,
-                });
+    match Machine::from_coff(machine) {
+        Ok(Machine::Amd64) => match r_type {
+            IMAGE_REL_AMD64_ABSOLUTE => Ok(()),
+            IMAGE_REL_AMD64_ADDR64 => field.addr64(data, out),
+            IMAGE_REL_AMD64_ADDR32 => field.addr32(data, out),
+            IMAGE_REL_AMD64_ADDR32NB => field.addr32nb(data),
+            IMAGE_REL_AMD64_REL32
+            | IMAGE_REL_AMD64_REL32_1
+            | IMAGE_REL_AMD64_REL32_2
+            | IMAGE_REL_AMD64_REL32_3
+            | IMAGE_REL_AMD64_REL32_4
+            | IMAGE_REL_AMD64_REL32_5 => {
+                field.rel32(data, u32::from(r_type.wrapping_sub(IMAGE_REL_AMD64_REL32)))
             }
-            Ok(())
-        }
-        IMAGE_REL_AMD64_ADDR32 => {
-            let addend = read32(data);
-            let target = match value {
-                Value::Address { rva, .. } => addresses
-                    .image_base
-                    .wrapping_add(u64::from(rva))
-                    .wrapping_add(u64::from(addend)),
-                Value::Absolute(number) => number.wrapping_add(u64::from(addend)),
-            };
-            let truncated = u32::try_from(target)
-                .map_err(|_| format!("32-bit address relocation overflows: {target:#x}"))?;
-            store32(data, at, truncated)?;
-            if matches!(value, Value::Address { .. }) {
-                out.base_relocs.push(BaseReloc {
-                    rva: site,
-                    kind: IMAGE_REL_BASED_HIGHLOW,
-                });
-            }
-            Ok(())
-        }
-        IMAGE_REL_AMD64_ADDR32NB => {
-            let addend = read32(data);
-            let target = match value {
-                Value::Address { rva, .. } => rva.wrapping_add(addend),
-                Value::Absolute(number) => (number as u32).wrapping_add(addend),
-            };
-            store32(data, at, target)
-        }
-        IMAGE_REL_AMD64_REL32
-        | IMAGE_REL_AMD64_REL32_1
-        | IMAGE_REL_AMD64_REL32_2
-        | IMAGE_REL_AMD64_REL32_3
-        | IMAGE_REL_AMD64_REL32_4
-        | IMAGE_REL_AMD64_REL32_5 => {
-            let extra = i64::from(r_type.wrapping_sub(IMAGE_REL_AMD64_REL32));
-            let addend = i64::from(read32(data).cast_signed());
-            let target = match value {
-                Value::Address { rva, .. } => i64::from(rva),
-                Value::Absolute(number) => number as i64,
-            };
-            let pc = i64::from(site).wrapping_add(4).wrapping_add(extra);
-            let displacement = target.wrapping_add(addend).wrapping_sub(pc);
-            let truncated = i32::try_from(displacement)
-                .map_err(|_| format!("PC-relative relocation out of range: {displacement:#x}"))?;
-            store32(data, at, truncated.cast_unsigned())
-        }
-        IMAGE_REL_AMD64_SECREL => {
-            let addend = read32(data);
-            let offset_in_section = section_offset(addresses, value).unwrap_or(0);
-            store32(data, at, offset_in_section.wrapping_add(addend))
-        }
-        IMAGE_REL_AMD64_SECREL7 => {
-            let offset_in_section = section_offset(addresses, value).unwrap_or(0);
-            let byte = data
-                .get_mut(at)
-                .ok_or_else(|| "relocation past the end of the section".to_string())?;
-            let truncated = u8::try_from(offset_in_section & 0x7f).unwrap_or(0);
-            *byte = (*byte & 0x80) | truncated;
-            Ok(())
-        }
-        IMAGE_REL_AMD64_SECTION => {
-            let index = match value {
-                Value::Address { section, .. } if section != u32::MAX => {
-                    u16::try_from(section.wrapping_add(1)).unwrap_or(0)
-                }
-                _ => 0,
-            };
-            let slot = data
-                .get_mut(at..)
-                .and_then(<[u8]>::first_chunk_mut::<2>)
-                .ok_or_else(|| "relocation past the end of the section".to_string())?;
-            *slot = index.to_le_bytes();
-            Ok(())
-        }
-        _ => Err(unknown()),
+            IMAGE_REL_AMD64_SECREL => field.secrel(data),
+            IMAGE_REL_AMD64_SECREL7 => field.secrel7(data),
+            IMAGE_REL_AMD64_SECTION => field.section_index(data),
+            _ => Err(unknown()),
+        },
+        Ok(Machine::I386) => match r_type {
+            IMAGE_REL_I386_ABSOLUTE => Ok(()),
+            IMAGE_REL_I386_DIR32 => field.addr32(data, out),
+            IMAGE_REL_I386_DIR32NB => field.addr32nb(data),
+            IMAGE_REL_I386_REL32 => field.rel32(data, 0),
+            IMAGE_REL_I386_SECREL => field.secrel(data),
+            IMAGE_REL_I386_SECREL7 => field.secrel7(data),
+            IMAGE_REL_I386_SECTION => field.section_index(data),
+            _ => Err(unknown()),
+        },
+        Ok(Machine::Arm64) => match super::arm64::apply(&field, data, r_type, out) {
+            Some(result) => result,
+            None => Err(unknown()),
+        },
+        Err(_) => Err(unknown()),
     }
+}
+
+/// One relocated field: where it is and the value it refers to, with the
+/// computations every machine shares.
+#[derive(Clone, Copy)]
+pub(super) struct Field<'f, 'i, 'a> {
+    /// Symbol addresses.
+    pub addresses: &'f Addresses<'i, 'a>,
+    /// Where the field is.
+    pub site: Site,
+    /// The value of the relocation's symbol.
+    pub value: Value,
+}
+
+impl Field<'_, '_, '_> {
+    /// The value as an RVA, with an absolute symbol read as a number.
+    pub fn rva(self) -> u64 {
+        match self.value {
+            Value::Address { rva, .. } => u64::from(rva),
+            Value::Absolute(number) => number,
+        }
+    }
+
+    /// The virtual address the value names: the image base plus the RVA
+    /// for an address, the number itself for an absolute symbol.
+    pub fn address(self) -> u64 {
+        match self.value {
+            Value::Address { rva, .. } => self.addresses.image_base.wrapping_add(u64::from(rva)),
+            Value::Absolute(number) => number,
+        }
+    }
+
+    /// Records a base relocation of `kind` for the field, when it holds an
+    /// address rather than an absolute number.
+    fn rebase(self, kind: u16, out: &mut Applied) {
+        if matches!(self.value, Value::Address { .. }) {
+            out.base_relocs.push(BaseReloc {
+                rva: self.site.rva(),
+                kind,
+            });
+        }
+    }
+
+    /// `ADDR64`: a 64-bit virtual address.
+    pub fn addr64(self, data: &mut [u8], out: &mut Applied) -> Result<(), String> {
+        let slot = data
+            .get_mut(self.site.at()..)
+            .and_then(<[u8]>::first_chunk_mut::<8>)
+            .ok_or_else(past_the_end)?;
+        let addend = u64::from_le_bytes(*slot);
+        *slot = self.address().wrapping_add(addend).to_le_bytes();
+        self.rebase(IMAGE_REL_BASED_DIR64, out);
+        Ok(())
+    }
+
+    /// `ADDR32` / i386 `DIR32`: a 32-bit virtual address, rebased with
+    /// `HIGHLOW`.
+    pub fn addr32(self, data: &mut [u8], out: &mut Applied) -> Result<(), String> {
+        // The addend is signed: `movl table-4(,%eax,4)` stores -4.
+        let addend = i64::from(read32(data, self.site.at()).cast_signed());
+        let target = (self.address() as i64).wrapping_add(addend);
+        let truncated = u32::try_from(target)
+            .map_err(|_| format!("32-bit address relocation overflows: {target:#x}"))?;
+        store32(data, self.site.at(), truncated)?;
+        self.rebase(IMAGE_REL_BASED_HIGHLOW, out);
+        Ok(())
+    }
+
+    /// `ADDR32NB` / i386 `DIR32NB`: a 32-bit RVA.
+    pub fn addr32nb(self, data: &mut [u8]) -> Result<(), String> {
+        let addend = read32(data, self.site.at());
+        store32(
+            data,
+            self.site.at(),
+            (self.rva() as u32).wrapping_add(addend),
+        )
+    }
+
+    /// x86 `REL32`: a displacement from the end of the field, plus `extra`
+    /// bytes of immediate that follow it (`REL32_1` … `REL32_5`).
+    pub fn rel32(self, data: &mut [u8], extra: u32) -> Result<(), String> {
+        let addend = i64::from(read32(data, self.site.at()).cast_signed());
+        let pc = i64::from(self.site.rva())
+            .wrapping_add(4)
+            .wrapping_add(i64::from(extra));
+        let displacement = (self.rva() as i64).wrapping_add(addend).wrapping_sub(pc);
+        let truncated = i32::try_from(displacement)
+            .map_err(|_| format!("PC-relative relocation out of range: {displacement:#x}"))?;
+        store32(data, self.site.at(), truncated.cast_unsigned())
+    }
+
+    /// The value's offset in its output section, for `SECREL`.
+    pub fn section_offset(self) -> u32 {
+        section_offset(self.addresses, self.value).unwrap_or(0)
+    }
+
+    /// `SECREL`: a 32-bit offset in the output section.
+    pub fn secrel(self, data: &mut [u8]) -> Result<(), String> {
+        let addend = read32(data, self.site.at());
+        store32(
+            data,
+            self.site.at(),
+            self.section_offset().wrapping_add(addend),
+        )
+    }
+
+    /// `SECREL7`: the low seven bits of the section offset.
+    pub fn secrel7(self, data: &mut [u8]) -> Result<(), String> {
+        let byte = data.get_mut(self.site.at()).ok_or_else(past_the_end)?;
+        let truncated = u8::try_from(self.section_offset() & 0x7f).unwrap_or(0);
+        *byte = (*byte & 0x80) | truncated;
+        Ok(())
+    }
+
+    /// `SECTION`: the 1-based index of the output section, in 16 bits.
+    pub fn section_index(self, data: &mut [u8]) -> Result<(), String> {
+        let index = match self.value {
+            Value::Address { section, .. } if section != u32::MAX => {
+                u16::try_from(section.wrapping_add(1)).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let slot = data
+            .get_mut(self.site.at()..)
+            .and_then(<[u8]>::first_chunk_mut::<2>)
+            .ok_or_else(past_the_end)?;
+        *slot = index.to_le_bytes();
+        Ok(())
+    }
+}
+
+/// The message for a field that does not fit in its section.
+pub(super) fn past_the_end() -> String {
+    "relocation past the end of the section".to_string()
+}
+
+/// The little-endian word at `at`, or 0 past the end.
+pub(super) fn read32(data: &[u8], at: usize) -> u32 {
+    data.get(at..)
+        .and_then(<[u8]>::first_chunk::<4>)
+        .map_or(0, |bytes| u32::from_le_bytes(*bytes))
 }
 
 /// The offset of an address inside its output section.
@@ -525,11 +666,11 @@ fn section_offset(addresses: &Addresses<'_, '_>, value: Value) -> Option<u32> {
     rva.checked_sub(out.rva)
 }
 
-fn store32(data: &mut [u8], at: usize, value: u32) -> Result<(), String> {
+pub(super) fn store32(data: &mut [u8], at: usize, value: u32) -> Result<(), String> {
     let slot = data
         .get_mut(at..)
         .and_then(<[u8]>::first_chunk_mut::<4>)
-        .ok_or_else(|| "relocation past the end of the section".to_string())?;
+        .ok_or_else(past_the_end)?;
     *slot = value.to_le_bytes();
     Ok(())
 }

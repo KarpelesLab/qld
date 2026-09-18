@@ -221,16 +221,81 @@ fn section_size(tools: &Tools, dir: &Path, file: &str, name: &str) -> Option<u64
 
 /// Links `objects` with GNU ld and with qld, and returns the two outputs'
 /// names.
+///
+/// qld gets `--no-relax`: by default it relaxes ADRP pairs as lld does
+/// (see [`adrp_relaxations_match_lld`]), which GNU ld never does.
 fn link_both(tools: &Tools, dir: &Path, args: &[&str]) -> (String, String) {
     let gnu = "out.gnu".to_string();
     let ours = "out.qld".to_string();
     let mut gnu_args: Vec<&str> = vec!["-o", &gnu];
     gnu_args.extend_from_slice(args);
     run_ok(dir, &tools.ld, &gnu_args);
-    let mut our_args: Vec<&str> = vec!["-o", &ours];
+    let mut our_args: Vec<&str> = vec!["-o", &ours, "--no-relax"];
     our_args.extend_from_slice(args);
     qld_ok(dir, &our_args);
     (gnu, ours)
+}
+
+/// lld, the reference for what GNU ld does not implement: `QLD_TEST_LLD`,
+/// or `ld.lld` in `PATH`.
+fn lld() -> Option<PathBuf> {
+    match std::env::var_os("QLD_TEST_LLD") {
+        Some(path) if path.is_empty() => None,
+        Some(path) => Some(PathBuf::from(path)),
+        None => in_path("ld.lld"),
+    }
+}
+
+/// The instruction words (hex, as `objdump -d` prints them) of symbol
+/// `name`.
+fn words_of(text: &str, name: &str) -> Vec<String> {
+    let header = format!("<{name}>:");
+    text.lines()
+        .skip_while(|line| !line.ends_with(&header))
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split('\t').nth(1))
+        .map(|word| word.trim().to_string())
+        .collect()
+}
+
+/// The instructions of symbol `name`: mnemonics and registers, with every
+/// number and symbolic address replaced by `ADDR`.
+fn mnemonics_of(text: &str, name: &str) -> Vec<String> {
+    let header = format!("<{name}>:");
+    text.lines()
+        .skip_while(|line| !line.ends_with(&header))
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split('\t').skip(2);
+            let mnemonic = fields.next()?.trim();
+            let operands = fields.next().unwrap_or_default();
+            let operands = operands.split("//").next().unwrap_or_default();
+            let normalized: Vec<String> = operands
+                .split_whitespace()
+                .map(|token| {
+                    let bare = token.trim_start_matches('[');
+                    if bare.starts_with('#')
+                        || bare.starts_with('<')
+                        || bare.starts_with(|c: char| c.is_ascii_digit())
+                    {
+                        let close = if token.ends_with(']') { "]" } else { "" };
+                        let comma = if token.ends_with(',') { "," } else { "" };
+                        let open = if token.starts_with('[') { "[" } else { "" };
+                        format!("{open}ADDR{close}{comma}")
+                    } else {
+                        token.to_string()
+                    }
+                })
+                .collect();
+            Some(
+                format!("{mnemonic} {}", normalized.join(" "))
+                    .trim()
+                    .to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Every data and instruction relocation of the ABI that GNU `as` will
@@ -394,6 +459,63 @@ int main(void) { return read_local_qld() + read_other_qld(); }
     }
 }
 
+/// An undefined weak TLS variable, as static glibc 2.39's `setlocale.o`
+/// reaches `_nl_current_LC_*` (behind a check that it is linked in): its
+/// initial-exec and descriptor accesses relax to local-exec with the
+/// addend as the offset, as in lld, instead of failing as out of range.
+#[test]
+fn undefined_weak_tls_relaxes_to_zero() {
+    let tools = require!();
+    let dir = scratch("weak-tls");
+    let source = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	adrp	x1, :gottprel:weak_tls_qld
+	ldr	x1, [x1, :gottprel_lo12:weak_tls_qld]
+	adrp	x0, :tlsdesc:weak_tls_qld
+	ldr	x2, [x0, :tlsdesc_lo12:weak_tls_qld]
+	add	x0, x0, :tlsdesc_lo12:weak_tls_qld
+	.tlsdesccall weak_tls_qld
+	blr	x2
+	ret
+	.size _start, . - _start
+	.weak	weak_tls_qld
+	.hidden	weak_tls_qld
+	.type	weak_tls_qld, %tls_object
+	.section .tbss, "awT", %nobits
+	.balign	8
+defined_tls_qld:
+	.zero	8
+"#;
+    compile(&tools, &dir, "weak", source, &[]);
+    for extra in [&[][..], &["--fix-cortex-a53-843419"][..]] {
+        let mut args = vec!["-static", "-o", "out", "weak.o", "-e", "_start"];
+        args.extend_from_slice(extra);
+        qld_ok(&dir, &args);
+        let text = run_ok(&dir, &tools.objdump, &["-d", "out"]);
+        assert_eq!(
+            mnemonics_of(&text, "_start"),
+            [
+                "movz x1, ADDR, lsl ADDR",
+                "movk x1, ADDR",
+                "movz x0, ADDR, lsl ADDR",
+                "movk x0, ADDR",
+                "nop",
+                "nop",
+                "ret",
+            ],
+            "{text}"
+        );
+        assert_eq!(
+            words_of(&text, "_start")[..4],
+            ["d2a00001", "f2800001", "d2a00000", "f2800000"],
+            "the offsets are not zero:\n{text}"
+        );
+    }
+}
+
 /// A shared object: PLT, GOT and dynamic relocations, without libc.
 #[test]
 fn shared_object_plt_and_got_match_gnu_ld() {
@@ -489,6 +611,146 @@ int exported_qld(int n) { return imported_qld(n); }
         section_size(&tools, &dir, &gnu, ".plt"),
         "BTI .plt sizes differ"
     );
+    let dynamic = run_ok(&dir, &tools.readelf, &["-dW", &ours]);
+    assert!(dynamic.contains("AARCH64_BTI_PLT"), "{dynamic}");
+}
+
+/// The mnemonics of section `section` of `file`, in order.
+fn section_mnemonics(tools: &Tools, dir: &Path, file: &str, section: &str) -> Vec<String> {
+    let text = run_ok(dir, &tools.objdump, &["-d", "-j", section, file]);
+    text.lines()
+        .filter(|line| line.starts_with(' ') && line.contains(":\t"))
+        .filter_map(|line| line.split('\t').nth(2))
+        .map(|m| m.trim().to_string())
+        .collect()
+}
+
+/// An executable calling a shared library, built from `source` with
+/// `flags`, and the library.
+fn plt_executable(tools: &Tools, dir: &Path, flags: &[&str]) {
+    compile(
+        tools,
+        dir,
+        "imp",
+        "int imported_qld(int n) { return n; }\n",
+        &["-O2", "-fPIC"],
+    );
+    run_ok(dir, &tools.ld, &["-shared", "-o", "libimp.so", "imp.o"]);
+    let source = r#"
+extern int imported_qld(int);
+int main(void) { return imported_qld(1); }
+int (*address_qld(void))(int) { return imported_qld; }
+"#;
+    let mut all = vec!["-O2", "-fno-PIC"];
+    all.extend_from_slice(flags);
+    compile(tools, dir, "exe", source, &all);
+}
+
+/// BTI in an executable: GNU ld gives the entries a landing pad too (an
+/// entry can be a function's canonical address), 24 bytes each, and
+/// `DT_AARCH64_BTI_PLT`. `-z force-bti` does the same for unmarked inputs,
+/// with a warning for each, and marks the output.
+#[test]
+fn bti_plt_in_an_executable() {
+    let tools = require!();
+    for (name, flags, z) in [
+        ("marked", &["-mbranch-protection=bti"][..], &[][..]),
+        // Unmarked whatever the compiler's default branch protection.
+        (
+            "forced",
+            &["-mbranch-protection=none"][..],
+            &["-z", "force-bti"][..],
+        ),
+    ] {
+        let dir = scratch(&format!("bti-exe-{name}"));
+        plt_executable(&tools, &dir, flags);
+        let mut args = vec!["exe.o", "libimp.so", "-e", "main"];
+        args.extend_from_slice(z);
+        let gnu_err = run(&dir, &tools.ld, &[&["-o", "out.gnu"], &args[..]].concat());
+        let ours = qld(&dir, &[&["-o", "out.qld"], &args[..]].concat());
+        assert!(ours.status.success(), "{name}: qld failed");
+        let plt = section_mnemonics(&tools, &dir, "out.qld", ".plt");
+        assert_eq!(
+            plt,
+            section_mnemonics(&tools, &dir, "out.gnu", ".plt"),
+            "{name}: the PLT differs from GNU ld's"
+        );
+        assert_eq!(plt.iter().filter(|m| *m == "bti").count(), 2, "{plt:?}");
+        let dynamic = run_ok(&dir, &tools.readelf, &["-dW", "out.qld"]);
+        assert!(dynamic.contains("AARCH64_BTI_PLT"), "{name}: {dynamic}");
+        let notes = run_ok(&dir, &tools.readelf, &["-nW", "out.qld"]);
+        assert!(notes.contains("BTI"), "{name}: {notes}");
+        // qld words the warning as GNU ld 2.45 does; 2.42 (Ubuntu 24.04)
+        // says "BTI turned on by -z force-bti when all inputs do not have
+        // BTI in NOTE section".
+        let ours_warn = String::from_utf8_lossy(&ours.stderr)
+            .contains("BTI is required by -z force-bti, but this input object file lacks");
+        let gnu_warn = String::from_utf8_lossy(&gnu_err.stderr).contains("force-bti");
+        assert_eq!(ours_warn, gnu_warn, "{name}: warnings differ");
+        assert_eq!(ours_warn, name == "forced");
+    }
+}
+
+/// `-z pac-plt`: every entry authenticates with `autia1716` before its
+/// `br x17` (24 bytes), the header does not, and `DT_AARCH64_PAC_PLT` is
+/// set; with BTI the entry keeps its landing pad. The shapes are GNU ld's.
+#[test]
+fn pac_plt_authenticates_entries() {
+    let tools = require!();
+    for (name, flags) in [
+        ("plain", &[][..]),
+        ("bti", &["-mbranch-protection=bti"][..]),
+    ] {
+        let dir = scratch(&format!("pac-plt-{name}"));
+        plt_executable(&tools, &dir, flags);
+        let args = ["exe.o", "libimp.so", "-e", "main", "-z", "pac-plt"];
+        let (gnu, ours) = link_both(&tools, &dir, &args);
+        let plt = section_mnemonics(&tools, &dir, &ours, ".plt");
+        assert_eq!(
+            plt,
+            section_mnemonics(&tools, &dir, &gnu, ".plt"),
+            "{name}: the PLT differs from GNU ld's"
+        );
+        assert_eq!(
+            plt.iter().filter(|m| *m == "autia1716").count(),
+            1,
+            "{name}: {plt:?}"
+        );
+        let dynamic = run_ok(&dir, &tools.readelf, &["-dW", &ours]);
+        assert!(dynamic.contains("AARCH64_PAC_PLT"), "{name}: {dynamic}");
+        assert_same_code(&tools, &dir, &gnu, &ours);
+    }
+}
+
+/// A static executable's IFUNC stubs are PLT entries, so they get the BTI
+/// landing pad (and `-z pac-plt`) too.
+#[test]
+fn bti_ifunc_stubs_in_a_static_executable() {
+    let tools = require!();
+    let dir = scratch("bti-iplt");
+    let source = r#"
+static int impl_qld(void) { return 42; }
+static void *resolve_qld(void) { return (void *)impl_qld; }
+int ifunc_qld(void) __attribute__((ifunc("resolve_qld")));
+int main(void) { return ifunc_qld(); }
+int (*take_qld(void))(void) { return ifunc_qld; }
+"#;
+    compile(
+        &tools,
+        &dir,
+        "ifunc",
+        source,
+        &["-O2", "-mbranch-protection=standard"],
+    );
+    for z in [&[][..], &["-z", "pac-plt"][..]] {
+        let mut args = vec!["ifunc.o", "-static", "-e", "main"];
+        args.extend_from_slice(z);
+        let (gnu, ours) = link_both(&tools, &dir, &args);
+        let plt = section_mnemonics(&tools, &dir, &ours, ".plt");
+        assert_eq!(plt, section_mnemonics(&tools, &dir, &gnu, ".plt"), "{z:?}");
+        assert_eq!(plt.first().map(String::as_str), Some("bti"), "{plt:?}");
+        assert_same_code(&tools, &dir, &gnu, &ours);
+    }
 }
 
 /// `--gc-sections` keeps what is reachable from the entry point.
@@ -523,6 +785,194 @@ dead_function_qld:
         !symbols.contains("dead_function_qld"),
         "--gc-sections kept an unreachable function:\n{symbols}"
     );
+}
+
+/// ADRP pairs that lld relaxes, and ones it must leave alone.
+const ADRP_PAIRS: &str = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	adrp	x0, :got:var_qld
+	ldr	x0, [x0, :got_lo12:var_qld]
+	adrp	x1, var_qld
+	add	x1, x1, :lo12:var_qld
+	adrp	x2, :got:weak_qld
+	ldr	x2, [x2, :got_lo12:weak_qld]
+	adrp	x3, var_qld
+	add	x4, x3, :lo12:var_qld
+	adrp	x5, :got:var_qld
+	ldr	x6, [x5, :got_lo12:var_qld]
+	adrp	x7, far_qld
+	add	x7, x7, :lo12:far_qld
+	adrp	x8, :got:far_qld
+	ldr	x8, [x8, :got_lo12:far_qld]
+	adrp	x9, :got:near_qld
+	ldr	x9, [x9, :got_lo12:near_qld]
+	adrp	x10, :got:big_qld
+	ldr	x10, [x10, :got_lo12:big_qld]
+	adrp	x11, near_qld + 8
+	add	x11, x11, :lo12:near_qld + 8
+	ret
+	.size _start, . - _start
+
+	.data
+	.global var_qld
+var_qld:
+	.xword	1
+	.global near_qld
+near_qld:
+	.xword	2, 3
+	.bss
+	.space	0x200000
+	.global big_qld
+big_qld:
+	.xword	0
+	.weak weak_qld
+	.global far_qld
+	.set far_qld, 0x10000000
+"#;
+
+/// What lld 23 makes of [`ADRP_PAIRS`] in a static executable.
+const ADRP_PAIRS_RELAXED: [&str; 23] = [
+    // `var_qld` has one GOT access that cannot be relaxed (x5/x6), so none
+    // of its GOT accesses are.
+    "adrp x0, ADDR ADDR",
+    "ldr x0, [x0, ADDR]",
+    // ADRP+ADD within 1 MiB: `nop; adr`.
+    "nop",
+    "adr x1, ADDR ADDR",
+    // An undefined weak symbol keeps its GOT entry.
+    "adrp x2, ADDR ADDR",
+    "ldr x2, [x2, ADDR]",
+    // Two registers: not a pair.
+    "adrp x3, ADDR ADDR",
+    "add x4, x3, ADDR",
+    "adrp x5, ADDR ADDR",
+    "ldr x6, [x5, ADDR]",
+    // 256 MiB away: out of `adr` range.
+    "adrp x7, ADDR ADDR",
+    "add x7, x7, ADDR",
+    // GOT to ADRP+ADD, then not to ADR.
+    "adrp x8, ADDR ADDR",
+    "add x8, x8, ADDR",
+    // GOT to ADRP+ADD to ADR.
+    "nop",
+    "adr x9, ADDR ADDR",
+    // 2 MiB away: ADRP+ADD only.
+    "adrp x10, ADDR ADDR",
+    "add x10, x10, ADDR",
+    // An addend: lld leaves it.
+    "adrp x11, ADDR ADDR",
+    "add x11, x11, ADDR",
+    "ret",
+    "",
+    "",
+];
+
+/// `--relax` (the default) rewrites ADRP pairs as lld does; `--no-relax`
+/// leaves them as GNU ld does.
+#[test]
+fn adrp_relaxations_match_lld() {
+    let tools = require!();
+    let dir = scratch("adrp-relax");
+    compile(&tools, &dir, "pairs", ADRP_PAIRS, &[]);
+    qld_ok(&dir, &["-o", "relaxed", "pairs.o", "-e", "_start"]);
+    let text = run_ok(&dir, &tools.objdump, &["-d", "relaxed"]);
+    let ours = mnemonics_of(&text, "_start");
+    let expected: Vec<&str> = ADRP_PAIRS_RELAXED
+        .iter()
+        .copied()
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(ours, expected, "\n{text}");
+    // Every relaxed sequence still computes the address it did.
+    let symbols = run_ok(&dir, &tools.readelf, &["-sW", "relaxed"]);
+    let address_of = |name: &str| {
+        symbols
+            .lines()
+            .find(|l| l.ends_with(&format!(" {name}")))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| u64::from_str_radix(v, 16).ok())
+            .unwrap()
+    };
+    let near = format!("{:x} <near_qld>", address_of("near_qld"));
+    assert!(text.contains(&format!("adr\tx9, {near}")), "{text}");
+    // `--no-relax`: GNU ld's code.
+    let (gnu, ours) = link_both(&tools, &dir, &["pairs.o", "-e", "_start"]);
+    assert_same_code(&tools, &dir, &gnu, &ours);
+    let plain = run_ok(&dir, &tools.objdump, &["-d", &ours]);
+    assert!(!words_of(&plain, "_start").contains(&"d503201f".to_string()));
+    // And lld itself, when it is installed.
+    let Some(lld) = lld() else {
+        println!("SKIPPED: lld comparison (no ld.lld)");
+        return;
+    };
+    run_ok(&dir, &lld, &["-o", "lld", "pairs.o", "-e", "_start"]);
+    let lld_text = run_ok(&dir, &tools.objdump, &["-d", "lld"]);
+    assert_eq!(mnemonics_of(&lld_text, "_start"), expected, "\n{lld_text}");
+}
+
+/// In a PIE, an absolute symbol's GOT entry is not relaxed (ADRP+ADD
+/// would make its address PC-relative), but everything else is.
+#[test]
+fn adrp_relaxations_in_a_pie() {
+    let tools = require!();
+    let dir = scratch("adrp-relax-pie");
+    let source = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	adrp	x0, :got:abs_qld
+	ldr	x0, [x0, :got_lo12:abs_qld]
+	adrp	x1, :got:local_qld
+	ldr	x1, [x1, :got_lo12:local_qld]
+	adrp	x2, :got:hidden_qld
+	ldr	x2, [x2, :got_lo12:hidden_qld]
+	ret
+	.data
+local_qld:
+	.xword	1
+	.global hidden_qld
+	.hidden hidden_qld
+hidden_qld:
+	.xword	2
+	.global abs_qld
+	.set abs_qld, 0x1234
+"#;
+    compile(&tools, &dir, "pie", source, &[]);
+    for (output, flags) in [("pie", &["-pie"][..]), ("so", &["-shared"][..])] {
+        let mut args = vec!["-o", output, "pie.o", "-e", "_start"];
+        args.extend_from_slice(flags);
+        qld_ok(&dir, &args);
+        let text = run_ok(&dir, &tools.objdump, &["-d", output]);
+        assert_eq!(
+            mnemonics_of(&text, "_start"),
+            [
+                "adrp x0, ADDR ADDR",
+                "ldr x0, [x0, ADDR]",
+                "nop",
+                "adr x1, ADDR ADDR",
+                "nop",
+                "adr x2, ADDR ADDR",
+                "ret",
+            ],
+            "{output}:\n{text}"
+        );
+        if let Some(lld) = lld() {
+            let lld_out = format!("{output}.lld");
+            let mut args = vec!["-o", &lld_out, "pie.o", "-e", "_start"];
+            args.extend_from_slice(flags);
+            run_ok(&dir, &lld, &args);
+            let lld_text = run_ok(&dir, &tools.objdump, &["-d", &lld_out]);
+            assert_eq!(
+                mnemonics_of(&lld_text, "_start"),
+                mnemonics_of(&text, "_start"),
+                "lld differs for {output}"
+            );
+        }
+    }
 }
 
 /// `-r` keeps the machine and the relocations.
@@ -574,27 +1024,249 @@ fn emulation_selects_the_backend() {
     );
 }
 
-/// The Cortex-A53 erratum workaround is not implemented, and says so.
+/// The instruction words of `file` (`objdump -d`), by address.
+fn words_by_address(tools: &Tools, dir: &Path, file: &str) -> BTreeMap<u64, u32> {
+    let text = run_ok(dir, &tools.objdump, &["-d", file]);
+    text.lines()
+        .filter_map(|line| {
+            let (address, rest) = line.trim_start().split_once(":\t")?;
+            let address = u64::from_str_radix(address, 16).ok()?;
+            let word = u32::from_str_radix(rest.split('\t').next()?.trim(), 16).ok()?;
+            Some((address, word))
+        })
+        .collect()
+}
+
+/// The address of symbol `name` in `file`.
+fn symbol_address(tools: &Tools, dir: &Path, file: &str, name: &str) -> u64 {
+    let symbols = run_ok(dir, &tools.readelf, &["-sW", file]);
+    symbols
+        .lines()
+        .find(|l| l.ends_with(&format!(" {name}")))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| u64::from_str_radix(v, 16).ok())
+        .unwrap_or_else(|| panic!("no {name} in {file}"))
+}
+
+fn is_b(word: u32) -> bool {
+    word >> 26 == 0b00_0101
+}
+
+fn b_target(at: u64, word: u32) -> u64 {
+    let offset = i64::from(((word & 0x03ff_ffff) << 6).cast_signed() >> 6) * 4;
+    at.wrapping_add_signed(offset)
+}
+
+/// The offsets from `_start` of the instructions of `object`'s `.text` that
+/// `linked` replaced with a branch to an erratum patch.
+fn patched_sites(tools: &Tools, dir: &Path, object: &str, linked: &str) -> Vec<u64> {
+    let original = words_by_address(tools, dir, object);
+    let words = words_by_address(tools, dir, linked);
+    let start = symbol_address(tools, dir, linked, "_start");
+    original
+        .iter()
+        .filter(|&(&offset, &word)| {
+            !is_b(word) && words.get(&(start + offset)).is_some_and(|&w| is_b(w))
+        })
+        .map(|(&offset, _)| offset)
+        .collect()
+}
+
+/// Checks that every patch of `linked` holds the instruction it replaced
+/// (only a relocated immediate may differ) and branches back after it.
+fn assert_patches_return(tools: &Tools, dir: &Path, object: &str, linked: &str, sites: &[u64]) {
+    let original = words_by_address(tools, dir, object);
+    let words = words_by_address(tools, dir, linked);
+    let start = symbol_address(tools, dir, linked, "_start");
+    for &offset in sites {
+        let site = start + offset;
+        let patch = b_target(site, words[&site]);
+        let moved = words[&patch];
+        let imm12 = 0xfff << 10;
+        assert_eq!(
+            moved & !imm12,
+            original[&offset] & !imm12,
+            "patch at {patch:#x}"
+        );
+        let back = words[&(patch + 4)];
+        assert!(is_b(back), "patch at {patch:#x} does not end in a branch");
+        assert_eq!(b_target(patch + 4, back), site + 4, "patch at {patch:#x}");
+    }
+}
+
+/// Code whose `adrp` lands at page offsets `0xff8`/`0xffc`: every page of
+/// `.text` (aligned to 4 KiB) ends with one candidate sequence.
+fn page_end_sequences(sequences: &[(u32, &[&str])]) -> String {
+    let mut source = String::from(
+        "\t.text\n\t.global _start\n\t.type _start, %function\n_start:\n\tret\n\t.balign 4096\n",
+    );
+    for (page_offset, body) in sequences {
+        source.push_str(&format!("\t.rept {}\n\tnop\n\t.endr\n", page_offset / 4));
+        for line in *body {
+            source.push_str(&format!("\t{line}\n"));
+        }
+        source.push_str("1:\n\t.balign 4096\n");
+    }
+    source.push_str("\t.section .rodata\n\t.balign 8\ntarget_qld:\n\t.xword 0\n");
+    source
+}
+
+/// `--fix-cortex-a53-843419` patches the sequences lld patches, and only
+/// those; the patch runs the moved instruction and returns.
 #[test]
-fn cortex_a53_erratum_is_reported_as_unimplemented() {
+fn cortex_a53_843419_matches_lld() {
     let tools = require!();
-    let dir = scratch("cortex-a53");
+    let dir = scratch("cortex-a53-843419");
+    let sequences: [(u32, &[&str]); 8] = [
+        // Three instructions from 0xff8: patched.
+        (
+            0xff8,
+            &["adrp x0, target_qld", "ldr x1, [x2]", "ldr x3, [x0, #8]"],
+        ),
+        // Four from 0xffc, with a relocated last access: patched.
+        (
+            0xffc,
+            &[
+                "adrp x0, target_qld",
+                "stp x1, x2, [sp]",
+                "add x5, x6, x7",
+                "str w3, [x0, :lo12:target_qld]",
+            ],
+        ),
+        // The second instruction writes the `adrp` register: safe.
+        (
+            0xff8,
+            &["adrp x0, target_qld", "ldr x0, [x2]", "ldr x3, [x0]"],
+        ),
+        // A branch in third place ends the sequence.
+        (
+            0xff8,
+            &[
+                "adrp x0, target_qld",
+                "str x1, [x2]",
+                "b 1f",
+                "ldr x3, [x0]",
+            ],
+        ),
+        // Not at the end of a page.
+        (
+            0xff0,
+            &["adrp x0, target_qld", "str x1, [x2]", "ldr x3, [x0]"],
+        ),
+        // Another base register.
+        (
+            0xffc,
+            &["adrp x0, target_qld", "str x1, [x2]", "ldr x3, [x1]"],
+        ),
+        // Store exclusive, then a vector load: patched.
+        (
+            0xffc,
+            &[
+                "adrp x4, target_qld",
+                "stxr w5, x1, [x2]",
+                "ldr q3, [x4, #16]",
+            ],
+        ),
+        // Writeback of the base register: safe.
+        (
+            0xff8,
+            &["adrp x0, target_qld", "ldr x1, [x0, #8]!", "ldr x3, [x0]"],
+        ),
+    ];
+    compile(&tools, &dir, "seq", &page_end_sequences(&sequences), &[]);
+    let args = ["--fix-cortex-a53-843419", "seq.o", "-e", "_start"];
+    qld_ok(&dir, &[&["-o", "fixed"][..], &args[..]].concat());
+    let sites = patched_sites(&tools, &dir, "seq.o", "fixed");
+    // The first, second and seventh sequences. A sequence that runs past
+    // its page takes two pages: they start on pages 1, 3 and 12 (the page
+    // of `_start` is page 0).
+    assert_eq!(
+        sites,
+        [0x1000 + 0xff8 + 8, 0x3000 + 0xffc + 12, 0xc000 + 0xffc + 8]
+    );
+    assert_patches_return(&tools, &dir, "seq.o", "fixed", &sites);
+    // The relocated `str` in the patch stores to `target_qld`.
+    let words = words_by_address(&tools, &dir, "fixed");
+    let start = symbol_address(&tools, &dir, "fixed", "_start");
+    let site = start + sites[1];
+    let moved = words[&b_target(site, words[&site])];
+    let target = symbol_address(&tools, &dir, "fixed", "target_qld");
+    assert_eq!(u64::from((moved >> 10) & 0xfff), (target & 0xfff) >> 2);
+    // Without the option, nothing moves.
+    qld_ok(&dir, &[&["-o", "plain"][..], &args[1..]].concat());
+    assert!(patched_sites(&tools, &dir, "seq.o", "plain").is_empty());
+    if let Some(lld) = lld() {
+        run_ok(&dir, &lld, &[&["-o", "lld"][..], &args[..]].concat());
+        assert_eq!(patched_sites(&tools, &dir, "seq.o", "lld"), sites);
+    }
+}
+
+/// `--fix-cortex-a53-835769` patches the multiply-accumulates GNU ld
+/// patches: those right after a memory access they do not depend on.
+#[test]
+fn cortex_a53_835769_matches_gnu_ld() {
+    let tools = require!();
+    let dir = scratch("cortex-a53-835769");
+    let source = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	ldr	x1, [x2]
+	madd	x3, x4, x5, x6
+	ldr	x1, [x2]
+	madd	x3, x1, x5, x6
+	str	x1, [x2]
+	msub	x3, x1, x5, x6
+	ldp	x1, x7, [x2]
+	smaddl	x3, w4, w7, x6
+	ldr	q1, [x2]
+	umsubl	x3, w1, w5, x6
+	ldr	x1, [x2]
+	mul	x3, x4, x5
+	ldr	x1, [x2]
+	madd	w3, w4, w5, w6
+	add	x1, x2, x3
+	madd	x3, x4, x5, x6
+	ldr	x1, [x2], #8
+	madd	x3, x4, x5, x1
+	ret
+	.4byte	0xf9400041
+	.4byte	0x9b041c23
+"#;
+    compile(&tools, &dir, "mac", source, &[]);
+    let args = ["--fix-cortex-a53-835769", "mac.o", "-e", "_start"];
+    let (gnu, ours) = link_both(&tools, &dir, &args);
+    let sites = patched_sites(&tools, &dir, "mac.o", &ours);
+    // The independent `madd`, the one after a store, the vector load's.
+    assert_eq!(sites, [0x4, 0x14, 0x24]);
+    assert_eq!(patched_sites(&tools, &dir, "mac.o", &gnu), sites);
+    assert_patches_return(&tools, &dir, "mac.o", &ours, &sites);
+}
+
+/// A linker script layout has no pool for erratum patches, and says so.
+#[test]
+fn cortex_a53_fix_with_a_script_is_unimplemented() {
+    let tools = require!();
+    let dir = scratch("cortex-a53-script");
     compile(&tools, &dir, "relocs", RELOCATIONS, &[]);
-    let output = qld(
-        &dir,
-        &[
-            "--fix-cortex-a53-843419",
-            "-o",
-            "out",
-            "relocs.o",
-            "-e",
-            "_start",
-        ],
-    );
-    let message = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "the option was silently ignored");
-    assert!(
-        message.contains("843419") && message.contains("not implemented"),
-        "unclear message: {message}"
-    );
+    fs::write(
+        dir.join("link.ld"),
+        "SECTIONS { . = 0x10000; .text : { *(.text) } .data : { *(.data) } }\n",
+    )
+    .unwrap();
+    for option in ["--fix-cortex-a53-843419", "--fix-cortex-a53-835769"] {
+        let output = qld(
+            &dir,
+            &[
+                option, "-T", "link.ld", "-o", "out", "relocs.o", "-e", "_start",
+            ],
+        );
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{option} was silently ignored");
+        assert!(
+            message.contains("linker script") && message.contains("not implemented"),
+            "unclear message: {message}"
+        );
+    }
 }

@@ -1,0 +1,20 @@
+# M4: range-extension thunks on PowerPC64 LE. The `bl`/`b` destinations are
+# 256 MiB away, past the 32 MiB a direct branch reaches, so the link only
+# succeeds if the linker inserts thunks. The far branches are guarded by a
+# zero byte in `.data`, so the program runs to its `write` and `exit`
+# without taking them.
+description = "PowerPC64 LE range-extension thunks for out-of-range branches"
+compile = ["cc -c far.s"]
+link = "-static -e _start -o out far.o"
+run = "./out"
+expect.stdout = "thunks work\n"
+expect.exit = 7
+expect.readelf = [
+  "PowerPC64",
+  "EXEC (Executable file)",
+  "!INTERP",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]

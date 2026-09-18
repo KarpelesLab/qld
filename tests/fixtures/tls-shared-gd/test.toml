@@ -19,7 +19,7 @@ main: 12 12
 expect.readelf = ["Shared library: [libtls.so]", "TLS "]
 expect.readelf_files."libtls.so" = [
   "Library soname: [libtls.so]",
-  "R_X86_64_DTPMOD64",
   "TLS ",
-  "!R_X86_64_TPOFF64",
 ]
+expect.readelf_arch.x86_64."libtls.so" = ["R_X86_64_DTPMOD64", "!R_X86_64_TPOFF64"]
+expect.readelf_arch.aarch64."libtls.so" = ["R_AARCH64_TLSDESC", "!R_AARCH64_TLS_TPREL64"]

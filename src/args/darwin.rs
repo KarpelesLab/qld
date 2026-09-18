@@ -210,8 +210,10 @@ pub struct DarwinArgs {
     pub function_starts: bool,
     /// `-data_in_code_info` (default) / `-no_data_in_code_info`.
     pub data_in_code: bool,
-    /// `-lto_library`: recorded; Mach-O LTO is not implemented.
+    /// `-lto_library`: the libLTO for bitcode inputs.
     pub lto_library: Option<PathBuf>,
+    /// The other LTO options.
+    pub lto: DarwinLto,
     /// `-bundle_loader`: the executable a bundle is loaded into.
     pub bundle_loader: Option<PathBuf>,
     /// `-v` given together with a link: print the version first.
@@ -220,8 +222,18 @@ pub struct DarwinArgs {
     /// externs instead of becoming local symbols.
     pub keep_private_externs: bool,
     /// `-flat_namespace` (`true`) / `-twolevel_namespace` (`false`, the
-    /// default).
+    /// default). `-force_flat_namespace` sets it too.
     pub flat_namespace: bool,
+    /// `-force_flat_namespace`: an executable that makes dyld bind every
+    /// image it loads with flat lookup (`MH_FORCE_FLAT`).
+    pub force_flat_namespace: bool,
+    /// `-objc_relative_method_lists` (`Some(true)`) /
+    /// `-no_objc_relative_method_lists` (`Some(false)`). `None` chooses from
+    /// the deployment target.
+    pub objc_relative_method_lists: Option<bool>,
+    /// `-objc_category_merging` (`-no_objc_category_merging` turns it off
+    /// again).
+    pub objc_category_merging: bool,
 }
 
 impl Default for DarwinArgs {
@@ -264,12 +276,44 @@ impl Default for DarwinArgs {
             function_starts: true,
             data_in_code: true,
             lto_library: None,
+            lto: DarwinLto::default(),
             bundle_loader: None,
             print_version: false,
             keep_private_externs: false,
             flat_namespace: false,
+            force_flat_namespace: false,
+            objc_relative_method_lists: None,
+            objc_category_merging: false,
         }
     }
+}
+
+/// The LTO options of an ld64 command line, used when inputs are bitcode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DarwinLto {
+    /// `-object_path_lto`: where to keep the objects LTO produces (a file
+    /// for full LTO, a directory for ThinLTO), so the debug map can refer
+    /// to them.
+    pub object_path: Option<PathBuf>,
+    /// `-cache_path_lto`: the ThinLTO cache directory.
+    pub cache_path: Option<PathBuf>,
+    /// `-prune_interval_lto`: seconds between cache prunings (negative:
+    /// never).
+    pub prune_interval: Option<i32>,
+    /// `-prune_after_lto`: seconds after which a cache entry expires.
+    pub prune_after: Option<u32>,
+    /// `-max_relative_cache_size_lto`: cache size limit, in percent of the
+    /// free space.
+    pub max_relative_cache_size: Option<u32>,
+    /// `-mllvm` options, in order.
+    pub mllvm: Vec<String>,
+    /// `-mcpu`: the CPU to generate code for.
+    pub mcpu: Option<String>,
+    /// `-export_dynamic`: LTO keeps every global symbol of an executable.
+    pub export_dynamic: bool,
+    /// `-flto-codegen-only`: generate code from the bitcode without
+    /// optimizing it.
+    pub codegen_only: bool,
 }
 
 /// How an ld64 option takes its value.
@@ -339,6 +383,15 @@ enum Act {
     NoExported,
     OrderFile,
     LtoLibrary,
+    LtoObjectPath,
+    LtoCachePath,
+    LtoPruneInterval,
+    LtoPruneAfter,
+    LtoMaxCacheSize,
+    Mllvm,
+    Mcpu,
+    ExportDynamic,
+    LtoCodegenOnly,
     Demangle,
     AdhocCodesign(bool),
     Headerpad,
@@ -354,6 +407,10 @@ enum Act {
     StackSize,
     Sectcreate,
     Alias,
+    AliasList,
+    RelativeMethodLists(bool),
+    CategoryMerging(bool),
+    ForceFlat,
     Init,
     DeadStrippableDylib,
     OsoPrefix,
@@ -839,7 +896,12 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
         Act::Namespace(true),
         "Flat namespace: imports are looked up by name in every image",
     ),
-    unsupported("force_flat_namespace", Flag, "flat namespace output"),
+    opt(
+        "force_flat_namespace",
+        Flag,
+        Act::ForceFlat,
+        "Flat namespace for this executable and every image it loads",
+    ),
     ignored("multiply_defined", V1),
     ignored("multiply_defined_unused", V1),
     ignored("weak_reference_mismatches", V1),
@@ -851,7 +913,12 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
         Act::KeepPrivateExterns,
         "With -r, keep private externs instead of making them local",
     ),
-    unsupported("alias_list", V1, "-alias_list"),
+    opt(
+        "alias_list",
+        V1,
+        Act::AliasList,
+        "Define aliases listed in a file (symbol alias, one per line)",
+    ),
     unsupported("interposable", Flag, "interposable symbols"),
     unsupported("interposable_list", V1, "interposable symbols"),
     unsupported("reexported_symbols_list", V1, "-reexported_symbols_list"),
@@ -911,8 +978,30 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     ignored("deduplicate", Flag),
     ignored("bind_at_load", Flag),
     ignored("no_implicit_dylibs", Flag),
-    ignored("no_objc_category_merging", Flag),
-    ignored("objc_category_merging", Flag),
+    opt(
+        "objc_category_merging",
+        Flag,
+        Act::CategoryMerging(true),
+        "Merge Objective-C categories into their classes",
+    ),
+    opt(
+        "no_objc_category_merging",
+        Flag,
+        Act::CategoryMerging(false),
+        "Do not merge Objective-C categories (the default)",
+    ),
+    opt(
+        "objc_relative_method_lists",
+        Flag,
+        Act::RelativeMethodLists(true),
+        "Objective-C method lists with 32-bit offsets",
+    ),
+    opt(
+        "no_objc_relative_method_lists",
+        Flag,
+        Act::RelativeMethodLists(false),
+        "Objective-C method lists with pointers",
+    ),
     ignored("objc_abi_version", V1),
     ignored("ld_classic", Flag),
     // Obsolete options ld64 accepts and ignores.
@@ -935,23 +1024,62 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     ignored("no_weak_imports", Flag),
     ignored("dylib_file", V1),
     ignored("thread_count", V1),
-    // LTO: Mach-O LTO is not implemented, so these only matter for bitcode
-    // inputs, which the driver rejects by name.
+    // LTO: used when inputs are bitcode (see `macho::lto`).
     opt(
         "lto_library",
         V1,
         Act::LtoLibrary,
         "libLTO to use for bitcode inputs",
     ),
-    ignored("object_path_lto", V1),
-    ignored("cache_path_lto", V1),
-    ignored("prune_interval_lto", V1),
-    ignored("prune_after_lto", V1),
-    ignored("max_relative_cache_size_lto", V1),
-    ignored("mllvm", V1),
-    ignored("mcpu", V1),
-    ignored("export_dynamic", Flag),
-    ignored("flto-codegen-only", Flag),
+    opt(
+        "object_path_lto",
+        V1,
+        Act::LtoObjectPath,
+        "Keep the LTO object (ThinLTO: objects) at this path",
+    ),
+    opt(
+        "cache_path_lto",
+        V1,
+        Act::LtoCachePath,
+        "ThinLTO cache directory",
+    ),
+    opt(
+        "prune_interval_lto",
+        V1,
+        Act::LtoPruneInterval,
+        "Seconds between ThinLTO cache prunings",
+    ),
+    opt(
+        "prune_after_lto",
+        V1,
+        Act::LtoPruneAfter,
+        "Seconds after which ThinLTO cache entries expire",
+    ),
+    opt(
+        "max_relative_cache_size_lto",
+        V1,
+        Act::LtoMaxCacheSize,
+        "ThinLTO cache size limit, in percent of free space",
+    ),
+    opt(
+        "mllvm",
+        V1,
+        Act::Mllvm,
+        "Pass an option to LLVM's code generator",
+    ),
+    opt("mcpu", V1, Act::Mcpu, "CPU for LTO code generation"),
+    opt(
+        "export_dynamic",
+        Flag,
+        Act::ExportDynamic,
+        "Keep all global symbols of an executable during LTO",
+    ),
+    opt(
+        "flto-codegen-only",
+        Flag,
+        Act::LtoCodegenOnly,
+        "Generate code from bitcode without optimizing it",
+    ),
     // Rejected.
     unsupported("bitcode_bundle", Flag, "bitcode bundles"),
     unsupported("sectalign", V3, "-sectalign"),
@@ -1219,6 +1347,11 @@ fn parse_number(option: &str, text: &str) -> Result<u64> {
     parsed.ok_or_else(|| Error::Option(format!("-{option}: malformed number: {text}")))
 }
 
+fn parse_decimal<T: std::str::FromStr>(option: &str, text: &str) -> Result<T> {
+    text.parse()
+        .map_err(|_| Error::Option(format!("-{option}: malformed number: {text}")))
+}
+
 /// Parses an ld64 platform name or number.
 fn parse_platform(text: &str) -> Option<u32> {
     let named = match text {
@@ -1347,6 +1480,19 @@ impl Parser<'_> {
             Act::NoExported => darwin.no_exported_symbols = true,
             Act::OrderFile => darwin.order_file = Some(PathBuf::from(first)),
             Act::LtoLibrary => darwin.lto_library = Some(PathBuf::from(first)),
+            Act::LtoObjectPath => darwin.lto.object_path = Some(PathBuf::from(first)),
+            Act::LtoCachePath => darwin.lto.cache_path = Some(PathBuf::from(first)),
+            Act::LtoPruneInterval => {
+                darwin.lto.prune_interval = Some(parse_decimal(name, first)?);
+            }
+            Act::LtoPruneAfter => darwin.lto.prune_after = Some(parse_decimal(name, first)?),
+            Act::LtoMaxCacheSize => {
+                darwin.lto.max_relative_cache_size = Some(parse_decimal(name, first)?);
+            }
+            Act::Mllvm => darwin.lto.mllvm.push(first.to_owned()),
+            Act::Mcpu => darwin.lto.mcpu = Some(first.to_owned()),
+            Act::ExportDynamic => darwin.lto.export_dynamic = true,
+            Act::LtoCodegenOnly => darwin.lto.codegen_only = true,
             Act::Demangle => self.options.demangle = false,
             Act::AdhocCodesign(sign) => darwin.adhoc_codesign = Some(sign),
             Act::Headerpad => darwin.headerpad = Some(parse_number(name, first)?),
@@ -1376,7 +1522,17 @@ impl Parser<'_> {
                 .push((first.to_owned(), values.get(1).cloned().unwrap_or_default())),
             Act::Init => self.options.init = Some(first.to_owned()),
             Act::KeepPrivateExterns => darwin.keep_private_externs = true,
-            Act::Namespace(flat) => darwin.flat_namespace = flat,
+            Act::Namespace(flat) => {
+                darwin.flat_namespace = flat;
+                darwin.force_flat_namespace = false;
+            }
+            Act::ForceFlat => {
+                darwin.flat_namespace = true;
+                darwin.force_flat_namespace = true;
+            }
+            Act::AliasList => self.alias_list(first)?,
+            Act::RelativeMethodLists(on) => darwin.objc_relative_method_lists = Some(on),
+            Act::CategoryMerging(on) => darwin.objc_category_merging = on,
             Act::DeadStrippableDylib => darwin.mark_dead_strippable_dylib = true,
             Act::OsoPrefix => darwin.oso_prefix = Some(PathBuf::from(first)),
             Act::FunctionStarts(on) => darwin.function_starts = on,
@@ -1385,6 +1541,38 @@ impl Parser<'_> {
             Act::FatalWarnings => self.options.fatal_warnings = true,
             Act::BundleLoader => darwin.bundle_loader = Some(PathBuf::from(first)),
             Act::Trace => self.options.trace = true,
+        }
+        Ok(())
+    }
+
+    /// `-alias_list file`: one `symbol alias` pair per line, separated by
+    /// white space; `#` starts a comment.
+    fn alias_list(&mut self, file: &str) -> Result<()> {
+        let contents = self
+            .reader
+            .read_file(std::path::Path::new(file))
+            .map_err(|error| Error::io(file, error))?;
+        for (number, line) in contents.split(|&b| b == b'\n').enumerate() {
+            let line = match line.iter().position(|&b| b == b'#') {
+                Some(hash) => line.get(..hash).unwrap_or(&[]),
+                None => line,
+            };
+            let mut words = line
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|w| !w.is_empty());
+            let Some(symbol) = words.next() else {
+                continue;
+            };
+            let (Some(alias), None) = (words.next(), words.next()) else {
+                return Err(Error::Option(format!(
+                    "-alias_list {file}:{}: expected `symbol alias`",
+                    number.saturating_add(1)
+                )));
+            };
+            self.options.darwin.aliases.push((
+                String::from_utf8_lossy(symbol).into_owned(),
+                String::from_utf8_lossy(alias).into_owned(),
+            ));
         }
         Ok(())
     }
@@ -1431,6 +1619,13 @@ impl Parser<'_> {
                         .into(),
                 ));
             }
+        }
+        if options.darwin.force_flat_namespace
+            && options.darwin.output_type != MachOutputType::Execute
+        {
+            return Err(Error::Option(
+                "-force_flat_namespace can only be used with main executables".into(),
+            ));
         }
         if options.darwin.bundle_loader.is_some()
             && options.darwin.output_type != MachOutputType::Bundle
@@ -1500,7 +1695,10 @@ mod tests {
     #[test]
     fn every_table_entry_parses_or_is_rejected_by_name() {
         for option in DARWIN_OPTIONS {
-            if matches!(option.action, Act::Help | Act::Version | Act::Filelist) {
+            if matches!(
+                option.action,
+                Act::Help | Act::Version | Act::Filelist | Act::AliasList
+            ) {
                 continue;
             }
             let value = match option.action {
@@ -1512,6 +1710,7 @@ mod tests {
                 | Act::CurrentVersion
                 | Act::CompatibilityVersion => "1.2",
                 Act::Headerpad | Act::ImageBase | Act::PagezeroSize | Act::StackSize => "0x1000",
+                Act::LtoPruneInterval | Act::LtoPruneAfter | Act::LtoMaxCacheSize => "10",
                 _ => "x",
             };
             let mut args = vec![format!("-{}", option.name)];
@@ -1603,6 +1802,7 @@ mod tests {
             DarwinInputKind::Library("System".into())
         );
         assert!(darwin.lto_library.is_some());
+        assert_eq!(darwin.lto.mllvm, ["-enable-linkonceodr-outlining"]);
     }
 
     #[test]
@@ -1698,6 +1898,45 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(darwin_usage().contains("-platform_version"));
+    }
+
+    #[test]
+    fn alias_list_and_force_flat_namespace() {
+        struct List;
+        impl FileReader for List {
+            fn read_file(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                Ok(b"# aliases\n_foo _bar\n\n  _baz\t_qux # trailing\n".to_vec())
+            }
+        }
+        let args: Vec<&OsStr> = ["-alias_list", "aliases.txt", "a.o"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        let Ok(ParseOutcome::Link(options)) = parse(&args, &List) else {
+            panic!("-alias_list did not parse");
+        };
+        assert_eq!(
+            options.darwin.aliases,
+            [
+                ("_foo".to_owned(), "_bar".to_owned()),
+                ("_baz".to_owned(), "_qux".to_owned())
+            ]
+        );
+
+        struct Bad;
+        impl FileReader for Bad {
+            fn read_file(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                Ok(b"_foo _bar\n_one\n".to_vec())
+            }
+        }
+        let error = parse(&args, &Bad).unwrap_err().to_string();
+        assert!(error.contains("aliases.txt:2"), "{error}");
+
+        let options = parse_ok(&["-force_flat_namespace", "a.o"]);
+        assert!(options.darwin.flat_namespace && options.darwin.force_flat_namespace);
+        let options = parse_ok(&["-force_flat_namespace", "-twolevel_namespace", "a.o"]);
+        assert!(!options.darwin.flat_namespace && !options.darwin.force_flat_namespace);
+        assert!(parse_err(&["-force_flat_namespace", "-dylib", "a.o"]).contains("executables"));
     }
 
     #[test]

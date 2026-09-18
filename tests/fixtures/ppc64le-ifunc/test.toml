@@ -1,0 +1,16 @@
+# M4: an IFUNC in a static PowerPC64 LE executable. Calls go through a stub
+# that saves r2 and jumps through a slot an IRELATIVE relocation fills at
+# startup; the function pointer is the stub's address, so both agree.
+description = "IFUNC resolved at startup in a static executable, for PowerPC64 LE"
+compile = ["cc -O2 -c ifunc.c"]
+driver = "cc"
+link = "-static -o out ifunc.o"
+run = "./out"
+expect.stdout = "pick 2 2 same\n"
+expect.readelf = [
+  "PowerPC64",
+  "R_PPC64_IRELATIVE",
+  "!R_PPC64_JMP_SLOT",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true

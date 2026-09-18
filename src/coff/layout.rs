@@ -15,6 +15,7 @@
 //! | `.tls` | `.tls$AAA`, `.tls`, `.tls$*`, `.tls$ZZZ` |
 //! | `.rsrc` | `.rsrc`, `.rsrc$*` |
 //! | `.reloc` | the base relocations |
+//! | `.stab`, `.debug_*` | after `.reloc`, in the script's order |
 //!
 //! Sections with a `$` in their name are *grouped sections*: the output name
 //! is the part before the `$`, and the contributions are ordered by the whole
@@ -24,12 +25,22 @@
 //!
 //! Anything a rule does not match is an orphan: it gets an output section
 //! named after the part before its `$`, placed after the known sections.
+//!
+//! `i386pe`'s script differs in three places, which the recipe follows for
+//! PE32 images: the constructor lists start and end with 4-byte rather than
+//! 8-byte words, and `.text`, `.rdata` and `.idata` have no 8-byte
+//! alignments. The i386 SafeSEH table goes at the end of `.rdata`, and an
+//! ARM64 input section may be followed by its range-extension thunks.
 
 #![deny(clippy::arithmetic_side_effects)]
 
+use std::collections::BTreeMap;
+
 use crate::error::{Error, Result};
 
+use super::arm64::Thunks;
 use super::inputs::CoffInput;
+use super::machine::Machine;
 use super::options::PeOptions;
 use super::read::consts::{
     IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_CNT_UNINITIALIZED_DATA,
@@ -137,6 +148,9 @@ pub enum Marker {
     TlsStart,
     /// `___tls_end__`.
     TlsEnd,
+    /// The i386 SafeSEH handler table, `___safe_se_handler_table`, at the
+    /// end of `.rdata`.
+    SafeSehTable,
 }
 
 /// One step of the output section recipe: a rule, a marker or an alignment.
@@ -145,6 +159,9 @@ enum Step {
     Place(Rule),
     Insert(&'static [u8], Marker),
     Align(&'static [u8], u32),
+    /// An alignment only the PE32+ scripts (`i386pep`, `arm64pe`) have;
+    /// `i386pe` packs these places to 4 bytes.
+    AlignWide(&'static [u8], u32),
 }
 
 /// The recipe, in output order. Output sections appear in the order their
@@ -161,7 +178,7 @@ const RECIPE: &[Step] = &[
     )),
     Step::Place(rule(b".text", Match::Exact(b".glue_7t"), Sort::None)),
     Step::Place(rule(b".text", Match::Exact(b".glue_7"), Sort::None)),
-    Step::Align(b".text", 8),
+    Step::AlignWide(b".text", 8),
     Step::Place(rule(b".text", Match::Exact(b".fini"), Sort::None)),
     Step::Place(rule(b".text", Match::Exact(b".gcc_exc"), Sort::None)),
     Step::Place(rule(
@@ -205,7 +222,7 @@ const RECIPE: &[Step] = &[
         Sort::None,
     )),
     Step::Insert(b".rdata", Marker::PseudoEnd),
-    Step::Align(b".rdata", 8),
+    Step::AlignWide(b".rdata", 8),
     Step::Insert(b".rdata", Marker::CtorHead),
     Step::Place(rule(b".rdata", Match::Exact(b".ctors"), Sort::None)),
     Step::Place(rule(b".rdata", Match::Exact(b".ctor"), Sort::None)),
@@ -234,6 +251,8 @@ const RECIPE: &[Step] = &[
     Step::Place(rule(b".rdata", Match::Prefix(b".CRT$XD"), Sort::ByName)),
     Step::Insert(b".rdata", Marker::CrtXdEnd),
     Step::Place(rule(b".rdata", Match::Prefix(b".CRT$"), Sort::ByName)),
+    Step::Align(b".rdata", 4),
+    Step::Insert(b".rdata", Marker::SafeSehTable),
     Step::Place(rule(b".eh_frame", Match::Prefix(b".eh_frame"), Sort::None)),
     Step::Place(rule(b".pdata", Match::Prefix(b".pdata"), Sort::None)),
     Step::Place(rule(b".xdata", Match::Prefix(b".xdata"), Sort::None)),
@@ -249,7 +268,7 @@ const RECIPE: &[Step] = &[
     Step::Place(rule(b".idata", Match::Exact(b".idata$2"), Sort::ByFile)),
     Step::Place(rule(b".idata", Match::Exact(b".idata$3"), Sort::ByFile)),
     Step::Insert(b".idata", Marker::IdataNull),
-    Step::Align(b".idata", 8),
+    Step::AlignWide(b".idata", 8),
     Step::Place(rule(b".idata", Match::Exact(b".idata$4"), Sort::ByFile)),
     Step::Insert(b".idata", Marker::IatStart),
     Step::Place(rule(b".idata", Match::Exact(b".idata$5"), Sort::ByFile)),
@@ -281,6 +300,14 @@ pub enum Piece {
     Fill(Vec<u8>),
     /// Zero bytes (padding, `.bss`, common symbols).
     Zero,
+    /// The ARM64 range-extension thunks for the branches of an input
+    /// section, placed right after it.
+    Thunks {
+        /// Index into the input file list.
+        file: u32,
+        /// The 1-based COFF section number.
+        section: u32,
+    },
 }
 
 /// A placed piece of an output section.
@@ -371,6 +398,12 @@ pub struct Layout {
     pub file_size: u64,
     /// Offset of each marker in its output section, by [`Marker`].
     pub markers: Vec<(Marker, u32, u32)>,
+    /// The range-extension thunks laid out, as planned.
+    pub thunks: Thunks,
+    /// RVA of each thunk block, by `(file, section)`.
+    pub thunk_rvas: BTreeMap<(u32, u32), u32>,
+    /// The machine the image is for.
+    pub machine: Machine,
 }
 
 impl Layout {
@@ -470,6 +503,11 @@ pub struct LayoutInput<'i, 'a> {
     /// Bytes to reserve for the MinGW runtime pseudo-relocation list, which
     /// sits between the `__RUNTIME_PSEUDO_RELOC_LIST__` bounds in `.rdata`.
     pub pseudo_reloc_size: u32,
+    /// ARM64 range-extension thunks, each block placed after the input
+    /// section whose branches need it.
+    pub thunks: &'i Thunks,
+    /// Bytes to reserve for the i386 SafeSEH handler table.
+    pub safe_seh_size: u32,
 }
 
 /// Assigns every live input section to an output section and gives each one
@@ -488,7 +526,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
     for (index, step) in RECIPE.iter().enumerate() {
         let name = match step {
             Step::Place(rule) => rule.output,
-            Step::Insert(name, _) | Step::Align(name, _) => name,
+            Step::Insert(name, _) | Step::Align(name, _) | Step::AlignWide(name, _) => name,
         };
         let rank = u32::try_from(index).unwrap_or(0);
         step_output.push(build.section(name, rank));
@@ -514,7 +552,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
             let name: &[u8] = &section.name;
             let step = RECIPE.iter().position(|step| match step {
                 Step::Place(rule) => rule.pattern.matches(name),
-                Step::Insert(..) | Step::Align(..) => false,
+                Step::Insert(..) | Step::Align(..) | Step::AlignWide(..) => false,
             });
             let (at, sort, step_index) = match step {
                 Some(step) => {
@@ -529,7 +567,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                 }
                 None => {
                     let base = orphan_name(name);
-                    let at = build.section(base, RANK_ORPHAN);
+                    let at = build.section(base, orphan_rank(base));
                     let sort = if base.len() == name.len() {
                         Sort::None
                     } else {
@@ -554,6 +592,14 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                 if section.header.is_code() {
                     out.characteristics |= IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE;
                 }
+                // GNU ld's output flags are the union of the inputs': code
+                // that also claims initialized data (some i386 runtime
+                // objects) makes `.text` count as both.
+                if out.characteristics & IMAGE_SCN_CNT_CODE != 0
+                    && section.header.is_initialized_data()
+                {
+                    out.characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+                }
             }
         }
         placements.push(per_section);
@@ -575,6 +621,8 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
     }
 
     // Order the contributions of each output section and place them.
+    let pointer = options.target().pointer_size();
+    let wide = !options.target().is_pe32();
     let mut markers = Vec::new();
     for at in 0..build.sections.len() {
         let mut list = std::mem::take(&mut build.order[at]);
@@ -591,8 +639,11 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                 Step::Align(step_name, step_align) if *step_name == name.as_slice() => {
                     offset = align_up32(offset, *step_align);
                 }
+                Step::AlignWide(step_name, step_align) if wide && *step_name == name.as_slice() => {
+                    offset = align_up32(offset, *step_align);
+                }
                 Step::Insert(step_name, marker) if *step_name == name.as_slice() => {
-                    let bytes = marker_bytes(*marker);
+                    let bytes = marker_bytes(*marker, pointer);
                     markers.push((*marker, u32::try_from(at).unwrap_or(u32::MAX), offset));
                     if !bytes.is_empty() {
                         let size = u32::try_from(bytes.len()).unwrap_or(0);
@@ -607,13 +658,18 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                     // where GNU ld's script puts the input sections of the
                     // same name: inside the `__RUNTIME_PSEUDO_RELOC_LIST__`
                     // bounds. Its bytes are patched in after layout.
-                    if *marker == Marker::PseudoStart && input.pseudo_reloc_size > 0 {
+                    let reserved = match marker {
+                        Marker::PseudoStart => input.pseudo_reloc_size,
+                        Marker::SafeSehTable => input.safe_seh_size,
+                        _ => 0,
+                    };
+                    if reserved > 0 {
                         chunks.push(Chunk {
                             offset,
-                            size: input.pseudo_reloc_size,
+                            size: reserved,
                             piece: Piece::Zero,
                         });
-                        offset = offset.saturating_add(input.pseudo_reloc_size);
+                        offset = offset.saturating_add(reserved);
                     }
                 }
                 Step::Place(_) => {
@@ -622,15 +678,15 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                             break;
                         }
                         cursor = cursor.saturating_add(1);
-                        offset = push_input(&mut chunks, input.files, placed, offset);
+                        offset = push_input(&mut chunks, input, placed, offset);
                     }
                 }
-                Step::Align(..) | Step::Insert(..) => {}
+                Step::Align(..) | Step::AlignWide(..) | Step::Insert(..) => {}
             }
         }
         while let Some(placed) = list.get(cursor).copied() {
             cursor = cursor.saturating_add(1);
-            offset = push_input(&mut chunks, input.files, placed, offset);
+            offset = push_input(&mut chunks, input, placed, offset);
         }
         if name == b".bss" {
             for common in input.commons {
@@ -685,7 +741,7 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
         .collect();
 
     // Headers, then the sections, at the section and file alignments.
-    let header_size = u64::try_from(super::write::header_size(sections.len()))
+    let header_size = u64::try_from(super::write::header_size(sections.len(), options.target()))
         .map_err(|_| Error::Limit("too many output sections".into()))?;
     let file_alignment = u64::from(options.file_alignment);
     let section_alignment = options.section_alignment;
@@ -710,6 +766,20 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
             .checked_add(section.virtual_size)
             .map(|end| align_up32(end, section_alignment))
             .ok_or_else(|| Error::Limit("image larger than 4 GiB".into()))?;
+    }
+
+    // Record where the thunk blocks ended up.
+    let mut thunk_rvas = BTreeMap::new();
+    for section in &sections {
+        for chunk in &section.chunks {
+            if let Piece::Thunks {
+                file,
+                section: number,
+            } = chunk.piece
+            {
+                thunk_rvas.insert((file, number), section.rva.wrapping_add(chunk.offset));
+            }
+        }
     }
 
     // Record where every input section ended up.
@@ -744,6 +814,9 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
         rvas,
         outputs: placements,
         markers,
+        thunks: input.thunks.clone(),
+        thunk_rvas,
+        machine: options.target(),
     })
 }
 
@@ -751,6 +824,68 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
 const RANK_ORPHAN: u32 = 1000;
 /// Rank of the sections in [`TRAILING`], which close the image.
 const RANK_TRAILING: u32 = 2000;
+/// Rank of the debugging sections, which follow `.reloc` in the order of
+/// [`DEBUG_ORDER`].
+const RANK_DEBUG: u32 = 3000;
+
+/// The non-loaded sections GNU `ld`'s PE scripts place after `.reloc`, in
+/// the scripts' order. A debugging section not listed follows them.
+const DEBUG_ORDER: &[&[u8]] = &[
+    b".stab",
+    b".stabstr",
+    b".debug_aranges",
+    b".debug_pubnames",
+    b".debug_info",
+    b".debug_abbrev",
+    b".debug_line",
+    b".debug_frame",
+    b".debug_str",
+    b".debug_loc",
+    b".debug_macinfo",
+    b".debug_weaknames",
+    b".debug_funcnames",
+    b".debug_typenames",
+    b".debug_varnames",
+    b".debug_pubtypes",
+    b".debug_ranges",
+    b".debug_types",
+    b".debug_addr",
+    b".debug_line_str",
+    b".debug_loclists",
+    b".debug_macro",
+    b".debug_names",
+    b".debug_rnglists",
+    b".debug_str_offsets",
+    b".debug_sup",
+    b".debug_gdb_scripts",
+];
+
+/// Whether an output section holds debugging information (DWARF or
+/// STABS), which the loader does not map.
+#[must_use]
+pub fn is_debug_section(name: &[u8]) -> bool {
+    name.starts_with(b".debug") || name.starts_with(b".zdebug") || name.starts_with(b".stab")
+}
+
+/// The rank of an orphan output section: debugging sections go after
+/// `.reloc` in GNU `ld`'s order (`.zdebug_*` next to its `.debug_*`), the
+/// rest after the sections the recipe names.
+fn orphan_rank(name: &[u8]) -> u32 {
+    let plain = match name.strip_prefix(b".z") {
+        Some(rest) if rest.starts_with(b"debug") => [b".".as_slice(), rest].concat(),
+        _ => name.to_vec(),
+    };
+    if let Some(index) = DEBUG_ORDER
+        .iter()
+        .position(|known| *known == plain.as_slice())
+    {
+        return RANK_DEBUG.saturating_add(u32::try_from(index).unwrap_or(0));
+    }
+    if plain.starts_with(b".debug") {
+        return RANK_DEBUG.saturating_add(u32::try_from(DEBUG_ORDER.len()).unwrap_or(0));
+    }
+    RANK_ORPHAN
+}
 
 /// The output sections under construction, with their ordering keys.
 #[derive(Default)]
@@ -786,15 +921,16 @@ impl Builder {
     }
 }
 
-/// Appends an input section's chunk to `chunks`, aligned, and returns the
-/// new offset.
+/// Appends an input section's chunk to `chunks`, aligned, followed by its
+/// thunk block if it has one, and returns the new offset.
 fn push_input(
     chunks: &mut Vec<Chunk>,
-    files: &[CoffInput<'_>],
+    input: &LayoutInput<'_, '_>,
     placed: Placed,
     offset: u32,
 ) -> u32 {
-    let Some(section) = files
+    let Some(section) = input
+        .files
         .get(placed.file as usize)
         .and_then(CoffInput::object)
         .and_then(|parsed| parsed.section(placed.section))
@@ -810,7 +946,21 @@ fn push_input(
             section: placed.section,
         },
     });
-    offset.saturating_add(section.size)
+    let end = offset.saturating_add(section.size);
+    let thunks = input.thunks.block_size(placed.file, placed.section);
+    if thunks == 0 {
+        return end;
+    }
+    let at = align_up32(end, 4);
+    chunks.push(Chunk {
+        offset: at,
+        size: thunks,
+        piece: Piece::Thunks {
+            file: placed.file,
+            section: placed.section,
+        },
+    });
+    at.saturating_add(thunks)
 }
 
 /// Sorts the contributions of one output section: by recipe step, then by
@@ -846,16 +996,14 @@ fn orphan_name(name: &[u8]) -> &[u8] {
     }
 }
 
-/// The bytes a marker inserts.
-fn marker_bytes(marker: Marker) -> Vec<u8> {
+/// The bytes a marker inserts, for an image whose pointers are `pointer`
+/// bytes wide: the constructor lists hold one pointer-sized `-1` head and
+/// a null tail (`LONG (-1); LONG (-1);` in `i386pep`, `LONG (-1);` in
+/// `i386pe`).
+fn marker_bytes(marker: Marker, pointer: u32) -> Vec<u8> {
     match marker {
-        Marker::CtorHead | Marker::DtorHead => {
-            let mut bytes = Vec::with_capacity(8);
-            bytes.extend_from_slice(&(-1i32).to_le_bytes());
-            bytes.extend_from_slice(&(-1i32).to_le_bytes());
-            bytes
-        }
-        Marker::CtorTail | Marker::DtorTail => vec![0u8; 8],
+        Marker::CtorHead | Marker::DtorHead => vec![0xffu8; pointer as usize],
+        Marker::CtorTail | Marker::DtorTail => vec![0u8; pointer as usize],
         // A null `IMAGE_IMPORT_DESCRIPTOR` ends the import directory.
         Marker::IdataNull => vec![0u8; 20],
         // Position-only markers for linker-defined symbols.
@@ -874,6 +1022,16 @@ mod tests {
         assert_eq!(align_up32(16, 16), 16);
         assert_eq!(align_up32(u32::MAX, 16), u32::MAX);
         assert_eq!(align_up64(513, 512), 1024);
+    }
+
+    #[test]
+    fn debugging_sections_follow_reloc_in_gnu_order() {
+        assert!(orphan_rank(b".debug_aranges") < orphan_rank(b".debug_info"));
+        assert!(orphan_rank(b".debug_line_str") < orphan_rank(b".debug_rnglists"));
+        assert_eq!(orphan_rank(b".zdebug_info"), orphan_rank(b".debug_info"));
+        assert!(orphan_rank(b".debug_info") > RANK_TRAILING);
+        assert!(orphan_rank(b".debug_unknown") > orphan_rank(b".debug_gdb_scripts"));
+        assert_eq!(orphan_rank(b".mysection"), RANK_ORPHAN);
     }
 
     #[test]

@@ -142,6 +142,42 @@ fn word_splitting() {
     assert_eq!(process::shell_quote("/usr/bin/cc"), "/usr/bin/cc");
 }
 
+/// Under qemu, every program of a `run` chain gets the emulator, after its
+/// own environment assignments.
+#[test]
+fn qemu_runs_every_program_of_a_chain() {
+    assert_eq!(
+        fixture::qemu_script("./out", "/usr/bin/qemu-aarch64").unwrap(),
+        "/usr/bin/qemu-aarch64 ./out"
+    );
+    assert_eq!(
+        fixture::qemu_script("./out && LD_LIBRARY_PATH=. ./b arg || ./c ; ./d", "/q/qemu").unwrap(),
+        "/q/qemu ./out && LD_LIBRARY_PATH=. /q/qemu ./b arg || /q/qemu ./c ; /q/qemu ./d"
+    );
+    // `;` needs spaces around it to separate commands, as `&&` does.
+    assert!(fixture::qemu_script("'open", "q").is_err());
+}
+
+/// `expect.readelf_arch.<arch>` is parsed per architecture.
+#[test]
+fn readelf_patterns_per_architecture() {
+    let fixtures = Fixture::load_all(&fixture::fixtures_root()).unwrap_or_else(|e| panic!("{e}"));
+    let pie = fixtures
+        .iter()
+        .find(|f| f.name == "pie")
+        .expect("the pie fixture");
+    let arches: Vec<&str> = pie
+        .expect_readelf_arch
+        .iter()
+        .map(|(arch, ..)| arch.as_str())
+        .collect();
+    assert_eq!(arches, ["x86_64", "aarch64"]);
+    assert!(
+        !pie.expect_readelf.iter().any(|p| p.contains("R_X86_64")),
+        "architecture-specific patterns belong in expect.readelf_arch"
+    );
+}
+
 #[test]
 fn triples_normalize() {
     use common::tools::Triple;

@@ -127,7 +127,7 @@ every output format:
 
 | Item | Scope |
 | --- | --- |
-| Architectures | arm64, x86_64 (arm64e and arm64_32 later) |
+| Architectures | arm64, arm64e, x86_64 (arm64_32 later) |
 | Kinds | `MH_EXECUTE`, `MH_DYLIB`, `MH_BUNDLE`, `-r` |
 | Dynamic info | `LC_DYLD_CHAINED_FIXUPS` + `LC_DYLD_EXPORTS_TRIE` (default for new deployment targets), legacy `LC_DYLD_INFO_ONLY` |
 | Linking | two-level namespace, re-exports, `-undefined dynamic_lookup`, weak imports, `-exported_symbols_list` |

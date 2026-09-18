@@ -68,16 +68,16 @@ can work at the same time without colliding.
 | W27 | Mach-O follow-ups (M8) | `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs` (moved from `src/macho/`), `tests/macho_link*` | W25 | merged |
 | W28 | Symbol resolution redesign (M5) | `src/symbols/**`, `src/elf/{resolve,object}*.rs`, `benches/**`, `tests/projects/bench*` | W26 | in progress |
 | W29 | Debug and ordering outputs (M5) | new `src/debug/{gdb_index,debug_names}*`, new `src/elf/{ordering,separate_debug}*`, hooks in `src/elf/{layout,write,synth}.rs`, `tests/debug_index*`, `tests/ordering*` | W24 | in progress |
-| W30 | RISC-V 64 (M4) | `src/elf/arch/riscv*`, `src/arch/riscv*`, relaxation/shrinking hooks, `tests/riscv*`, `tests/fixtures/riscv64-*` | W20 | in progress |
-| W31 | PowerPC64 LE, ELFv2 (M4) | `src/elf/arch/ppc64*`, `src/arch/ppc64*`, `tests/ppc64*`, `tests/fixtures/ppc64-*` | W20 | in progress |
-| W32 | LoongArch64 (M4) | `src/elf/arch/loongarch*`, `src/arch/loongarch*`, `tests/loongarch*`, `tests/fixtures/loongarch64-*` | W20 | in progress |
-| W33 | PE i386 and ARM64 (M7) | `src/coff/**`, `tests/coff_link*` and its data | W21 | in progress |
-| W34 | Mach-O completeness (M8) | `src/macho/**` except `lto*`, `src/args/darwin.rs`, `tests/macho_link*` | W27 | in progress |
-| W35 | Mach-O LTO through libLTO (M8) | new `src/plugin/liblto*`, `src/macho/lto*`, one hook in `src/macho/link.rs`, `tests/macho_lto*` | W17, W27 | in progress |
+| W30 | RISC-V 64 (M4) | `src/elf/arch/riscv*`, `src/arch/riscv*`, relaxation/shrinking hooks, `tests/riscv*`, `tests/fixtures/riscv64-*` | W20 | merged |
+| W31 | PowerPC64 LE, ELFv2 (M4) | `src/elf/arch/ppc64*`, `src/arch/ppc64*`, `tests/ppc64*`, `tests/fixtures/ppc64le-*` | W20 | merged |
+| W32 | LoongArch64 (M4) | `src/elf/arch/loongarch*`, `src/arch/loongarch*`, `tests/loongarch*`, `tests/fixtures/loongarch64-*` | W20 | merged |
+| W33 | PE i386 and ARM64 (M7) | `src/coff/**`, `tests/coff_link*` and its data | W21 | merged |
+| W34 | Mach-O completeness (M8) | `src/macho/**` except `lto*`, `src/args/darwin.rs`, `tests/macho_link*` | W27 | merged |
+| W35 | Mach-O LTO through libLTO (M8) | new `src/plugin/liblto*`, `src/macho/lto*`, one hook in `src/macho/link.rs`, `tests/macho_lto*` | W17, W27 | merged |
 | W36 | Library API for 1.0 (M9) | `examples/**`, `tests/api*`, new `src/input/source*`, API-only changes in `src/args/options.rs`; proposals for `lib.rs` | — | merged |
-| W37 | AArch64 completeness (M4) | `src/elf/arch/aarch64.rs`, `src/arch/aarch64.rs`, `tests/aarch64*`, `tests/fixtures/aarch64-*` | W20 | in progress |
+| W37 | AArch64 completeness (M4) | `src/elf/arch/aarch64.rs`, `src/arch/aarch64.rs`, `tests/aarch64*`, `tests/fixtures/aarch64-*` | W20 | merged |
 | W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | in progress |
-| W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | in progress |
+| W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -571,6 +571,30 @@ links, distribution package recipes.
 ---
 
 ## Integration follow-ups
+
+- **W32 (LoongArch64):** shrinking relaxation on W30's framework;
+  `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis
+  in `-r`; move the `R_LARCH_*` constants to `src/elf/read/consts/`; remove
+  the per-relocation lookahead cost on x86-64/AArch64 (in progress).
+- **W31 (PowerPC64):** remove the +5% x86-64 instruction cost (in
+  progress); a test for PC-relative `__tls_get_addr` annotation; the
+  outstanding items in ROADMAP M4.
+- **W37 (AArch64):** erratum fixes with linker-script layout; a patch pool
+  per 128 MiB of code; `$x` and `__CortexA53843419_*` symbols for patches;
+  check `DT_AARCH64_VARIANT_PCS`. `src/elf/arch/aarch64_errata.rs` and
+  `thunk.rs` belong to the AArch64 owner.
+- **W34 (Mach-O):** relative method lists add a second link attempt when a
+  method name has no selector reference; fold it into the selector-stub
+  attempt. arm64_32 later.
+- **W30 (RISC-V):** remove the +1.7% x86-64 instruction cost (in progress);
+  reuse the previous layout between relaxation passes; `.sbss` next to
+  `.sdata` for `--relax-gp`; `PT_RISCV_ATTRIBUTES` under scripts;
+  `DT_RISCV_VARIANT_CC`. LoongArch shrinking can now plug into
+  `src/elf/arch/shrink.rs`.
+- **W33 (PE):** a BRANCH26 thunk test past ±128 MB; GNU's automatic DLL image
+  base; `__nm_` symbols in qld-written import libraries; export hints;
+  `--oformat pe-i386` without `-m` still selects ELF; import libraries and
+  `--output-def` bypass the output buffer.
 
 - **W25/W27 (Mach-O):** done: dispatch, the `macho-macos` job, SHA-256 in
   `output::hash`, `-r`, literal merging, `-init`, `-alias`,

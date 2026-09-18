@@ -20,9 +20,9 @@ use crate::macho::read::consts::{
     LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_ID_DYLIB,
     LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_REEXPORT_DYLIB,
     LC_ROUTINES_64, LC_RPATH, LC_SEGMENT_64, LC_SYMTAB, LC_UUID, MH_BINDS_TO_WEAK, MH_BUNDLE,
-    MH_DEAD_STRIPPABLE_DYLIB, MH_DYLDLINK, MH_DYLIB, MH_EXECUTE, MH_HAS_TLV_DESCRIPTORS,
-    MH_MAGIC_64, MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_OBJECT, MH_PIE, MH_TWOLEVEL,
-    MH_WEAK_DEFINES, S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, TOOL_LD,
+    MH_DEAD_STRIPPABLE_DYLIB, MH_DYLDLINK, MH_DYLIB, MH_EXECUTE, MH_FORCE_FLAT,
+    MH_HAS_TLV_DESCRIPTORS, MH_MAGIC_64, MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_OBJECT, MH_PIE,
+    MH_TWOLEVEL, MH_WEAK_DEFINES, S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, TOOL_LD,
 };
 
 use super::buf::{align_up, pad_to, push_name16, push32, push64, to_u64};
@@ -366,7 +366,15 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
     let offsets = input.offsets;
     let mut out = Vec::new();
 
-    let (cpu_type, cpu_subtype) = if config.arch.cpu_type == CPU_TYPE_ARM64 {
+    let (cpu_type, cpu_subtype) = if config.is_arm64e() {
+        // Versioned pointer authentication ABI, version 0, as clang's
+        // objects and ld64's images have it.
+        (
+            CPU_TYPE_ARM64,
+            crate::macho::read::consts::CPU_SUBTYPE_ARM64E
+                | crate::macho::read::consts::CPU_SUBTYPE_PTRAUTH_ABI,
+        )
+    } else if config.arch.cpu_type == CPU_TYPE_ARM64 {
         (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
     } else if config.is_exec() {
         (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL | CPU_SUBTYPE_LIB64)
@@ -382,6 +390,8 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
     let mut flags = MH_DYLDLINK | commands.extra_flags;
     if !config.flat_namespace {
         flags |= MH_TWOLEVEL;
+    } else if config.force_flat_namespace {
+        flags |= MH_FORCE_FLAT;
     }
     if commands.no_undefs {
         flags |= MH_NOUNDEFS;

@@ -43,7 +43,6 @@ use super::scan::{ScanResult, location};
 use super::symtab::{SymtabPlan, write_strtab, write_symtab};
 use super::synth::{Owner, SlotReloc, got_slot_relocs, write_build_id_header};
 use super::values::Addresses;
-use crate::arch::aarch64::Field as A64Field;
 
 /// What one output chunk holds.
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +66,9 @@ enum Chunk {
     Data(u32, u32),
     /// Padding between the contents of a code section: no-op instructions.
     Nop,
+    /// The Cortex-A53 erratum patches of a section: section position,
+    /// index of their block in its data.
+    Patches(u32, u32),
 }
 
 /// Adds no-op padding for the gaps of an executable section that nothing
@@ -233,6 +235,16 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
             }
             Trailer::None => {
                 let position32 = u32::try_from(position).unwrap_or(u32::MAX);
+                // The block of erratum patches starts at the first one.
+                let patches = if section.flags & SHF_EXECINSTR != 0
+                    && arch::aarch64_errata::enabled(input.options)
+                {
+                    arch::thunk::patches_in(&layout.thunks, section.output, 0, u64::MAX)
+                        .map(|p| p.address)
+                        .min()
+                } else {
+                    None
+                };
                 for (index, &(offset, size, _)) in section.fills.iter().enumerate() {
                     if size > 0 {
                         chunks.push((
@@ -244,9 +256,15 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                 for (index, (offset, bytes)) in section.data.iter().enumerate() {
                     let size = u64::try_from(bytes.len()).unwrap_or(0);
                     if size > 0 {
+                        let index = u32::try_from(index).unwrap_or(u32::MAX);
+                        let chunk = if patches == Some(section.addr.wrapping_add(*offset)) {
+                            Chunk::Patches(position32, index)
+                        } else {
+                            Chunk::Data(position32, index)
+                        };
                         chunks.push((
                             ChunkRange::new(section.offset.saturating_add(*offset), size),
-                            Chunk::Data(position32, u32::try_from(index).unwrap_or(u32::MAX)),
+                            chunk,
                         ));
                     }
                 }
@@ -508,6 +526,7 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             input.context.arch.write_nops(out);
             Ok(())
         }
+        Chunk::Patches(position, index) => write_patches(input, position, index, out),
         Chunk::Data(position, index) => {
             if let Some((_, bytes)) = layout
                 .sections
@@ -541,6 +560,8 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     header[18..20].copy_from_slice(&input.context.arch.machine().to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[24..32].copy_from_slice(&input.entry.to_le_bytes());
+    let e_flags = input.context.arch.output_flags(input.addresses.refs.files);
+    header[48..52].copy_from_slice(&e_flags.to_le_bytes());
     let phoff = if layout.segments.is_empty() {
         0
     } else {
@@ -679,14 +700,20 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
                 .layout
                 .synthetic(Synthetic::PltSec)
                 .unwrap_or_default();
-            let size = arch.plt_entry_size(synth.plt_flags());
+            let size = arch.plt_sec_entry_size(synth.plt_flags());
             let step = usize::try_from(size).unwrap_or(16);
             for (index, entry) in out.chunks_exact_mut(step).enumerate() {
                 let index64 = u64::try_from(index).unwrap_or(u64::MAX);
                 let address = base.saturating_add(index64.saturating_mul(size));
                 let slot = addresses.igot_address(index).unwrap_or(0);
-                arch.write_plt_jump(entry, address, slot, synth.plt_flags())
-                    .map_err(|_| Error::Internal("PLT slot out of range".into()))?;
+                arch.write_plt_jump(
+                    entry,
+                    address,
+                    slot,
+                    synth.plt_flags(),
+                    addresses.got_base(),
+                )
+                .map_err(|_| Error::Internal("PLT slot out of range".into()))?;
             }
         }
         Synthetic::PltGot => {
@@ -703,8 +730,14 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
                 };
                 let address = base.saturating_add(u64::try_from(start).unwrap_or(0));
                 let slot = addresses.got_address(owner).unwrap_or(0);
-                arch.write_plt_jump(entry, address, slot, synth.plt_flags())
-                    .map_err(|_| Error::Internal("PLT GOT slot out of range".into()))?;
+                arch.write_plt_jump(
+                    entry,
+                    address,
+                    slot,
+                    synth.plt_flags(),
+                    addresses.got_base(),
+                )
+                .map_err(|_| Error::Internal("PLT GOT slot out of range".into()))?;
             }
         }
         Synthetic::RelaPlt => write_rela_plt(input, out),
@@ -751,6 +784,11 @@ fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
         }
     };
     let refs = &addresses.refs;
+    // PowerPC64 keeps the TOC pointer's link-time value in the first word.
+    if synth.arch.got_header_words() > 0 {
+        put(base, addresses.got_base());
+    }
+    let dtv_offset = synth.arch.dtv_offset();
     for (list, kind) in [
         (&synth.got, GotKind::Address),
         (&synth.tlsgd, GotKind::TlsGd),
@@ -782,9 +820,10 @@ fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
                     put(address, word);
                 }
                 GotKind::TlsGd => {
+                    let dtpoff = value.wrapping_sub(tls.start).wrapping_sub(dtv_offset);
                     let (module, offset) = match relocs {
-                        [SlotReloc::None, SlotReloc::None] => (1, value.wrapping_sub(tls.start)),
-                        [_, SlotReloc::None] => (0, value.wrapping_sub(tls.start)),
+                        [SlotReloc::None, SlotReloc::None] => (1, dtpoff),
+                        [_, SlotReloc::None] => (0, dtpoff),
                         _ => (0, 0),
                     };
                     put(address, module);
@@ -805,7 +844,9 @@ fn write_got_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     let (words, _) = out.as_chunks_mut::<8>();
     let reserved = usize::try_from(synth.got_plt_reserved).unwrap_or(0);
     if synth.dynamic() {
-        if let Some(first) = words.first_mut() {
+        if synth.arch.got_plt_holds_dynamic()
+            && let Some(first) = words.first_mut()
+        {
             let dynamic = addresses
                 .layout
                 .synthetic(Synthetic::Dynamic)
@@ -855,7 +896,7 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         .unwrap_or_default();
     let range = || Error::Internal("PLT slot out of range".into());
     if !synth.dynamic() {
-        let size = arch.iplt_entry_size();
+        let size = arch.iplt_entry_size(flags);
         let step = usize::try_from(size).unwrap_or(16);
         for (index, entry) in out
             .chunks_exact_mut(step)
@@ -864,7 +905,8 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         {
             let stub = base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(size));
             let slot = addresses.igot_address(index).unwrap_or(0);
-            arch.write_iplt(entry, stub, slot).map_err(|_| range())?;
+            arch.write_iplt(entry, stub, slot, flags, addresses.got_base())
+                .map_err(|_| range())?;
         }
         return Ok(());
     }
@@ -1031,6 +1073,22 @@ fn collect_dyn_relocs(
             addresses.got_entry_address(Owner::Local { file: 0, symbol: 0 }, GotKind::TlsLd)
     {
         relocs.push(dyn_reloc(arch, address, 0, DynKind::DtpMod, 0));
+    }
+    if !arch.irelative_in_rela_plt() {
+        let first = synth.plt.len();
+        for (index, owner) in synth.iplt.iter().enumerate() {
+            let slot = addresses
+                .igot_address(first.saturating_add(index))
+                .unwrap_or(0);
+            let resolver = symbol_value(addresses, owner);
+            relocs.push(dyn_reloc(
+                arch,
+                slot,
+                0,
+                DynKind::Irelative,
+                resolver as i64,
+            ));
+        }
     }
     for copy in &synth.copies {
         let address = addresses
@@ -1229,7 +1287,8 @@ fn offset_address(
 ) -> u64 {
     // Callers pass a section of the output, which always has an ID.
     let merge = addresses.refs.sections.kind_in(file, section) == Some(SectionKind::Merge);
-    if merge {
+    // Merged pieces and relaxed code (RISC-V) move offsets.
+    if merge || !addresses.layout.relax.is_empty() {
         return addresses
             .section_offset_address(file, section, offset)
             .unwrap_or(0);
@@ -1304,7 +1363,7 @@ fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
 }
 
 /// Why a relocation's target section is not in the output, if it is not.
-fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
+pub(crate) fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
     let id = refs.target_section(target)?;
     if refs.sections.is_live(id) {
         return None;
@@ -1316,8 +1375,127 @@ fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<Dead
     })
 }
 
-#[allow(clippy::too_many_lines)]
+/// The Cortex-A53 erratum patches of input section `id`, which starts at
+/// `base` and is `len` bytes long, as `(offset of the site, patch address)`.
+fn erratum_patches(
+    input: &WriteInput<'_, '_, '_>,
+    id: SectionId,
+    base: u64,
+    len: usize,
+) -> Vec<(u64, u64)> {
+    if !arch::aarch64_errata::enabled(input.options) {
+        return Vec::new();
+    }
+    let layout = input.addresses.layout;
+    let Some(output) = layout
+        .section_shndx
+        .get(id.index())
+        .and_then(|&shndx| layout.output_of_shndx(shndx))
+    else {
+        return Vec::new();
+    };
+    let end = base.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+    arch::thunk::patches_in(&layout.thunks, output, base, end)
+        .filter_map(|p| match p.patch {
+            Some((section, offset)) if section == id => Some((offset, p.address)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Writes input section `id`: its relocated contents, then the branches to
+/// its Cortex-A53 erratum patches.
 fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) -> Result<()> {
+    relocate_input(input, id, out)?;
+    let base = input.addresses.section_address(id).unwrap_or(0);
+    for (offset, patch) in erratum_patches(input, id, base, out.len()) {
+        let site = base.wrapping_add(offset);
+        let written = crate::arch::aarch64::erratum_branch(site, patch)
+            .ok()
+            .and_then(|branch| {
+                crate::arch::aarch64::write_insn(out, usize::try_from(offset).ok()?, branch)
+            });
+        if written.is_none() {
+            input.diagnostics.emit(Diagnostic::error(format!(
+                "Cortex-A53 erratum patch at {patch:#x} is out of range of {site:#x}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the Cortex-A53 erratum patches of the output section at
+/// `position`, whose block is its data entry `index`: each one is the
+/// relocated instruction it replaces, and a branch back after it.
+fn write_patches(
+    input: &WriteInput<'_, '_, '_>,
+    position: u32,
+    index: u32,
+    out: &mut [u8],
+) -> Result<()> {
+    let addresses = input.addresses;
+    let layout = addresses.layout;
+    let Some(section) = layout.sections.get(position as usize) else {
+        return Ok(());
+    };
+    let Some(&(offset, _)) = section.data.get(index as usize) else {
+        return Ok(());
+    };
+    let start = section.addr.wrapping_add(offset);
+    // The relocated sections are rebuilt here, since their own chunks may
+    // not be written yet; relocation problems are reported by those.
+    let quiet = Collect::new();
+    let scratch_input = WriteInput {
+        diagnostics: &quiet,
+        ..*input
+    };
+    let mut scratch: Option<(SectionId, Vec<u8>)> = None;
+    let patches = arch::thunk::patches_in(&layout.thunks, section.output, 0, u64::MAX);
+    for placed in patches {
+        let Some((id, site_offset)) = placed.patch else {
+            continue;
+        };
+        if scratch.as_ref().is_none_or(|(current, _)| *current != id) {
+            let size = addresses
+                .refs
+                .sections
+                .locate(id)
+                .and_then(|(file, index)| {
+                    let object = addresses.refs.files.get(file)?.object.as_ref()?;
+                    object.section(index).map(|s| s.header.sh_size)
+                })
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(0);
+            let mut bytes = vec![0u8; size];
+            relocate_input(&scratch_input, id, &mut bytes)?;
+            scratch = Some((id, bytes));
+        }
+        let moved = scratch.as_ref().and_then(|(_, bytes)| {
+            crate::arch::aarch64::read_insn(bytes, usize::try_from(site_offset).ok()?)
+        });
+        let words = moved.and_then(|moved| {
+            crate::arch::aarch64::erratum_patch(placed.address, placed.target, moved).ok()
+        });
+        let at = placed
+            .address
+            .checked_sub(start)
+            .and_then(|at| usize::try_from(at).ok());
+        match (words, at) {
+            (Some([first, second]), Some(at)) => {
+                crate::arch::aarch64::write_insn(out, at, first);
+                crate::arch::aarch64::write_insn(out, at.saturating_add(4), second);
+            }
+            _ => input.diagnostics.emit(Diagnostic::error(format!(
+                "Cortex-A53 erratum patch at {:#x} is out of range of {:#x}",
+                placed.address, placed.target
+            ))),
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) -> Result<()> {
     let addresses = input.addresses;
     let refs = &addresses.refs;
     let (file_index, section_index) = refs
@@ -1348,6 +1526,18 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         };
         return write_eh_frame(input, eh, base, out);
     }
+    // RISC-V relocations depend on each other and on linker relaxation.
+    if input.context.arch == Arch::RiscV64 {
+        let section = super::arch::riscv::apply::SectionWrite {
+            id,
+            file: file_index,
+            index: section_index,
+            section,
+            data,
+            base,
+        };
+        return super::arch::riscv::apply::write_section(input, section, out);
+    }
 
     if let Some(dest) = out.get_mut(..data.len()) {
         dest.copy_from_slice(data);
@@ -1372,8 +1562,17 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
     let executable = input.context.mode.executable() || !input.context.mode.dynamic;
     let arch = input.context.arch;
     let order = file.position.raw();
+    let tls = addresses.layout.tls.unwrap_or_default();
+    let tp = tls.tp(arch);
+    // PowerPC64: `.toc` entries this section takes the address of, whose
+    // accesses keep going through the entry.
+    let pinned_toc = if arch == super::arch::Arch::Ppc64 && alloc {
+        super::arch::ppc64::pinned_toc_entries(refs, file_index, Relocations::Rela(relas))
+    } else {
+        Vec::new()
+    };
     let mut skip = false;
-    for rel in relas.iter() {
+    arch::for_each_relocation!(arch, relas, |rel| {
         if skip {
             skip = false;
             continue;
@@ -1434,17 +1633,25 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                     ));
                     continue;
                 }
+                // Both labels of a difference in a discarded section count
+                // from zero, which keeps the difference (lld does the same).
+                if let Some(delta) = add_delta(class.kind, rel.addend as u64) {
+                    let _ = arch::add_value(out, rel.offset, class.width, delta);
+                    continue;
+                }
                 let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
                 let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
                 let _ = arch::write_value(out, rel.offset, class.width, value);
                 continue;
             }
         };
+        let mut via_stub = false;
         if alloc {
             if target.is_ifunc()
                 && let Some(stub) = addresses.iplt_address(owner)
             {
                 s = stub;
+                via_stub = true;
             }
             if class.kind == Kind::Pc
                 && arch.is_branch(rel.r_type)
@@ -1452,11 +1659,26 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 && let Some(plt) = addresses.plt_address(owner)
             {
                 s = plt;
+                via_stub = true;
             }
         }
-        let sa = s.wrapping_add_signed(a);
-        let tls = addresses.layout.tls.unwrap_or_default();
-        let tp = tls.tp(arch);
+        let mut sa = s.wrapping_add_signed(a);
+        let mut class = class;
+        // PowerPC64: a load through a `.toc` entry becomes the TOC-relative
+        // address of the symbol the entry holds.
+        if alloc
+            && arch == super::arch::Arch::Ppc64
+            && let Some((address, field)) = super::arch::ppc64::toc_indirection(
+                addresses,
+                file_index,
+                &rel,
+                &pinned_toc,
+                input.context.mode.pic,
+            )
+        {
+            sa = address;
+            class.width = Width::Ppc(field);
+        }
         let slot_address = || -> Result<u64, ApplyError> {
             addresses
                 .got_entry_address(owner, class.slot)
@@ -1465,6 +1687,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         let put =
             |out: &mut [u8], value: u64| arch::write_value(out, rel.offset, class.width, value);
         let page = crate::arch::aarch64::page;
+        let page_delta = |target: u64| arch.page_delta(target, place, rel.r_type);
         let result = match class.kind {
             Kind::None => Ok(()),
             Kind::Abs => match decision.dynamic {
@@ -1484,31 +1707,50 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 // A branch that cannot reach its target goes through the
                 // range-extension thunk layout placed for this output
                 // section (`elf::arch::thunk`).
-                let mut sa = sa;
-                if class.width == Width::Field(A64Field::Branch26)
-                    && !crate::arch::aarch64::branch_in_range(place, sa)
+                let branch = super::arch::Branch {
+                    r_type: rel.r_type,
+                    place,
+                    target: sa,
+                    st_other: target.raw.map_or(0, |raw| raw.st_other),
+                    via_stub,
+                    slot: via_stub
+                        .then(|| {
+                            super::values::plt_slot_address(
+                                addresses.synth,
+                                addresses.layout,
+                                owner,
+                            )
+                        })
+                        .flatten(),
+                };
+                let mut sa = arch.branch_destination(branch);
+                if let Some(destination) = arch.branch_thunk(branch)
                     && let Some(output) = addresses
                         .layout
                         .section_shndx
                         .get(id.index())
                         .copied()
                         .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
-                    && let Some(thunk) = addresses.layout.thunk_for(output, sa)
+                    && let Some(thunk) = addresses.layout.thunk_for(output, destination)
                 {
                     sa = thunk;
                 }
-                put(out, sa.wrapping_sub(place))
+                arch.finish_call(out, rel.offset, branch)
+                    .and_then(|()| put(out, sa.wrapping_sub(place)))
             }
-            Kind::Page => put(out, page(sa).wrapping_sub(page(place))),
+            Kind::Page => put(out, page_delta(sa)),
             Kind::Got => {
                 slot_address().and_then(|g| put(out, g.wrapping_add_signed(a).wrapping_sub(place)))
             }
-            Kind::GotPage => slot_address().and_then(|g| {
-                put(
-                    out,
-                    page(g.wrapping_add_signed(a)).wrapping_sub(page(place)),
-                )
-            }),
+            Kind::GotPage => {
+                slot_address().and_then(|g| put(out, page_delta(g.wrapping_add_signed(a))))
+            }
+            Kind::PageOff => put(out, sa),
+            Kind::Add | Kind::Sub => {
+                let delta = add_delta(class.kind, sa).unwrap_or_default();
+                arch::add_value(out, rel.offset, class.width, delta)
+            }
+            Kind::Relax => arch.relax(out, rel.offset, rel.r_type, sa, place),
             Kind::GotAbs => slot_address().and_then(|g| put(out, g.wrapping_add_signed(a))),
             Kind::GotPageOff => slot_address().and_then(|g| {
                 put(
@@ -1559,6 +1801,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 let size = target.raw.map_or(0, |r| r.st_size);
                 put(out, size.wrapping_add_signed(a))
             }
+            Kind::Addend => put(out, rel.addend as u64),
             // An undefined (weak) TLS symbol has no thread pointer offset;
             // GNU ld and lld write the addend, as for an absolute value.
             Kind::TpOff if matches!(target.def, super::refs::Def::Undefined { .. }) => {
@@ -1569,10 +1812,14 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 put(out, a as u64)
             }
             Kind::DtpOff => {
-                let value = if alloc && executable {
+                // Where the dynamic thread vector is biased (PowerPC64),
+                // relaxed local-dynamic code computes the biased block
+                // start too, so the offset is the same either way.
+                let dtv_offset = arch.dtv_offset();
+                let value = if alloc && executable && dtv_offset == 0 {
                     sa.wrapping_sub(tp)
                 } else {
-                    sa.wrapping_sub(tls.start)
+                    sa.wrapping_sub(tls.start).wrapping_sub(dtv_offset)
                 };
                 put(out, value)
             }
@@ -1580,8 +1827,13 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 // Local-dynamic code takes the start of the module's TLS
                 // block as its base, so that is what the relaxed sequence
                 // must compute.
+                // An undefined (weak) variable has no offset: like lld,
+                // relax to the addend (glibc's static `setlocale.o` reaches
+                // `_nl_current_LC_*` this way, behind a `_used` check).
                 let tpoff = if class.kind == Kind::LdToLe {
                     tls.start.wrapping_sub(tp) as i64
+                } else if matches!(target.def, super::refs::Def::Undefined { .. }) {
+                    a
                 } else {
                     sa.wrapping_sub(tp) as i64
                 };
@@ -1615,15 +1867,48 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
             };
             report(message);
         }
+    });
+    if alloc && arch == Arch::AArch64 && input.context.relax {
+        // AArch64 ADRP relaxations: they look at pairs of relocations, so
+        // they run over the relocated section rather than in the loop.
+        let got_target = |symbol: u32| -> Option<u64> {
+            let target = refs.target(file_index, symbol as usize)?;
+            let flags = target
+                .global
+                .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+            if target.is_tls() || !reloc::classify_context(&input.context, &target, flags).relax_got
+            {
+                return None;
+            }
+            let (s, a) = addresses.symbol_address(&target, 0)?;
+            Some(s.wrapping_add_signed(a))
+        };
+        // An instruction moved into an erratum patch is no longer half of a
+        // pair.
+        let patched: Vec<u64> = erratum_patches(input, id, base, out.len())
+            .into_iter()
+            .map(|(offset, _)| offset)
+            .collect();
+        arch::aarch64::relax_adrp_pairs(out, relas.iter(), base, &patched, &got_target);
     }
     Ok(())
+}
+
+/// The amount a label-difference relocation ([`Kind::Add`] or
+/// [`Kind::Sub`]) adds to its field, for the value `value`.
+fn add_delta(kind: Kind, value: u64) -> Option<u64> {
+    match kind {
+        Kind::Add => Some(value),
+        Kind::Sub => Some(value.wrapping_neg()),
+        _ => None,
+    }
 }
 
 /// The output section names of a reference from input section `from` to
 /// `target` when a `NOCROSSREFS` list prohibits it, as GNU ld checks: both
 /// output sections are in one list and differ, and for `NOCROSSREFS_TO`
 /// the target is in the list's first section.
-fn prohibited_cross_reference(
+pub(crate) fn prohibited_cross_reference(
     input: &WriteInput<'_, '_, '_>,
     from: SectionId,
     target: &super::refs::Target,
@@ -1674,7 +1959,7 @@ fn prohibited_cross_reference(
 
 /// The name a cross-reference error uses for a symbol: GNU ld names a
 /// section symbol after its input section, which has no symbol name.
-fn cross_reference_name(
+pub(crate) fn cross_reference_name(
     refs: &Refs<'_, '_>,
     file: usize,
     symbol: u32,
@@ -1694,7 +1979,7 @@ fn cross_reference_name(
     symbol_name(refs, file, symbol)
 }
 
-fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {
+pub(crate) fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {
     refs.symbol_name(file, symbol)
         .unwrap_or_else(|| format!("symbol {symbol}"))
 }
@@ -1772,12 +2057,19 @@ fn write_eh_frame(
                 continue;
             };
             let sa = s.wrapping_add_signed(a);
-            let value = match class.kind {
-                Kind::Abs => sa,
-                Kind::Pc => sa.wrapping_sub(place),
-                _ => continue,
+            // LoongArch assembles the advances of the call frame
+            // instructions as label differences when the code may relax.
+            let written = if let Some(delta) = add_delta(class.kind, sa) {
+                arch::add_value(out, local, class.width, delta)
+            } else {
+                let value = match class.kind {
+                    Kind::Abs => sa,
+                    Kind::Pc => sa.wrapping_sub(place),
+                    _ => continue,
+                };
+                arch::write_value(out, local, class.width, value)
             };
-            if arch::write_value(out, local, class.width, value).is_err() {
+            if written.is_err() {
                 input.diagnostics.emit(
                     Diagnostic::error("relocation in .eh_frame out of range".to_string())
                         .at(location(refs, eh.file, eh.index, rel.offset)),

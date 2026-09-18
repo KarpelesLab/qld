@@ -55,6 +55,9 @@ pub enum Value {
     RelaIpltEnd,
     /// `_DYNAMIC`: the `.dynamic` section.
     Dynamic,
+    /// RISC-V `__global_pointer$`: 0x800 past the start of `.sdata`, or of
+    /// the image when there is none (lld's definition).
+    GlobalPointer,
     /// `--defsym`, by index in the options.
     Defsym(usize),
     /// A linker script symbol, by slot in the script placement's symbol
@@ -105,6 +108,8 @@ const FIXED: &[(&str, Value)] = &[
     ("__fini_array_end", Value::SectionEnd(".fini_array")),
     ("__tdata_start", Value::SectionStart(".tdata")),
     ("_GLOBAL_OFFSET_TABLE_", Value::GotBase),
+    // PowerPC64's TOC pointer, which takes the place of the GOT base.
+    (".TOC.", Value::GotBase),
     ("__rela_iplt_start", Value::RelaIpltStart),
     ("__rela_iplt_end", Value::RelaIpltEnd),
     ("_DYNAMIC", Value::Dynamic),
@@ -202,6 +207,16 @@ pub fn register(
         {
             define(id, value, &mut result);
         }
+    }
+
+    // RISC-V executables: `__global_pointer$`, which the C runtime loads
+    // into `gp`.
+    if options.kind != crate::args::OutputKind::Shared
+        && super::arch::Arch::of_files(files) == Some(super::arch::Arch::RiscV64)
+        && let Some(id) = symbols.lookup(&SymbolName::new(b"__global_pointer$"))
+        && wanted(symbols, id)
+    {
+        define(id, Value::GlobalPointer, &mut result);
     }
 
     // __start_SEC / __stop_SEC.

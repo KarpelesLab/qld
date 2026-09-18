@@ -70,6 +70,12 @@ pub struct Fixture {
     pub expect_readelf: Vec<String>,
     /// Patterns for other files: `expect.readelf_files."libfoo.so" = [...]`.
     pub expect_readelf_files: Vec<(String, Vec<String>)>,
+    /// Patterns that apply only when the fixture is linked for one
+    /// architecture, named as in [`Triple::arch`](super::tools::Triple):
+    /// `expect.readelf_arch.x86_64 = [...]` for the main output,
+    /// `expect.readelf_arch.aarch64."libfoo.so" = [...]` for another file.
+    /// Relocation names differ between architectures; the program does not.
+    pub expect_readelf_arch: Vec<(String, Option<String>, Vec<String>)>,
     /// Arguments given to `readelf -W` for pattern checks (default `-a`).
     pub readelf_args: Vec<String>,
     /// Targets the fixture applies to (empty: the host, if it is Linux).
@@ -122,6 +128,7 @@ impl Fixture {
             expect_exit: 0,
             expect_readelf: Vec::new(),
             expect_readelf_files: Vec::new(),
+            expect_readelf_arch: Vec::new(),
             readelf_args: vec!["-a".to_string()],
             targets: Vec::new(),
             determinism: false,
@@ -234,6 +241,16 @@ impl Fixture {
                         .expect_readelf_files
                         .push(((*file).to_string(), strings()?));
                 }
+                ["expect", "readelf_arch", arch] => {
+                    fixture
+                        .expect_readelf_arch
+                        .push(((*arch).to_string(), None, strings()?));
+                }
+                ["expect", "readelf_arch", arch, file] => fixture.expect_readelf_arch.push((
+                    (*arch).to_string(),
+                    Some((*file).to_string()),
+                    strings()?,
+                )),
                 ["diff", "ignore"] => fixture.diff_ignore = strings()?,
                 ["diff", "skip"] => fixture.diff_skip = Some(string()?),
                 _ => return Err(at("unknown key".to_string())),
@@ -911,14 +928,7 @@ pub fn run_program(
     };
     let sh = tools().sh.clone().ok_or_else(|| Status::missing("sh"))?;
     let script = match &env.qemu {
-        Some(qemu) => {
-            // Insert qemu after any leading VAR=value assignments.
-            let words = process::split_words(run).map_err(Status::Fail)?;
-            let split = words.iter().take_while(|w| w.contains('=')).count();
-            let mut quoted: Vec<String> = words.iter().map(|w| process::shell_quote(w)).collect();
-            quoted.insert(split, process::shell_quote(&qemu.to_string_lossy()));
-            quoted.join(" ")
-        }
+        Some(qemu) => qemu_script(run, &qemu.to_string_lossy()).map_err(Status::Fail)?,
         None => run.clone(),
     };
     let mut command = process::shell(&sh, &script, dir);
@@ -927,6 +937,28 @@ pub fn run_program(
         .map_err(|e| Status::Fail(format!("cannot run `{run}`: {e}")))?;
     log.command(run, &output);
     Ok(Some(output))
+}
+
+/// Rewrites `run` so that every program of it runs under `qemu`: in each
+/// command of a `&&`, `||` or `;` chain, qemu goes after any leading
+/// `VAR=value` assignments.
+pub fn qemu_script(run: &str, qemu: &str) -> Result<String, String> {
+    let words = process::split_words(run)?;
+    let mut script: Vec<String> = Vec::new();
+    let mut command_start = true;
+    for word in &words {
+        if matches!(word.as_str(), "&&" | "||" | ";") {
+            script.push(word.clone());
+            command_start = true;
+            continue;
+        }
+        if command_start && !word.contains('=') {
+            script.push(process::shell_quote(qemu));
+            command_start = false;
+        }
+        script.push(process::shell_quote(word));
+    }
+    Ok(script.join(" "))
 }
 
 /// Checks `expect.exit` and `expect.stdout` against a run.
@@ -954,15 +986,25 @@ pub fn check_run(fixture: &Fixture, output: &Output, problems: &mut Vec<String>)
     }
 }
 
-/// Checks `expect.readelf` and `expect.readelf_files` in `dir`.
+/// Checks `expect.readelf`, `expect.readelf_arch` (for architecture
+/// `arch`) and `expect.readelf_files` in `dir`.
 pub fn check_readelf(
     fixture: &Fixture,
+    arch: &str,
     dir: &Path,
     problems: &mut Vec<String>,
 ) -> Result<(), Status> {
     let mut checks: Vec<(String, &[String])> = Vec::new();
     if !fixture.expect_readelf.is_empty() {
         checks.push((fixture.main_output(), &fixture.expect_readelf));
+    }
+    for (_, file, patterns) in fixture
+        .expect_readelf_arch
+        .iter()
+        .filter(|(a, ..)| a == arch)
+    {
+        let file = file.clone().unwrap_or_else(|| fixture.main_output());
+        checks.push((file, patterns));
     }
     for (file, patterns) in &fixture.expect_readelf_files {
         checks.push((file.clone(), patterns));
@@ -1151,7 +1193,7 @@ fn run_job_inner(
     if let Some(output) = run_program(fixture, &env, &work, log)? {
         check_run(fixture, &output, &mut problems);
     }
-    check_readelf(fixture, &work, &mut problems)?;
+    check_readelf(fixture, &env.triple.arch, &work, &mut problems)?;
 
     let mut note = None;
     if fixture.determinism && problems.is_empty() {

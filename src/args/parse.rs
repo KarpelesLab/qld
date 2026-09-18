@@ -238,8 +238,14 @@ pub fn usage() -> String {
     // libtool decides whether the linker can build shared libraries by
     // looking for ": supported targets:.* elf" in `ld --help`. List only what
     // qld links today; later milestones extend these lines.
-    text.push_str("qld: supported targets: elf64-x86-64 pei-x86-64\n");
-    text.push_str("qld: supported emulations: elf_x86_64 i386pep\n");
+    text.push_str(
+        "qld: supported targets: elf64-x86-64 elf64-littleaarch64 elf64-loongarch \
+         pei-x86-64 pei-i386 pei-aarch64-little\n",
+    );
+    text.push_str(
+        "qld: supported emulations: elf_x86_64 aarch64linux elf64loongarch \
+         i386pep i386pe arm64pe\n",
+    );
     text
 }
 
@@ -650,6 +656,7 @@ impl GnuParser {
             Action::EmitRelocs => o.emit_relocs = true,
             Action::Magic(mode) => o.magic = mode,
             Action::Relax(on) => o.relax = on,
+            Action::RelaxGp(on) => o.relax_gp = on,
             Action::ImageBase => o.image_base = Some(integer(m)?),
             Action::SectionStart => {
                 let spec = text(m)?;
@@ -735,6 +742,7 @@ impl GnuParser {
             }
             Action::ApplyDynamicRelocs(on) => o.apply_dynamic_relocs = on,
             Action::FixCortexA53Erratum843419 => o.fix_cortex_a53_843419 = true,
+            Action::FixCortexA53Erratum835769 => o.aarch64.fix_cortex_a53_835769 = true,
             Action::Z => {
                 let keyword = required(m)?.to_vec();
                 self.apply_z(&keyword)?;
@@ -813,6 +821,18 @@ impl GnuParser {
     /// target is, and only a PE link reads them.
     fn apply_pe(&mut self, m: &Matched, action: PeAction) -> Result<()> {
         let pe = &mut self.options.pe;
+        // Options whose default depends on the emulation (W33).
+        match action {
+            PeAction::Flag(PeFlag::LargeAddressAware, _) => pe.explicit.large_address_aware = true,
+            PeAction::MajorOsVersion | PeAction::MinorOsVersion => pe.explicit.os_version = true,
+            PeAction::MajorImageVersion | PeAction::MinorImageVersion => {
+                pe.explicit.image_version = true;
+            }
+            PeAction::MajorSubsystemVersion | PeAction::MinorSubsystemVersion => {
+                pe.explicit.subsystem_version = true;
+            }
+            _ => {}
+        }
         match action {
             PeAction::Flag(flag, on) => match flag {
                 PeFlag::Dynamicbase => pe.dynamicbase = on,
@@ -841,6 +861,7 @@ impl GnuParser {
                 let (subsystem, version) = crate::coff::options::parse_subsystem(&value)?;
                 pe.subsystem = Some(subsystem);
                 if let Some(version) = version {
+                    pe.explicit.subsystem_version = true;
                     pe.major_subsystem_version = version.major;
                     pe.minor_subsystem_version = version.minor;
                 }
@@ -966,6 +987,8 @@ impl GnuParser {
             ZAction::Ibt => o.x86.ibt = true,
             ZAction::Shstk => o.x86.shstk = true,
             ZAction::IbtPlt => o.x86.ibtplt = true,
+            ZAction::ForceBti => o.aarch64.force_bti = true,
+            ZAction::PacPlt => o.aarch64.pac_plt = true,
             ZAction::CetReport => {
                 o.x86.cet_report = match value {
                     "none" => ReportLevel::None,

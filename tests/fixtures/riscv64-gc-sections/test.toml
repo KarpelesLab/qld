@@ -1,0 +1,18 @@
+# M4: --gc-sections on RISC-V. `%pcrel_lo` relocations name the label of
+# their `auipc`, not the data, so liveness must come from the `%pcrel_hi`
+# half; the referenced function and data stay and the rest goes.
+description = "--gc-sections removes dead functions and data, for RISC-V 64"
+compile = ["cc -O2 -ffunction-sections -fdata-sections -fPIE -c main.c"]
+driver = "cc"
+link = "-pie -o out main.o -Wl,--gc-sections"
+run = "./out"
+expect.stdout = "42\n"
+expect.readelf = [
+  "RISC-V",
+  "live_function_qld",
+  "live_data_qld",
+  "!dead_function_qld",
+  "!dead_data_qld",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true

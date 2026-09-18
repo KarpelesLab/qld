@@ -274,6 +274,11 @@ pub fn decide(
             if matches!(class.width, Width::Field(field) if !field.is_data()) {
                 return Ok(decision);
             }
+            // RISC-V label differences (`ADD`/`SUB`/`SET`) are final at
+            // link time.
+            if matches!(class.width, Width::RiscV(field) if field.is_label_math()) {
+                return Ok(decision);
+            }
             if !mode.dynamic {
                 return Ok(decision);
             }

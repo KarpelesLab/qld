@@ -189,6 +189,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
             Value::OutputEnd(output) => {
                 layout.output_places.get(output as usize).map_or(0, |p| p.1)
             }
+            Value::GotBase if self.synth.arch.toc_bias().is_some() => self.got_base(),
             Value::GotBase => layout
                 .synthetic(Synthetic::GotPlt)
                 .or_else(|| layout.synthetic(Synthetic::Got))
@@ -204,6 +205,14 @@ impl<'x, 'a> Addresses<'x, 'a> {
             Value::Dynamic => layout
                 .synthetic(Synthetic::Dynamic)
                 .map_or(0, |(addr, ..)| addr),
+            Value::GlobalPointer => placement
+                .outputs
+                .iter()
+                .position(|o| o.name == b".sdata")
+                .and_then(|i| layout.output_places.get(i))
+                .filter(|place| place.2 != super::sections::NONE)
+                .map_or(layout.base, |place| place.0)
+                .wrapping_add(0x800),
             Value::Defsym(_) => 0,
             Value::Script { slot, .. } => layout
                 .script_symbols
@@ -221,6 +230,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
         if !refs.sections.is_live(id) {
             // Folded by ICF: the kept section has the same contents.
             let kept = refs.sections.resolve(id)?;
+            let offset = self.layout.relax.map(kept, offset);
             return Some(self.section_address(kept)?.wrapping_add(offset));
         }
         let kind = *refs.sections.kind.get(id.index())?;
@@ -263,7 +273,25 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 // start of the section's contribution.
                 Some(start)
             }
-            _ => Some(self.section_address(id)?.wrapping_add(offset)),
+            // Linker relaxation (RISC-V) moves offsets in code sections.
+            _ => Some(
+                self.section_address(id)?
+                    .wrapping_add(self.layout.relax.map(id, offset)),
+            ),
+        }
+    }
+
+    /// The size of a symbol at `value` with size `size` in section
+    /// `section` of `file`: smaller than `size` when linker relaxation
+    /// deleted bytes inside it.
+    #[must_use]
+    pub fn symbol_size(&self, file: usize, section: u32, value: u64, size: u64) -> u64 {
+        if self.layout.relax.is_empty() {
+            return size;
+        }
+        match self.refs.sections.id(file, section) {
+            Some(id) => self.layout.relax.symbol_size(id, value, size),
+            None => size,
         }
     }
 
@@ -299,6 +327,17 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 if merge && target.is_section_symbol() {
                     let offset = value.checked_add_signed(addend)?;
                     return Some((self.section_offset_address(file, section, offset)?, 0));
+                }
+                // A section symbol plus an offset into code that linker
+                // relaxation shrank (RISC-V): the offset moves too.
+                if target.is_section_symbol()
+                    && !self.layout.relax.is_empty()
+                    && let Some(id) = self.refs.sections.id(file, section)
+                    && let Some(relax) = self.layout.relax.section(id)
+                    && let Some(offset) = value.checked_add_signed(addend)
+                {
+                    let base = self.section_address(id)?;
+                    return Some((base.wrapping_add(relax.map(offset)), 0));
                 }
                 if let Some(global) = target.global {
                     if !self.refs.sections.is_present_in(file, section) {
@@ -361,9 +400,16 @@ impl<'x, 'a> Addresses<'x, 'a> {
         base.checked_add(slot.checked_mul(8)?)
     }
 
-    /// The GOT base (`_GLOBAL_OFFSET_TABLE_`).
+    /// The GOT base (`_GLOBAL_OFFSET_TABLE_`; on PowerPC64 the TOC pointer
+    /// `.TOC.`, 0x8000 bytes into `.got`).
     #[must_use]
     pub fn got_base(&self) -> u64 {
+        if let Some(bias) = self.synth.arch.toc_bias() {
+            return self
+                .layout
+                .synthetic(Synthetic::Got)
+                .map_or(0, |(addr, ..)| addr.wrapping_add(bias));
+        }
         self.layout
             .synthetic(Synthetic::GotPlt)
             .or_else(|| self.layout.synthetic(Synthetic::Got))
@@ -396,7 +442,7 @@ pub fn iplt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<
     }
     let index = u64::try_from(synth.iplt.index(owner)?).ok()?;
     let (base, ..) = layout.synthetic(Synthetic::Plt)?;
-    base.checked_add(index.checked_mul(synth.arch.iplt_entry_size())?)
+    base.checked_add(index.checked_mul(synth.arch.iplt_entry_size(synth.plt_flags()))?)
 }
 
 /// The address code jumps to for `owner`'s PLT entry: `.plt.sec` with IBT,
@@ -415,9 +461,26 @@ pub fn plt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u
     }
     let index = synth.plt_index(owner)?;
     if let Some((base, ..)) = layout.synthetic(Synthetic::PltSec) {
-        return base.checked_add(index.checked_mul(arch.plt_entry_size(flags))?);
+        return base.checked_add(index.checked_mul(arch.plt_sec_entry_size(flags))?);
     }
     lazy_plt_address(synth, layout, index)
+}
+
+/// The address of the GOT word `owner`'s PLT entry (or IFUNC stub) jumps
+/// through: its `.got.plt` slot, or its GOT entry for `.plt.got`.
+#[must_use]
+pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
+    if synth.plt_got.index(owner).is_some() {
+        let (base, ..) = layout.synthetic(Synthetic::Got)?;
+        return base.checked_add(synth.got_word(owner, GotKind::Address)?.checked_mul(8)?);
+    }
+    let index = if synth.dynamic() {
+        synth.plt_index(owner)?
+    } else {
+        u64::try_from(synth.iplt.index(owner)?).ok()?
+    };
+    let (base, ..) = layout.synthetic(Synthetic::GotPlt)?;
+    base.checked_add(index.checked_add(synth.got_plt_reserved)?.checked_mul(8)?)
 }
 
 /// The address of lazy `.plt` entry `index`, after the header.

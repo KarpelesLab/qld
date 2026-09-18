@@ -203,6 +203,9 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
         return result;
     };
     let order = file.position.raw();
+    if let Some(error) = context.arch.incompatible(refs.files, file_index) {
+        result.errors.push(Diagnostic::error(error).order(order));
+    }
     for (section_index, section) in object.sections.iter().enumerate() {
         let section_index = u32::try_from(section_index).unwrap_or(u32::MAX);
         if section.relocs == 0
@@ -257,7 +260,7 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             packable: 0,
         };
         let mut skip = false;
-        for rel in relas.iter() {
+        super::arch::for_each_relocation!(context.arch, relas, |rel| {
             if skip {
                 // The call a TLS relaxation removed still counts as a use
                 // (GNU ld keeps `__tls_get_addr` in the dynamic symbols).
@@ -396,7 +399,7 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
                     }
                 }
             }
-        }
+        });
         if dyn_section.relative != 0 || dyn_section.symbolic != 0 {
             result.dyn_sections.push(dyn_section);
         }

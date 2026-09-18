@@ -2643,6 +2643,7 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         sections: out_sections,
         // Script-driven layout does not insert range-extension thunks.
         thunks: Vec::new(),
+        relax: Default::default(),
         output_places,
         section_addr,
         section_shndx,

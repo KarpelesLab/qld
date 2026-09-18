@@ -1,0 +1,16 @@
+# M4: an IFUNC in a static LoongArch executable. The stub jumps through a
+# GOT slot that an IRELATIVE relocation fills at startup, and the function
+# pointer must be the stub's address, so the two calls agree.
+description = "IFUNC resolved at startup in a static executable, for LoongArch64"
+compile = ["cc -O2 -c ifunc.c"]
+driver = "cc"
+link = "-static -o out ifunc.o"
+run = "./out"
+expect.stdout = "pick 2 2 same\n"
+expect.readelf = [
+  "LoongArch",
+  "R_LARCH_IRELATIVE",
+  "!R_LARCH_JUMP_SLOT",
+]
+targets = ["loongarch64-linux-gnu"]
+determinism = true

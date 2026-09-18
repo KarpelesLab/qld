@@ -15,12 +15,12 @@ expect.readelf = [
   "Relocation section '.rela.text'",
   "Relocation section '.rela.data.rel.ro'",
   "Relocation section '.rela.debug_info'",
-  "R_X86_64_GOTTPOFF",
   "SECTION LOCAL  DEFAULT",
-  "R_X86_64_64 ",
   "helper_qld + 0",
   "!unused_qld",
 ]
+expect.readelf_arch.x86_64 = ["R_X86_64_GOTTPOFF", "R_X86_64_64 "]
+expect.readelf_arch.aarch64 = ["R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21", "R_AARCH64_ABS64 "]
 determinism = true
 # GNU ld 2.46 keeps `.note.GNU-stack` as an output section with
 # --emit-relocs, as qld does; GNU ld 2.42 (Ubuntu 24.04) drops it.

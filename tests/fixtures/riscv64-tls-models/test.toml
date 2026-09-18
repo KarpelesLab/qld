@@ -1,0 +1,31 @@
+# M4: the TLS models on RISC-V, in a PIE and in a static executable. The
+# psABI defines no general-dynamic or initial-exec relaxation, so the
+# general-dynamic access keeps its `__tls_get_addr` call through a GOT pair
+# (module 1, offset minus 0x800) and initial-exec keeps its GOT entry; both
+# are link-time constants in an executable, so no TLS dynamic relocation is
+# left. Local-exec accesses within 2 KiB of the thread pointer relax.
+description = "RISC-V TLS: general-dynamic, local-dynamic, initial-exec and local-exec in executables"
+compile = ["cc -O2 -fPIE -c tls.c"]
+driver = "cc"
+link = [
+  "-pie -o out-pie tls.o",
+  "-static -o out-static tls.o",
+]
+output = "out-pie"
+run = "./out-pie && ./out-static"
+expect.stdout = "tls 63 64\ntls 63 64\n"
+expect.readelf = [
+  "RISC-V",
+  "TLS",
+  "__tls_get_addr",
+  "!R_RISCV_TLS_DTPMOD64",
+  "!R_RISCV_TLS_DTPREL64",
+  "!R_RISCV_TLS_TPREL64",
+]
+expect.readelf_files."out-static" = [
+  "EXEC (Executable file)",
+  "TLS",
+  "!INTERP",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true

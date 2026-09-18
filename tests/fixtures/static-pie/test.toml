@@ -8,7 +8,8 @@ run = "./out"
 expect.stdout = "static-pie: 3 entries, last=gamma\n"
 expect.readelf = [
   "DYN (Position-Independent Executable file)",
-  "R_X86_64_RELATIVE",
   "!INTERP",
   "!(NEEDED)",
 ]
+expect.readelf_arch.x86_64 = ["R_X86_64_RELATIVE"]
+expect.readelf_arch.aarch64 = ["R_AARCH64_RELATIVE"]

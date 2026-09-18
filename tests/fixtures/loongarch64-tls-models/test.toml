@@ -1,0 +1,19 @@
+# M4: the four TLS models in a LoongArch PIE, built with linker relaxation
+# (GCC's default). Everything is in the executable, so no TLS dynamic
+# relocation may be left. `loongarch64-tls-models-norelax` builds the same
+# program without relaxation.
+description = "LoongArch64 TLS: general-dynamic, local-dynamic, initial-exec and local-exec in a PIE"
+compile = ["cc -O2 -fPIE -mrelax -c tls.c -o tls-relax.o"]
+driver = "cc"
+link = "-pie -o out-relax tls-relax.o"
+output = "out-relax"
+run = "./out-relax"
+expect.stdout = "tls 31\n"
+expect.readelf = [
+  "LoongArch",
+  "TLS",
+  "!R_LARCH_TLS_DTPMOD64",
+  "!R_LARCH_TLS_TPREL64",
+]
+targets = ["loongarch64-linux-gnu"]
+determinism = true

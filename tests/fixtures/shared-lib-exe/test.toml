@@ -19,8 +19,9 @@ expect.readelf = [
   "Shared library: [libgreet.so]",
   "$ORIGIN",
   "exe_callback",
-  "R_X86_64_JUMP_SLOT",
 ]
+expect.readelf_arch.x86_64 = ["R_X86_64_JUMP_SLOT"]
+expect.readelf_arch.aarch64 = ["R_AARCH64_JUMP_SLOT"]
 expect.readelf_files."libgreet.so" = [
   "DYN (Shared object file)",
   "Library soname: [libgreet.so]",

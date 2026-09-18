@@ -26,6 +26,7 @@
 use rayon::prelude::*;
 
 use crate::args::{BuildId, LinkOptions};
+use crate::diag::Diagnostic;
 use crate::elf::read::consts::{
     GNU_PROPERTY_1_NEEDED, GNU_PROPERTY_AARCH64_FEATURE_1_AND, GNU_PROPERTY_AARCH64_FEATURE_1_BTI,
     GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_FEATURE_1_IBT,
@@ -152,6 +153,8 @@ pub struct Synth {
     pub dynrelro: (u64, u64),
     /// IBT-enabled PLT (x86-64), or BTI-enabled PLT header (AArch64).
     pub ibt: bool,
+    /// AArch64 `-z pac-plt`: PLT entries authenticate what they load.
+    pub pac_plt: bool,
     /// Reserved words at the start of `.got.plt`.
     pub got_plt_reserved: u64,
     /// Dynamic relocations in `.rela.dyn` that come from GOT entries and
@@ -187,6 +190,8 @@ pub struct Synth {
     pub verneed_count: u64,
     /// Number of `.gnu.version_d` entries (`sh_info`).
     pub verdef_count: u64,
+    /// RISC-V: the merged `.riscv.attributes`.
+    pub riscv_attributes: Option<super::arch::riscv::attributes::Output>,
 }
 
 /// The string the linker adds to `.comment`.
@@ -212,12 +217,15 @@ impl Synth {
     }
 
     /// The shape of PLT entries: landing pads for x86-64 IBT or AArch64
-    /// BTI. On AArch64 only the header needs one.
+    /// BTI, and AArch64 pointer authentication. An AArch64 shared object's
+    /// entries need no landing pad, only the header does (GNU ld).
     #[must_use]
     pub fn plt_flags(&self) -> PltFlags {
+        let executable = self.mode.is_none_or(|m| m.executable());
         PltFlags {
             landing_pad: self.ibt,
-            entry_landing_pad: self.ibt && self.arch == Arch::X86_64,
+            entry_landing_pad: self.ibt && (self.arch == Arch::X86_64 || executable),
+            authenticate: self.pac_plt && self.arch == Arch::AArch64,
         }
     }
 
@@ -244,10 +252,12 @@ impl Synth {
                 .collect()
         };
         let dynamic = mode.dynamic;
+        let uses_plt_got = self.arch.uses_plt_got();
         // A preemptible function with both a GOT entry and calls goes
         // through `.plt.got`, unless its PLT entry is its canonical address.
         let plt_got = move |f: SymbolFlags| {
             dynamic
+                && uses_plt_got
                 && f.contains(SymbolFlags::NEEDS_PLT | SymbolFlags::NEEDS_GOT)
                 && !f.contains(SymbolFlags::NEEDS_CANONICAL_PLT)
         };
@@ -300,7 +310,14 @@ impl Synth {
             || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
         // `.got.plt` words.
-        self.got_plt_reserved = if dynamic && has_got_plt { 3 } else { 0 };
+        self.got_plt_reserved = if dynamic && has_got_plt {
+            self.arch.got_plt_reserved()
+        } else {
+            0
+        };
+        if self.arch == Arch::RiscV64 {
+            self.riscv_attributes = super::arch::riscv::attributes::collect(refs);
+        }
         self.section_dyn_relocs = scan.section_dyn_relocs();
         self.section_packable = scan.section_packable();
         self.got_dyn_relocs = self.count_got_relocs(refs);
@@ -435,6 +452,10 @@ impl Synth {
             add(SlotReloc::Module(DynKind::DtpMod));
         }
         other = other.saturating_add(u64_len(self.copies.len()));
+        // IFUNC slots whose IRELATIVE relocations go to `.rela.dyn`.
+        if !self.arch.irelative_in_rela_plt() {
+            other = other.saturating_add(u64_len(self.iplt.len()));
+        }
         (relative, other)
     }
 
@@ -473,7 +494,9 @@ impl Synth {
     /// Number of words the GOT occupies.
     #[must_use]
     pub fn got_words(&self) -> u64 {
-        u64_len(self.got.len())
+        self.arch
+            .got_header_words()
+            .saturating_add(u64_len(self.got.len()))
             .saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2))
             .saturating_add(u64_len(self.gottpoff.len()))
             .saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2))
@@ -483,12 +506,13 @@ impl Synth {
     /// The first GOT word of each kind of entry.
     #[must_use]
     pub fn got_base_word(&self, kind: GotKind) -> u64 {
-        let address = u64_len(self.got.len());
+        let header = self.arch.got_header_words();
+        let address = header.saturating_add(u64_len(self.got.len()));
         let tlsgd = address.saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2));
         let tpoff = tlsgd.saturating_add(u64_len(self.gottpoff.len()));
         let desc = tpoff.saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2));
         match kind {
-            GotKind::Address => 0,
+            GotKind::Address => header,
             GotKind::TlsGd => address,
             GotKind::TpOff => tlsgd,
             GotKind::TlsDesc => tpoff,
@@ -565,7 +589,9 @@ impl Synth {
                 }
             }
             Synthetic::RelaPlt => {
-                let entries = if dynamic {
+                let entries = if dynamic && !self.arch.irelative_in_rela_plt() {
+                    u64_len(self.plt.len())
+                } else if dynamic {
                     self.plt_entries()
                 } else {
                     count(&self.iplt)
@@ -591,17 +617,18 @@ impl Synth {
                     }
                 } else {
                     (
-                        count(&self.iplt).saturating_mul(self.arch.iplt_entry_size()),
+                        count(&self.iplt).saturating_mul(self.arch.iplt_entry_size(flags)),
                         align,
                     )
                 }
             }
             Synthetic::PltSec => {
-                // Only x86-64 IBT splits the PLT in two.
-                if dynamic && self.ibt && self.arch == Arch::X86_64 {
+                // x86-64 IBT splits the PLT in two, and PowerPC64 calls
+                // through stubs there.
+                if dynamic && self.arch.has_plt_sec(self.ibt) {
                     (
                         self.plt_entries()
-                            .saturating_mul(self.arch.plt_entry_size(self.plt_flags())),
+                            .saturating_mul(self.arch.plt_sec_entry_size(self.plt_flags())),
                         self.arch.plt_align(),
                     )
                 } else {
@@ -813,11 +840,48 @@ pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
 #[must_use]
 pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
     if Arch::of_files(files) == Some(Arch::AArch64) {
-        return input_features(files) & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
+        return options.aarch64.force_bti
+            || input_features(files) & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
     }
     options.x86.ibtplt
         || options.x86.ibt
         || input_features(files) & GNU_PROPERTY_X86_FEATURE_1_IBT != 0
+}
+
+/// Whether PLT entries authenticate the addresses they load: AArch64
+/// `-z pac-plt`.
+#[must_use]
+pub fn plan_pac_plt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+    options.aarch64.pac_plt && Arch::of_files(files) == Some(Arch::AArch64)
+}
+
+/// The warnings `-z force-bti` gives, as GNU ld does: one for each input
+/// object without the BTI property.
+#[must_use]
+pub fn force_bti_warnings(files: &[ElfInput<'_>], options: &LinkOptions) -> Vec<Diagnostic> {
+    if !options.aarch64.force_bti || Arch::of_files(files) != Some(Arch::AArch64) {
+        return Vec::new();
+    }
+    files
+        .iter()
+        .filter(|file| {
+            file.object.as_ref().is_some_and(|object| {
+                let features = object
+                    .properties
+                    .unwrap_or_default()
+                    .aarch64_feature_1_and
+                    .unwrap_or(0);
+                features & GNU_PROPERTY_AARCH64_FEATURE_1_BTI == 0
+            })
+        })
+        .map(|file| {
+            Diagnostic::warning(format!(
+                "{}: BTI is required by -z force-bti, but this input object file lacks the necessary property note",
+                file.display()
+            ))
+            .order(file.position.raw())
+        })
+        .collect()
 }
 
 /// Merges the inputs' GNU properties into the output note, as GNU ld does:
@@ -864,6 +928,12 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     }
     let features = input_features(files);
     if aarch64 {
+        // `-z force-bti` marks the output even when an input is not.
+        let features = if options.aarch64.force_bti {
+            features | GNU_PROPERTY_AARCH64_FEATURE_1_BTI
+        } else {
+            features
+        };
         // AArch64 has one feature word; the x86 properties do not apply.
         let properties: Vec<(u32, u32)> = [
             (GNU_PROPERTY_1_NEEDED, needed_1),
