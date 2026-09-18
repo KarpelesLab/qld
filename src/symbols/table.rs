@@ -43,7 +43,8 @@
 //! # Small batches
 //!
 //! Passes 2 and 3, and the parallelism of pass 1, only pay off for large
-//! batches. A batch of fewer than 65,536 names whose jobs
+//! batches. A batch of fewer than 65,536 names (16,384 once the table holds
+//! names, as most names of later batches then exist already) whose jobs
 //! all have distinct positions (always the case for the resolution driver) is
 //! interned on the calling thread, jobs in position order and names in job
 //! order. Each new name is then first seen at its first occurrence, so
@@ -118,8 +119,16 @@ const MIN_PARALLEL_CHUNK: usize = 1024;
 // `tests/symbols.rs`, where a 20,000-name batch took 2 ms on one thread and
 // 3.5 ms on 64 with lower thresholds.
 
-/// Pass 1 (a hash probe under a shard lock, about 30 ns per name), in names.
+/// Pass 1 (a hash probe under a shard lock, about 30 ns per name), in names,
+/// for a batch into an empty table. All its names are new, and numbering
+/// new names (pass 2) makes the three passes slower than the calling
+/// thread below this size (a 30,000-name first batch: 2.4 ms against 4.5).
 const MIN_PARALLEL_LOOKUP: usize = 1 << 16;
+/// Pass 1 for later batches, whose names mostly exist already: clang's
+/// resolution rounds of 23,000 and 50,000 names took 1.5 and 2.9 ms on the
+/// calling thread, and the resolution about 4 ms less at 16 and 64 threads
+/// with this threshold.
+const MIN_PARALLEL_LOOKUP_KNOWN: usize = 1 << 14;
 /// The sort of pass 2 (about 45 ns per new name), in new names.
 const MIN_PARALLEL_SORT: usize = 1 << 17;
 /// The linear steps of passes 2 and 3 (a few ns per element, but touching
@@ -488,7 +497,12 @@ impl<'a> SymbolTable<'a> {
             );
             total = total.saturating_add(job.names.len());
         }
-        if total < MIN_PARALLEL_LOOKUP {
+        let min_parallel = if self.names.is_empty() {
+            MIN_PARALLEL_LOOKUP
+        } else {
+            MIN_PARALLEL_LOOKUP_KNOWN
+        };
+        if total < min_parallel {
             let mut order: Vec<usize> = (0..jobs.len()).collect();
             order.sort_unstable_by_key(|&j| jobs[j].position);
             if order
@@ -517,7 +531,7 @@ impl<'a> SymbolTable<'a> {
                         &overflowed,
                     ));
                 };
-                if job.ids.len() >= 2 * MIN_PARALLEL_CHUNK && total >= MIN_PARALLEL_LOOKUP {
+                if job.ids.len() >= 2 * MIN_PARALLEL_CHUNK && total >= min_parallel {
                     job.ids
                         .par_iter_mut()
                         .zip(job.names.par_iter())
@@ -528,7 +542,7 @@ impl<'a> SymbolTable<'a> {
                     job.ids.iter_mut().zip(job.names).enumerate().for_each(one);
                 }
             };
-            if total >= MIN_PARALLEL_LOOKUP {
+            if total >= min_parallel {
                 jobs.par_iter_mut()
                     .with_min_len(jobs_per_task)
                     .for_each(intern_job);
