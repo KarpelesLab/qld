@@ -395,10 +395,11 @@ fn link_inputs<'a>(
         narrow.run(|| dso::mark_dependency_symbols(files, &symbols, &needed, options));
     }
     let always: &[&str] = if mode.dynamic && mode.executable() && options.export_dynamic {
-        for name in defined::ALWAYS_DEFINED {
+        let always = defined::always_defined(files);
+        for name in always {
             symbols.intern(SymbolName::new(name.as_bytes()));
         }
-        defined::ALWAYS_DEFINED
+        always
     } else {
         &[]
     };

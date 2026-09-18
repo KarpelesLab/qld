@@ -23,3 +23,8 @@ expect.readelf_files."libtls.so" = [
 ]
 expect.readelf_arch.x86_64."libtls.so" = ["R_X86_64_DTPMOD64", "!R_X86_64_TPOFF64"]
 expect.readelf_arch.aarch64."libtls.so" = ["R_AARCH64_TLSDESC", "!R_AARCH64_TLS_TPREL64"]
+# GCC's AArch64 general-dynamic model uses TLS descriptors. qld binds them
+# eagerly (R_AARCH64_TLSDESC in .rela.dyn, as lld does); GNU ld puts them
+# in .rela.plt with a lazy TLSDESC trampoline (DT_TLSDESC_PLT/GOT) that
+# glibc no longer uses.
+diff.ignore_arch.aarch64 = ["TLSDESC"]

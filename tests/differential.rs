@@ -152,7 +152,7 @@ fn diff_inner(
     let expected = observe(fixture, &env, &reference_dir, &readelf_path, log)?;
     let actual = observe(fixture, &env, &candidate_dir, &readelf_path, log)?;
     let (only_reference, only_candidate) =
-        readelf::compare(&expected, &actual, &fixture.diff_ignore);
+        readelf::compare(&expected, &actual, &fixture.diff_ignores(&env.triple.arch));
     if only_reference.is_empty() && only_candidate.is_empty() {
         return Ok(Status::Pass(Some(format!(
             "{} properties match",

@@ -13,3 +13,8 @@ expect.readelf = [
 ]
 expect.readelf_arch.x86_64 = ["R_X86_64_RELATIVE"]
 expect.readelf_arch.aarch64 = ["R_AARCH64_RELATIVE"]
+# AArch64 GNU ld leaves two R_AARCH64_NONE placeholders, and adds the load
+# base to the GOT slots of an absolute symbol (_nl_current_LC_CTYPE_used,
+# which static glibc defines as 2): two RELATIVE relocations that qld,
+# keeping the absolute value, does not emit.
+diff.ignore_arch.aarch64 = ["R_AARCH64_NONE", "R_AARCH64_RELATIVE"]

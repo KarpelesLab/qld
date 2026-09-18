@@ -119,6 +119,39 @@ const FIXED: &[(&str, Value)] = &[
 /// assigns them unconditionally; they are exported with `--export-dynamic`.
 pub const ALWAYS_DEFINED: &[&str] = &["_edata", "__bss_start", "_end"];
 
+/// Boundary symbols GNU ld's AArch64 default script assigns besides the
+/// common ones (`__bss_start__ = .;` before `.bss`, `_bss_end__` and
+/// `__bss_end__` after it, `__end__` with `_end`). qld's `.bss` ends at
+/// `_end`, so the last three take its value.
+const AARCH64_EXTRA: &[(&str, Value)] = &[
+    ("__bss_start__", Value::BssStart),
+    ("_bss_end__", Value::End),
+    ("__bss_end__", Value::End),
+    ("__end__", Value::End),
+];
+
+/// [`ALWAYS_DEFINED`] with the AArch64 script's own boundary symbols.
+const ALWAYS_DEFINED_AARCH64: &[&str] = &[
+    "_edata",
+    "__bss_start",
+    "_end",
+    "__bss_start__",
+    "_bss_end__",
+    "__bss_end__",
+    "__end__",
+];
+
+/// The symbols an executable of the architecture of `files` always
+/// defines under `--export-dynamic` (see [`ALWAYS_DEFINED`]).
+#[must_use]
+pub fn always_defined(files: &[ElfInput<'_>]) -> &'static [&'static str] {
+    if super::arch::Arch::of_files(files) == Some(super::arch::Arch::AArch64) {
+        ALWAYS_DEFINED_AARCH64
+    } else {
+        ALWAYS_DEFINED
+    }
+}
+
 /// The linker-defined symbols of a link.
 #[derive(Debug, Default)]
 pub struct LinkerSymbols {
@@ -184,7 +217,10 @@ pub fn register(
         result.entries.push((id, value));
     };
     let script = placement.script.as_deref();
-    for &(name, value) in FIXED {
+    let aarch64 =
+        script.is_none() && super::arch::Arch::of_files(files) == Some(super::arch::Arch::AArch64);
+    let extra: &[(&str, Value)] = if aarch64 { AARCH64_EXTRA } else { &[] };
+    for &(name, value) in FIXED.iter().chain(extra) {
         if dynamic && matches!(value, Value::RelaIpltStart | Value::RelaIpltEnd) {
             continue;
         }
