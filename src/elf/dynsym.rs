@@ -1081,6 +1081,7 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
     let mode = input.mode;
     let synth = input.synth;
     let refs = input.refs;
+    let rel = synth.arch.uses_rel();
     let mut entries = Vec::new();
     for &needed in &strings.needed {
         entries.push((DT_NEEDED, Value(u64::from(needed))));
@@ -1140,7 +1141,12 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
     }
     if synth.size_align(Synthetic::RelaPlt).0 > 0 {
         entries.push((DT_PLTRELSZ, Size(Synthetic::RelaPlt)));
-        entries.push((DT_PLTREL, Value(crate::elf::read::consts::DT_RELA as u64)));
+        let pltrel = if rel {
+            crate::elf::read::consts::DT_REL
+        } else {
+            crate::elf::read::consts::DT_RELA
+        };
+        entries.push((DT_PLTREL, Value(pltrel as u64)));
         entries.push((DT_JMPREL, Address(Synthetic::RelaPlt)));
         if let Some(offset) = synth.arch.glink_offset() {
             entries.push((
@@ -1150,9 +1156,16 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
         }
     }
     if synth.rela_dyn_count() > 0 {
-        entries.push((DT_RELA, Address(Synthetic::RelaDyn)));
-        entries.push((DT_RELASZ, Size(Synthetic::RelaDyn)));
-        entries.push((DT_RELAENT, Value(plan.kind.rela_size())));
+        if rel {
+            use crate::elf::read::consts::{DT_REL, DT_RELENT, DT_RELSZ};
+            entries.push((DT_REL, Address(Synthetic::RelaDyn)));
+            entries.push((DT_RELSZ, Size(Synthetic::RelaDyn)));
+            entries.push((DT_RELENT, Value(plan.kind.rel_size())));
+        } else {
+            entries.push((DT_RELA, Address(Synthetic::RelaDyn)));
+            entries.push((DT_RELASZ, Size(Synthetic::RelaDyn)));
+            entries.push((DT_RELAENT, Value(plan.kind.rela_size())));
+        }
     }
     if synth.relr_count() > 0 {
         entries.push((DT_RELR, Address(Synthetic::RelrDyn)));
@@ -1228,7 +1241,12 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
     }
     let relative = synth.relative_count();
     if options.combine_relocs && relative > 0 {
-        entries.push((DT_RELACOUNT, Value(relative)));
+        let count = if rel {
+            crate::elf::read::consts::DT_RELCOUNT
+        } else {
+            DT_RELACOUNT
+        };
+        entries.push((count, Value(relative)));
     }
     for _ in 0..options.spare_dynamic_tags.unwrap_or(0).min(64) {
         entries.push((DT_NULL, Value(0)));

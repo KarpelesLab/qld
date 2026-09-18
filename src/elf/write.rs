@@ -830,7 +830,6 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
         {
             word.copy_from_slice(F::encode_word(value).as_bytes());
         }
-        let _ = size64;
     };
     let refs = &addresses.refs;
     // PowerPC64 keeps the TOC pointer's link-time value in the first word.
@@ -876,11 +875,11 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
                         _ => (0, 0),
                     };
                     put(address, module);
-                    put(address.wrapping_add(8), offset);
+                    put(address.wrapping_add(size64), offset);
                 }
                 GotKind::TlsDesc | GotKind::TlsLd => {
                     put(address, 0);
-                    put(address.wrapping_add(8), 0);
+                    put(address.wrapping_add(size64), 0);
                 }
             }
         }
@@ -984,24 +983,38 @@ fn write_plt<F: crate::elf::read::ElfFormat>(
     Ok(())
 }
 
+/// The size of one dynamic relocation entry: `Elf_Rel` where the
+/// architecture uses `SHT_REL`, else `Elf_Rela`.
+fn dyn_entry_size<F: ElfFormat>(arch: Arch) -> usize {
+    if arch.uses_rel() {
+        <F::Rel as RawRecord>::SIZE
+    } else {
+        <F::Rela as RawRecord>::SIZE
+    }
+}
+
+/// Encodes a dynamic relocation into `out`, an entry of
+/// [`dyn_entry_size`]: an `Elf_Rel` (its addend is in the word it
+/// relocates) or an `Elf_Rela`.
 fn put_rela<F: ElfFormat>(out: &mut [u8], offset: u64, symbol: u32, r_type: u32, addend: i64) {
-    let Some(entry) = out.get_mut(..<F::Rela as RawRecord>::SIZE) else {
-        return;
-    };
     let rel = crate::elf::read::Relocation {
         offset,
         symbol,
         r_type,
         addend,
     };
-    entry.copy_from_slice(F::encode_rela(&rel).as_bytes());
+    if out.len() == <F::Rel as RawRecord>::SIZE {
+        out.copy_from_slice(F::encode_rel(&rel).as_bytes());
+    } else if let Some(entry) = out.get_mut(..<F::Rela as RawRecord>::SIZE) {
+        entry.copy_from_slice(F::encode_rela(&rel).as_bytes());
+    }
 }
 
 fn write_rela_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let irelative = synth.arch.dyn_reloc(DynKind::Irelative);
-    let entry_size = <F::Rela as RawRecord>::SIZE.max(1);
+    let entry_size = dyn_entry_size::<F>(synth.arch).max(1);
     if !synth.dynamic() {
         for (index, (owner, entry)) in synth
             .iplt
@@ -1194,7 +1207,7 @@ fn write_rela_dyn<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8
         )));
     }
     relocs.par_sort_unstable();
-    let entry_size = <F::Rela as RawRecord>::SIZE.max(1);
+    let entry_size = dyn_entry_size::<F>(synth.arch).max(1);
     for (reloc, entry) in relocs.iter().zip(out.chunks_exact_mut(entry_size)) {
         put_rela::<F>(
             entry,
@@ -1294,12 +1307,10 @@ fn section_dyn_relocs<F: crate::elf::read::ElfFormat>(
     else {
         return out;
     };
-    let Relocations::Rela(relas) = relocations.relocations else {
-        return out;
-    };
+    let arch = context.arch;
     let base = addresses.section_address(id).unwrap_or(0);
     let mut skip = false;
-    for rel in relas.iter() {
+    arch::for_each_relocation!(arch, relocations.relocations, data, |rel| {
         if skip {
             skip = false;
             continue;
@@ -1346,7 +1357,7 @@ fn section_dyn_relocs<F: crate::elf::read::ElfFormat>(
                 out.push(dyn_reloc(context.arch, place, symbol, dyn_kind, rel.addend));
             }
         }
-    }
+    });
     out
 }
 
@@ -1384,7 +1395,7 @@ fn write_eh_frame_hdr<F: ElfFormat>(addresses: &Addresses<'_, '_, F>, out: &mut 
             let (true, Some(_), Some(pc_begin)) = (record.live, record.cie, record.pc_begin) else {
                 continue;
             };
-            let Some(rel) = section.relocs.get(pc_begin as usize) else {
+            let Some(rel) = section.reloc(pc_begin as usize) else {
                 continue;
             };
             let Some(target) = addresses.refs.target(section.file, rel.symbol as usize) else {
@@ -1618,7 +1629,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         .map(|r| object.elf.relocation_section(section.relocs, &r.header))
         .transpose()?
         .flatten();
-    let Some(Relocations::Rela(relas)) = relocations.map(|r| r.relocations) else {
+    let Some(relocations) = relocations.map(|r| r.relocations) else {
         return Ok(());
     };
     let alloc = section.header.sh_flags & SHF_ALLOC != 0;
@@ -1636,7 +1647,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
     // accesses keep going through the entry; found on first use.
     let pinned_toc: std::cell::OnceCell<Vec<(u32, u64)>> = std::cell::OnceCell::new();
     let mut skip = false;
-    arch::for_each_relocation!(arch, relas, |rel| {
+    arch::for_each_relocation!(arch, relocations, data, |rel| {
         if skip {
             skip = false;
             continue;
@@ -1833,6 +1844,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                             got: g,
                             got_pc: g.wrapping_add_signed(a).wrapping_sub(place) as i64,
                             place,
+                            got_base: addresses.got_base(),
                         },
                     )
                 }),
@@ -1840,6 +1852,12 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 arch.relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
             }
             Kind::RelaxGotPcNoPic => arch.relax_got(out, rel.offset, class.kind, sa as i64),
+            Kind::RelaxGotOff => arch.relax_got(
+                out,
+                rel.offset,
+                class.kind,
+                sa.wrapping_sub(addresses.got_base()) as i64,
+            ),
             // PowerPC64: a load through a `.toc` entry becomes the
             // TOC-relative address of the symbol the entry holds.
             Kind::GotRel
@@ -1856,7 +1874,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                     addresses,
                     file_index,
                     &rel,
-                    relas,
+                    relocations,
                     &pinned_toc,
                     input.context.mode.pic,
                     sa,
@@ -1921,6 +1939,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                         got: 0,
                         got_pc: 0,
                         place,
+                        got_base: 0,
                     },
                 )
             }
@@ -1963,7 +1982,9 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             .into_iter()
             .map(|(offset, _)| offset)
             .collect();
-        arch::aarch64::relax_adrp_pairs(out, relas.iter(), base, &patched, &got_target);
+        if let Relocations::Rela(relas) = relocations {
+            arch::aarch64::relax_adrp_pairs(out, relas.iter(), base, &patched, &got_target);
+        }
     }
     Ok(())
 }
@@ -2042,18 +2063,14 @@ fn ppc64_toc_access<F: crate::elf::read::ElfFormat>(
     addresses: &Addresses<'_, '_, F>,
     file_index: usize,
     rel: &crate::elf::read::Relocation,
-    relas: crate::elf::read::RelaSlice<'_, F>,
+    relocations: Relocations<'_, F>,
     pinned: &std::cell::OnceCell<Vec<(u32, u64)>>,
     pic: bool,
     sa: u64,
     width: Width,
 ) -> std::result::Result<(), ApplyError> {
     let pinned = pinned.get_or_init(|| {
-        super::arch::ppc64::pinned_toc_entries(
-            &addresses.refs,
-            file_index,
-            Relocations::Rela(relas),
-        )
+        super::arch::ppc64::pinned_toc_entries(&addresses.refs, file_index, relocations)
     });
     let (sa, width) =
         match super::arch::ppc64::toc_indirection(addresses, file_index, rel, pinned, pic) {
@@ -2201,7 +2218,7 @@ fn write_eh_frame<F: crate::elf::read::ElfFormat>(
             }
         }
         for index in record.relocs.0..record.relocs.1 {
-            let Some(rel) = eh.relocs.get(index as usize) else {
+            let Some(rel) = eh.reloc(index as usize) else {
                 continue;
             };
             let Some(target) = refs.target(eh.file, rel.symbol as usize) else {

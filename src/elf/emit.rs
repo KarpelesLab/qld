@@ -301,7 +301,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
             // Relocations of dropped records stay, as R_X86_64_NONE.
             for record in &eh.records {
                 for reloc in record.relocs.0..record.relocs.1 {
-                    let (Some(rel), Some(entry)) = (eh.relocs.get(reloc as usize), entries.next())
+                    let (Some(rel), Some(entry)) = (eh.reloc(reloc as usize), entries.next())
                     else {
                         continue;
                     };

@@ -65,12 +65,30 @@ pub struct EhSection<'a, F: ElfFormat = Elf64Le> {
     pub index: u32,
     /// The section contents.
     pub data: &'a [u8],
-    /// Its relocations.
-    pub relocs: RelaSlice<'a, F>,
+    /// Its relocations. `SHT_REL` addends are read by
+    /// [`reloc`](Self::reloc).
+    pub relocs: Relocations<'a, F>,
     /// The records.
     pub records: Vec<Record>,
     /// Output size (live records only).
     pub size: u64,
+}
+
+impl<F: ElfFormat> EhSection<'_, F> {
+    /// Relocation `index` of the section, with its addend: for `SHT_REL`,
+    /// the 32-bit field it patches (`.eh_frame` pointers are 4 bytes on
+    /// every architecture that uses `SHT_REL`).
+    #[must_use]
+    pub fn reloc(&self, index: usize) -> Option<crate::elf::read::Relocation> {
+        let rel = self.relocs.get(index)?;
+        if self.relocs.is_rela() {
+            return Some(rel);
+        }
+        let at = usize::try_from(rel.offset).ok()?;
+        let field = self.data.get(at..at.checked_add(4)?)?.first_chunk::<4>()?;
+        let addend = i64::from(<F::Endian as crate::elf::read::Endian>::u32(*field) as i32);
+        Some(crate::elf::read::Relocation { addend, ..rel })
+    }
 }
 
 /// All `.eh_frame` input sections of the link, in section ID order.
@@ -114,16 +132,8 @@ pub fn split<'a, F: crate::elf::read::ElfFormat>(
                     }
                     _ => None,
                 };
-                let relocs = match reloc_section.map(|r| r.relocations) {
-                    Some(Relocations::Rela(relas)) => relas,
-                    Some(Relocations::Rel(_)) => {
-                        return Err(object.malformed(
-                            section.header.sh_offset,
-                            ".eh_frame relocations (SHT_REL on x86-64)",
-                        ));
-                    }
-                    None => RelaSlice::default(),
-                };
+                let relocs = reloc_section
+                    .map_or(Relocations::Rela(RelaSlice::default()), |r| r.relocations);
                 let entries = object
                     .elf
                     .eh_frame(&section.header, reloc_section.as_ref())?;
@@ -284,7 +294,7 @@ impl<'a, F: crate::elf::read::ElfFormat> EhFrames<'a, F> {
                 };
                 let mut key_relocs = Vec::new();
                 for index in record.relocs.0..record.relocs.1 {
-                    let Some(rel) = section.relocs.get(index as usize) else {
+                    let Some(rel) = section.reloc(index as usize) else {
                         continue;
                     };
                     let target = match refs.global_id(section.file, rel.symbol as usize) {
@@ -386,7 +396,7 @@ fn reloc_section<F: crate::elf::read::ElfFormat>(
 fn reloc_section_of<F: crate::elf::read::ElfFormat>(
     refs: &Refs<'_, '_, F>,
     file: usize,
-    relocs: &RelaSlice<'_, F>,
+    relocs: &Relocations<'_, F>,
     index: u32,
 ) -> Option<SectionId> {
     let rel = relocs.get(index as usize)?;

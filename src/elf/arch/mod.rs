@@ -21,6 +21,7 @@
 
 pub mod aarch64;
 pub mod aarch64_errata;
+pub mod i386;
 pub mod loongarch;
 pub mod ppc64;
 pub mod riscv;
@@ -49,6 +50,8 @@ pub enum Arch {
     LoongArch64,
     /// PowerPC64, little-endian, ELFv2 ABI.
     Ppc64,
+    /// i386 (32-bit x86).
+    I386,
 }
 
 /// What a relocation computes.
@@ -91,8 +94,12 @@ pub enum Kind {
     /// x86-64: a relaxed `GOTPCRELX`, `S + A - P` with the instruction
     /// rewritten.
     RelaxGotPc,
-    /// x86-64: a relaxed `REX_GOTPCRELX` to an immediate operand, `S`.
+    /// x86-64: a relaxed `REX_GOTPCRELX` to an immediate operand, `S`; i386:
+    /// a relaxed `GOT32X` load without a base register, `S + A`.
     RelaxGotPcNoPic,
+    /// i386: a relaxed `GOT32X` load through a base register, turned into
+    /// a `lea` of `S + A - GOT`.
+    RelaxGotOff,
     /// General-dynamic → local-exec.
     GdToLe,
     /// Local-dynamic → local-exec.
@@ -359,6 +366,8 @@ pub struct RelaxValues {
     pub got_pc: i64,
     /// The place being relocated.
     pub place: u64,
+    /// The GOT base, which i386 initial-exec code addresses the entry from.
+    pub got_base: u64,
 }
 
 /// A direct branch, as range-extension thunk planning and the writer both
@@ -397,6 +406,9 @@ pub struct PltFlags {
     /// AArch64 `-z pac-plt`: entries authenticate the address they loaded
     /// (`autia1716`) before branching to it.
     pub authenticate: bool,
+    /// The output is position-independent: i386 PLT entries address the
+    /// GOT through `%ebx` rather than absolutely.
+    pub pic: bool,
 }
 
 impl Arch {
@@ -409,6 +421,7 @@ impl Arch {
             EM_RISCV => Some(Self::RiscV64),
             EM_LOONGARCH => Some(Self::LoongArch64),
             EM_PPC64 => Some(Self::Ppc64),
+            crate::elf::read::consts::EM_386 => Some(Self::I386),
             _ => None,
         }
     }
@@ -424,6 +437,7 @@ impl Arch {
                 Some(Self::RiscV64)
             }
             Architecture::LoongArch64 => Some(Self::LoongArch64),
+            Architecture::X86 => Some(Self::I386),
             Architecture::PowerPc64 if target.endian == crate::target::Endianness::Little => {
                 Some(Self::Ppc64)
             }
@@ -494,9 +508,51 @@ impl Arch {
     #[must_use]
     pub fn kind(self) -> crate::elf::read::ElfKind {
         match self {
+            Self::I386 => crate::elf::read::ElfKind::Elf32Le,
             Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
                 crate::elf::read::ElfKind::Elf64Le
             }
+        }
+    }
+
+    /// The addend of `SHT_REL` relocation `r_type` at `offset` in section
+    /// `data`: the contents of the field it patches (i386). Architectures
+    /// that use `SHT_RELA` never store one there.
+    #[must_use]
+    #[inline]
+    pub fn implicit_addend(self, r_type: u32, data: &[u8], offset: u64) -> i64 {
+        match self {
+            Self::I386 => i386::implicit_addend(r_type, data, offset),
+            _ => 0,
+        }
+    }
+
+    /// Whether dynamic relocations are `SHT_REL`, their addends stored in
+    /// the words they relocate (i386), rather than `SHT_RELA`.
+    #[must_use]
+    pub fn uses_rel(self) -> bool {
+        self == Self::I386
+    }
+
+    /// Whether a field of `width` holds a whole address, so a dynamic
+    /// relocation can fill it: 64 bits in ELF64, 32 in ELF32.
+    #[must_use]
+    #[inline]
+    pub fn is_word(self, width: Width) -> bool {
+        if self.kind().is_32() {
+            matches!(width, Width::Any32 | Width::U32 | Width::I32)
+        } else {
+            width == Width::W64
+        }
+    }
+
+    /// Size of one dynamic relocation entry.
+    #[must_use]
+    pub fn dyn_reloc_size(self) -> u64 {
+        if self.uses_rel() {
+            self.kind().rel_size()
+        } else {
+            self.kind().rela_size()
         }
     }
 
@@ -504,6 +560,7 @@ impl Arch {
     #[must_use]
     pub fn machine(self) -> u16 {
         match self {
+            Self::I386 => crate::elf::read::consts::EM_386,
             Self::X86_64 => EM_X86_64,
             Self::AArch64 => EM_AARCH64,
             Self::RiscV64 => EM_RISCV,
@@ -516,6 +573,7 @@ impl Arch {
     #[must_use]
     pub fn emulation(self) -> &'static str {
         match self {
+            Self::I386 => "elf_i386",
             Self::X86_64 => "elf_x86_64",
             Self::AArch64 => "aarch64linux",
             Self::RiscV64 => "elf64lriscv",
@@ -550,6 +608,7 @@ impl Arch {
     #[must_use]
     pub fn default_max_page(self) -> u64 {
         match self {
+            Self::I386 => 0x1000,
             Self::X86_64 | Self::RiscV64 => 0x1000,
             Self::AArch64 | Self::Ppc64 => 0x1_0000,
             // GNU ld's; lld assumes 64 KiB.
@@ -562,6 +621,7 @@ impl Arch {
     #[must_use]
     pub fn default_base(self) -> u64 {
         match self {
+            Self::I386 => 0x0804_8000,
             Self::X86_64 | Self::AArch64 => super::layout::DEFAULT_BASE,
             Self::RiscV64 => 0x1_0000,
             Self::LoongArch64 => 0x1_2000_0000,
@@ -576,6 +636,7 @@ impl Arch {
     #[must_use]
     pub fn got_plt_reserved(self) -> u64 {
         match self {
+            Self::I386 => 3,
             Self::X86_64 | Self::AArch64 => 3,
             Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => 2,
         }
@@ -655,6 +716,9 @@ impl Arch {
     #[must_use]
     pub fn page_delta(self, target: u64, place: u64, r_type: u32) -> u64 {
         match self {
+            Self::I386 => {
+                crate::arch::aarch64::page(target).wrapping_sub(crate::arch::aarch64::page(place))
+            }
             Self::LoongArch64 => loongarch::page_delta(target, place, r_type),
             Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::Ppc64 => {
                 let page = crate::arch::aarch64::page;
@@ -678,6 +742,7 @@ impl Arch {
         place: u64,
     ) -> Result<(), ApplyError> {
         match self {
+            Self::I386 => Err(ApplyError::BadInstruction),
             Self::LoongArch64 => loongarch::relax(out, offset, r_type, target, place),
             Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::Ppc64 => {
                 Err(ApplyError::BadInstruction)
@@ -769,6 +834,7 @@ impl Arch {
     pub fn is_thunk_branch(self, r_type: u32) -> bool {
         use crate::elf::read::consts::aarch64 as a64;
         match self {
+            Self::I386 => false,
             Self::X86_64 | Self::RiscV64 | Self::LoongArch64 => false,
             Self::AArch64 => matches!(r_type, a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26),
             Self::Ppc64 => ppc64::is_thunk_branch(r_type),
@@ -791,6 +857,7 @@ impl Arch {
     #[must_use]
     pub fn branch_thunk(self, branch: Branch) -> Option<u64> {
         match self {
+            Self::I386 => None,
             Self::X86_64 | Self::RiscV64 | Self::LoongArch64 => None,
             Self::AArch64 => (self.is_thunk_branch(branch.r_type)
                 && !crate::arch::aarch64::branch_in_range(branch.place, branch.target))
@@ -823,13 +890,14 @@ impl Arch {
     /// x86 targets but not for AArch64.
     #[must_use]
     pub fn separate_code_by_default(self) -> bool {
-        self == Self::X86_64
+        matches!(self, Self::X86_64 | Self::I386)
     }
 
     /// The default program interpreter on Linux.
     #[must_use]
     pub fn default_interpreter(self) -> &'static str {
         match self {
+            Self::I386 => "/lib/ld-linux.so.2",
             Self::X86_64 => "/lib64/ld-linux-x86-64.so.2",
             Self::AArch64 => "/lib/ld-linux-aarch64.so.1",
             Self::RiscV64 => riscv::interpreter(riscv::EF_RISCV_FLOAT_ABI),
@@ -853,6 +921,7 @@ impl Arch {
     #[must_use]
     pub fn tcb_size(self) -> u64 {
         match self {
+            Self::I386 => 0,
             Self::X86_64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => 0,
             Self::AArch64 => 16,
         }
@@ -918,6 +987,7 @@ impl Arch {
     #[must_use]
     pub fn has_plt_sec(self, ibt: bool) -> bool {
         match self {
+            Self::I386 => ibt,
             Self::X86_64 => ibt,
             Self::AArch64 | Self::RiscV64 | Self::LoongArch64 => false,
             Self::Ppc64 => true,
@@ -956,6 +1026,21 @@ impl Arch {
     pub fn dyn_reloc(self, kind: DynKind) -> u32 {
         use crate::elf::read::consts::{aarch64 as a64, ppc64 as p64, riscv as rv, x86_64 as x64};
         match self {
+            Self::I386 => {
+                use crate::elf::read::consts::i386 as x86;
+                match kind {
+                    DynKind::Relative => x86::R_386_RELATIVE,
+                    DynKind::Irelative => x86::R_386_IRELATIVE,
+                    DynKind::JumpSlot => x86::R_386_JUMP_SLOT,
+                    DynKind::GlobDat => x86::R_386_GLOB_DAT,
+                    DynKind::Copy => x86::R_386_COPY,
+                    DynKind::Abs64 => x86::R_386_32,
+                    DynKind::DtpMod => x86::R_386_TLS_DTPMOD32,
+                    DynKind::DtpOff => x86::R_386_TLS_DTPOFF32,
+                    DynKind::TpOff => x86::R_386_TLS_TPOFF,
+                    DynKind::TlsDesc => x86::R_386_TLS_DESC,
+                }
+            }
             Self::X86_64 => match kind {
                 DynKind::Relative => x64::R_X86_64_RELATIVE,
                 DynKind::Irelative => x64::R_X86_64_IRELATIVE,
@@ -1032,6 +1117,7 @@ impl Arch {
             return matches!(r_type, x64::R_X86_64_PLT32 | x64::R_X86_64_PLT32_BND);
         }
         match self {
+            Self::I386 => r_type == crate::elf::read::consts::i386::R_386_PLT32,
             Self::X86_64 => false, // answered above
             Self::Ppc64 => matches!(r_type, p64::R_PPC64_REL24 | p64::R_PPC64_REL24_NOTOC),
             Self::AArch64 => matches!(
@@ -1059,6 +1145,7 @@ impl Arch {
         context: ClassifyContext,
     ) -> Result<Class, ClassifyError> {
         match self {
+            Self::I386 => i386::classify(r_type, data, offset, context),
             Self::X86_64 => x86_64::classify(r_type, addend, data, offset, context),
             Self::AArch64 => aarch64::classify(r_type, context),
             Self::RiscV64 => riscv::classify(r_type, context),
@@ -1081,6 +1168,7 @@ impl Arch {
         value: i64,
     ) -> Result<(), ApplyError> {
         match self {
+            Self::I386 => i386::relax_got(out, offset, kind, value),
             Self::X86_64 => x86_64::relax_got(out, offset, kind, value),
             Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
                 Err(ApplyError::BadInstruction)
@@ -1102,6 +1190,7 @@ impl Arch {
         values: RelaxValues,
     ) -> Result<(), ApplyError> {
         match self {
+            Self::I386 => i386::relax_tls(out, offset, kind, r_type, values),
             Self::X86_64 => x86_64::relax_tls(out, offset, kind, values),
             Self::AArch64 => aarch64::relax_tls(out, offset, kind, r_type, values),
             // RISC-V sections are written by `riscv::apply`.
@@ -1115,6 +1204,7 @@ impl Arch {
     #[must_use]
     pub fn plt_header_size(self, flags: PltFlags) -> u64 {
         match self {
+            Self::I386 => 16,
             Self::X86_64 => 16,
             Self::AArch64 => {
                 let _ = flags;
@@ -1130,6 +1220,7 @@ impl Arch {
     #[must_use]
     pub fn plt_entry_size(self, flags: PltFlags) -> u64 {
         match self {
+            Self::I386 => i386::PLT_ENTRY_SIZE,
             Self::X86_64 => 16,
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
@@ -1142,6 +1233,13 @@ impl Arch {
     #[must_use]
     pub fn plt_got_entry_size(self, flags: PltFlags) -> u64 {
         match self {
+            Self::I386 => {
+                if flags.landing_pad {
+                    i386::PLT_ENTRY_SIZE
+                } else {
+                    i386::PLT_GOT_ENTRY_SIZE
+                }
+            }
             Self::X86_64 if flags.landing_pad => 16,
             Self::X86_64 => 8,
             Self::AArch64 => aarch64::plt_entry_size(aarch64::plt_got_flags(flags)),
@@ -1161,6 +1259,7 @@ impl Arch {
     #[must_use]
     pub fn iplt_entry_size(self, flags: PltFlags) -> u64 {
         match self {
+            Self::I386 => i386::IPLT_ENTRY_SIZE,
             Self::X86_64 => 16,
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
@@ -1175,6 +1274,14 @@ impl Arch {
     #[must_use]
     pub fn lazy_slot_value(self, plt: u64, entry: u64, flags: PltFlags) -> u64 {
         match self {
+            Self::I386 => {
+                // The `push` after the jump, or the whole entry with IBT.
+                if flags.landing_pad {
+                    entry
+                } else {
+                    entry.wrapping_add(6)
+                }
+            }
             // The `push` after the jump, or the whole entry with IBT.
             Self::X86_64 if flags.landing_pad => entry,
             Self::X86_64 => entry.wrapping_add(6),
@@ -1200,6 +1307,7 @@ impl Arch {
         flags: PltFlags,
     ) -> Result<(), ApplyError> {
         match self {
+            Self::I386 => i386::write_plt_header(out, got_plt, flags.pic),
             Self::X86_64 => x86_64::write_plt_header(out, plt, got_plt),
             Self::AArch64 => aarch64::write_plt_header(out, plt, got_plt, flags),
             Self::RiscV64 => riscv::write_plt_header(out, plt, got_plt),
@@ -1224,6 +1332,21 @@ impl Arch {
         flags: PltFlags,
     ) -> Result<(), ApplyError> {
         match self {
+            Self::I386 => {
+                // `.got.plt` slot `index` follows the three reserved words,
+                // which start at the GOT base.
+                let got = slot.wrapping_sub(u64::from(index).wrapping_add(3).wrapping_mul(4));
+                i386::write_plt_entry(
+                    out,
+                    entry,
+                    slot,
+                    index,
+                    plt,
+                    got,
+                    flags.pic,
+                    flags.landing_pad,
+                )
+            }
             Self::X86_64 => {
                 x86_64::write_plt_entry(out, entry, slot, index, plt, flags.landing_pad)
             }
@@ -1251,6 +1374,7 @@ impl Arch {
         got_base: u64,
     ) -> Result<(), ApplyError> {
         match self {
+            Self::I386 => i386::write_plt_jump(out, slot, got_base, flags.pic, flags.landing_pad),
             Self::X86_64 => x86_64::write_plt_jump(out, entry, slot, flags.landing_pad),
             Self::AArch64 => {
                 aarch64::write_plt_entry(out, entry, slot, aarch64::plt_got_flags(flags))
@@ -1276,6 +1400,7 @@ impl Arch {
         got_base: u64,
     ) -> Result<(), ApplyError> {
         match self {
+            Self::I386 => i386::write_iplt(out, slot_address, got_base, flags.pic),
             Self::X86_64 => x86_64::write_iplt(out, stub, slot_address),
             // GNU ld writes IFUNC stubs as ordinary PLT entries, landing
             // pad and authentication included.
@@ -1301,6 +1426,7 @@ impl Arch {
         r_type: u32,
     ) -> Result<bool, ApplyError> {
         match self {
+            Self::I386 => Ok(false),
             Self::X86_64 | Self::RiscV64 => Ok(false),
             Self::LoongArch64 => loongarch::undefined_weak_branch(out, offset, r_type),
             Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
@@ -1312,6 +1438,7 @@ impl Arch {
     /// fill does for gaps in executable sections.
     pub fn write_nops(self, out: &mut [u8]) {
         match self {
+            Self::I386 => x86_64::write_nops(out),
             Self::X86_64 => x86_64::write_nops(out),
             Self::AArch64 => aarch64::write_nops(out),
             Self::RiscV64 => riscv::write_nops(out),
@@ -1488,24 +1615,41 @@ pub fn add_value(out: &mut [u8], offset: u64, width: Width, delta: u64) -> Resul
     Ok(())
 }
 
-/// Runs `$body` for every relocation of `$relas` (a relocation slice), with
-/// `$rel` bound to it, as a `for` loop does (`continue` and `break` work).
+/// Runs `$body` for every relocation of `$relocations` (the
+/// [`Relocations`](crate::elf::read::Relocations) of one section, whose
+/// contents are `$data`), with `$rel` bound to it, as a `for` loop does
+/// (`continue` and `break` work).
 ///
-/// On architectures that [`Arch::annotates`], `$rel` is
-/// [`Arch::annotate`]d with the relocation that follows it. The choice is
-/// made once, and the body is expanded into two loops, so architectures
-/// without annotation pay nothing per relocation.
+/// `SHT_REL` relocations get the addend stored in the field they patch
+/// ([`Arch::implicit_addend`]). On architectures that [`Arch::annotates`],
+/// `$rel` is [`Arch::annotate`]d with the relocation that follows it. Each
+/// choice is made once, and the body is expanded into one loop per case,
+/// so an architecture pays per relocation only for what it uses.
 macro_rules! for_each_relocation {
-    ($arch:expr, $relas:expr, |$rel:ident| $body:block) => {{
+    ($arch:expr, $relocations:expr, $data:expr, |$rel:ident| $body:block) => {{
         let arch: $crate::elf::arch::Arch = $arch;
-        if arch.annotates() {
-            let mut relocations = $relas.iter().peekable();
-            while let Some(current) = relocations.next() {
-                let $rel = arch.annotate(current, relocations.peek());
-                $body
+        match $relocations {
+            $crate::elf::read::Relocations::Rela(relas) => {
+                if arch.annotates() {
+                    let mut relocations = relas.iter().peekable();
+                    while let Some(current) = relocations.next() {
+                        let $rel = arch.annotate(current, relocations.peek());
+                        $body
+                    }
+                } else {
+                    for $rel in relas.iter() $body
+                }
             }
-        } else {
-            for $rel in $relas.iter() $body
+            $crate::elf::read::Relocations::Rel(rels) => {
+                let data: &[u8] = $data;
+                for current in rels.iter() {
+                    let $rel = $crate::elf::read::Relocation {
+                        addend: arch.implicit_addend(current.r_type, data, current.offset),
+                        ..current
+                    };
+                    $body
+                }
+            }
         }
     }};
 }

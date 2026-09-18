@@ -1667,12 +1667,18 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
                 }
                 Synthetic::RelaDyn => {
                     section.link = dynsym;
-                    section.entsize = class.rela_size();
+                    section.entsize = synth.arch.dyn_reloc_size();
+                    if synth.arch.uses_rel() {
+                        section.sh_type = crate::elf::read::consts::SHT_REL;
+                    }
                 }
                 Synthetic::RelaPlt => {
                     section.link = dynsym;
                     section.info = got_plt;
-                    section.entsize = class.rela_size();
+                    section.entsize = synth.arch.dyn_reloc_size();
+                    if synth.arch.uses_rel() {
+                        section.sh_type = crate::elf::read::consts::SHT_REL;
+                    }
                 }
                 Synthetic::RelrDyn => section.entsize = class.word_size(),
                 Synthetic::Dynamic => {
@@ -1846,9 +1852,15 @@ pub(crate) fn entsize_of<F: crate::elf::read::ElfFormat>(
                     crate::passes::merge::MergeKind::Strings { char_size } => u64::from(char_size),
                     crate::passes::merge::MergeKind::Fixed { entry_size } => entry_size,
                 }),
-            Member::Synthetic(Synthetic::RelaPlt | Synthetic::RelaDyn | Synthetic::DynSym) => 24,
-            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt | Synthetic::RelrDyn) => 8,
-            Member::Synthetic(Synthetic::Dynamic | Synthetic::Plt | Synthetic::PltSec) => 16,
+            Member::Synthetic(Synthetic::RelaPlt | Synthetic::RelaDyn) => {
+                input.synth.arch.dyn_reloc_size()
+            }
+            Member::Synthetic(Synthetic::DynSym) => input.kind().sym_size(),
+            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt | Synthetic::RelrDyn) => {
+                input.kind().word_size()
+            }
+            Member::Synthetic(Synthetic::Dynamic) => input.kind().dyn_size(),
+            Member::Synthetic(Synthetic::Plt | Synthetic::PltSec) => 16,
             Member::Synthetic(Synthetic::VerSym) => 2,
             Member::Synthetic(Synthetic::Comment) => 1,
             Member::Synthetic(_) => 0,

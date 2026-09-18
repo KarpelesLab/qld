@@ -28,7 +28,6 @@
 use rayon::prelude::*;
 
 use crate::diag::{Diagnostic, Location};
-use crate::elf::read::Relocations;
 use crate::elf::read::consts::SHF_ALLOC;
 use crate::ids::SymbolId;
 use crate::symbols::SymbolFlags;
@@ -253,7 +252,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
             }
             _ => continue,
         };
-        let Relocations::Rela(relas) = relocations else {
+        if !relocations.is_rela() && !context.arch.uses_rel() {
             result.errors.push(
                 Diagnostic::error(format!(
                     "{}: SHT_REL relocations are not supported for {}",
@@ -263,7 +262,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                 .order(order),
             );
             continue;
-        };
+        }
         let eh_frame = section.kind == SectionKind::EhFrame;
         let mut dyn_section = DynSection {
             section: section_index,
@@ -272,7 +271,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
             packable: 0,
         };
         let mut skip = false;
-        super::arch::for_each_relocation!(context.arch, relas, |rel| {
+        super::arch::for_each_relocation!(context.arch, relocations, data, |rel| {
             if skip {
                 // The call a TLS relaxation removed still counts as a use
                 // (GNU ld keeps `__tls_get_addr` in the dynamic symbols).

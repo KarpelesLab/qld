@@ -507,7 +507,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     }
     let always = always.as_slice();
 
-    let rule_set = RuleSet::for_link(script, diagnostics);
+    let rule_set = RuleSet::for_link(script, diagnostics, super::arch::Arch::of(options, files));
     let mut placement = narrow.run(|| place::place(&rule_set, files, &sections, options));
     for id in &placement.discarded {
         if let Some(slot) = sections.live.get_mut(id.index()) {
@@ -695,7 +695,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         .relr_count()
         .div_ceil(32)
         .saturating_add(8)
-        .saturating_mul(8);
+        .saturating_mul(context.arch.kind().word_size());
     synth.ibt = synth::plan_ibt(files, options);
     synth.pac_plt = synth::plan_pac_plt(files, options);
     for warning in synth::force_bti_warnings(files, options) {
@@ -798,7 +798,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
             relr = write::encode_relr(&places, context.arch.kind());
             let size = u64::try_from(relr.len())
                 .unwrap_or(u64::MAX)
-                .saturating_mul(8);
+                .saturating_mul(context.arch.kind().word_size());
             if size == synth.relr_size || (size < synth.relr_size && shrunk) {
                 break;
             }
@@ -1086,7 +1086,7 @@ fn link_relocatable<'a, F: crate::elf::read::ElfFormat>(
                 "--gc-sections requires a defined symbol root specified by -e or -u".into(),
             ));
         }
-        let rule_set = RuleSet::default_rules();
+        let rule_set = RuleSet::default_rules_for(super::arch::Arch::of(options, files));
         let default_placement;
         let placement = match &script_placement {
             Some(placement) => placement,

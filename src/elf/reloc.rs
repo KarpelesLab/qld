@@ -283,7 +283,7 @@ pub fn decide(
                 return Ok(decision);
             }
             let writable = section_flags & SHF_WRITE != 0;
-            if matches!(class.width, Width::W64) {
+            if context.arch.is_word(class.width) {
                 if !p.preemptible {
                     if mode.pic && (p.defined || !p.global) && !p.absolute {
                         decision.dynamic = Dynamic::Relative;

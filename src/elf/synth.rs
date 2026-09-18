@@ -226,6 +226,7 @@ impl Synth {
             landing_pad: self.ibt,
             entry_landing_pad: self.ibt && (self.arch == Arch::X86_64 || executable),
             authenticate: self.pac_plt && self.arch == Arch::AArch64,
+            pic: self.mode.is_some_and(|m| m.pic),
         }
     }
 
@@ -594,7 +595,8 @@ impl Synth {
                 .find(|(k, ..)| *k == kind)
                 .map_or((0, 1), |&(_, size, align)| (size, align)),
             Synthetic::RelaDyn => (
-                self.rela_dyn_count().saturating_mul(word.rela_size()),
+                self.rela_dyn_count()
+                    .saturating_mul(self.arch.dyn_reloc_size()),
                 word.word_size(),
             ),
             Synthetic::RelrDyn => {
@@ -612,7 +614,10 @@ impl Synth {
                 } else {
                     count(&self.iplt)
                 };
-                (entries.saturating_mul(word.rela_size()), word.word_size())
+                (
+                    entries.saturating_mul(self.arch.dyn_reloc_size()),
+                    word.word_size(),
+                )
             }
             Synthetic::Plt => {
                 let flags = self.plt_flags();

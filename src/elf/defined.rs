@@ -123,6 +123,10 @@ const FIXED: &[(&str, Value)] = &[
     (".TOC.", Value::GotBase),
     ("__rela_iplt_start", Value::RelaIpltStart),
     ("__rela_iplt_end", Value::RelaIpltEnd),
+    // The same bounds where `IRELATIVE` relocations are `SHT_REL` (i386
+    // glibc's static startup reads these names).
+    ("__rel_iplt_start", Value::RelaIpltStart),
+    ("__rel_iplt_end", Value::RelaIpltEnd),
     ("_DYNAMIC", Value::Dynamic),
 ];
 

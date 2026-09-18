@@ -399,7 +399,7 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
     pub fn got_entry_address(&self, owner: Owner, kind: GotKind) -> Option<u64> {
         let word = self.synth.got_word(owner, kind)?;
         let (base, ..) = self.layout.synthetic(Synthetic::Got)?;
-        base.checked_add(word.checked_mul(8)?)
+        base.checked_add(word.checked_mul(self.synth.arch.kind().word_size())?)
     }
 
     /// The address of the `.got.plt` slot of PLT entry `index` (for a
@@ -410,7 +410,7 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
         let slot = u64::try_from(index)
             .ok()?
             .checked_add(self.synth.got_plt_reserved)?;
-        base.checked_add(slot.checked_mul(8)?)
+        base.checked_add(slot.checked_mul(self.synth.arch.kind().word_size())?)
     }
 
     /// The GOT base (`_GLOBAL_OFFSET_TABLE_`; on PowerPC64 the TOC pointer
@@ -485,7 +485,11 @@ pub fn plt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u
 pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
     if synth.plt_got.index(owner).is_some() {
         let (base, ..) = layout.synthetic(Synthetic::Got)?;
-        return base.checked_add(synth.got_word(owner, GotKind::Address)?.checked_mul(8)?);
+        return base.checked_add(
+            synth
+                .got_word(owner, GotKind::Address)?
+                .checked_mul(synth.arch.kind().word_size())?,
+        );
     }
     let index = if synth.dynamic() {
         synth.plt_index(owner)?
@@ -493,7 +497,11 @@ pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Opt
         u64::try_from(synth.iplt.index(owner)?).ok()?
     };
     let (base, ..) = layout.synthetic(Synthetic::GotPlt)?;
-    base.checked_add(index.checked_add(synth.got_plt_reserved)?.checked_mul(8)?)
+    base.checked_add(
+        index
+            .checked_add(synth.got_plt_reserved)?
+            .checked_mul(synth.arch.kind().word_size())?,
+    )
 }
 
 /// The address of lazy `.plt` entry `index`, after the header.
