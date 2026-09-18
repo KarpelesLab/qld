@@ -240,8 +240,16 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
             "-r and --gdb-index may not be used together".into(),
         ));
     }
-    if options.separate_debug_file.is_some() {
-        return unimplemented("--separate-debug-file", "M5");
+    if options.separate_debug_file.is_some()
+        && (options.kind == OutputKind::Relocatable
+            || options
+                .output_format
+                .as_deref()
+                .is_some_and(|f| super::rawout::Format::from_name(f).is_some()))
+    {
+        return Err(Error::Option(
+            "--separate-debug-file needs an ELF executable or shared object output".into(),
+        ));
     }
     for (name, expr) in &options.defsym {
         if inputs::parse_defsym(expr).is_none() {
@@ -824,23 +832,130 @@ fn link_inputs<'a>(
     });
     let entry = entry_address(&addresses, options, mode, diagnostics);
     narrow.run(|| debug_indexes.render(&addresses, &mut prerendered))?;
-    narrow.run(|| {
-        write::write(&WriteInput {
+    let debug_path = super::separate_debug::debug_path(options);
+    if let Some(debug_path) = &debug_path {
+        // `--separate-debug-file`: the output is laid out again without
+        // the debug sections (allocated sections do not move), written,
+        // and the complete layout becomes the debug file's.
+        narrow.run(|| map::write(options, &addresses, &plan, cref.as_deref()))?;
+        drop(addresses);
+        let stripped = super::separate_debug::stripped_sections(&sections, &placement);
+        let stripped_refs = Refs {
+            sections: &stripped,
+            ..refs
+        };
+        let main_layout = narrow.run(|| {
+            layout::layout(&LayoutInput {
+                options,
+                refs: stripped_refs,
+                rules: &rule_set,
+                files,
+                sections: &stripped,
+                placement: &placement,
+                merged: &merged,
+                eh_frames: &eh_frames,
+                synth: &synth,
+                trailers: TrailerSizes {
+                    debuglink: super::separate_debug::debuglink_size(debug_path),
+                    ..TrailerSizes::default()
+                },
+                exec_stack,
+                mode,
+                compressed: &[],
+                order: order.as_ref(),
+            })
+        })?;
+        let link = main_layout
+            .sections
+            .iter()
+            .position(|s| s.name == b".gnu_debuglink")
+            .and_then(|p| u32::try_from(p).ok())
+            .map(|position| write::Prerendered {
+                position,
+                bytes: super::separate_debug::debuglink_contents(debug_path),
+                compressed: false,
+            });
+        let main_addresses = Addresses::new(
+            stripped_refs,
+            &main_layout,
+            &merged,
+            &eh_frames,
+            &synth,
+            &commons,
+            &placement,
+            &linker,
             options,
-            addresses: &addresses,
-            symtab: &plan,
-            linker: &linker,
-            dynamic: &dynamic,
-            scan: &scan,
-            context,
-            tombstones: &tombstones,
-            relr: &relr,
-            entry,
-            prerendered: &prerendered,
-            diagnostics,
-        })
-    })?;
-    narrow.run(|| map::write(options, &addresses, &plan, cref.as_deref()))?;
+        );
+        narrow.run(|| {
+            write::write(&WriteInput {
+                options,
+                addresses: &main_addresses,
+                symtab: &plan,
+                linker: &linker,
+                dynamic: &dynamic,
+                scan: &scan,
+                context,
+                tombstones: &tombstones,
+                relr: &relr,
+                entry,
+                prerendered: link.as_slice(),
+                diagnostics,
+            })
+        })?;
+        let (crc, build_id) =
+            super::separate_debug::finish_output(&options.output_path(), &main_layout, options)?;
+        drop(main_addresses);
+        super::separate_debug::to_debug_file(&mut layout)?;
+        let mut debug_options = options.clone();
+        debug_options.output = Some(debug_path.clone());
+        debug_options.build_id = crate::args::BuildId::None;
+        let debug_addresses = Addresses::new(
+            refs,
+            &layout,
+            &merged,
+            &eh_frames,
+            &synth,
+            &commons,
+            &placement,
+            &linker,
+            &debug_options,
+        );
+        narrow.run(|| {
+            write::write(&WriteInput {
+                options: &debug_options,
+                addresses: &debug_addresses,
+                symtab: &plan,
+                linker: &linker,
+                dynamic: &dynamic,
+                scan: &scan,
+                context,
+                tombstones: &tombstones,
+                relr: &relr,
+                entry,
+                prerendered: &prerendered,
+                diagnostics,
+            })
+        })?;
+        super::separate_debug::finish_debug_file(debug_path, &layout, build_id.as_deref(), crc)?;
+    } else {
+        narrow.run(|| {
+            write::write(&WriteInput {
+                options,
+                addresses: &addresses,
+                symtab: &plan,
+                linker: &linker,
+                dynamic: &dynamic,
+                scan: &scan,
+                context,
+                tombstones: &tombstones,
+                relr: &relr,
+                entry,
+                prerendered: &prerendered,
+                diagnostics,
+            })
+        })?;
+        narrow.run(|| map::write(options, &addresses, &plan, cref.as_deref()))?;
+    }
     lap("write");
     lto.finish(diagnostics)?;
     // Freeing the link's data and unmapping the inputs come after this.

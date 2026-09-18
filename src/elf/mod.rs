@@ -39,6 +39,7 @@
 //! | [`symtab`] | `.symtab` and `.strtab` planning and writing |
 //! | [`layout`] | 10: output section contents, segments (RELRO included), addresses |
 //! | [`values`] | Symbol, section, GOT and PLT addresses after layout |
+//! | [`separate_debug`] | `--separate-debug-file`: the stripped output, the debug file, `.gnu_debuglink` |
 //! | [`write`](mod@write) | 11: parallel chunked writing, relocation in place, `.rela.dyn`, `.eh_frame_hdr` |
 //! | [`emit`] | `--emit-relocs`: input relocations rewritten into `.rela` trailers |
 //! | [`map`] | `-Map` and `-M`, and where the `--cref` table goes |
@@ -96,6 +97,7 @@ pub mod rules;
 pub mod scan;
 pub mod script_layout;
 pub mod sections;
+pub mod separate_debug;
 pub mod symtab;
 pub mod synth;
 pub mod values;

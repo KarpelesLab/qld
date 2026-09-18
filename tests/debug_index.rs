@@ -1,5 +1,5 @@
-//! Debug index tests (workstream W29): `--gdb-index` (and, later in this
-//! file, `--debug-names`).
+//! Debug output tests (workstream W29): `--gdb-index`, `--debug-names` and
+//! `--separate-debug-file`.
 //!
 //! The inputs are small freestanding C and C++ programs compiled with the
 //! host compilers, linked without libc. The index is decoded here and
@@ -679,5 +679,157 @@ fn debug_names_are_compressed_with_debug_sections() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(dump("plain.out"), dump("z.out"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --separate-debug-file
+// ---------------------------------------------------------------------------
+
+/// CRC-32 (the `.gnu_debuglink` checksum), bit by bit.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Section name, type and flags of every section of `path`.
+fn section_list(path: &Path) -> Vec<(String, u32, u64)> {
+    let data = fs::read(path).unwrap();
+    let elf = ElfFile::<Elf64Le>::parse(&data, Source::new(path)).unwrap();
+    elf.enumerate_sections()
+        .skip(1)
+        .map(|(_, h)| {
+            let name = elf.section_name(&h).unwrap();
+            (
+                String::from_utf8_lossy(name).into_owned(),
+                h.sh_type,
+                h.sh_flags,
+            )
+        })
+        .collect()
+}
+
+/// The build ID of `path`.
+fn build_id(path: &Path) -> Vec<u8> {
+    let data = fs::read(path).unwrap();
+    let elf = ElfFile::<Elf64Le>::parse(&data, Source::new(path)).unwrap();
+    let note = section(&elf, b".note.gnu.build-id").expect("no build ID");
+    note[16..].to_vec()
+}
+
+#[test]
+fn separate_debug_file_splits_the_output() {
+    let Some((cc, cxx)) = compilers() else { return };
+    let dir = scratch("separate");
+    compile(&dir, &cc, &cxx, &["-g", "-O1"]);
+    qld(
+        &dir,
+        &[
+            "a.o",
+            "b.o",
+            "-e",
+            "_start",
+            "--build-id",
+            "--gdb-index",
+            "--separate-debug-file",
+            "-o",
+            "prog",
+        ],
+    );
+    let main = section_list(&dir.join("prog"));
+    let names: Vec<&str> = main.iter().map(|(n, ..)| n.as_str()).collect();
+    assert!(names.contains(&".gnu_debuglink"), "{names:?}");
+    for (name, ..) in &main {
+        assert!(
+            !name.starts_with(".debug") && name != ".symtab" && name != ".gdb_index",
+            "{name} is in the output"
+        );
+    }
+    // The debug file mirrors the output's sections, empty but for debug
+    // information, notes and the symbol table.
+    let debug = section_list(&dir.join("prog.dbg"));
+    for (name, sh_type, flags) in &debug {
+        if flags & 2 != 0 && *sh_type != 7 {
+            assert_eq!(*sh_type, 8, "{name} should be SHT_NOBITS");
+        }
+    }
+    let debug_names: Vec<&str> = debug.iter().map(|(n, ..)| n.as_str()).collect();
+    for name in [
+        ".debug_info",
+        ".symtab",
+        ".gdb_index",
+        ".text",
+        ".note.gnu.build-id",
+    ] {
+        assert!(debug_names.contains(&name), "{name}: {debug_names:?}");
+    }
+    assert!(!debug_names.contains(&".gnu_debuglink"));
+    assert_eq!(build_id(&dir.join("prog")), build_id(&dir.join("prog.dbg")));
+    // `.gnu_debuglink` names the file and holds its CRC.
+    let data = fs::read(dir.join("prog")).unwrap();
+    let elf = ElfFile::<Elf64Le>::parse(&data, Source::new(Path::new("prog"))).unwrap();
+    let link = section(&elf, b".gnu_debuglink").unwrap();
+    assert_eq!(&link[..9], b"prog.dbg\0");
+    let crc = u32::from_le_bytes(link[link.len() - 4..].try_into().unwrap());
+    assert_eq!(crc, crc32(&fs::read(dir.join("prog.dbg")).unwrap()));
+
+    if let Some(gdb) = find_program("gdb") {
+        let output = run_ok(
+            &dir,
+            &gdb,
+            &["-nx", "-batch", "-ex", "info line add", "prog"],
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("of \"a.c\""), "{text}");
+    }
+}
+
+#[test]
+fn separate_debug_file_takes_a_path_and_is_deterministic() {
+    let Some((cc, cxx)) = compilers() else { return };
+    let dir = scratch("separate-path");
+    compile(&dir, &cc, &cxx, &["-g", "-O1"]);
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    let mut first: Option<(Vec<u8>, Vec<u8>)> = None;
+    for threads in ["1", "2"] {
+        let threads = format!("--threads={threads}");
+        qld(
+            &dir,
+            &[
+                "a.o",
+                "b.o",
+                "-e",
+                "_start",
+                &threads,
+                "--separate-debug-file=sub/x.debug",
+                "-o",
+                "prog",
+            ],
+        );
+        let outputs = (
+            fs::read(dir.join("prog")).unwrap(),
+            fs::read(dir.join("sub/x.debug")).unwrap(),
+        );
+        // Without a build ID, the CRC still matches.
+        let data = &outputs.0;
+        let elf = ElfFile::<Elf64Le>::parse(data, Source::new(Path::new("prog"))).unwrap();
+        let link = section(&elf, b".gnu_debuglink").unwrap();
+        assert_eq!(&link[..8], b"x.debug\0");
+        let crc = u32::from_le_bytes(link[link.len() - 4..].try_into().unwrap());
+        assert_eq!(crc, crc32(&outputs.1));
+        match &first {
+            None => first = Some(outputs),
+            Some(first) => assert!(*first == outputs, "outputs differ with {threads}"),
+        }
     }
 }

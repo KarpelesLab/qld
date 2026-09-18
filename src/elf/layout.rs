@@ -236,6 +236,8 @@ pub struct TrailerSizes {
     /// Whether `.debug_names` is compressed: `Some(true)` for the gABI
     /// formats (`SHF_COMPRESSED`), `Some(false)` for `zlib-gnu`.
     pub debug_names_compressed: Option<bool>,
+    /// `--separate-debug-file`: the `.gnu_debuglink` size (0: none).
+    pub debuglink: u64,
 }
 
 /// The finished layout.
@@ -1369,6 +1371,7 @@ pub(crate) fn add_trailers(
     for (name, size, align) in [
         (&b".debug_names"[..], input.trailers.debug_names, 4),
         (&b".gdb_index"[..], input.trailers.gdb_index, 1),
+        (&b".gnu_debuglink"[..], input.trailers.debuglink, 4),
     ] {
         if size == 0 {
             continue;
