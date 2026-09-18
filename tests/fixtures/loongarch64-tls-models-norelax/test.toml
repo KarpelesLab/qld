@@ -1,0 +1,22 @@
+# M4: `loongarch64-tls-models` built without linker relaxation, so the
+# initial-exec to local-exec rewrite writes both instructions (no `nop` the
+# relaxation would delete).
+description = "LoongArch64 TLS models in a PIE, without linker relaxation"
+compile = ["cc -O2 -fPIE -mno-relax -c tls.c -o tls-norelax.o"]
+driver = "cc"
+link = "-pie -o out-norelax tls-norelax.o"
+output = "out-norelax"
+run = "./out-norelax"
+expect.stdout = "tls 31\n"
+expect.readelf = [
+  "LoongArch",
+  "TLS",
+  "!R_LARCH_TLS_DTPMOD64",
+  "!R_LARCH_TLS_TPREL64",
+]
+targets = ["loongarch64-linux-gnu"]
+determinism = true
+# GNU ld 2.42 (Ubuntu 24.04) fails the reference link of this -mno-relax
+# object with ".eh_frame_hdr refers to overlapping FDEs". 2.43 is the next
+# release; the exact first fixed version has not been verified.
+gnu_ld_min_version = "2.43"
