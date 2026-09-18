@@ -179,15 +179,31 @@ mod fork {
     /// Whether a link may run in a child process: see "Failure modes" in
     /// the [module documentation](self).
     pub fn allowed(args: &[OsString], options: &LinkOptions) -> bool {
-        let system = |path: &[u8]| {
-            path.windows(5).any(|w| w == b"/dev/") || path.windows(6).any(|w| w == b"/proc/")
-        };
         let paths = [Some(options.output_path()), options.map_file.clone()];
-        !args.iter().any(|arg| system(arg.as_encoded_bytes()))
+        !args
+            .iter()
+            .any(|arg| names_system_path(arg.as_encoded_bytes()))
             && !paths
                 .iter()
                 .flatten()
-                .any(|path| system(path.as_os_str().as_encoded_bytes()))
+                .any(|path| path.starts_with("/dev") || path.starts_with("/proc"))
+    }
+
+    /// Whether an argument names a path under `/dev/` or `/proc/`: as a
+    /// whole (`/dev/stdin`), as an option's value (`-o/dev/stdout`,
+    /// `--output=/dev/stdout`), or as a response file (`@/dev/stdin`).
+    /// `/home/me/dev/out.o` does not count.
+    fn names_system_path(arg: &[u8]) -> bool {
+        [&b"/dev/"[..], b"/proc/"].iter().any(|dir| {
+            (0..arg.len()).any(|at| {
+                let (before, rest) = arg.split_at(at);
+                rest.starts_with(dir)
+                    && (before.is_empty()
+                        || before.ends_with(b"=")
+                        || before.ends_with(b"@")
+                        || (before.starts_with(b"-") && !before.contains(&b'/')))
+            })
+        })
     }
 
     /// A standard stream of the parent, as the child gets it.
@@ -421,6 +437,36 @@ mod fork {
     fn shut_down(fd: BorrowedFd<'_>) {
         if let Ok(fd) = fd.try_clone_to_owned() {
             let _ = UnixStream::from(fd).shutdown(Shutdown::Write);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::names_system_path;
+
+        #[test]
+        fn system_paths_in_arguments() {
+            for arg in [
+                "/dev/stdout",
+                "/proc/self/fd/1",
+                "-o/dev/stdout",
+                "--output=/dev/stdout",
+                "-Map=/dev/stderr",
+                "@/dev/stdin",
+                "-T/dev/stdin",
+            ] {
+                assert!(names_system_path(arg.as_bytes()), "{arg}");
+            }
+            for arg in [
+                "/home/me/dev/out",
+                "-L/home/me/dev/lib",
+                "--output=/home/me/proc/a.out",
+                "dev/stdout",
+                "-lproc",
+                "",
+            ] {
+                assert!(!names_system_path(arg.as_bytes()), "{arg}");
+            }
         }
     }
 }
