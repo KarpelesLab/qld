@@ -409,6 +409,12 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   names `_StdFunc`, where GNU writes `_StdFunc@8`.
 - **Pseudo-relocations** are also accepted for PC-relative x86 references
   (REL32 auto-import).
+- **Debug sections** follow GNU:
+  - `.stab` and `.debug_*` sections come after `.reloc`, in the order GNU's
+    PE scripts give;
+  - no base relocations are written for addresses in debug sections;
+  - `IMAGE_FILE_DEBUG_STRIPPED` is set only when the image has no debug
+    sections.
 - **Linking:**
   - archive members for another machine are skipped;
   - x86 code padding is `nop`;
