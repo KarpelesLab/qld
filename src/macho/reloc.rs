@@ -8,8 +8,11 @@
 //! stores every addend in the relocated field. A PC-relative x86_64 field
 //! is relative to the end of the 4-byte field plus the 1, 2 or 4 bytes
 //! `SIGNED_1`/`_2`/`_4` announce; for a symbol relocation the assembler has
-//! already folded that distance into the stored addend, so the value is
-//! `S + A - (P + 4)` for every type.
+//! already subtracted that distance `n` from the stored addend, so the
+//! field holds `S + A - (P + 4 + n)` with `A` = stored + `n`. Decoding adds
+//! `n` back, so that the target `S + A` is the real one (a store of an
+//! immediate to the first byte of a static would otherwise land one to four
+//! bytes before its atom).
 //!
 //! A relocation without `r_extern` names a section, and the stored value
 //! locates the target by its address in the object: the value itself for
@@ -227,24 +230,28 @@ pub fn decode(
             | X86_64_RELOC_BRANCH
             | X86_64_RELOC_GOT_LOAD
             | X86_64_RELOC_GOT
-            | X86_64_RELOC_TLV => match symbol_referent(reloc.target)? {
-                Some(referent) => (referent, embedded),
-                None => {
-                    let extra = pcrel_extra(reloc.r_type);
-                    let address = section_addr
-                        .wrapping_add(offset)
-                        .wrapping_add(4)
-                        .wrapping_add(extra as u64)
-                        .wrapping_add(embedded as u64);
-                    (
-                        Referent::Address {
-                            section: section_of(reloc.target)?,
-                            address,
-                        },
-                        extra.wrapping_neg(),
-                    )
+            | X86_64_RELOC_TLV => {
+                let extra = pcrel_extra(reloc.r_type);
+                match symbol_referent(reloc.target)? {
+                    // The stored addend has the `SIGNED_n` distance taken
+                    // out; put it back so the target is the real one.
+                    Some(referent) => (referent, embedded.wrapping_add(extra)),
+                    None => {
+                        let address = section_addr
+                            .wrapping_add(offset)
+                            .wrapping_add(4)
+                            .wrapping_add(extra as u64)
+                            .wrapping_add(embedded as u64);
+                        (
+                            Referent::Address {
+                                section: section_of(reloc.target)?,
+                                address,
+                            },
+                            0,
+                        )
+                    }
                 }
-            },
+            }
             X86_64_RELOC_SUBTRACTOR => return Err(fail("unpaired SUBTRACTOR")),
             _ => return Err(fail("unknown relocation type")),
         }
@@ -754,7 +761,12 @@ pub fn apply(
             "PC-relative relocation at {place_address:#x} with an unsupported size"
         )));
     }
-    let delta = destination.wrapping_sub(place_address.wrapping_add(4)) as i64;
+    // The CPU adds the address after the instruction, which ends 1, 2 or 4
+    // bytes after the field for `SIGNED_n`.
+    let end = place_address
+        .wrapping_add(4)
+        .wrapping_add(pcrel_extra(decoded.r_type) as u64);
+    let delta = destination.wrapping_sub(end) as i64;
     let delta32 =
         i32::try_from(delta).map_err(|_| range_error("PC-relative", delta, place_address))?;
     put32(out, at, delta32 as u32)?;

@@ -1575,6 +1575,40 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+/// Stores of immediates to statics (x86_64 `SIGNED_1`/`SIGNED_4` against a
+/// local symbol that starts its atom) reach the static itself, not the
+/// bytes before it.
+#[test]
+fn pcrel_immediate_stores() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "pcrel_immediate_stores",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("statics", "statics.c", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[object.to_str().unwrap(), "-lSystem"]));
+        let exe = scratch("statics").join(format!("statics-{arch}"));
+        link_and_compare(&args, &exe);
+        if let Some(disassembly) = objdump(&["--macho", "-d"], &exe) {
+            // llvm-objdump symbolizes RIP-relative operands: an operand one
+            // byte before the static shows as `_flag-1`.
+            for name in ["_flag", "_counter", "_wide"] {
+                assert!(
+                    !disassembly.contains(&format!("{name}-")),
+                    "{arch}: {name} is missed:\n{disassembly}"
+                );
+            }
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "1 12345678 1122334455667788\n");
+        }
+    }
+}
+
 /// Identical C strings and floating-point literals from two objects are
 /// merged, as ld64 and lld merge them: one copy in the output, and both
 /// objects' references resolve to it.
