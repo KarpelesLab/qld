@@ -63,7 +63,9 @@ can work at the same time without colliding.
 | W23 | Write-based (`pwrite`) output backend | `src/output/**`, writer call sites in `src/elf/` and `src/coff/` | W5 | merged (default) |
 | W24 | Benchmarks and performance (M5) | `benches/**`, `tests/projects/bench*`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**`, `src/input/**`, `src/debug/**` | W23 | merged |
 | W25 | Mach-O linking (M8) | `src/macho/**`, the ld64 front end in `src/args/`, `tests/macho_link*` | W15 | merged |
-| W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | in progress |
+| W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | merged |
+| W26 | Performance round 2 (M5) | `src/main.rs` (fork on exit, agreed), `--fork`/`--no-fork` in `src/args/`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**` (except `hash/sha256.rs`), `src/input/**`, `src/debug/**`, `benches/**`, `tests/projects/bench*` | W24 | in progress |
+| W27 | Mach-O follow-ups (M8) | `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs` (moved from `src/macho/`), `tests/macho_link*` | W25 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -457,6 +459,32 @@ the results. The readers are merged (W15).
 
 **Owns:** `src/macho/**` outside `read/` (extending `read/` as needed), the
 ld64 flavor parser in `src/args/`, `tests/macho_link.rs`, new fixtures.
+
+---
+
+## W26: Performance round 2 (M5)
+
+**Goal:** close the gap to mold and wild found by W24
+(`tests/projects/bench.md`). In priority order: fork on exit so the parent
+returns once the output is written (`src/main.rs`, agreed with the user;
+`--no-fork` disables it, and the library API never forks); scaling past 16
+threads; symbol resolution; single-threaded speed. Every change is measured
+with `benches/run.py` and keeps output byte-identical.
+
+**Owns:** `src/main.rs`, the `--fork`/`--no-fork` options, performance
+changes in the ELF pipeline modules, `benches/**`, `tests/projects/bench*`.
+
+---
+
+## W27: Mach-O follow-ups (M8)
+
+**Goal:** the rest of M8's exit criteria and the gaps W25 left: a Rust
+`aarch64-apple-darwin` binary linked by qld and run in the macOS job, `-r`,
+cstring deduplication, `-init`, `-bundle_loader`, and moving the SHA-256
+implementation into `src/output/hash`.
+
+**Owns:** `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs`,
+`tests/macho_link*` and its data.
 
 ---
 
