@@ -243,13 +243,6 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     if options.separate_debug_file.is_some() {
         return unimplemented("--separate-debug-file", "M5");
     }
-    if options.call_graph_ordering_file.is_some()
-        || options
-            .call_graph_profile_sort
-            .is_some_and(|s| s != crate::args::options::CallGraphSort::None)
-    {
-        return unimplemented("--call-graph-profile-sort", "M5");
-    }
     for (name, expr) in &options.defsym {
         if inputs::parse_defsym(expr).is_none() {
             return unimplemented(
@@ -571,7 +564,7 @@ fn link_inputs<'a>(
         sections: &sections,
     };
     narrow.run(|| eh_frames.finalize(&refs));
-    let order = super::ordering::for_link(&refs, options, diagnostics)?;
+    let order = super::ordering::for_link(&refs, &placement, options, diagnostics)?;
 
     let mut synth = Synth {
         arch: context.arch,

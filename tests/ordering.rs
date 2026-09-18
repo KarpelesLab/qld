@@ -267,3 +267,105 @@ fn symbol_ordering_is_deterministic_across_threads() {
         }
     }
 }
+
+/// A call graph over `f0`..`f7` (sizes vary): `(caller, callee, weight)`.
+const GRAPH: [(u32, u32, u64); 9] = [
+    (0, 3, 100),
+    (3, 5, 400),
+    (5, 3, 50),
+    (1, 2, 1000),
+    (2, 7, 10),
+    (6, 1, 30),
+    (4, 4, 90),
+    (7, 0, 5),
+    (1, 6, 300),
+];
+
+/// Assembly for `f0`..`f7` with the call graph profile section of `GRAPH`,
+/// hand-written so that any ELF assembler takes it.
+fn graph_source() -> String {
+    let mut s = String::new();
+    for (i, size) in [16, 300, 40, 8, 1000, 64, 12, 200].into_iter().enumerate() {
+        s.push_str(&format!(
+            "\t.section .text.f{i},\"ax\",@progbits\n\t.globl f{i}\n\t.type f{i},@function\nf{i}:\n\t.skip {size}, 0x90\n\t.size f{i}, {size}\n"
+        ));
+    }
+    s.push_str("\t.section .llvm.call-graph-profile,\"eM\",@0x6fff4c09,8\n");
+    for (from, to, weight) in GRAPH {
+        s.push_str(&format!(
+            "\t.reloc ., R_X86_64_NONE, f{from}\n\t.reloc ., R_X86_64_NONE, f{to}\n\t.quad {weight}\n"
+        ));
+    }
+    s.push_str("\t.section .text._start,\"ax\",@progbits\n\t.globl _start\n_start: ret\n");
+    s
+}
+
+#[test]
+fn call_graph_profile_sort_matches_lld() {
+    let Some(cc) = compiler() else { return };
+    let dir = scratch("call-graph");
+    assemble(&cc, &dir, "g", &graph_source());
+    for (algorithm, expected) in [
+        ("hfsort", ["f1", "f2", "f6", "f7", "f0", "f3", "f5", "f4"]),
+        ("cdsort", ["f6", "f1", "f2", "f7", "f0", "f3", "f5", "f4"]),
+    ] {
+        let option = format!("--call-graph-profile-sort={algorithm}");
+        let args = ["g.o", option.as_str()];
+        qld(&dir, &["g.o", &option, "-o", "qld.out"]);
+        let symbols = symbols_by_address(&dir.join("qld.out"));
+        assert_eq!(names(&symbols), expected, "{algorithm}");
+        compare_with_lld(&dir, &args, &symbols);
+    }
+    // Without the option, qld keeps GNU ld's order.
+    qld(&dir, &["g.o", "-o", "plain.out"]);
+    let symbols = symbols_by_address(&dir.join("plain.out"));
+    assert_eq!(
+        names(&symbols),
+        ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"]
+    );
+}
+
+#[test]
+fn call_graph_ordering_file_and_symbol_order() {
+    let Some(cc) = compiler() else { return };
+    let dir = scratch("call-graph-file");
+    assemble(&cc, &dir, "g", &graph_source());
+    fs::write(
+        dir.join("graph.txt"),
+        "f7 f6 500\nf6 f5 400\nf2 missing 3\nf0 f1 1\n",
+    )
+    .unwrap();
+    let args = [
+        "g.o",
+        "--call-graph-ordering-file=graph.txt",
+        "--call-graph-profile-sort=hfsort",
+        "--print-symbol-order=order.txt",
+    ];
+    let mut ours = args.to_vec();
+    ours.extend(["-o", "qld.out"]);
+    let output = qld(&dir, &ours);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("graph.txt: no such symbol: missing"),
+        "{stderr}"
+    );
+    let symbols = symbols_by_address(&dir.join("qld.out"));
+    let order = fs::read_to_string(dir.join("order.txt")).unwrap();
+    let printed: Vec<&str> = order.lines().collect();
+    assert_eq!(printed, &names(&symbols)[..printed.len()]);
+    compare_with_lld(&dir, &args, &symbols);
+
+    // The symbol ordering file goes first, then the call graph.
+    fs::write(dir.join("syms.txt"), "f4\nf2\n").unwrap();
+    let args = [
+        "g.o",
+        "--symbol-ordering-file=syms.txt",
+        "--call-graph-profile-sort=hfsort",
+    ];
+    let mut ours = args.to_vec();
+    ours.extend(["-o", "qld.out"]);
+    qld(&dir, &ours);
+    let symbols = symbols_by_address(&dir.join("qld.out"));
+    assert_eq!(&names(&symbols)[..2], ["f4", "f2"]);
+    compare_with_lld(&dir, &args, &symbols);
+}

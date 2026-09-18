@@ -25,7 +25,10 @@
 //! `--no-warn-symbol-ordering`, with lld's wording. Symbols in sections ICF
 //! folded order the section they were folded into.
 //!
-//! `--call-graph-profile-sort` is to follow.
+//! [`callgraph`] implements `--call-graph-profile-sort` (`hfsort` and
+//! `cdsort`). When both a call graph and `--symbol-ordering-file` apply,
+//! the listed symbols' sections come first, then the call graph's, as in
+//! lld 23.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -34,15 +37,21 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::args::LinkOptions;
+use crate::args::options::CallGraphSort;
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::SectionIndex;
 use crate::elf::read::consts::{STT_FILE, STT_SECTION};
 use crate::error::{Error, Result};
-use crate::ids::SectionId;
+use crate::ids::{SectionId, SymbolId};
 use crate::symbols::{DefinitionKind, SymbolName};
 
 use super::arch::Arch;
+use super::inputs::ElfInput;
+use super::place::Placement;
 use super::refs::{Def, Refs};
+
+pub mod callgraph;
+pub mod cdsort;
 
 /// A priority for input sections: negative values go first.
 #[derive(Clone, Debug, Default)]
@@ -206,30 +215,85 @@ pub fn read_symbol_ordering_file(
     Ok(names)
 }
 
-/// The section order of a link: from `--symbol-ordering-file`, else from
-/// the call graph (`--call-graph-profile-sort`,
-/// `--call-graph-ordering-file`), else none.
+/// The section order of a link, as lld's `buildSectionOrder`: sections of
+/// the call graph (`--call-graph-profile-sort`, `--call-graph-ordering-file`)
+/// in the order its algorithm gives, and before them the sections of the
+/// symbols of `--symbol-ordering-file`. `None` when neither applies.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Option`] when both ordering files are given, and I/O
-/// errors for unreadable files.
+/// Returns [`Error::Option`] when both ordering files are given or the
+/// call graph file does not parse, I/O errors for unreadable files, and
+/// [`Error::Malformed`] for broken call graph profile sections.
 pub fn for_link(
     refs: &Refs<'_, '_>,
+    placement: &Placement<'_>,
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
 ) -> Result<Option<SectionOrder>> {
-    if let Some(path) = &options.symbol_ordering_file {
-        if options.call_graph_ordering_file.is_some() {
-            return Err(Error::Option(
-                "--symbol-ordering-file and --call-graph-order-file may not be used together"
-                    .into(),
-            ));
-        }
-        let names = read_symbol_ordering_file(path, !options.no_warn_symbol_ordering, diagnostics)?;
-        return Ok(Some(symbol_order(refs, &names, options, diagnostics)));
+    if options.symbol_ordering_file.is_some() && options.call_graph_ordering_file.is_some() {
+        return Err(Error::Option(
+            "--symbol-ordering-file and --call-graph-order-file may not be used together".into(),
+        ));
     }
-    Ok(None)
+    let warn = !options.no_warn_symbol_ordering;
+    let ignore_undefined = ignores_undefined(options);
+    // The call graph is used when a sort is asked for (lld also sorts with
+    // `cdsort` by default; qld keeps GNU ld's layout unless asked).
+    let algorithm = match (
+        options.call_graph_profile_sort,
+        &options.call_graph_ordering_file,
+    ) {
+        (Some(algorithm), _) => algorithm,
+        (None, Some(_)) => CallGraphSort::default(),
+        (None, None) => CallGraphSort::None,
+    };
+    let mut order = SectionOrder::new(refs.sections.len());
+    let mut graph_sections = 0usize;
+    if algorithm != CallGraphSort::None {
+        let profile = match &options.call_graph_ordering_file {
+            Some(path) => callgraph::from_file(refs, path, warn, ignore_undefined, diagnostics)?,
+            None => callgraph::from_objects(refs, diagnostics)?,
+        };
+        if !profile.is_empty() {
+            let (sections, first) = callgraph::order(refs, placement, &profile, algorithm);
+            let mut priority = first;
+            for &id in &sections {
+                order.lower(id, i32::try_from(priority).unwrap_or(i32::MIN));
+                priority = priority.saturating_add(1);
+            }
+            graph_sections = sections.len();
+            if algorithm == CallGraphSort::Hfsort
+                && let Some(path) = &options.print_symbol_order
+            {
+                callgraph::print_symbol_order(refs, &sections, path)?;
+            }
+        }
+    }
+    if let Some(path) = &options.symbol_ordering_file {
+        let names = read_symbol_ordering_file(path, warn, diagnostics)?;
+        symbol_order(
+            refs,
+            &names,
+            graph_sections,
+            &mut order,
+            options,
+            diagnostics,
+        );
+    }
+    Ok((!order.is_empty()).then_some(order))
+}
+
+/// Whether `--unresolved-symbols` silences undefined symbols (lld's
+/// `UnresolvedPolicy::Ignore`).
+fn ignores_undefined(options: &LinkOptions) -> bool {
+    matches!(
+        options.unresolved_symbols,
+        Some(
+            crate::args::UnresolvedSymbols::IgnoreAll
+                | crate::args::UnresolvedSymbols::IgnoreInObjectFiles
+        )
+    )
 }
 
 /// Why a listed symbol cannot order a section.
@@ -254,97 +318,160 @@ impl Unorderable {
     }
 }
 
-/// Builds the section order of `--symbol-ordering-file` from its `names`.
+/// Where a symbol leads for ordering.
+enum Located {
+    /// The (live, or folded into) section it orders.
+    Section(SectionId),
+    /// A symbol that cannot be ordered: the file to name in the warning.
+    Unorderable(String, Unorderable),
+    /// Nothing to order and nothing to report (lazy and common symbols).
+    Nothing,
+}
+
+/// Where global symbol `id` leads.
+fn locate_global(refs: &Refs<'_, '_>, id: SymbolId, ignore_undefined: bool) -> Located {
+    let definition = refs.symbols.definition(id);
+    let file = || {
+        refs.files
+            .get(definition.file.index())
+            .map_or_else(|| "<internal>".to_string(), ElfInput::display)
+    };
+    match definition.kind {
+        DefinitionKind::Lazy => return Located::Nothing,
+        DefinitionKind::Undefined => {
+            if ignore_undefined {
+                return Located::Nothing;
+            }
+            let name = refs.symbols.name(id);
+            return match first_reference(refs, name.bytes()) {
+                Some(file) => Located::Unorderable(file, Unorderable::Undefined),
+                None => Located::Nothing,
+            };
+        }
+        _ => {}
+    }
+    match refs.global_target(id, false).def {
+        Def::Section {
+            file: f, section, ..
+        } => match refs
+            .sections
+            .id(f, section)
+            .and_then(|s| refs.sections.resolve(s))
+        {
+            Some(live) => Located::Section(live),
+            None => Located::Unorderable(file(), Unorderable::Discarded),
+        },
+        Def::Absolute(_) => Located::Unorderable(file(), Unorderable::Absolute),
+        Def::Linker(_) => Located::Unorderable("<internal>".to_string(), Unorderable::Synthetic),
+        Def::Shared(_) => Located::Unorderable(file(), Unorderable::Shared),
+        Def::Undefined { .. } if !ignore_undefined => {
+            Located::Unorderable(file(), Unorderable::Undefined)
+        }
+        // Common symbols live in a linker-allocated block, which is not an
+        // input section: nothing to order (and nothing to report).
+        Def::Undefined { .. } | Def::Common(_) => Located::Nothing,
+    }
+}
+
+/// Where local symbol `index` of `file` leads.
+fn locate_local(refs: &Refs<'_, '_>, file: usize, index: usize) -> Located {
+    let Some(object) = refs.files.get(file).and_then(|f| f.object.as_ref()) else {
+        return Located::Nothing;
+    };
+    let symbols = object.elf.symbols();
+    let Some(raw) = symbols.get_raw(index) else {
+        return Located::Nothing;
+    };
+    let display = || {
+        refs.files
+            .get(file)
+            .map_or_else(String::new, ElfInput::display)
+    };
+    let section = if raw.kind() == STT_FILE {
+        Some(SectionIndex::Absolute)
+    } else {
+        symbols.section_of(index, &raw)
+    };
+    match section {
+        Some(SectionIndex::Section(section)) => match refs
+            .sections
+            .id(file, section)
+            .and_then(|s| refs.sections.resolve(s))
+        {
+            Some(live) => Located::Section(live),
+            None => Located::Unorderable(display(), Unorderable::Discarded),
+        },
+        Some(SectionIndex::Absolute | SectionIndex::Common) => {
+            Located::Unorderable(display(), Unorderable::Absolute)
+        }
+        _ => Located::Nothing,
+    }
+}
+
+/// Why symbol `index` of `file` cannot be ordered, as `(file to name,
+/// what)`, or `None` if it can.
+fn unorderable(
+    refs: &Refs<'_, '_>,
+    file: usize,
+    index: usize,
+    ignore_undefined: bool,
+) -> Option<(String, &'static str)> {
+    let first_global = refs.files.get(file)?.object.as_ref()?.first_global;
+    let located = if index < first_global {
+        locate_local(refs, file, index)
+    } else {
+        locate_global(refs, refs.global_id(file, index)?, ignore_undefined)
+    };
+    match located {
+        Located::Unorderable(file, why) => Some((file, why.what())),
+        _ => None,
+    }
+}
+
+/// Adds the sections of `--symbol-ordering-file`'s `names` to `order`,
+/// ahead of the `before` sections already in it, and reports what cannot
+/// be ordered.
 ///
 /// Call it once sections are final (after `--gc-sections` and ICF).
-#[must_use]
 pub fn symbol_order(
     refs: &Refs<'_, '_>,
     names: &[Vec<u8>],
+    before: usize,
+    order: &mut SectionOrder,
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
-) -> SectionOrder {
-    let mut order = SectionOrder::new(refs.sections.len());
-    let count = i32::try_from(names.len()).unwrap_or(i32::MAX);
+) {
+    let base = i32::try_from(names.len().saturating_add(before)).unwrap_or(i32::MAX);
     let priority_of = |index: usize| -> i32 {
         i32::try_from(index)
             .unwrap_or(i32::MAX)
-            .saturating_sub(count)
+            .saturating_sub(base)
     };
     let warn = !options.no_warn_symbol_ordering;
-    let ignore_undefined = matches!(
-        options.unresolved_symbols,
-        Some(
-            crate::args::UnresolvedSymbols::IgnoreAll
-                | crate::args::UnresolvedSymbols::IgnoreInObjectFiles
-        )
-    );
+    let ignore_undefined = ignores_undefined(options);
     let mut present = vec![false; names.len()];
     let mut problems: Vec<(String, Unorderable, usize)> = Vec::new();
+    let mut apply = |located: Located, index: usize, problems: &mut Vec<_>| match located {
+        Located::Section(id) => order.lower(id, priority_of(index)),
+        Located::Unorderable(file, why) => problems.push((file, why, index)),
+        Located::Nothing => {}
+    };
 
-    // Global symbols, by name.
+    // Global symbols, by name. lld looks at every symbol of its table, so
+    // a name that only an unextracted archive member or an undefined
+    // reference knows still counts as present.
     for (index, name) in names.iter().enumerate() {
         let Some(id) = refs.symbols.lookup(&SymbolName::new(name)) else {
             continue;
         };
-        let definition = refs.symbols.definition(id);
-        match definition.kind {
-            // lld looks at every symbol of its table, so a name that only
-            // an unextracted archive member or an undefined reference
-            // knows still counts as present.
-            DefinitionKind::Lazy => {
-                if let Some(slot) = present.get_mut(index) {
-                    *slot = true;
-                }
-                continue;
-            }
-            DefinitionKind::Undefined => {
-                // Only names something refers to are in the table.
-                if let Some(slot) = present.get_mut(index) {
-                    *slot = true;
-                }
-                if !ignore_undefined && let Some(file) = first_reference(refs, name) {
-                    problems.push((file, Unorderable::Undefined, index));
-                }
-                continue;
-            }
-            _ => {}
-        }
         if let Some(slot) = present.get_mut(index) {
             *slot = true;
         }
-        let file = || {
-            refs.files.get(definition.file.index()).map_or_else(
-                || "<internal>".to_string(),
-                super::inputs::ElfInput::display,
-            )
-        };
-        let target = refs.global_target(id, false);
-        match target.def {
-            Def::Section {
-                file: f, section, ..
-            } => match refs
-                .sections
-                .id(f, section)
-                .and_then(|s| refs.sections.resolve(s))
-            {
-                Some(live) => order.lower(live, priority_of(index)),
-                None => problems.push((file(), Unorderable::Discarded, index)),
-            },
-            Def::Absolute(_) => problems.push((file(), Unorderable::Absolute, index)),
-            Def::Linker(_) => {
-                problems.push(("<internal>".to_string(), Unorderable::Synthetic, index));
-            }
-            Def::Shared(_) => problems.push((file(), Unorderable::Shared, index)),
-            Def::Undefined { .. } => {
-                if !ignore_undefined {
-                    problems.push((file(), Unorderable::Undefined, index));
-                }
-            }
-            // Common symbols live in a linker-allocated block, which is not
-            // an input section: nothing to order (and nothing to report).
-            Def::Common(_) => {}
-        }
+        apply(
+            locate_global(refs, id, ignore_undefined),
+            index,
+            &mut problems,
+        );
     }
 
     // Local symbols, found per file in parallel.
@@ -356,7 +483,7 @@ pub fn symbol_order(
     for (index, name) in names.iter().enumerate() {
         lookup.insert(name.as_slice(), index);
     }
-    let locals: Vec<Vec<(usize, Option<SectionIndex>, u8)>> = refs
+    let locals: Vec<Vec<(usize, usize)>> = refs
         .files
         .par_iter()
         .enumerate()
@@ -379,45 +506,21 @@ pub fn symbol_order(
                 let Ok(name) = symbols.name(index, &raw) else {
                     continue;
                 };
-                if name.is_empty() {
-                    continue;
-                }
-                if let Some(&at) = lookup.get(name) {
-                    let section = if raw.kind() == STT_FILE {
-                        Some(SectionIndex::Absolute)
-                    } else {
-                        symbols.section_of(index, &raw)
-                    };
-                    found.push((at, section, raw.kind()));
+                if !name.is_empty()
+                    && let Some(&at) = lookup.get(name)
+                {
+                    found.push((at, index));
                 }
             }
             found
         })
         .collect();
     for (file, found) in locals.iter().enumerate() {
-        for &(index, section, _) in found {
-            if let Some(slot) = present.get_mut(index) {
+        for &(at, index) in found {
+            if let Some(slot) = present.get_mut(at) {
                 *slot = true;
             }
-            let display = || {
-                refs.files
-                    .get(file)
-                    .map_or_else(String::new, super::inputs::ElfInput::display)
-            };
-            match section {
-                Some(SectionIndex::Section(section)) => match refs
-                    .sections
-                    .id(file, section)
-                    .and_then(|s| refs.sections.resolve(s))
-                {
-                    Some(live) => order.lower(live, priority_of(index)),
-                    None => problems.push((display(), Unorderable::Discarded, index)),
-                },
-                Some(SectionIndex::Absolute | SectionIndex::Common) => {
-                    problems.push((display(), Unorderable::Absolute, index));
-                }
-                _ => {}
-            }
+            apply(locate_local(refs, file, index), at, &mut problems);
         }
     }
 
@@ -439,7 +542,6 @@ pub fn symbol_order(
             }
         }
     }
-    order
 }
 
 /// The first live file (in input order) whose global symbols include an
