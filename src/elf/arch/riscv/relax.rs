@@ -41,7 +41,7 @@ use crate::arch::riscv::{self as insn, C_J, JAL, TP, fits_signed, hi20};
 use crate::elf::common::Commons;
 use crate::elf::export::PREEMPTIBLE;
 use crate::elf::layout::{Layout, LayoutInput};
-use crate::elf::object::{ObjectInput, SectionKind};
+use crate::elf::object::SectionKind;
 use crate::elf::read::Relocations;
 use crate::elf::read::consts::riscv::*;
 use crate::elf::read::consts::{SHF_ALLOC, SHF_EXECINSTR};
@@ -98,6 +98,8 @@ impl Rewrite {
 pub struct Edit {
     /// Position of the relocation in processing order ([`sorted_order`]).
     pub seq: u32,
+    /// Its index in the relocation section.
+    pub index: u32,
     /// Its offset in the input section.
     pub offset: u64,
     /// Bytes deleted after the kept part of the instruction.
@@ -115,6 +117,9 @@ pub struct SectionRelax {
     pub id: SectionId,
     /// Its edits, in processing order.
     pub edits: Vec<Edit>,
+    /// The relocation table was sorted by offset, so processing order is
+    /// table order.
+    pub sorted: bool,
 }
 
 impl SectionRelax {
@@ -142,6 +147,24 @@ impl SectionRelax {
     pub fn edit(&self, seq: u32) -> Option<&Edit> {
         let at = self.edits.binary_search_by_key(&seq, |e| e.seq).ok()?;
         self.edits.get(at)
+    }
+
+    /// The type `--emit-relocs` writes for relocation `index` of the
+    /// section's table, as lld writes it: a relaxed call becomes the jump it
+    /// is now, a deleted instruction's relocation `R_RISCV_RELAX`.
+    #[must_use]
+    pub fn emitted_type(&self, index: u32, r_type: u32) -> u32 {
+        let edit = if self.sorted {
+            self.edit(index)
+        } else {
+            self.edits.iter().find(|e| e.index == index)
+        };
+        match edit.map(|e| e.rewrite) {
+            Some(Rewrite::Jal(_)) => R_RISCV_JAL,
+            Some(Rewrite::CJump(_)) => R_RISCV_RVC_JUMP,
+            Some(Rewrite::Delete) => R_RISCV_RELAX,
+            _ => r_type,
+        }
     }
 
     /// The deletions, which decide the layout.
@@ -200,6 +223,16 @@ impl Relaxation {
         match self.section(id) {
             Some(section) => section.map(offset),
             None => offset,
+        }
+    }
+
+    /// The type `--emit-relocs` writes for relocation `index` of section
+    /// `id` ([`SectionRelax::emitted_type`]).
+    #[must_use]
+    pub fn emitted_type(&self, id: SectionId, index: usize, r_type: u32) -> u32 {
+        match (self.section(id), u32::try_from(index)) {
+            (Some(section), Ok(index)) => section.emitted_type(index, r_type),
+            _ => r_type,
         }
     }
 
@@ -302,10 +335,14 @@ pub fn layout<'a>(
     inner: &dyn Fn(&LayoutInput<'_, 'a>) -> Result<Layout<'a>>,
 ) -> Result<Layout<'a>> {
     let candidates = candidates(input);
-    if candidates.is_empty() {
-        return inner(input);
-    }
     let mut state = Relaxation::default();
+    if candidates.is_empty() {
+        let round = LayoutInput {
+            relax: Some(&state),
+            ..*input
+        };
+        return inner(&round);
+    }
     for pass in 0..MAX_PASSES {
         let round = LayoutInput {
             relax: Some(&state),
@@ -377,13 +414,7 @@ fn relax_pass<'a>(
     Ok(Relaxation::new(input.refs.sections.len(), sections))
 }
 
-fn malformed(
-    object: &ObjectInput<'_>,
-    file: &crate::elf::inputs::ElfInput<'_>,
-    offset: u64,
-    what: String,
-) -> Error {
-    let _ = object;
+fn malformed(file: &crate::elf::inputs::ElfInput<'_>, offset: u64, what: String) -> Error {
     Error::Malformed {
         file: file.path(),
         member: file.member(),
@@ -553,7 +584,6 @@ fn relax_section(pass: &Pass<'_, '_, '_>, candidate: Candidate) -> Result<Option
                     .map_or(loc, |v| v & !align.wrapping_sub(1));
                 let Some(trim) = next.checked_sub(aligned) else {
                     return Err(malformed(
-                        object,
                         input_file,
                         section.header.sh_offset.saturating_add(rel.offset),
                         format!(
@@ -667,6 +697,7 @@ fn relax_section(pass: &Pass<'_, '_, '_>, candidate: Candidate) -> Result<Option
             delta = delta.saturating_add(u64::from(remove));
             edits.push(Edit {
                 seq,
+                index: u32::try_from(index_at(seq)).unwrap_or(u32::MAX),
                 offset: rel.offset,
                 remove,
                 delta,
@@ -680,6 +711,7 @@ fn relax_section(pass: &Pass<'_, '_, '_>, candidate: Candidate) -> Result<Option
     Ok(Some(SectionRelax {
         id: candidate.id,
         edits,
+        sorted: order.is_none(),
     }))
 }
 
@@ -697,6 +729,7 @@ mod tests {
     fn edit(seq: u32, offset: u64, remove: u32, delta: u64, rewrite: Rewrite) -> Edit {
         Edit {
             seq,
+            index: seq,
             offset,
             remove,
             delta,
@@ -708,6 +741,7 @@ mod tests {
     fn offsets_move_by_the_bytes_deleted_before_them() {
         let section = SectionRelax {
             id: SectionId::new(0),
+            sorted: true,
             edits: vec![
                 edit(0, 0x10, 4, 4, Rewrite::Jal(JAL)),
                 edit(3, 0x20, 0, 4, Rewrite::X0Rel),

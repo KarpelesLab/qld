@@ -715,9 +715,11 @@ mod tests {
         ];
         let relax = SectionRelax {
             id: SectionId::new(0),
+            sorted: true,
             edits: vec![
                 Edit {
                     seq: 0,
+                    index: 0,
                     offset: 0,
                     remove: 4,
                     delta: 4,
@@ -727,6 +729,7 @@ mod tests {
                 // of padding: 2 of the 6 go.
                 Edit {
                     seq: 2,
+                    index: 2,
                     offset: 8,
                     remove: 2,
                     delta: 6,

@@ -321,14 +321,20 @@ pub fn write(input: &WriteInput<'_, '_, '_>, position: u32, out: &mut [u8]) -> R
             object.section_data(section).unwrap_or_default()
         };
         if let Some(relas) = relocations(object, index) {
-            for (rel, entry) in relas.iter().zip(entries) {
-                let place = base.wrapping_add(rel.offset);
+            for (index, (rel, entry)) in relas.iter().zip(entries).enumerate() {
+                // Linker relaxation (RISC-V) moves offsets in code.
+                let relax = &addresses.layout.relax;
+                let place = base.wrapping_add(relax.map(id, rel.offset));
                 match output_symbol(addresses, plan, section_symbols, file, &rel) {
                     Some((symbol, addend)) => put(
                         entry,
                         place,
                         symbol,
-                        output_type(input, file, section, data, &rel),
+                        relax.emitted_type(
+                            id,
+                            index,
+                            output_type(input, file, section, data, &rel),
+                        ),
                         addend,
                     ),
                     None => put(entry, place, 0, R_X86_64_NONE, 0),
