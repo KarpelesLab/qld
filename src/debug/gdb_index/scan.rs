@@ -87,6 +87,10 @@ const KIND_FUNCTION: u32 = 3;
 /// external linkage.
 const TYPE_UNIT_BITS: u32 = KIND_TYPE << 4;
 
+/// How many enclosing scopes a name is qualified by, at most: real code
+/// nests far less, and the bound keeps crafted inputs linear.
+const MAX_DEPTH: usize = 256;
+
 /// No DIE.
 const NONE: u32 = u32::MAX;
 
@@ -503,7 +507,7 @@ impl<'a> Scan<'_, '_, 'a> {
         }
         let mut parts: Vec<&[u8]> = Vec::new();
         // Bounded: a malformed chain of specifications cannot loop.
-        for _ in 0..self.dies.len() {
+        for _ in 0..self.dies.len().min(MAX_DEPTH) {
             let Some(die) = self.die(scope) else { break };
             let name = match self.name_of(die) {
                 Some(name) if !name.is_empty() => Some(name),
@@ -540,7 +544,7 @@ impl<'a> Scan<'_, '_, 'a> {
     /// Whether `die` is inside a function (or a block of one).
     fn in_function(&self, die: &Die<'a>) -> bool {
         let mut scope = die.parent;
-        for _ in 0..self.dies.len() {
+        for _ in 0..self.dies.len().min(MAX_DEPTH) {
             let Some(parent) = self.die(scope) else {
                 return false;
             };

@@ -769,6 +769,13 @@ fn parse_index<'a>(
         index.abbrevs.push(InputAbbrev { code, tag, attrs });
     }
     let pool = abbrev_end;
+    // Every name has its own entries: a list read twice would make the
+    // work quadratic in the section size.
+    let mut sorted_offsets = entry_offsets.clone();
+    sorted_offsets.sort_unstable();
+    if sorted_offsets.windows(2).any(|w| w.first() == w.get(1)) {
+        return Err(r.error("entry offset (shared by two names)"));
+    }
     for (string, entry_offset) in strings.into_iter().zip(entry_offsets) {
         let name = string
             .section

@@ -833,3 +833,77 @@ fn separate_debug_file_takes_a_path_and_is_deterministic() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Malformed debug information
+// ---------------------------------------------------------------------------
+
+/// Corrupts the debug sections of an object in many ways (xorshift PRNG,
+/// fixed seed) and links it with every debug output: qld may report
+/// errors or warnings but must never crash.
+#[test]
+fn malformed_debug_info_never_crashes() {
+    let Some((cc, cxx)) = compilers() else { return };
+    let dir = scratch("malformed");
+    let pubnames = if driver_is_clang(&cxx) {
+        "-gpubnames"
+    } else {
+        "-ggnu-pubnames"
+    };
+    compile(&dir, &cc, &cxx, &["-g", "-O1", pubnames]);
+    let object = fs::read(dir.join("b.o")).unwrap();
+    // The file ranges of the debug sections and their relocations.
+    let ranges: Vec<(usize, usize)> = {
+        let elf = ElfFile::<Elf64Le>::parse(&object, Source::new(Path::new("b.o"))).unwrap();
+        elf.enumerate_sections()
+            .filter(|(_, h)| {
+                elf.section_name(h)
+                    .is_ok_and(|n| n.starts_with(b".debug") || n.starts_with(b".rela.debug"))
+            })
+            .map(|(_, h)| (h.sh_offset as usize, h.sh_size as usize))
+            .filter(|&(_, size)| size > 0)
+            .collect()
+    };
+    assert!(!ranges.is_empty());
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for round in 0..120 {
+        let mut corrupt = object.clone();
+        let (start, size) = ranges[(next() as usize) % ranges.len()];
+        for _ in 0..1 + next() % 8 {
+            let at = start + (next() as usize) % size;
+            corrupt[at] = match next() % 4 {
+                0 => 0xff,
+                1 => 0,
+                _ => next() as u8,
+            };
+        }
+        fs::write(dir.join("bad.o"), &corrupt).unwrap();
+        let output = run(
+            &dir,
+            Path::new(env!("CARGO_BIN_EXE_qld")),
+            &[
+                "a.o",
+                "bad.o",
+                "-e",
+                "_start",
+                "--gdb-index",
+                "--debug-names",
+                "--threads=2",
+                "-o",
+                "out",
+            ],
+        );
+        assert!(
+            matches!(output.status.code(), Some(0 | 1)),
+            "round {round}: qld crashed ({:?}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
