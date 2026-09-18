@@ -8,6 +8,7 @@
 //! Anything that names a relocation constant belongs in a backend instead.
 
 pub mod aarch64;
+pub mod loongarch;
 
 /// A value does not fit the instruction field it is being packed into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

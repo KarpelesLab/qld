@@ -300,7 +300,11 @@ impl Synth {
             || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
         // `.got.plt` words.
-        self.got_plt_reserved = if dynamic && has_got_plt { 3 } else { 0 };
+        self.got_plt_reserved = if dynamic && has_got_plt {
+            self.arch.got_plt_reserved()
+        } else {
+            0
+        };
         self.section_dyn_relocs = scan.section_dyn_relocs();
         self.section_packable = scan.section_packable();
         self.got_dyn_relocs = self.count_got_relocs(refs);

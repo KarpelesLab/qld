@@ -535,6 +535,8 @@ fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     header[18..20].copy_from_slice(&input.context.arch.machine().to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[24..32].copy_from_slice(&input.entry.to_le_bytes());
+    let e_flags = input.context.arch.output_flags(input.addresses.refs.files);
+    header[48..52].copy_from_slice(&e_flags.to_le_bytes());
     let phoff = if layout.segments.is_empty() {
         0
     } else {
@@ -1367,7 +1369,9 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
     let arch = input.context.arch;
     let order = file.position.raw();
     let mut skip = false;
-    for rel in relas.iter() {
+    let mut relas = relas.iter().peekable();
+    while let Some(rel) = relas.next() {
+        let rel = arch.annotate(rel, relas.peek());
         if skip {
             skip = false;
             continue;
@@ -1428,6 +1432,12 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                     ));
                     continue;
                 }
+                // Both labels of a difference in a discarded section count
+                // from zero, which keeps the difference (lld does the same).
+                if let Some(delta) = add_delta(class.kind, rel.addend as u64) {
+                    let _ = arch::add_value(out, rel.offset, class.width, delta);
+                    continue;
+                }
                 let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
                 let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
                 let _ = arch::write_value(out, rel.offset, class.width, value);
@@ -1459,6 +1469,7 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         let put =
             |out: &mut [u8], value: u64| arch::write_value(out, rel.offset, class.width, value);
         let page = crate::arch::aarch64::page;
+        let page_delta = |target: u64| arch.page_delta(target, place, rel.r_type);
         let result = match class.kind {
             Kind::None => Ok(()),
             Kind::Abs => match decision.dynamic {
@@ -1493,16 +1504,19 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
                 }
                 put(out, sa.wrapping_sub(place))
             }
-            Kind::Page => put(out, page(sa).wrapping_sub(page(place))),
+            Kind::Page => put(out, page_delta(sa)),
             Kind::Got => {
                 slot_address().and_then(|g| put(out, g.wrapping_add_signed(a).wrapping_sub(place)))
             }
-            Kind::GotPage => slot_address().and_then(|g| {
-                put(
-                    out,
-                    page(g.wrapping_add_signed(a)).wrapping_sub(page(place)),
-                )
-            }),
+            Kind::GotPage => {
+                slot_address().and_then(|g| put(out, page_delta(g.wrapping_add_signed(a))))
+            }
+            Kind::PageOff => put(out, sa),
+            Kind::Add | Kind::Sub => {
+                let delta = add_delta(class.kind, sa).unwrap_or_default();
+                arch::add_value(out, rel.offset, class.width, delta)
+            }
+            Kind::Relax => arch.relax(out, rel.offset, rel.r_type, sa, place),
             Kind::GotAbs => slot_address().and_then(|g| put(out, g.wrapping_add_signed(a))),
             Kind::GotPageOff => slot_address().and_then(|g| {
                 put(
@@ -1611,6 +1625,16 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
         }
     }
     Ok(())
+}
+
+/// The amount a label-difference relocation ([`Kind::Add`] or
+/// [`Kind::Sub`]) adds to its field, for the value `value`.
+fn add_delta(kind: Kind, value: u64) -> Option<u64> {
+    match kind {
+        Kind::Add => Some(value),
+        Kind::Sub => Some(value.wrapping_neg()),
+        _ => None,
+    }
 }
 
 /// The output section names of a reference from input section `from` to
@@ -1766,12 +1790,19 @@ fn write_eh_frame(
                 continue;
             };
             let sa = s.wrapping_add_signed(a);
-            let value = match class.kind {
-                Kind::Abs => sa,
-                Kind::Pc => sa.wrapping_sub(place),
-                _ => continue,
+            // LoongArch assembles the advances of the call frame
+            // instructions as label differences when the code may relax.
+            let written = if let Some(delta) = add_delta(class.kind, sa) {
+                arch::add_value(out, local, class.width, delta)
+            } else {
+                let value = match class.kind {
+                    Kind::Abs => sa,
+                    Kind::Pc => sa.wrapping_sub(place),
+                    _ => continue,
+                };
+                arch::write_value(out, local, class.width, value)
             };
-            if arch::write_value(out, local, class.width, value).is_err() {
+            if written.is_err() {
                 input.diagnostics.emit(
                     Diagnostic::error("relocation in .eh_frame out of range".to_string())
                         .at(location(refs, eh.file, eh.index, rel.offset)),

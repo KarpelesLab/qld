@@ -4,7 +4,7 @@
 //! instruction sequences and writes linker-generated stubs. The rest of the
 //! ELF backend never names a relocation constant: it asks [`Arch`], which is
 //! chosen once per link ([`Arch::of`]) and dispatches to the module for
-//! x86-64 or AArch64.
+//! x86-64, AArch64 or LoongArch64.
 //!
 //! The vocabulary is shared, so the relocation scan and the writer run one
 //! loop for every architecture:
@@ -13,16 +13,19 @@
 //!   Page(P)`, a GOT slot's address, a thread pointer offset, …) and
 //!   [`GotKind`] which GOT entry it goes through;
 //! - [`Width`] says how the result is stored: a data field, or an AArch64
-//!   instruction field ([`crate::arch::aarch64::Field`]);
+//!   or LoongArch instruction field ([`crate::arch::aarch64::Field`],
+//!   [`crate::arch::loongarch::Field`]);
 //! - [`DynKind`] names the dynamic relocation a GOT slot, a PLT slot or a
 //!   copy needs, without naming its number.
 
 pub mod aarch64;
+pub mod loongarch;
 pub mod thunk;
 pub mod x86_64;
 
 use crate::args::LinkOptions;
-use crate::elf::read::consts::{EM_AARCH64, EM_X86_64, reloc_name};
+use crate::elf::read::Relocation;
+use crate::elf::read::consts::{EM_AARCH64, EM_LOONGARCH, EM_X86_64, SHF_EXECINSTR, reloc_name};
 use crate::target::{Architecture, Target};
 
 /// The architecture an ELF link targets.
@@ -33,6 +36,8 @@ pub enum Arch {
     X86_64,
     /// AArch64 (LP64, little-endian).
     AArch64,
+    /// LoongArch64 (LP64D, little-endian).
+    LoongArch64,
 }
 
 /// What a relocation computes.
@@ -91,6 +96,20 @@ pub enum Kind {
     GdToIe,
     /// TLS descriptor → initial-exec.
     DescToIe,
+    /// `S + A` added to the field's current contents (a label difference
+    /// assembled as a pair of relocations: LoongArch `ADD*`).
+    Add,
+    /// `S + A` subtracted from the field's current contents (the other half
+    /// of the pair: LoongArch `SUB*`).
+    Sub,
+    /// The low bits of `S + A` that complete a page-relative pair
+    /// (LoongArch `pcalau12i` + `addi.d`): the same wherever the output is
+    /// loaded, so it needs no dynamic relocation even in a PIE.
+    PageOff,
+    /// An instruction pair the architecture rewrites once it knows both
+    /// `S + A` and the place ([`Arch::relax`]; LoongArch: a GOT load turned
+    /// into an address computation, or linker relaxation to `pcaddi`).
+    Relax,
 }
 
 /// What a GOT entry holds.
@@ -132,6 +151,8 @@ pub enum Width {
     I8,
     /// An AArch64 instruction (or data) field.
     Field(crate::arch::aarch64::Field),
+    /// A LoongArch instruction (or data) field.
+    LoongArch(crate::arch::loongarch::Field),
 }
 
 /// A classified relocation.
@@ -342,6 +363,7 @@ impl Arch {
         match e_machine {
             EM_X86_64 => Some(Self::X86_64),
             EM_AARCH64 => Some(Self::AArch64),
+            EM_LOONGARCH => Some(Self::LoongArch64),
             _ => None,
         }
     }
@@ -352,6 +374,7 @@ impl Arch {
         match target.arch {
             Architecture::X86_64 => Some(Self::X86_64),
             Architecture::Aarch64 => Some(Self::AArch64),
+            Architecture::LoongArch64 => Some(Self::LoongArch64),
             _ => None,
         }
     }
@@ -382,6 +405,7 @@ impl Arch {
         match self {
             Self::X86_64 => EM_X86_64,
             Self::AArch64 => EM_AARCH64,
+            Self::LoongArch64 => EM_LOONGARCH,
         }
     }
 
@@ -391,18 +415,26 @@ impl Arch {
         match self {
             Self::X86_64 => "elf_x86_64",
             Self::AArch64 => "aarch64linux",
+            Self::LoongArch64 => "elf64loongarch",
         }
     }
 
     /// The name of relocation type `r_type`, as `readelf` prints it.
     #[must_use]
     pub fn reloc_name(self, r_type: u32) -> Option<&'static str> {
-        reloc_name(self.machine(), r_type)
+        match self {
+            Self::LoongArch64 => loongarch::reloc_name(r_type),
+            _ => reloc_name(self.machine(), r_type),
+        }
     }
 
     /// That name, or the number when the type is unknown.
     #[must_use]
     pub fn reloc_label(self, r_type: u32) -> String {
+        let r_type = match self {
+            Self::LoongArch64 => loongarch::base_type(r_type),
+            _ => r_type,
+        };
         self.reloc_name(r_type)
             .map_or_else(|| r_type.to_string(), str::to_owned)
     }
@@ -414,6 +446,103 @@ impl Arch {
         match self {
             Self::X86_64 => 0x1000,
             Self::AArch64 => 0x1_0000,
+            // GNU ld's; lld assumes 64 KiB.
+            Self::LoongArch64 => 0x4000,
+        }
+    }
+
+    /// The address a non-PIE executable is linked at by default (GNU ld's
+    /// text start, headers included).
+    #[must_use]
+    pub fn default_base(self) -> u64 {
+        match self {
+            Self::X86_64 | Self::AArch64 => super::layout::DEFAULT_BASE,
+            Self::LoongArch64 => 0x1_2000_0000,
+        }
+    }
+
+    /// The number of words `.got.plt` reserves for the dynamic linker:
+    /// `_DYNAMIC`, the link map and the resolver on x86-64 and AArch64; the
+    /// resolver and the link map on LoongArch.
+    #[must_use]
+    pub fn got_plt_reserved(self) -> u64 {
+        match self {
+            Self::X86_64 | Self::AArch64 => 3,
+            Self::LoongArch64 => 2,
+        }
+    }
+
+    /// The `e_flags` of the output, from the input objects: the LoongArch
+    /// ABI and object ABI version; zero elsewhere.
+    #[must_use]
+    pub fn output_flags(self, files: &[super::inputs::ElfInput<'_>]) -> u32 {
+        if self != Self::LoongArch64 {
+            return 0;
+        }
+        loongarch::output_flags(files.iter().filter_map(|file| {
+            let object = file.object.as_ref()?;
+            let header = object.elf.elf().header();
+            if header.e_machine != EM_LOONGARCH {
+                return None;
+            }
+            let code = object
+                .sections
+                .iter()
+                .any(|section| section.header.sh_flags & SHF_EXECINSTR != 0);
+            Some((header.e_flags, code))
+        }))
+    }
+
+    /// `rel` with what the architecture needs to know about the relocation
+    /// that follows it (`next`) folded into its type: on LoongArch, whether
+    /// an `R_LARCH_RELAX` allows the instructions to be relaxed
+    /// ([`loongarch::RELAX_HINT`]). Other architectures get `rel` back.
+    #[must_use]
+    pub fn annotate(self, rel: Relocation, next: Option<&Relocation>) -> Relocation {
+        if self == Self::LoongArch64
+            && let Some(next) = next
+            && next.r_type == loongarch::R_LARCH_RELAX
+            && next.offset == rel.offset
+        {
+            return Relocation {
+                r_type: rel.r_type | loongarch::RELAX_HINT,
+                ..rel
+            };
+        }
+        rel
+    }
+
+    /// The page delta a page-relative relocation `r_type` at `place`
+    /// computes to `target`: `Page(target) - Page(place)`, adjusted on
+    /// LoongArch for the sign of the low part that completes it.
+    #[must_use]
+    pub fn page_delta(self, target: u64, place: u64, r_type: u32) -> u64 {
+        match self {
+            Self::LoongArch64 => loongarch::page_delta(target, place, r_type),
+            Self::X86_64 | Self::AArch64 => {
+                let page = crate::arch::aarch64::page;
+                page(target).wrapping_sub(page(place))
+            }
+        }
+    }
+
+    /// Rewrites an instruction pair classified [`Kind::Relax`], given the
+    /// value `target` (`S + A`) and the `place` of the relocation.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplyError`] when the rewrite does not apply.
+    pub fn relax(
+        self,
+        out: &mut [u8],
+        offset: u64,
+        r_type: u32,
+        target: u64,
+        place: u64,
+    ) -> Result<(), ApplyError> {
+        match self {
+            Self::LoongArch64 => loongarch::relax(out, offset, r_type, target, place),
+            Self::X86_64 | Self::AArch64 => Err(ApplyError::BadInstruction),
         }
     }
 
@@ -453,6 +582,7 @@ impl Arch {
         match self {
             Self::X86_64 => "/lib64/ld-linux-x86-64.so.2",
             Self::AArch64 => "/lib/ld-linux-aarch64.so.1",
+            Self::LoongArch64 => "/lib64/ld-linux-loongarch-lp64d.so.1",
         }
     }
 
@@ -460,7 +590,7 @@ impl Arch {
     /// after a two-word thread control block) rather than variant II.
     #[must_use]
     pub fn tls_variant1(self) -> bool {
-        self == Self::AArch64
+        matches!(self, Self::AArch64 | Self::LoongArch64)
     }
 
     /// The size of the thread control block variant I reserves below the
@@ -468,7 +598,7 @@ impl Arch {
     #[must_use]
     pub fn tcb_size(self) -> u64 {
         match self {
-            Self::X86_64 => 0,
+            Self::X86_64 | Self::LoongArch64 => 0,
             Self::AArch64 => 16,
         }
     }
@@ -502,6 +632,19 @@ impl Arch {
                 DynKind::TpOff => a64::R_AARCH64_TLS_TPREL64,
                 DynKind::TlsDesc => a64::R_AARCH64_TLSDESC,
             },
+            // LoongArch has no GLOB_DAT: a GOT slot takes the symbolic
+            // 64-bit relocation.
+            Self::LoongArch64 => match kind {
+                DynKind::Relative => loongarch::R_LARCH_RELATIVE,
+                DynKind::Irelative => loongarch::R_LARCH_IRELATIVE,
+                DynKind::JumpSlot => loongarch::R_LARCH_JUMP_SLOT,
+                DynKind::GlobDat | DynKind::Abs64 => loongarch::R_LARCH_64,
+                DynKind::Copy => loongarch::R_LARCH_COPY,
+                DynKind::DtpMod => loongarch::R_LARCH_TLS_DTPMOD64,
+                DynKind::DtpOff => loongarch::R_LARCH_TLS_DTPREL64,
+                DynKind::TpOff => loongarch::R_LARCH_TLS_TPREL64,
+                DynKind::TlsDesc => loongarch::R_LARCH_TLS_DESC64,
+            },
         }
     }
 
@@ -517,6 +660,7 @@ impl Arch {
                 r_type,
                 a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26 | a64::R_AARCH64_PLT32
             ),
+            Self::LoongArch64 => loongarch::is_branch(r_type),
         }
     }
 
@@ -536,6 +680,7 @@ impl Arch {
         match self {
             Self::X86_64 => x86_64::classify(r_type, addend, data, offset, context),
             Self::AArch64 => aarch64::classify(r_type, context),
+            Self::LoongArch64 => loongarch::classify(r_type, addend, data, offset, context),
         }
     }
 
@@ -554,7 +699,7 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::X86_64 => x86_64::relax_got(out, offset, kind, value),
-            Self::AArch64 => Err(ApplyError::BadInstruction),
+            Self::AArch64 | Self::LoongArch64 => Err(ApplyError::BadInstruction),
         }
     }
 
@@ -574,6 +719,7 @@ impl Arch {
         match self {
             Self::X86_64 => x86_64::relax_tls(out, offset, kind, values),
             Self::AArch64 => aarch64::relax_tls(out, offset, kind, r_type, values),
+            Self::LoongArch64 => loongarch::relax_tls(out, offset, kind, r_type, values),
         }
     }
 
@@ -586,6 +732,7 @@ impl Arch {
                 let _ = flags;
                 32
             }
+            Self::LoongArch64 => loongarch::PLT_HEADER_SIZE,
         }
     }
 
@@ -596,6 +743,7 @@ impl Arch {
             Self::X86_64 => 16,
             Self::AArch64 if flags.entry_landing_pad => 24,
             Self::AArch64 => 16,
+            Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
         }
     }
 
@@ -607,6 +755,7 @@ impl Arch {
             Self::X86_64 => 8,
             Self::AArch64 if flags.entry_landing_pad => 24,
             Self::AArch64 => 16,
+            Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
         }
     }
 
@@ -631,8 +780,9 @@ impl Arch {
             // The `push` after the jump, or the whole entry with IBT.
             Self::X86_64 if flags.landing_pad => entry,
             Self::X86_64 => entry.wrapping_add(6),
-            // The header pushes and jumps; entries do not.
-            Self::AArch64 => plt,
+            // The header pushes and jumps; entries do not. On LoongArch the
+            // header finds the index from the entry's return address.
+            Self::AArch64 | Self::LoongArch64 => plt,
         }
     }
 
@@ -652,6 +802,7 @@ impl Arch {
         match self {
             Self::X86_64 => x86_64::write_plt_header(out, plt, got_plt),
             Self::AArch64 => aarch64::write_plt_header(out, plt, got_plt, flags),
+            Self::LoongArch64 => loongarch::write_plt_header(out, plt, got_plt),
         }
     }
 
@@ -675,6 +826,7 @@ impl Arch {
                 x86_64::write_plt_entry(out, entry, slot, index, plt, flags.landing_pad)
             }
             Self::AArch64 => aarch64::write_plt_entry(out, entry, slot, flags),
+            Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
         }
     }
 
@@ -695,6 +847,7 @@ impl Arch {
             Self::X86_64 => x86_64::write_plt_jump(out, entry, slot, flags.landing_pad),
             #[allow(clippy::match_same_arms)]
             Self::AArch64 => aarch64::write_plt_entry(out, entry, slot, flags),
+            Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
         }
     }
 
@@ -713,6 +866,7 @@ impl Arch {
         match self {
             Self::X86_64 => x86_64::write_iplt(out, stub, slot_address),
             Self::AArch64 => aarch64::write_plt_entry(out, stub, slot_address, PltFlags::default()),
+            Self::LoongArch64 => loongarch::write_plt_entry(out, stub, slot_address),
         }
     }
 
@@ -730,7 +884,7 @@ impl Arch {
         r_type: u32,
     ) -> Result<bool, ApplyError> {
         match self {
-            Self::X86_64 => Ok(false),
+            Self::X86_64 | Self::LoongArch64 => Ok(false),
             Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
         }
     }
@@ -741,6 +895,7 @@ impl Arch {
         match self {
             Self::X86_64 => x86_64::write_nops(out),
             Self::AArch64 => aarch64::write_nops(out),
+            Self::LoongArch64 => loongarch::write_nops(out),
         }
     }
 }
@@ -817,6 +972,43 @@ pub fn write_value(
                 *word = encoded.to_le_bytes();
             }
         }
+        Width::LoongArch(field) => loongarch::write_field(out, offset, field, value)?,
+    }
+    Ok(())
+}
+
+/// Adds `delta` to the field of width `width` at `offset`, wrapping as the
+/// label-difference relocations do ([`Kind::Add`]; [`Kind::Sub`] passes
+/// the negated value).
+///
+/// # Errors
+///
+/// [`ApplyError::OutOfBounds`], or [`ApplyError::BadInstruction`] for a
+/// width that is not data.
+pub fn add_value(out: &mut [u8], offset: u64, width: Width, delta: u64) -> Result<(), ApplyError> {
+    match width {
+        Width::W64 => {
+            let word = slot::<8>(out, offset)?;
+            *word = u64::from_le_bytes(*word).wrapping_add(delta).to_le_bytes();
+        }
+        Width::U32 | Width::I32 | Width::Any32 => {
+            let word = slot::<4>(out, offset)?;
+            *word = u32::from_le_bytes(*word)
+                .wrapping_add(delta as u32)
+                .to_le_bytes();
+        }
+        Width::Any16 | Width::I16 => {
+            let word = slot::<2>(out, offset)?;
+            *word = u16::from_le_bytes(*word)
+                .wrapping_add(delta as u16)
+                .to_le_bytes();
+        }
+        Width::Any8 | Width::I8 => {
+            let [byte] = slot::<1>(out, offset)?;
+            *byte = byte.wrapping_add(delta as u8);
+        }
+        Width::LoongArch(field) => loongarch::add_field(out, offset, field, delta)?,
+        Width::None | Width::Field(_) => return Err(ApplyError::BadInstruction),
     }
     Ok(())
 }
@@ -831,5 +1023,6 @@ pub fn width_bytes(width: Width) -> usize {
         Width::Any16 | Width::I16 => 2,
         Width::Any8 | Width::I8 => 1,
         Width::Field(field) => field.bytes(),
+        Width::LoongArch(field) => field.bytes(),
     }
 }

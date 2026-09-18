@@ -841,7 +841,11 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         .max_page_size
         .filter(|p| p.is_power_of_two())
         .unwrap_or_else(|| input.synth.arch.default_max_page());
-    let default_base = if mode.pic { 0 } else { DEFAULT_BASE };
+    let default_base = if mode.pic {
+        0
+    } else {
+        input.synth.arch.default_base()
+    };
     let base = input
         .options
         .text_segment
