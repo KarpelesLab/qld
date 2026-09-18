@@ -95,17 +95,6 @@ pub fn link_to_bytes(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) ->
             crate::version_line(),
         ));
     }
-    if !options.darwin.aliases.is_empty() {
-        return Err(Error::Unimplemented("-alias (roadmap M8)".into()));
-    }
-    if options.darwin.bundle_loader.is_some() {
-        return Err(Error::Unimplemented("-bundle_loader (roadmap M8)".into()));
-    }
-    if options.init.is_some() {
-        return Err(Error::Unimplemented(
-            "-init (LC_ROUTINES_64, roadmap M8)".into(),
-        ));
-    }
     let archs = match options.darwin.archs.as_slice() {
         [] => vec![infer_arch(options)?],
         archs => archs.to_vec(),
@@ -384,7 +373,9 @@ fn link_arch_once(
     }
     // Two-level namespace images set MH_NOUNDEFS even with flat lookups
     // (`-undefined dynamic_lookup`), as ld64 and lld do.
-    commands.no_undefs = true;
+    commands.no_undefs = !config.flat_namespace;
+    // `-init`: LC_ROUTINES_64, its address filled in once known.
+    commands.init_address = options.init.as_ref().map(|_| 0);
     let (_, commands_size) = write::commands_size(&config, &layout, &commands);
     let header_size = 32u64
         .saturating_add(commands_size)
@@ -434,6 +425,22 @@ fn link_arch_once(
         && let Some(crate::macho::reloc::Value::Address(address)) = addresses.symbol(id)
     {
         commands.entry_offset = address.saturating_sub(addresses.header_address());
+    }
+    if let Some(init) = &options.init {
+        let address = link
+            .symbols
+            .lookup(&crate::symbols::SymbolName::new(init.as_bytes()))
+            .and_then(|id| addresses.symbol(id));
+        match address {
+            Some(crate::macho::reloc::Value::Address(address)) => {
+                commands.init_address = Some(address);
+            }
+            _ => {
+                return Err(Error::Option(format!(
+                    "-init: {init} is not defined in the output"
+                )));
+            }
+        }
     }
 
     let linkedit_start = layout.segment(b"__LINKEDIT").map_or(0, |s| s.fileoff);

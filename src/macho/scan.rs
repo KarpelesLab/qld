@@ -10,7 +10,10 @@ use crate::args::darwin::LoadMode;
 use crate::error::Result;
 use crate::ids::SymbolId;
 use crate::macho::read::compact_unwind_entries;
-use crate::macho::read::consts::{BIND_SPECIAL_DYLIB_FLAT_LOOKUP, BIND_SPECIAL_DYLIB_WEAK_LOOKUP};
+use crate::macho::read::consts::{
+    BIND_SPECIAL_DYLIB_FLAT_LOOKUP, BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE,
+    BIND_SPECIAL_DYLIB_WEAK_LOOKUP,
+};
 
 use super::layout::is_consumed;
 use super::reloc::{self, Place, Referent};
@@ -272,6 +275,11 @@ pub fn scan(
     synthetic.dylib_all_weak = vec![false; dylib_count];
     let mut next = 1i32;
     for (index, dylib) in link.dylibs.iter().enumerate() {
+        // The executable a bundle is loaded into gets no load command:
+        // imports from it use the main-executable ordinal.
+        if dylib.bundle_loader {
+            continue;
+        }
         let keep = dylib.mode == LoadMode::Needed
             || used.get(index).copied().unwrap_or(false)
             || (!options.darwin.dead_strip_dylibs && !dylib.implicit);
@@ -294,7 +302,13 @@ pub fn scan(
         let (ordinal, weak) = match link.defs.get(index) {
             Some(SymbolDef::Dylib { dylib, .. }) => {
                 let dylib = usize::try_from(*dylib).unwrap_or(usize::MAX);
-                let ordinal = synthetic.dylib_ordinals.get(dylib).copied().unwrap_or(0);
+                let ordinal = if link.config.flat_namespace {
+                    BIND_SPECIAL_DYLIB_FLAT_LOOKUP
+                } else if link.dylibs.get(dylib).is_some_and(|d| d.bundle_loader) {
+                    BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE
+                } else {
+                    synthetic.dylib_ordinals.get(dylib).copied().unwrap_or(0)
+                };
                 let weak_dylib = link
                     .dylibs
                     .get(dylib)

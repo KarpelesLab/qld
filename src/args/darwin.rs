@@ -219,6 +219,9 @@ pub struct DarwinArgs {
     /// `-keep_private_externs`: with `-r`, private externs stay private
     /// externs instead of becoming local symbols.
     pub keep_private_externs: bool,
+    /// `-flat_namespace` (`true`) / `-twolevel_namespace` (`false`, the
+    /// default).
+    pub flat_namespace: bool,
 }
 
 impl Default for DarwinArgs {
@@ -264,6 +267,7 @@ impl Default for DarwinArgs {
             bundle_loader: None,
             print_version: false,
             keep_private_externs: false,
+            flat_namespace: false,
         }
     }
 }
@@ -302,6 +306,7 @@ enum Act {
     Arch,
     Output,
     KeepPrivateExterns,
+    Namespace(bool),
     OutputType(MachOutputType),
     Entry,
     InstallName,
@@ -825,10 +830,15 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     opt(
         "twolevel_namespace",
         Flag,
-        Act::None,
+        Act::Namespace(false),
         "Two-level namespace (default)",
     ),
-    unsupported("flat_namespace", Flag, "flat namespace output"),
+    opt(
+        "flat_namespace",
+        Flag,
+        Act::Namespace(true),
+        "Flat namespace: imports are looked up by name in every image",
+    ),
     unsupported("force_flat_namespace", Flag, "flat namespace output"),
     ignored("multiply_defined", V1),
     ignored("multiply_defined_unused", V1),
@@ -1335,6 +1345,7 @@ impl Parser<'_> {
                 .push((first.to_owned(), values.get(1).cloned().unwrap_or_default())),
             Act::Init => self.options.init = Some(first.to_owned()),
             Act::KeepPrivateExterns => darwin.keep_private_externs = true,
+            Act::Namespace(flat) => darwin.flat_namespace = flat,
             Act::DeadStrippableDylib => darwin.mark_dead_strippable_dylib = true,
             Act::OsoPrefix => darwin.oso_prefix = Some(PathBuf::from(first)),
             Act::FunctionStarts(on) => darwin.function_starts = on,
@@ -1396,6 +1407,9 @@ impl Parser<'_> {
             return Err(Error::Option(
                 "-bundle_loader can only be used with -bundle".into(),
             ));
+        }
+        if options.init.is_some() && options.darwin.output_type != MachOutputType::Dylib {
+            return Err(Error::Option("-init can only be used with -dylib".into()));
         }
         let arch = options
             .darwin
@@ -1482,7 +1496,7 @@ mod tests {
             }
             if matches!(
                 option.action,
-                Act::InstallName | Act::CurrentVersion | Act::CompatibilityVersion
+                Act::InstallName | Act::CurrentVersion | Act::CompatibilityVersion | Act::Init
             ) {
                 args.push("-dylib".to_owned());
             }

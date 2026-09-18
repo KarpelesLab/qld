@@ -252,6 +252,9 @@ impl<'a> Link<'a> {
                         .map(|(n, _)| n.as_slice());
                     if name == Some(b"___dso_handle") {
                         SymbolDef::DsoHandle
+                    } else if name.is_some_and(|n| self.internal.aliases.iter().any(|a| a.0 == n)) {
+                        // Filled in below, from the target.
+                        SymbolDef::Undefined
                     } else {
                         SymbolDef::Header
                     }
@@ -287,6 +290,26 @@ impl<'a> Link<'a> {
                 }
                 _ => SymbolDef::Undefined,
             };
+        }
+
+        // `-alias`: the alias resolves to what its target resolved to.
+        for (alias, target) in &self.internal.aliases {
+            let lookup = |name: &[u8]| self.symbols.lookup(&crate::symbols::SymbolName::new(name));
+            let (Some(alias_id), Some(target_id)) = (lookup(alias), lookup(target)) else {
+                continue;
+            };
+            let def = match defs.get(target_id.index()) {
+                Some(def @ SymbolDef::Object { .. }) => def.clone(),
+                _ => {
+                    return Err(Error::Option(format!(
+                        "-alias: {} is not defined in an object",
+                        display_name(target, options.demangle)
+                    )));
+                }
+            };
+            if let Some(slot) = defs.get_mut(alias_id.index()) {
+                *slot = def;
+            }
         }
 
         // References: strong and weak.

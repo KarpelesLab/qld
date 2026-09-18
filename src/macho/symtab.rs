@@ -291,7 +291,7 @@ pub fn build(
                     if options.discard == DiscardMode::All {
                         continue;
                     }
-                    if n_type == N_SECT {
+                    if n_type == N_SECT && entry.name == name {
                         origins.push((file, *symbol));
                     }
                     locals.push(Nlist {
@@ -325,7 +325,8 @@ pub fn build(
                     flags,
                     address: export_address,
                 });
-                if n_type == N_SECT {
+                // An alias shares its target's debug map entry.
+                if n_type == N_SECT && entry.name == name {
                     origins.push((file, *symbol));
                 }
                 extdefs.push((

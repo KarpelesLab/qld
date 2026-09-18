@@ -5,7 +5,7 @@ use super::chained::ChainedFixups;
 use super::commands::{BuildVersion, DylibCommand, DylibLoadKind, PackedVersion};
 use super::consts::{
     LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO, LC_DYLD_INFO_ONLY, LC_ID_DYLIB,
-    LC_RPATH, LC_SUB_CLIENT, LC_SUB_FRAMEWORK, LC_SYMTAB, MH_DYLIB, MH_DYLIB_STUB,
+    LC_RPATH, LC_SUB_CLIENT, LC_SUB_FRAMEWORK, LC_SYMTAB, MH_DYLIB, MH_DYLIB_STUB, MH_EXECUTE,
     MH_NO_REEXPORTED_DYLIBS,
 };
 use super::file::{MachHeader, MachOFile};
@@ -49,8 +49,22 @@ impl<'a> Dylib<'a> {
     /// Returns `Error::Malformed` if the file is not a dylib, a load command
     /// is malformed, or a table lies outside the file.
     pub fn parse(data: &'a [u8], source: Source<'a>) -> Result<Self> {
+        Self::parse_kinds(data, source, &[MH_DYLIB, MH_DYLIB_STUB])
+    }
+
+    /// Parses a dylib or an executable (for `-bundle_loader`): an image
+    /// whose exports can resolve another image's references.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Dylib::parse`], with `MH_EXECUTE` also accepted.
+    pub fn parse_image(data: &'a [u8], source: Source<'a>) -> Result<Self> {
+        Self::parse_kinds(data, source, &[MH_DYLIB, MH_DYLIB_STUB, MH_EXECUTE])
+    }
+
+    fn parse_kinds(data: &'a [u8], source: Source<'a>, kinds: &[u32]) -> Result<Self> {
         let file = MachOFile::parse(data, source)?;
-        if !matches!(file.header().file_type, MH_DYLIB | MH_DYLIB_STUB) {
+        if !kinds.contains(&file.header().file_type) {
             return Err(source.malformed(12, "Mach-O file type (expected MH_DYLIB)"));
         }
         let mut dylib = Self {

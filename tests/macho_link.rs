@@ -1994,6 +1994,189 @@ fn relocatable_variants() {
     }
 }
 
+/// Runs `binary` with `args` on macOS and returns its stdout.
+fn run_with(binary: &Path, args: &[&Path]) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = Command::new(binary).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{} failed: {:?}\n{}{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `-bundle -bundle_loader <executable>`: the bundle's references to the
+/// executable bind with the main-executable ordinal, and the executable
+/// gets no load command. On macOS the executable loads the bundle, which
+/// calls back into it.
+#[test]
+fn bundle_loader() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "bundle_loader",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("bundle_loader");
+        let host = compile("bundle_loader", "bundle_host.c", arch, &[]);
+        let plugin = compile("bundle_loader", "bundle_plugin.c", arch, &[]);
+        let exe = dir.join(format!("host-{arch}"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[host.to_str().unwrap(), "-lSystem"]));
+        link_and_compare(&args, &exe);
+
+        let bundle = dir.join(format!("plugin-{arch}.bundle"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            "-bundle",
+            "-bundle_loader",
+            exe.to_str().unwrap(),
+            plugin.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let bytes = link_and_compare(&args, &bundle);
+        let file = MachOFile::parse(&bytes, Source::new(&bundle)).unwrap();
+        assert_eq!(file.header().file_type, qld::macho::read::consts::MH_BUNDLE);
+        let imports = chained_imports(&bytes);
+        // BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE.
+        assert_eq!(
+            import(&imports, "_host_value").lib_ordinal,
+            -1,
+            "{imports:?}"
+        );
+        let loads = file
+            .load_commands()
+            .map(Result::unwrap)
+            .filter(|c| c.cmd == LC_LOAD_DYLIB)
+            .count();
+        assert_eq!(loads, 1, "{arch}: only libSystem is loaded");
+        if host_can_run(arch) {
+            assert_eq!(run_with(&exe, &[&bundle]).unwrap(), "bundle 42\n");
+        }
+    }
+}
+
+/// `-init` (an `LC_ROUTINES_64` initializer that dyld runs before the
+/// dylib's other initializers) and `-alias` (a second name for a symbol).
+/// `ld64.lld` ignores `-init`, so only the rest is compared with it.
+#[test]
+fn init_and_alias() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "init_and_alias",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("init").join(arch);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = compile("init", "init_lib.c", arch, &[]);
+        let client = compile("init", "init_client.c", arch, &[]);
+        let dylib = dir.join("libinit.dylib");
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            "-dylib",
+            "-install_name",
+            "@rpath/libinit.dylib",
+            "-init",
+            "_lib_init",
+            "-alias",
+            "_lib_ready",
+            "_lib_ready_alias",
+            lib.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let bytes = link_and_compare(&args, &dylib);
+        let (_, at, _) = load_commands(&bytes)
+            .into_iter()
+            .find(|c| c.0 == qld::macho::read::consts::LC_ROUTINES_64)
+            .expect("LC_ROUTINES_64");
+        let init_address = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap());
+        assert_eq!(Some(init_address), symbol_address(&bytes, "_lib_init"));
+        assert_eq!(
+            symbol_address(&bytes, "_lib_ready_alias"),
+            symbol_address(&bytes, "_lib_ready"),
+            "{arch}: the alias is not at its target"
+        );
+        if let Some(trie) = objdump(&["--macho", "--exports-trie"], &dylib) {
+            assert!(trie.contains("_lib_ready_alias"), "{trie}");
+        }
+
+        let exe = dir.join("init_client");
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            client.to_str().unwrap(),
+            &format!("-L{}", dir.display()),
+            "-linit",
+            "-rpath",
+            "@executable_path",
+            "-lSystem",
+        ]));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "init ran\nready 42 42\n");
+        }
+    }
+    let error = link_bytes(&os(&["-arch", "arm64", "-init", "_main", "a.o"])).unwrap_err();
+    assert!(
+        error.contains("-init can only be used with -dylib"),
+        "{error}"
+    );
+}
+
+/// `-flat_namespace`: imports are looked up by name (ordinal
+/// `BIND_SPECIAL_DYLIB_FLAT_LOOKUP`), and the header has neither
+/// `MH_TWOLEVEL` nor `MH_NOUNDEFS`, as with ld64 and lld.
+#[test]
+fn flat_namespace() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "flat_namespace",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("flat", "hello.c", arch, &[]);
+        let exe = scratch("flat").join(format!("hello-{arch}"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            "-flat_namespace",
+            object.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let bytes = link_and_compare(&args, &exe);
+        let flags = MachOFile::parse(&bytes, Source::new(&exe))
+            .unwrap()
+            .header()
+            .flags;
+        assert_eq!(
+            flags & qld::macho::read::consts::MH_TWOLEVEL,
+            0,
+            "{flags:#x}"
+        );
+        assert_eq!(
+            flags & qld::macho::read::consts::MH_NOUNDEFS,
+            0,
+            "{flags:#x}"
+        );
+        let imports = chained_imports(&bytes);
+        assert_eq!(import(&imports, "_printf").lib_ordinal, -2, "{imports:?}");
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "hello from qld 3 42\n");
+        }
+    }
+}
+
 /// Whether `rustc` has the standard library for `target`.
 fn rust_std_for(target: &str) -> bool {
     let Ok(output) = Command::new("rustc")

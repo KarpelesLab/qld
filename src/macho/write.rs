@@ -18,11 +18,11 @@ use crate::macho::read::consts::{
     CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_LIB64, CPU_SUBTYPE_X86_64_ALL, CPU_TYPE_ARM64,
     CPU_TYPE_X86_64, LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS,
     LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_ID_DYLIB,
-    LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_REEXPORT_DYLIB, LC_RPATH,
-    LC_SEGMENT_64, LC_SYMTAB, LC_UUID, MH_BINDS_TO_WEAK, MH_BUNDLE, MH_DEAD_STRIPPABLE_DYLIB,
-    MH_DYLDLINK, MH_DYLIB, MH_EXECUTE, MH_HAS_TLV_DESCRIPTORS, MH_MAGIC_64,
-    MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_OBJECT, MH_PIE, MH_TWOLEVEL, MH_WEAK_DEFINES,
-    S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, TOOL_LD,
+    LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_REEXPORT_DYLIB,
+    LC_ROUTINES_64, LC_RPATH, LC_SEGMENT_64, LC_SYMTAB, LC_UUID, MH_BINDS_TO_WEAK, MH_BUNDLE,
+    MH_DEAD_STRIPPABLE_DYLIB, MH_DYLDLINK, MH_DYLIB, MH_EXECUTE, MH_HAS_TLV_DESCRIPTORS,
+    MH_MAGIC_64, MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_OBJECT, MH_PIE, MH_TWOLEVEL,
+    MH_WEAK_DEFINES, S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, TOOL_LD,
 };
 
 use super::buf::{align_up, pad_to, push_name16, push32, push64, to_u64};
@@ -78,6 +78,8 @@ pub struct Commands {
     pub extra_flags: u32,
     /// `MH_NOUNDEFS` applies (nothing is looked up by flat name).
     pub no_undefs: bool,
+    /// `-init`: the initializer's address, for `LC_ROUTINES_64`.
+    pub init_address: Option<u64>,
 }
 
 fn padded_string_size(fixed: u64, text: &[u8]) -> u64 {
@@ -114,6 +116,9 @@ pub fn commands_size(config: &Config, layout: &Layout, commands: &Commands) -> (
         MachOutputType::Execute => add(padded_string_size(12, b"/usr/lib/dyld")),
         MachOutputType::Dylib => add(padded_string_size(24, &config.install_name)),
         MachOutputType::Bundle | MachOutputType::Object => {}
+    }
+    if commands.init_address.is_some() {
+        add(72);
     }
     if config.uuid {
         add(24);
@@ -369,7 +374,10 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
         MachOutputType::Bundle => MH_BUNDLE,
         MachOutputType::Object => MH_OBJECT,
     };
-    let mut flags = MH_DYLDLINK | MH_TWOLEVEL | commands.extra_flags;
+    let mut flags = MH_DYLDLINK | commands.extra_flags;
+    if !config.flat_namespace {
+        flags |= MH_TWOLEVEL;
+    }
     if commands.no_undefs {
         flags |= MH_NOUNDEFS;
     }
@@ -492,6 +500,15 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
             },
         ),
         MachOutputType::Bundle | MachOutputType::Object => {}
+    }
+    if let Some(address) = commands.init_address {
+        // init_address, init_module, reserved1..6.
+        push32(&mut out, LC_ROUTINES_64);
+        push32(&mut out, 72);
+        push64(&mut out, address);
+        for _ in 0..7 {
+            push64(&mut out, 0);
+        }
     }
     let mut uuid_at = None;
     if config.uuid {
