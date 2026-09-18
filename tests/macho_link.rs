@@ -1,15 +1,22 @@
-//! Integration tests for the Mach-O linker (`qld::macho`, workstream W25).
+//! Integration tests for the Mach-O linker (`qld::macho`, workstreams W25
+//! and W27).
 //!
 //! Fixtures in `tests/data/macho_link/` are compiled with
 //! `clang --target=<arch>-apple-macos13` (no SDK needed: the sources declare
 //! what they use, and `tests/data/macho_link/sdk` provides `.tbd` stubs for
-//! libSystem and libc++). The outputs are checked structurally with qld's
-//! own Mach-O reader and, when installed, `llvm-objdump`; the code signature
-//! hashes are recomputed; and when `ld64.lld` is available the same inputs
-//! are linked with it and the two outputs compared.
+//! libSystem, including what Rust's std imports, and libc++). The outputs
+//! are checked structurally with qld's own Mach-O reader and, when
+//! installed, `llvm-objdump`; the code signature hashes are recomputed; and
+//! when `ld64.lld` is available the same inputs are linked with it and the
+//! two outputs compared. `ld64.lld` has no `-r`: relocatable outputs are
+//! checked by linking them (with qld and `ld64.lld`) and comparing with
+//! links of the original objects.
 //!
 //! On macOS the fixtures link against the real SDK (`xcrun --show-sdk-path`)
-//! and are run.
+//! and are run; `-r` outputs are also compared with Apple's `ld -r` and
+//! linked by Apple's linker. The Rust test needs `rustc` with the standard
+//! library of `aarch64-apple-darwin` (and runs `x86_64-apple-darwin` too
+//! when that is installed).
 //!
 //! Missing tools make tests skip with a message. With
 //! `QLD_REQUIRE_MACHO_TOOLS=1` (set on the macOS CI runner) a missing tool is
@@ -27,7 +34,7 @@ use qld::macho::read::consts::{
     LC_SYMTAB, LC_UUID, MH_EXECUTE,
 };
 use qld::macho::read::{ChainedFixups, MachOFile, Source};
-use qld::macho::sha256::Sha256;
+use qld::output::hash::Sha256;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -402,8 +409,21 @@ fn summarize(file: &Path) -> Option<Summary> {
             let mut parts = l.split_whitespace();
             let _index = parts.next()?.parse::<u32>().ok()?;
             let name = parts.next()?;
-            // Linker-specific extras.
-            (name != "__unwind_info" && name != "__eh_frame").then(|| name.to_owned())
+            // Linker-specific extras: lld's lazy binding for legacy
+            // (`LC_DYLD_INFO_ONLY`) outputs, which qld binds at load time.
+            if matches!(
+                name,
+                "__unwind_info" | "__eh_frame" | "__stub_helper" | "__la_symbol_ptr"
+            ) {
+                return None;
+            }
+            // lld merges the literal sections into one `__literals`; ld64
+            // and qld keep `__literal4`, `__literal8` and `__literal16`.
+            Some(if name.starts_with("__literal") {
+                "__literals".to_owned()
+            } else {
+                name.to_owned()
+            })
         })
         .collect();
     let trie = objdump(&["--macho", "--exports-trie"], file)?;
@@ -1518,6 +1538,972 @@ fn undefined_symbols_are_reported() {
     // BIND_SPECIAL_DYLIB_FLAT_LOOKUP.
     let imports = chained_imports(&bytes);
     assert_eq!(import(&imports, "_missing").lib_ordinal, -2, "{imports:?}");
+}
+
+/// The sections of a Mach-O image, in load command order, as (segment,
+/// section, file offset, size).
+fn section_list(data: &[u8]) -> Vec<(String, String, usize, usize)> {
+    let file = MachOFile::parse(data, Source::new(Path::new("out"))).unwrap();
+    let mut sections = Vec::new();
+    for command in file.load_commands() {
+        let command = command.unwrap();
+        if command.cmd == qld::macho::read::consts::LC_SEGMENT_64 {
+            for section in command.segment().unwrap().sections.iter() {
+                sections.push((
+                    String::from_utf8_lossy(section.segname).into_owned(),
+                    String::from_utf8_lossy(section.sectname).into_owned(),
+                    section.offset as usize,
+                    section.size as usize,
+                ));
+            }
+        }
+    }
+    sections
+}
+
+/// The names of the sections of a Mach-O image, in load command order.
+fn section_names(data: &[u8]) -> Vec<String> {
+    section_list(data).into_iter().map(|s| s.1).collect()
+}
+
+/// The contents of section `name` (the first with that name).
+fn section_contents<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    section_list(data)
+        .into_iter()
+        .find(|s| s.1 == name)
+        .map(|(_, _, offset, size)| &data[offset..offset + size])
+}
+
+/// How many times `needle` occurs in `haystack`.
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// Stores of immediates to statics (x86_64 `SIGNED_1`/`SIGNED_4` against a
+/// local symbol that starts its atom) reach the static itself, not the
+/// bytes before it.
+#[test]
+fn pcrel_immediate_stores() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "pcrel_immediate_stores",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("statics", "statics.c", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[object.to_str().unwrap(), "-lSystem"]));
+        let exe = scratch("statics").join(format!("statics-{arch}"));
+        link_and_compare(&args, &exe);
+        if let Some(disassembly) = objdump(&["--macho", "-d"], &exe) {
+            // llvm-objdump symbolizes RIP-relative operands: an operand one
+            // byte before the static shows as `_flag-1`.
+            for name in ["_flag", "_counter", "_wide"] {
+                assert!(
+                    !disassembly.contains(&format!("{name}-")),
+                    "{arch}: {name} is missed:\n{disassembly}"
+                );
+            }
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "1 12345678 1122334455667788\n");
+        }
+    }
+}
+
+/// An exception of a type with internal linkage: the LSDA's type table
+/// reaches the local type info through a `__got` slot (`POINTER_TO_GOT` or
+/// `X86_64_RELOC_GOT` against a local symbol), which must exist although
+/// no global symbol owns it. Also through `-r` twice, where the type info
+/// name is a local symbol with the arm64 top-bit addend.
+#[test]
+fn local_type_info() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "local_type_info",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("local_rtti");
+        let object = compile("local_rtti", "local_rtti.cpp", arch, &[]);
+        let exceptions = compile("local_rtti", "exceptions.cpp", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[object.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("local_rtti-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "local 7\n");
+        }
+        // Private-extern type infos become local with -r; a second -r and
+        // a link read them back.
+        let once = dir.join(format!("once-{arch}.o"));
+        link_relocatable(arch, &[&exceptions], &once);
+        let twice = dir.join(format!("twice-{arch}.o"));
+        link_relocatable(arch, &[&once], &twice);
+        let mut args = base_args(arch);
+        args.extend(strings(&[twice.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("exceptions-twice-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "caught 84 after 10 cleanups\n");
+        }
+    }
+}
+
+/// Identical C strings and floating-point literals from two objects are
+/// merged, as ld64 and lld merge them: one copy in the output, and both
+/// objects' references resolve to it.
+#[test]
+fn literal_deduplication() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "literal_deduplication",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let a = compile("literals", "literals_a.c", arch, &[]);
+        let b = compile("literals", "literals_b.c", arch, &[]);
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let exe = scratch("literals").join(format!("literals-{arch}"));
+        let bytes = link_and_compare(&args, &exe);
+        let cstrings = section_contents(&bytes, "__cstring").expect("__cstring");
+        assert_eq!(
+            occurrences(cstrings, b"shared string\0"),
+            1,
+            "{arch}: {cstrings:?}"
+        );
+        assert_eq!(occurrences(cstrings, b"only in a\0"), 1, "{arch}");
+        if arch == "x86_64" {
+            // The multiplier is a `__literal8` in both objects.
+            let literals = section_contents(&bytes, "__literal8").expect("__literal8");
+            assert_eq!(
+                // 3.14159265358979
+                occurrences(literals, &0x4009_21fb_5444_2d11_u64.to_le_bytes()),
+                1,
+                "{arch}: {literals:?}"
+            );
+        }
+        let reference = PathBuf::from(format!("{}-lld", exe.display()));
+        if let Ok(theirs) = std::fs::read(&reference) {
+            assert_eq!(
+                section_contents(&theirs, "__cstring").map(<[u8]>::len),
+                Some(cstrings.len()),
+                "{arch}: __cstring size, qld vs ld64.lld"
+            );
+        }
+        if host_can_run(arch) {
+            assert_eq!(
+                run(&exe).unwrap(),
+                "shared string shared string 1 only in a 9.42478\n"
+            );
+        }
+    }
+}
+
+/// Merges `objects` with `-r` into `output` and returns the bytes.
+fn link_relocatable(arch: &str, objects: &[&Path], output: &Path) -> Vec<u8> {
+    let mut args = os(&[
+        "-arch",
+        arch,
+        "-platform_version",
+        "macos",
+        "13.0",
+        "13.0",
+        "-r",
+    ]);
+    for object in objects {
+        args.push(object.into());
+    }
+    args.extend(os(&["-o", output.to_str().unwrap()]));
+    let (bytes, _) = link_bytes(&args).unwrap_or_else(|e| panic!("-r failed: {e}"));
+    std::fs::write(output, &bytes).unwrap();
+    bytes
+}
+
+/// The external symbols of an image or object: (name, defined), sorted.
+fn external_symbols(data: &[u8]) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = symbols(data)
+        .into_iter()
+        .filter(Nlist::is_external)
+        .map(|s| {
+            let defined = s.n_type & 0x0e != 0;
+            (s.name, defined)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Checks a relocatable object with qld's reader: an `MH_OBJECT` whose
+/// relocations all decode and pair, and whose sections atomize.
+fn check_object(data: &[u8], subsections: bool) {
+    use qld::macho::read::{Atomization, ObjectFile};
+    let file = MachOFile::parse(data, Source::new(Path::new("merged.o"))).unwrap();
+    assert_eq!(file.header().file_type, qld::macho::read::consts::MH_OBJECT);
+    assert_eq!(
+        file.header().flags & qld::macho::read::consts::MH_SUBSECTIONS_VIA_SYMBOLS != 0,
+        subsections
+    );
+    let object = ObjectFile::parse(data, Source::new(Path::new("merged.o"))).unwrap();
+    Atomization::new(&object).unwrap();
+    for index in 0..object.sections().len() {
+        for relocation in object.paired_relocations(index).unwrap() {
+            relocation.unwrap();
+        }
+    }
+}
+
+/// `-r`: two C++ objects (weak definitions in both, exceptions, statics, a
+/// thread-local, string literals) merged into one object, which is then
+/// linked into an executable. The executable matches a link of the two
+/// objects themselves; `ld64.lld` (which has no `-r`) links the merged
+/// object too and is compared. On macOS the executable runs, the merged
+/// object's external symbols match Apple's `ld -r`, and Apple's linker
+/// links the merged object into a program that runs as well.
+#[test]
+fn relocatable_output() {
+    const EXPECTED: &str = "hello from a total -50 counter 3 local 5 tls 7 flag 1\n";
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "relocatable_output",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("relocatable");
+        let a = compile("relocatable", "relocatable_a.cpp", arch, &[]);
+        let b = compile("relocatable", "relocatable_b.cpp", arch, &[]);
+        let merged = dir.join(format!("merged-{arch}.o"));
+        let bytes = link_relocatable(arch, &[&a, &b], &merged);
+        check_object(&bytes, true);
+        assert_eq!(
+            link_relocatable(arch, &[&a, &b], &merged),
+            bytes,
+            "{arch}: -r output is not deterministic"
+        );
+
+        // One copy of each weak definition; undefined references stay.
+        let externals = external_symbols(&bytes);
+        let count = |name: &str| externals.iter().filter(|s| s.0 == name).count();
+        assert_eq!(count("__ZNK3BoxIiE5twiceEv"), 1, "{arch}: {externals:?}");
+        assert_eq!(count("__ZZ14shared_countervE5count"), 1, "{arch}");
+        for undefined in ["___cxa_throw", "___gxx_personality_v0", "_printf"] {
+            assert!(
+                externals.iter().any(|s| s.0 == undefined && !s.1),
+                "{arch}: {undefined} not undefined: {externals:?}"
+            );
+        }
+        let names = section_names(&bytes);
+        for wanted in [
+            "__text",
+            "__compact_unwind",
+            "__gcc_except_tab",
+            "__cstring",
+        ] {
+            assert!(
+                names.iter().any(|n| n == wanted),
+                "{arch}: no {wanted} in {names:?}"
+            );
+        }
+        let cstrings = section_contents(&bytes, "__cstring").unwrap();
+        assert_eq!(occurrences(cstrings, b"hello from a\0"), 1, "{arch}");
+
+        // Linked, the merged object gives the program the objects give.
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("merged-{arch}"));
+        link_and_compare(&args, &exe);
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-lc++",
+            "-lSystem",
+        ]));
+        let direct = dir.join(format!("direct-{arch}"));
+        link_and_compare(&args, &direct);
+        if let (Some(ours), Some(theirs)) = (summarize(&exe), summarize(&direct)) {
+            assert_eq!(ours, theirs, "{arch}: linked from -r vs from the objects");
+            // `Box<int>::twice` is `.weak_def_can_be_hidden` in both
+            // objects: not exported, as with ld64.
+            assert!(
+                !ours.exports.contains("__ZNK3BoxIiE5twiceEv"),
+                "{arch}: {:?}",
+                ours.exports
+            );
+        }
+        if let (Some(ours), Some(theirs)) = (
+            objdump(&["--macho", "--section-headers"], &exe),
+            objdump(&["--macho", "--section-headers"], &direct),
+        ) {
+            // The same sections at the same addresses (the stubs and
+            // `__got` slots may come in another order).
+            let body = |text: &str| text.lines().skip(1).collect::<Vec<_>>().join("\n");
+            assert_eq!(body(&ours), body(&theirs), "{arch}: layouts differ");
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), EXPECTED, "{arch}");
+        }
+
+        if cfg!(target_os = "macos") && host_can_run(arch) {
+            apple_relocatable(arch, &[&a, &b], &bytes, &merged, EXPECTED);
+        }
+    }
+}
+
+/// On macOS: compares the external symbols of `ours` (qld's `-r` output,
+/// at `merged`) with Apple's `ld -r` of the same `objects`, then links
+/// `merged` with Apple's linker and runs it.
+fn apple_relocatable(arch: &str, objects: &[&Path], ours: &[u8], merged: &Path, expected: &str) {
+    let dir = merged.parent().unwrap();
+    let apple = dir.join(format!("apple-{arch}.o"));
+    let status = Command::new("ld")
+        .args(["-r", "-arch", arch])
+        .args(objects)
+        .arg("-o")
+        .arg(&apple)
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            let theirs = std::fs::read(&apple).unwrap();
+            assert_eq!(
+                external_symbols(ours),
+                external_symbols(&theirs),
+                "{arch}: external symbols, qld -r vs Apple ld -r"
+            );
+        }
+        _ => skip("relocatable_output", "Apple ld -r failed or is missing"),
+    }
+    let exe = dir.join(format!("apple-linked-{arch}"));
+    let status = Command::new("clang++")
+        .args(["-arch", arch])
+        .arg(merged)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{arch}: Apple's linker rejects qld's -r output"
+    );
+    assert_eq!(run(&exe).unwrap(), expected, "{arch}: linked by Apple's ld");
+}
+
+/// More `-r` inputs: Objective-C metadata (selector references into merged
+/// method names), `LC_LINKER_OPTION` carried to the final link, x86_64
+/// `SIGNED_n` stores, private externs (made local, or kept with
+/// `-keep_private_externs`), and debug information (dropped, with a
+/// warning).
+#[test]
+fn relocatable_variants() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "relocatable_variants",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("relocatable_variants");
+
+        // Objective-C, and statics stored to with immediates.
+        let objc = compile("relocatable_variants", "objc.m", arch, &[]);
+        let merged = dir.join(format!("objc-{arch}.o"));
+        let bytes = link_relocatable(arch, &[&objc], &merged);
+        check_object(&bytes, true);
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lobjc", "-lSystem"]));
+        let exe = dir.join(format!("objc-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "objc 42\n");
+        }
+        let statics = compile("relocatable_variants", "statics.c", arch, &[]);
+        let merged = dir.join(format!("statics-{arch}.o"));
+        link_relocatable(arch, &[&statics], &merged);
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lSystem"]));
+        let exe = dir.join(format!("statics-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "1 12345678 1122334455667788\n");
+        }
+
+        // DWARF unwind information: `__eh_frame` rebuilt, its pointers
+        // PC-relative without relocations (arm64 inputs have them).
+        let main = compile("relocatable_variants", "dwarf_unwind.cpp", arch, &[]);
+        let asm = compile(
+            "relocatable_variants",
+            &format!("dwarf-{arch}.s"),
+            arch,
+            &[],
+        );
+        let merged = dir.join(format!("dwarf-{arch}.o"));
+        let bytes = link_relocatable(arch, &[&main, &asm], &merged);
+        check_object(&bytes, true);
+        assert!(section_names(&bytes).iter().any(|n| n == "__eh_frame"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("dwarf-{arch}"));
+        let linked = link_and_compare(&args, &exe);
+        let function = symbol_address(&linked, "_call_through").unwrap();
+        if let Ok(frames) = Command::new(tool("dwarfdump"))
+            .arg("--eh-frame")
+            .arg(&exe)
+            .output()
+            && frames.status.success()
+        {
+            let frames = String::from_utf8_lossy(&frames.stdout);
+            let wanted = format!("pc={function:08x}...");
+            assert!(
+                frames.contains(&wanted),
+                "{arch}: no FDE for {wanted}:\n{frames}"
+            );
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "dwarf 7\n");
+            // Apple's linker takes the rebuilt `__eh_frame` too.
+            let apple = dir.join(format!("dwarf-apple-{arch}"));
+            let status = Command::new("clang++")
+                .args(["-arch", arch])
+                .arg(&merged)
+                .arg("-o")
+                .arg(&apple)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "{arch}: Apple's linker rejects the object"
+            );
+            assert_eq!(run(&apple).unwrap(), "dwarf 7\n");
+        }
+
+        // Private externs, and debug information.
+        let source = dir.join("hidden.c");
+        std::fs::write(
+            &source,
+            "__attribute__((visibility(\"hidden\"))) int hidden_answer(void) { return 42; }\n\
+             int visible_answer(void) { return hidden_answer(); }\n",
+        )
+        .unwrap();
+        let hidden = dir.join(format!("hidden-{arch}.o"));
+        assert!(tool_works(
+            "clang",
+            &[
+                &format!("--target={arch}-apple-macos13"),
+                "-g",
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                hidden.to_str().unwrap()
+            ]
+        ));
+        for keep in [false, true] {
+            let merged = dir.join(format!("hidden-{arch}-{keep}.o"));
+            let mut args = os(&[
+                "-arch",
+                arch,
+                "-platform_version",
+                "macos",
+                "13.0",
+                "13.0",
+                "-r",
+            ]);
+            args.push(hidden.clone().into());
+            if keep {
+                args.push("-keep_private_externs".into());
+            }
+            args.extend(os(&["-o", merged.to_str().unwrap()]));
+            let (bytes, messages) = link_bytes(&args).unwrap();
+            assert!(
+                messages.iter().any(|m| m.contains("DWARF")),
+                "{arch}: no warning about debug sections: {messages:?}"
+            );
+            assert!(
+                !section_names(&bytes)
+                    .iter()
+                    .any(|n| n.starts_with("__debug")),
+                "{arch}: debug sections copied"
+            );
+            let symbol = symbols(&bytes)
+                .into_iter()
+                .find(|s| s.name == "_hidden_answer")
+                .expect("_hidden_answer");
+            // N_PEXT | N_EXT when kept, a plain local otherwise.
+            assert_eq!(
+                symbol.n_type & 0x11,
+                if keep { 0x11 } else { 0 },
+                "{arch}: keep_private_externs {keep}: {:#x}",
+                symbol.n_type
+            );
+        }
+
+        // LC_LINKER_OPTION reaches the final link through -r.
+        if arch == "arm64" {
+            let autolink = compile("relocatable_variants", "autolink-arm64.s", arch, &[]);
+            let main = dir.join("autolink_main.c");
+            std::fs::write(
+                &main,
+                "void release(void *);\nint main(void) { release(0); return 0; }\n",
+            )
+            .unwrap();
+            let main_object = dir.join("autolink_main.o");
+            assert!(tool_works(
+                "clang",
+                &[
+                    "--target=arm64-apple-macos13",
+                    "-c",
+                    main.to_str().unwrap(),
+                    "-o",
+                    main_object.to_str().unwrap()
+                ]
+            ));
+            let merged = dir.join("autolink.o");
+            let bytes = link_relocatable(arch, &[&main_object, &autolink], &merged);
+            let options: Vec<u32> = load_commands(&bytes).iter().map(|c| c.0).collect();
+            assert!(
+                options.contains(&qld::macho::read::consts::LC_LINKER_OPTION),
+                "{options:x?}"
+            );
+            let mut args = base_args(arch);
+            args.extend(strings(&[merged.to_str().unwrap(), "-lSystem"]));
+            let exe = dir.join("autolink");
+            link_and_compare(&args, &exe);
+            if let Some(dylibs) = objdump(&["--macho", "--dylibs-used"], &exe) {
+                assert!(dylibs.contains("libc++"), "{dylibs}");
+            }
+        }
+    }
+}
+
+/// Runs `binary` with `args` on macOS and returns its stdout.
+fn run_with(binary: &Path, args: &[&Path]) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = Command::new(binary).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{} failed: {:?}\n{}{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `-bundle -bundle_loader <executable>`: the bundle's references to the
+/// executable bind with the main-executable ordinal, and the executable
+/// gets no load command. On macOS the executable loads the bundle, which
+/// calls back into it.
+#[test]
+fn bundle_loader() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "bundle_loader",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("bundle_loader");
+        let host = compile("bundle_loader", "bundle_host.c", arch, &[]);
+        let plugin = compile("bundle_loader", "bundle_plugin.c", arch, &[]);
+        let exe = dir.join(format!("host-{arch}"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[host.to_str().unwrap(), "-lSystem"]));
+        link_and_compare(&args, &exe);
+
+        let bundle = dir.join(format!("plugin-{arch}.bundle"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            "-bundle",
+            "-bundle_loader",
+            exe.to_str().unwrap(),
+            plugin.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let bytes = link_and_compare(&args, &bundle);
+        let file = MachOFile::parse(&bytes, Source::new(&bundle)).unwrap();
+        assert_eq!(file.header().file_type, qld::macho::read::consts::MH_BUNDLE);
+        let imports = chained_imports(&bytes);
+        // BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE.
+        assert_eq!(
+            import(&imports, "_host_value").lib_ordinal,
+            -1,
+            "{imports:?}"
+        );
+        let loads = file
+            .load_commands()
+            .map(Result::unwrap)
+            .filter(|c| c.cmd == LC_LOAD_DYLIB)
+            .count();
+        assert_eq!(loads, 1, "{arch}: only libSystem is loaded");
+        if host_can_run(arch) {
+            assert_eq!(run_with(&exe, &[&bundle]).unwrap(), "bundle 42\n");
+        }
+    }
+}
+
+/// `-init` (an `LC_ROUTINES_64` initializer that dyld runs before the
+/// dylib's other initializers) and `-alias` (a second name for a symbol).
+/// `ld64.lld` ignores `-init`, so only the rest is compared with it.
+#[test]
+fn init_and_alias() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "init_and_alias",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("init").join(arch);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = compile("init", "init_lib.c", arch, &[]);
+        let client = compile("init", "init_client.c", arch, &[]);
+        let dylib = dir.join("libinit.dylib");
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            "-dylib",
+            "-install_name",
+            "@rpath/libinit.dylib",
+            "-init",
+            "_lib_init",
+            "-alias",
+            "_lib_ready",
+            "_lib_ready_alias",
+            lib.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let bytes = link_and_compare(&args, &dylib);
+        let (_, at, _) = load_commands(&bytes)
+            .into_iter()
+            .find(|c| c.0 == qld::macho::read::consts::LC_ROUTINES_64)
+            .expect("LC_ROUTINES_64");
+        let init_address = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap());
+        assert_eq!(Some(init_address), symbol_address(&bytes, "_lib_init"));
+        assert_eq!(
+            symbol_address(&bytes, "_lib_ready_alias"),
+            symbol_address(&bytes, "_lib_ready"),
+            "{arch}: the alias is not at its target"
+        );
+        if let Some(trie) = objdump(&["--macho", "--exports-trie"], &dylib) {
+            assert!(trie.contains("_lib_ready_alias"), "{trie}");
+        }
+
+        let exe = dir.join("init_client");
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            client.to_str().unwrap(),
+            &format!("-L{}", dir.display()),
+            "-linit",
+            "-rpath",
+            "@executable_path",
+            "-lSystem",
+        ]));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "init ran\nready 42 42\n");
+        }
+    }
+    let error = link_bytes(&os(&["-arch", "arm64", "-init", "_main", "a.o"])).unwrap_err();
+    assert!(
+        error.contains("-init can only be used with -dylib"),
+        "{error}"
+    );
+}
+
+/// `-flat_namespace`: imports are looked up by name (ordinal
+/// `BIND_SPECIAL_DYLIB_FLAT_LOOKUP`), and the header has neither
+/// `MH_TWOLEVEL` nor `MH_NOUNDEFS`, as with ld64 and lld.
+#[test]
+fn flat_namespace() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "flat_namespace",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let object = compile("flat", "hello.c", arch, &[]);
+        let exe = scratch("flat").join(format!("hello-{arch}"));
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            "-flat_namespace",
+            object.to_str().unwrap(),
+            "-lSystem",
+        ]));
+        let bytes = link_and_compare(&args, &exe);
+        let flags = MachOFile::parse(&bytes, Source::new(&exe))
+            .unwrap()
+            .header()
+            .flags;
+        assert_eq!(
+            flags & qld::macho::read::consts::MH_TWOLEVEL,
+            0,
+            "{flags:#x}"
+        );
+        assert_eq!(
+            flags & qld::macho::read::consts::MH_NOUNDEFS,
+            0,
+            "{flags:#x}"
+        );
+        let imports = chained_imports(&bytes);
+        assert_eq!(import(&imports, "_printf").lib_ordinal, -2, "{imports:?}");
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "hello from qld 3 42\n");
+        }
+    }
+}
+
+/// Whether `rustc` has the standard library for `target`.
+fn rust_std_for(target: &str) -> bool {
+    let Ok(output) = Command::new("rustc")
+        .args(["--print", "target-libdir", "--target", target])
+        .output()
+    else {
+        return false;
+    };
+    let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    output.status.success()
+        && std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("libstd-"))
+        })
+}
+
+/// How `rustc` reaches the linker.
+#[derive(Clone, Copy)]
+enum RustLinker<'a> {
+    /// `-C linker=clang -C link-arg=-fuse-ld=<path>`: Apple clang's driver
+    /// runs the linker, as `cargo` does on macOS.
+    Clang(&'a Path),
+    /// `-C linker-flavor=ld64.lld -C linker=<path>`: rustc runs the linker
+    /// itself with an ld64 command line, against `syslibroot()`.
+    Direct(&'a Path),
+}
+
+/// Builds `rust_std.rs` for `target` into `output` with `linker`, and
+/// with `MACOSX_DEPLOYMENT_TARGET=deployment` when given (rustc's default
+/// for arm64 is 11.0, which gets `LC_DYLD_INFO_ONLY`).
+fn rustc_link(
+    target: &str,
+    linker: RustLinker<'_>,
+    deployment: Option<&str>,
+    link_args: &[&str],
+    output: &Path,
+) -> Result<(), String> {
+    let mut command = Command::new("rustc");
+    command
+        .args(["--edition", "2021", "-O", "--target", target])
+        .arg(data_dir().join("rust_std.rs"))
+        .arg("-o")
+        .arg(output)
+        .current_dir(output.parent().unwrap());
+    for arg in link_args {
+        command.arg("-C").arg(format!("link-arg={arg}"));
+    }
+    match linker {
+        RustLinker::Clang(path) => {
+            command
+                .args(["-C", "linker=clang", "-C"])
+                .arg(format!("link-arg=-fuse-ld={}", path.display()));
+        }
+        RustLinker::Direct(path) => {
+            command
+                .args(["-C", "linker-flavor=ld64.lld", "-C"])
+                .arg(format!("linker={}", path.display()))
+                .env("SDKROOT", syslibroot());
+        }
+    }
+    match deployment {
+        Some(version) => command.env("MACOSX_DEPLOYMENT_TARGET", version),
+        None => command.env_remove("MACOSX_DEPLOYMENT_TARGET"),
+    };
+    let result = command.output().map_err(|e| e.to_string())?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&result.stderr).into_owned())
+    }
+}
+
+const RUST_STD_OUTPUT: &str = "\
+threads: [(1, 1), (2, 4), (3, 9), (4, 16)] tls-len 12 main 0
+panics: caught 3 sum 54
+thread panic: true
+words: [(\"the\", 3), (\"brown\", 1), (\"dog\", 1)] pi    3.142 hex 0xff float 1.2345e3
+";
+
+/// A Rust program using threads, `panic=unwind` with `catch_unwind`,
+/// thread-locals, formatting and `HashMap`, linked by qld (M8's exit
+/// criterion for `aarch64-apple-darwin`; `x86_64-apple-darwin` too when
+/// its standard library is installed).
+///
+/// On macOS, rustc links through Apple clang with `-fuse-ld=ld64.qld`, and
+/// the result runs. Elsewhere rustc runs `ld64.qld` directly against the
+/// stub SDK, and the output is compared with `ld64.lld`'s. Both the default
+/// deployment target (legacy dyld info) and 13.0 (chained fixups) are
+/// linked.
+#[test]
+fn rust_binary() {
+    if !cfg!(unix) {
+        eprintln!("skipping rust_binary: needs a symlink to the qld binary");
+        return;
+    }
+    let dir = scratch("rust");
+    let linker = dir.join("ld64.qld");
+    let _ = std::fs::remove_file(&linker);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_qld"), &linker).unwrap();
+    for (target, arch) in [
+        ("aarch64-apple-darwin", "arm64"),
+        ("x86_64-apple-darwin", "x86_64"),
+    ] {
+        if !rust_std_for(target) {
+            // Only arm64 is required on the macOS runner.
+            if arch == "arm64" {
+                skip("rust_binary", &format!("rustc has no std for {target}"));
+            } else {
+                eprintln!("skipping rust_binary for {target}: rustc has no std for it");
+            }
+            continue;
+        }
+        for (deployment, chained) in [(None, false), (Some("13.0"), true)] {
+            let variant = format!("{arch}-{}", deployment.unwrap_or("default"));
+            let out_dir = dir.join(&variant);
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let exe = out_dir.join("rust_std");
+            let how = if cfg!(target_os = "macos") {
+                RustLinker::Clang(&linker)
+            } else {
+                RustLinker::Direct(&linker)
+            };
+            rustc_link(target, how, deployment, &[], &exe)
+                .unwrap_or_else(|e| panic!("{variant}: rustc with qld failed:\n{e}"));
+            let bytes = std::fs::read(&exe).unwrap();
+
+            let file = MachOFile::parse(&bytes, Source::new(&exe)).unwrap();
+            assert_eq!(file.header().file_type, MH_EXECUTE, "{variant}");
+            let commands: Vec<u32> = load_commands(&bytes).iter().map(|c| c.0).collect();
+            assert!(commands.contains(&LC_MAIN), "{variant}");
+            let dyld_info = if chained {
+                LC_DYLD_CHAINED_FIXUPS
+            } else {
+                qld::macho::read::consts::LC_DYLD_INFO_ONLY
+            };
+            assert!(commands.contains(&dyld_info), "{variant}: {commands:x?}");
+            if arch == "arm64" {
+                check_signature(&bytes);
+            }
+            let names = section_names(&bytes);
+            for wanted in [
+                "__thread_vars",
+                "__gcc_except_tab",
+                "__eh_frame",
+                "__unwind_info",
+            ] {
+                assert!(
+                    names.iter().any(|n| n == wanted),
+                    "{variant}: no {wanted} in {names:?}"
+                );
+            }
+            // The personality is reached only from `__eh_frame` CIEs, and
+            // must survive `-dead_strip`.
+            assert!(
+                symbol_address(&bytes, "_rust_eh_personality").is_some(),
+                "{variant}: _rust_eh_personality was dead-stripped"
+            );
+
+            if let Some(lld) = ld64_lld() {
+                let reference = out_dir.join("rust_std-lld");
+                rustc_link(
+                    target,
+                    RustLinker::Direct(&lld),
+                    deployment,
+                    &[],
+                    &reference,
+                )
+                .unwrap_or_else(|e| panic!("{variant}: rustc with ld64.lld failed:\n{e}"));
+                if let (Some(ours), Some(theirs)) = (summarize(&exe), summarize(&reference)) {
+                    assert_eq!(ours, theirs, "{variant}: qld vs ld64.lld");
+                }
+            }
+            if host_can_run(arch) {
+                assert_eq!(run(&exe).unwrap(), RUST_STD_OUTPUT, "{variant}");
+            }
+            if chained {
+                rust_prelinked(target, arch, &linker, &out_dir);
+            }
+        }
+    }
+}
+
+/// `-r` on a whole Rust program: rustc hands qld the program's objects
+/// and the standard library's rlibs with `-r`, and the merged object then
+/// links into the program (with qld, and with `ld64.lld` for comparison;
+/// on macOS also with Apple's linker), which runs.
+fn rust_prelinked(target: &str, arch: &str, linker: &Path, dir: &Path) {
+    let merged = dir.join("rust_std.o");
+    rustc_link(
+        target,
+        RustLinker::Direct(linker),
+        Some("13.0"),
+        &["-r"],
+        &merged,
+    )
+    .unwrap_or_else(|e| panic!("{arch}: rustc with qld -r failed:\n{e}"));
+    let bytes = std::fs::read(&merged).unwrap();
+    check_object(&bytes, true);
+    let mut args = base_args(arch);
+    args.extend(strings(&[
+        merged.to_str().unwrap(),
+        "-lSystem",
+        "-lc",
+        "-lm",
+        "-dead_strip",
+    ]));
+    let exe = dir.join("rust_std-prelinked");
+    link_and_compare(&args, &exe);
+    if host_can_run(arch) {
+        assert_eq!(run(&exe).unwrap(), RUST_STD_OUTPUT, "{arch}: prelinked");
+        let apple = dir.join("rust_std-prelinked-apple");
+        let status = Command::new("clang")
+            .args(["-arch", arch])
+            .arg(&merged)
+            .arg("-o")
+            .arg(&apple)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "{arch}: Apple's linker rejects the object"
+        );
+        assert_eq!(
+            run(&apple).unwrap(),
+            RUST_STD_OUTPUT,
+            "{arch}: by Apple's ld"
+        );
+    }
 }
 
 /// Runs the link in `W25_ARGS` (whitespace-separated), for development.

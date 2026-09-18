@@ -276,9 +276,7 @@ pub fn build(
                         continue;
                     }
                 }
-                let hidden = entry.is_private_external()
-                    || link.files.get(file).is_some_and(|f| f.hidden)
-                    || !filter.exports(name);
+                let hidden = link.is_hidden(id, file, &entry) || !filter.exports(name);
                 let (n_type, n_sect, address) = match value {
                     Value::Absolute(v) => (N_ABS, 0, v),
                     Value::Address(a) => (N_SECT, section_ordinal(sections, a), a),
@@ -293,7 +291,7 @@ pub fn build(
                     if options.discard == DiscardMode::All {
                         continue;
                     }
-                    if n_type == N_SECT {
+                    if n_type == N_SECT && entry.name == name {
                         origins.push((file, *symbol));
                     }
                     locals.push(Nlist {
@@ -327,7 +325,8 @@ pub fn build(
                     flags,
                     address: export_address,
                 });
-                if n_type == N_SECT {
+                // An alias shares its target's debug map entry.
+                if n_type == N_SECT && entry.name == name {
                     origins.push((file, *symbol));
                 }
                 extdefs.push((
@@ -517,7 +516,10 @@ pub fn build(
     for &id in &synthetic.got {
         push32(&mut tables.indirect, indirect_entry(id));
     }
-    tables.tlv_first = u32::try_from(synthetic.got.len()).unwrap_or(0);
+    for _ in &synthetic.local_got {
+        push32(&mut tables.indirect, INDIRECT_SYMBOL_LOCAL);
+    }
+    tables.tlv_first = u32::try_from(synthetic.got_slots()).unwrap_or(0);
     for &id in &synthetic.thread_ptrs {
         push32(&mut tables.indirect, indirect_entry(id));
     }

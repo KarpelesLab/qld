@@ -35,6 +35,8 @@ pub enum MachOutputType {
     Dylib,
     /// `MH_BUNDLE` (`-bundle`).
     Bundle,
+    /// `MH_OBJECT` (`-r`): a relocatable object.
+    Object,
 }
 
 /// `-undefined <treatment>`.
@@ -214,6 +216,12 @@ pub struct DarwinArgs {
     pub bundle_loader: Option<PathBuf>,
     /// `-v` given together with a link: print the version first.
     pub print_version: bool,
+    /// `-keep_private_externs`: with `-r`, private externs stay private
+    /// externs instead of becoming local symbols.
+    pub keep_private_externs: bool,
+    /// `-flat_namespace` (`true`) / `-twolevel_namespace` (`false`, the
+    /// default).
+    pub flat_namespace: bool,
 }
 
 impl Default for DarwinArgs {
@@ -258,6 +266,8 @@ impl Default for DarwinArgs {
             lto_library: None,
             bundle_loader: None,
             print_version: false,
+            keep_private_externs: false,
+            flat_namespace: false,
         }
     }
 }
@@ -295,6 +305,8 @@ enum Act {
     Version,
     Arch,
     Output,
+    KeepPrivateExterns,
+    Namespace(bool),
     OutputType(MachOutputType),
     Entry,
     InstallName,
@@ -431,7 +443,12 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     ),
     opt("dynamic", Flag, Act::None, "Link against dylibs (default)"),
     unsupported("static", Flag, "static Mach-O executables"),
-    unsupported("r", Flag, "relocatable Mach-O output (-r)"),
+    opt(
+        "r",
+        Flag,
+        Act::OutputType(MachOutputType::Object),
+        "Produce a relocatable object",
+    ),
     unsupported("preload", Flag, "MH_PRELOAD output"),
     unsupported("kext", Flag, "kernel extensions"),
     opt("e", V1, Act::Entry, "Entry point symbol (default _main)"),
@@ -813,17 +830,27 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     opt(
         "twolevel_namespace",
         Flag,
-        Act::None,
+        Act::Namespace(false),
         "Two-level namespace (default)",
     ),
-    unsupported("flat_namespace", Flag, "flat namespace output"),
+    opt(
+        "flat_namespace",
+        Flag,
+        Act::Namespace(true),
+        "Flat namespace: imports are looked up by name in every image",
+    ),
     unsupported("force_flat_namespace", Flag, "flat namespace output"),
     ignored("multiply_defined", V1),
     ignored("multiply_defined_unused", V1),
     ignored("weak_reference_mismatches", V1),
     ignored("commons", V1),
     ignored("warn_commons", Flag),
-    ignored("keep_private_externs", Flag),
+    opt(
+        "keep_private_externs",
+        Flag,
+        Act::KeepPrivateExterns,
+        "With -r, keep private externs instead of making them local",
+    ),
     unsupported("alias_list", V1, "-alias_list"),
     unsupported("interposable", Flag, "interposable symbols"),
     unsupported("interposable_list", V1, "interposable symbols"),
@@ -1317,6 +1344,8 @@ impl Parser<'_> {
                 .aliases
                 .push((first.to_owned(), values.get(1).cloned().unwrap_or_default())),
             Act::Init => self.options.init = Some(first.to_owned()),
+            Act::KeepPrivateExterns => darwin.keep_private_externs = true,
+            Act::Namespace(flat) => darwin.flat_namespace = flat,
             Act::DeadStrippableDylib => darwin.mark_dead_strippable_dylib = true,
             Act::OsoPrefix => darwin.oso_prefix = Some(PathBuf::from(first)),
             Act::FunctionStarts(on) => darwin.function_starts = on,
@@ -1378,6 +1407,9 @@ impl Parser<'_> {
             return Err(Error::Option(
                 "-bundle_loader can only be used with -bundle".into(),
             ));
+        }
+        if options.init.is_some() && options.darwin.output_type != MachOutputType::Dylib {
+            return Err(Error::Option("-init can only be used with -dylib".into()));
         }
         let arch = options
             .darwin
@@ -1464,7 +1496,7 @@ mod tests {
             }
             if matches!(
                 option.action,
-                Act::InstallName | Act::CurrentVersion | Act::CompatibilityVersion
+                Act::InstallName | Act::CurrentVersion | Act::CompatibilityVersion | Act::Init
             ) {
                 args.push("-dylib".to_owned());
             }
@@ -1596,13 +1628,21 @@ mod tests {
     }
 
     #[test]
+    fn relocatable_output() {
+        let options = parse_ok(&["-r", "-arch", "arm64", "a.o", "b.o", "-o", "ab.o"]);
+        assert_eq!(options.darwin.output_type, MachOutputType::Object);
+        assert!(!options.darwin.keep_private_externs);
+        let options = parse_ok(&["-r", "-keep_private_externs", "a.o"]);
+        assert!(options.darwin.keep_private_externs);
+    }
+
+    #[test]
     fn errors_name_the_problem() {
         assert!(parse_err(&["-frobnicate"]).contains("-frobnicate"));
         assert!(parse_err(&["-arch", "pdp11"]).contains("pdp11"));
         assert!(parse_err(&["-arch"]).contains("missing"));
         assert!(parse_err(&["-undefined", "maybe"]).contains("maybe"));
         assert!(parse_err(&["-install_name", "x"]).contains("-dylib"));
-        assert!(parse_err(&["-r", "a.o"]).contains("-r"));
         assert!(parse_err(&["-platform_version", "plan9", "1", "1"]).contains("plan9"));
     }
 

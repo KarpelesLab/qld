@@ -91,6 +91,10 @@ pub struct Link<'a> {
     pub defs: Vec<SymbolDef>,
     /// Whether any live file refers to each symbol without `N_WEAK_REF`.
     pub strong_ref: Vec<bool>,
+    /// Weak definitions every copy of which may be hidden automatically
+    /// (`N_WEAK_DEF | N_WEAK_REF`, `.weak_def_can_be_hidden`): a final
+    /// link makes them private externs, as ld64 does.
+    pub auto_hidden: Vec<bool>,
     /// Index of each file's first atom in the global atom numbering.
     pub atom_base: Vec<u32>,
     /// Total number of atoms.
@@ -179,6 +183,7 @@ impl<'a> Link<'a> {
             internal,
             defs: Vec::new(),
             strong_ref: Vec::new(),
+            auto_hidden: Vec::new(),
             atom_base,
             atom_count: usize::try_from(count).unwrap_or(usize::MAX),
             live: Vec::new(),
@@ -247,6 +252,9 @@ impl<'a> Link<'a> {
                         .map(|(n, _)| n.as_slice());
                     if name == Some(b"___dso_handle") {
                         SymbolDef::DsoHandle
+                    } else if name.is_some_and(|n| self.internal.aliases.iter().any(|a| a.0 == n)) {
+                        // Filled in below, from the target.
+                        SymbolDef::Undefined
                     } else {
                         SymbolDef::Header
                     }
@@ -284,6 +292,26 @@ impl<'a> Link<'a> {
             };
         }
 
+        // `-alias`: the alias resolves to what its target resolved to.
+        for (alias, target) in &self.internal.aliases {
+            let lookup = |name: &[u8]| self.symbols.lookup(&crate::symbols::SymbolName::new(name));
+            let (Some(alias_id), Some(target_id)) = (lookup(alias), lookup(target)) else {
+                continue;
+            };
+            let def = match defs.get(target_id.index()) {
+                Some(def @ SymbolDef::Object { .. }) => def.clone(),
+                _ => {
+                    return Err(Error::Option(format!(
+                        "-alias: {} is not defined in an object",
+                        display_name(target, options.demangle)
+                    )));
+                }
+            };
+            if let Some(slot) = defs.get_mut(alias_id.index()) {
+                *slot = def;
+            }
+        }
+
         // References: strong and weak.
         let mut strong_ref = vec![false; count];
         let mut referenced = vec![false; count];
@@ -308,11 +336,15 @@ impl<'a> Link<'a> {
             }
         }
 
-        // Undefined symbols.
+        // Undefined symbols. A relocatable object keeps them undefined for
+        // the final link, boundary symbols included.
         let darwin = &options.darwin;
         let mut errors = 0usize;
         for (index, def) in defs.iter_mut().enumerate() {
-            if *def != SymbolDef::Undefined || !referenced.get(index).copied().unwrap_or(false) {
+            if *def != SymbolDef::Undefined
+                || !referenced.get(index).copied().unwrap_or(false)
+                || self.config.is_relocatable()
+            {
                 continue;
             }
             let id = SymbolId::new(index);
@@ -335,7 +367,7 @@ impl<'a> Link<'a> {
                     let shown = display_name(name, options.demangle);
                     let mut diagnostic = Diagnostic::error(format!("undefined symbol: {shown}"));
                     for file in self.referencing_files(id).into_iter().take(3) {
-                        diagnostic = diagnostic.detail(format!(">>> referenced by {file}"));
+                        diagnostic = diagnostic.detail(format!("referenced by {file}"));
                     }
                     diagnostics.emit(diagnostic);
                     errors = errors.saturating_add(1);
@@ -352,10 +384,61 @@ impl<'a> Link<'a> {
         }
         self.defs = defs;
         self.strong_ref = strong_ref;
+        self.auto_hidden = self.auto_hidden_definitions();
         if errors > 0 && !options.noinhibit_exec {
             return Err(Error::Reported { errors });
         }
         Ok(())
+    }
+
+    /// Which symbols have only definitions that can be hidden
+    /// automatically. A relocatable object keeps the marks for the final
+    /// link instead.
+    fn auto_hidden_definitions(&self) -> Vec<bool> {
+        let count = self.symbols.len();
+        if self.config.is_relocatable() {
+            return vec![false; count];
+        }
+        let mut defined = vec![false; count];
+        let mut all = vec![true; count];
+        for index in 0..self.files.len() {
+            let Some(object) = self.object(index) else {
+                continue;
+            };
+            let ids = self.resolution.symbol_ids(FileId::new(index));
+            for (&symbol, id) in object.global_symbols.iter().zip(ids) {
+                let Ok(entry) = object.file.symbols().get(symbol) else {
+                    continue;
+                };
+                if !entry.is_defined() && !entry.is_common() {
+                    continue;
+                }
+                if let Some(slot) = defined.get_mut(id.index()) {
+                    *slot = true;
+                }
+                if !(entry.is_weak_def() && entry.is_weak_ref())
+                    && let Some(slot) = all.get_mut(id.index())
+                {
+                    *slot = false;
+                }
+            }
+        }
+        defined.iter().zip(all).map(|(&d, a)| d && a).collect()
+    }
+
+    /// Whether the definition of `id` (symbol table entry `entry` of file
+    /// `file`) stays out of the exports: a private extern, a member of a
+    /// `-hidden-l` archive, or an automatically hidden weak definition.
+    #[must_use]
+    pub fn is_hidden(
+        &self,
+        id: SymbolId,
+        file: usize,
+        entry: &crate::macho::read::Symbol<'_>,
+    ) -> bool {
+        entry.is_private_external()
+            || self.files.get(file).is_some_and(|f| f.hidden)
+            || self.auto_hidden.get(id.index()).copied().unwrap_or(false)
     }
 
     fn referencing_files(&self, id: SymbolId) -> Vec<String> {
@@ -502,7 +585,16 @@ impl<'a> Link<'a> {
                         .copied()
                         .unwrap_or(NOT_GLOBAL);
                     if global == NOT_GLOBAL {
-                        all_lost = false;
+                        // Assembler-temporary labels (`ltmp0`, `l_…`, as
+                        // arm64 assemblers put at section starts) do not
+                        // keep a coalesced definition alive, as in ld64.
+                        let temporary =
+                            object.file.symbols().get(symbol).is_ok_and(|s| {
+                                s.name.starts_with(b"l") || s.name.starts_with(b"L")
+                            });
+                        if !temporary {
+                            all_lost = false;
+                        }
                         continue;
                     }
                     any_global = true;
@@ -594,25 +686,39 @@ impl<'a> Link<'a> {
                         }
                     }
                 }
-                // An FDE keeps its function's LSDA alive.
+                // An FDE keeps its function's LSDA and its CIE's personality
+                // alive.
                 if let Some((section, frame)) = super::eh_frame::parse(object)? {
                     let data = object.file.section_data(section)?;
+                    let target = |pointer| match super::eh_frame::pointer_target(
+                        self, file, object, section, data, pointer,
+                    ) {
+                        Ok(Some(super::eh_frame::Target::Place(place))) => atom_of(place),
+                        Ok(Some(super::eh_frame::Target::Got(id, _))) => self.symbol_atom(id),
+                        _ => None,
+                    };
                     for record in &frame.records {
-                        let crate::macho::read::EhFrameKind::Fde(fde) = record.kind else {
+                        let crate::macho::read::EhFrameKind::Fde(fde) = &record.kind else {
                             continue;
                         };
-                        let Some(lsda) = &fde.lsda else {
+                        let Some(function) = target(&fde.pc_begin) else {
                             continue;
                         };
-                        let target = |pointer| match super::eh_frame::pointer_target(
-                            self, file, object, section, data, pointer,
-                        ) {
-                            Ok(Some(super::eh_frame::Target::Place(place))) => atom_of(place),
-                            _ => None,
-                        };
-                        if let (Some(function), Some(lsda)) = (target(&fde.pc_begin), target(lsda))
-                        {
+                        if let Some(lsda) = fde.lsda.as_ref().and_then(target) {
                             edges.push((function, lsda));
+                        }
+                        let personality =
+                            frame
+                                .records
+                                .get(fde.cie_index)
+                                .and_then(|cie| match &cie.kind {
+                                    crate::macho::read::EhFrameKind::Cie(cie) => {
+                                        cie.personality.as_ref().and_then(target)
+                                    }
+                                    crate::macho::read::EhFrameKind::Fde(_) => None,
+                                });
+                        if let Some(personality) = personality {
+                            edges.push((function, personality));
                         }
                     }
                 }
@@ -651,7 +757,7 @@ impl<'a> Link<'a> {
                 root_symbol(id, &mut roots);
             }
         }
-        for (file_index, file) in self.files.iter().enumerate() {
+        for file_index in 0..self.files.len() {
             let Some(object) = self.object(file_index) else {
                 continue;
             };
@@ -677,12 +783,13 @@ impl<'a> Link<'a> {
                     .get(usize::try_from(symbol.index).unwrap_or(usize::MAX))
                     .copied()
                     .unwrap_or(NOT_GLOBAL);
+                let exported = global != NOT_GLOBAL
+                    && self
+                        .global_id(file_index, global)
+                        .is_some_and(|id| !self.is_hidden(id, file_index, &symbol));
                 let keep = symbol.is_no_dead_strip()
                     || symbol.is_referenced_dynamically()
-                    || (exports_are_roots
-                        && global != NOT_GLOBAL
-                        && !symbol.is_private_external()
-                        && !file.hidden);
+                    || (exports_are_roots && exported);
                 if !keep {
                     continue;
                 }

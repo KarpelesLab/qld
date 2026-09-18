@@ -8,8 +8,11 @@
 //! stores every addend in the relocated field. A PC-relative x86_64 field
 //! is relative to the end of the 4-byte field plus the 1, 2 or 4 bytes
 //! `SIGNED_1`/`_2`/`_4` announce; for a symbol relocation the assembler has
-//! already folded that distance into the stored addend, so the value is
-//! `S + A - (P + 4)` for every type.
+//! already subtracted that distance `n` from the stored addend, so the
+//! field holds `S + A - (P + 4 + n)` with `A` = stored + `n`. Decoding adds
+//! `n` back, so that the target `S + A` is the real one (a store of an
+//! immediate to the first byte of a static would otherwise land one to four
+//! bytes before its atom).
 //!
 //! A relocation without `r_extern` names a section, and the stored value
 //! locates the target by its address in the object: the value itself for
@@ -72,6 +75,9 @@ pub struct Decoded {
     pub addend: i64,
     /// For a `SUBTRACTOR` pair, what is subtracted.
     pub subtrahend: Option<Referent>,
+    /// The file of the relocation (whose symbol table `Referent::Local`
+    /// indexes).
+    pub file: usize,
 }
 
 /// The extra PC offset of x86_64 `SIGNED_n` relocations.
@@ -227,24 +233,28 @@ pub fn decode(
             | X86_64_RELOC_BRANCH
             | X86_64_RELOC_GOT_LOAD
             | X86_64_RELOC_GOT
-            | X86_64_RELOC_TLV => match symbol_referent(reloc.target)? {
-                Some(referent) => (referent, embedded),
-                None => {
-                    let extra = pcrel_extra(reloc.r_type);
-                    let address = section_addr
-                        .wrapping_add(offset)
-                        .wrapping_add(4)
-                        .wrapping_add(extra as u64)
-                        .wrapping_add(embedded as u64);
-                    (
-                        Referent::Address {
-                            section: section_of(reloc.target)?,
-                            address,
-                        },
-                        extra.wrapping_neg(),
-                    )
+            | X86_64_RELOC_TLV => {
+                let extra = pcrel_extra(reloc.r_type);
+                match symbol_referent(reloc.target)? {
+                    // The stored addend has the `SIGNED_n` distance taken
+                    // out; put it back so the target is the real one.
+                    Some(referent) => (referent, embedded.wrapping_add(extra)),
+                    None => {
+                        let address = section_addr
+                            .wrapping_add(offset)
+                            .wrapping_add(4)
+                            .wrapping_add(extra as u64)
+                            .wrapping_add(embedded as u64);
+                        (
+                            Referent::Address {
+                                section: section_of(reloc.target)?,
+                                address,
+                            },
+                            0,
+                        )
+                    }
                 }
-            },
+            }
             X86_64_RELOC_SUBTRACTOR => return Err(fail("unpaired SUBTRACTOR")),
             _ => return Err(fail("unknown relocation type")),
         }
@@ -257,6 +267,7 @@ pub fn decode(
         referent,
         addend,
         subtrahend,
+        file,
     })
 }
 
@@ -332,14 +343,18 @@ pub fn place(
                         .ok_or_else(|| fail(format!("symbol {symbol} has no section")))?;
                     let target = entry.n_value.wrapping_add(addend as u64);
                     // Stay with the symbol's atom when the target is inside
-                    // it (or at its end).
+                    // it (or at its end), or outside the section altogether
+                    // (the arm64 C++ ABI sets the top bit of type name
+                    // pointers: `__ZTS… + 0x8000000000000000`).
                     if let Some(atom) = object.atoms.symbol_atom(symbol)
                         && let Some(info) = object.atoms.atoms().get(atom)
                         && let Some(header) = object.file.sections().get(section)
                     {
                         let start = header.addr.saturating_add(info.offset);
                         let end = start.saturating_add(info.size);
-                        if target >= start && target <= end {
+                        let in_section_range = target >= header.addr
+                            && target <= header.addr.saturating_add(header.size);
+                        if (target >= start && target <= end) || !in_section_range {
                             return Ok(Place::Atom {
                                 atom: link.atom_id(file, atom),
                                 offset: target.wrapping_sub(start) as i64,
@@ -439,6 +454,8 @@ pub trait Resolve {
     fn value(&self, place: Place, addend: i64) -> Result<Value>;
     /// The `__got` slot of a symbol.
     fn got(&self, id: SymbolId) -> Option<u64>;
+    /// The `__got` slot of local symbol `symbol` of file `file`.
+    fn local_got(&self, file: usize, symbol: u32) -> Option<u64>;
     /// The `__stubs` entry of a symbol.
     fn stub(&self, id: SymbolId) -> Option<u64>;
     /// The `__thread_ptrs` slot of a symbol.
@@ -668,7 +685,7 @@ pub fn apply(
                 put_insn(out, at, (insn & !0x003f_fc00) | (imm << 10))?;
             }
             ARM64_RELOC_POINTER_TO_GOT => {
-                let slot = symbol.and_then(|id| resolve.got(id)).ok_or_else(|| {
+                let slot = got_slot(decoded, resolve).ok_or_else(|| {
                     Error::Internal(format!(
                         "POINTER_TO_GOT relocation at {place_address:#x} without a GOT slot"
                     ))
@@ -709,8 +726,8 @@ pub fn apply(
         X86_64_RELOC_GOT_LOAD | X86_64_RELOC_GOT | X86_64_RELOC_TLV => {
             let slot = match (decoded.r_type, symbol) {
                 (X86_64_RELOC_TLV, Some(id)) => resolve.tlv_pointer(id),
-                (_, Some(id)) => resolve.got(id),
-                _ => None,
+                (X86_64_RELOC_TLV, None) => None,
+                _ => got_slot(decoded, resolve),
             };
             match slot {
                 Some(slot) => slot.wrapping_add(addend as u64),
@@ -754,11 +771,25 @@ pub fn apply(
             "PC-relative relocation at {place_address:#x} with an unsupported size"
         )));
     }
-    let delta = destination.wrapping_sub(place_address.wrapping_add(4)) as i64;
+    // The CPU adds the address after the instruction, which ends 1, 2 or 4
+    // bytes after the field for `SIGNED_n`.
+    let end = place_address
+        .wrapping_add(4)
+        .wrapping_add(pcrel_extra(decoded.r_type) as u64);
+    let delta = destination.wrapping_sub(end) as i64;
     let delta32 =
         i32::try_from(delta).map_err(|_| range_error("PC-relative", delta, place_address))?;
     put32(out, at, delta32 as u32)?;
     Ok(None)
+}
+
+/// The `__got` slot of the referent of `decoded`, global or local.
+fn got_slot(decoded: &Decoded, resolve: &dyn Resolve) -> Option<u64> {
+    match decoded.referent {
+        Referent::Global(id) => resolve.got(id),
+        Referent::Local(symbol) => resolve.local_got(decoded.file, symbol),
+        Referent::Address { .. } => None,
+    }
 }
 
 /// The destination of an arm64 page relocation: the symbol itself, its GOT

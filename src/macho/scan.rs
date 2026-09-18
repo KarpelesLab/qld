@@ -10,7 +10,10 @@ use crate::args::darwin::LoadMode;
 use crate::error::Result;
 use crate::ids::SymbolId;
 use crate::macho::read::compact_unwind_entries;
-use crate::macho::read::consts::{BIND_SPECIAL_DYLIB_FLAT_LOOKUP, BIND_SPECIAL_DYLIB_WEAK_LOOKUP};
+use crate::macho::read::consts::{
+    BIND_SPECIAL_DYLIB_FLAT_LOOKUP, BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE,
+    BIND_SPECIAL_DYLIB_WEAK_LOOKUP,
+};
 
 use super::layout::is_consumed;
 use super::reloc::{self, Place, Referent};
@@ -60,6 +63,20 @@ pub struct Synthetic {
     /// Exported weak definitions bound through dyld's weak lookup, by
     /// symbol.
     pub weak_bound: Vec<bool>,
+    /// `__got` slots of local symbols (file, symbol table index), which
+    /// follow the global symbols' slots: a pointer-to-GOT relocation
+    /// cannot be relaxed (an LSDA type table naming a local type info).
+    pub local_got: Vec<(u32, u32)>,
+    /// Index into [`Synthetic::local_got`] of each local symbol with a slot.
+    pub local_got_index: hashbrown::HashMap<(u32, u32), u32>,
+}
+
+impl Synthetic {
+    /// Number of `__got` slots, globals and locals.
+    #[must_use]
+    pub fn got_slots(&self) -> usize {
+        self.got.len().saturating_add(self.local_got.len())
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -83,12 +100,14 @@ pub fn scan(
     let count = link.symbols.len();
     let arm64 = link.config.is_arm64();
     let weak_bound = weak_bound(link, filter);
-    let per_file: Vec<Result<Vec<(SymbolId, Wants)>>> = (0..link.files.len())
+    type FileWants = (Vec<(SymbolId, Wants)>, Vec<u32>);
+    let per_file: Vec<Result<FileWants>> = (0..link.files.len())
         .into_par_iter()
         .map(|file| {
             let mut out = Vec::new();
+            let mut local_slots = Vec::new();
             let Some(object) = link.object(file) else {
-                return Ok(out);
+                return Ok((out, local_slots));
             };
             for (section_index, relocations) in object.relocations.iter().enumerate() {
                 let Some(section) = object.file.sections().get(section_index) else {
@@ -106,8 +125,13 @@ pub fn scan(
                             data,
                             &relocation.relocation,
                         )?;
+                        // A dead-stripped personality belongs only to CIEs
+                        // that no kept FDE uses.
                         if let Referent::Global(id) = decoded.referent
                             && reloc::needs(arm64, decoded.r_type).pointer
+                            && link
+                                .symbol_atom(id)
+                                .is_none_or(|atom| link.live.get(atom).copied().unwrap_or(false))
                         {
                             out.push((
                                 id,
@@ -140,10 +164,15 @@ pub fn scan(
                         .into_iter()
                         .flatten()
                     {
-                        let Referent::Global(id) = referent else {
-                            continue;
-                        };
                         let needs = reloc::needs(arm64, decoded.r_type);
+                        let id = match referent {
+                            Referent::Global(id) => id,
+                            Referent::Local(symbol) if needs.pointer => {
+                                local_slots.push(symbol);
+                                continue;
+                            }
+                            _ => continue,
+                        };
                         let imported = link.is_imported(id)
                             || weak_bound.get(id.index()).copied().unwrap_or(false);
                         out.push((
@@ -195,13 +224,23 @@ pub fn scan(
                     ));
                 }
             }
-            Ok(out)
+            Ok((out, local_slots))
         })
         .collect();
 
     let mut wants = vec![Wants::default(); count];
-    for list in per_file {
-        for (id, want) in list? {
+    let mut local_got: Vec<(u32, u32)> = Vec::new();
+    let mut local_got_index = hashbrown::HashMap::new();
+    for (file, result) in per_file.into_iter().enumerate() {
+        let (list, local_slots) = result?;
+        for symbol in local_slots {
+            let key = (u32::try_from(file).unwrap_or(NONE), symbol);
+            if let hashbrown::hash_map::Entry::Vacant(entry) = local_got_index.entry(key) {
+                entry.insert(u32::try_from(local_got.len()).unwrap_or(NONE));
+                local_got.push(key);
+            }
+        }
+        for (id, want) in list {
             if let Some(slot) = wants.get_mut(id.index()) {
                 slot.got |= want.got;
                 slot.stub |= want.stub;
@@ -216,6 +255,8 @@ pub fn scan(
         got_index: vec![NONE; count],
         tlv_index: vec![NONE; count],
         import_index: vec![NONE; count],
+        local_got,
+        local_got_index,
         ..Synthetic::default()
     };
     let to_u32 = |n: usize| u32::try_from(n).unwrap_or(NONE);
@@ -267,6 +308,11 @@ pub fn scan(
     synthetic.dylib_all_weak = vec![false; dylib_count];
     let mut next = 1i32;
     for (index, dylib) in link.dylibs.iter().enumerate() {
+        // The executable a bundle is loaded into gets no load command:
+        // imports from it use the main-executable ordinal.
+        if dylib.bundle_loader {
+            continue;
+        }
         let keep = dylib.mode == LoadMode::Needed
             || used.get(index).copied().unwrap_or(false)
             || (!options.darwin.dead_strip_dylibs && !dylib.implicit);
@@ -289,7 +335,13 @@ pub fn scan(
         let (ordinal, weak) = match link.defs.get(index) {
             Some(SymbolDef::Dylib { dylib, .. }) => {
                 let dylib = usize::try_from(*dylib).unwrap_or(usize::MAX);
-                let ordinal = synthetic.dylib_ordinals.get(dylib).copied().unwrap_or(0);
+                let ordinal = if link.config.flat_namespace {
+                    BIND_SPECIAL_DYLIB_FLAT_LOOKUP
+                } else if link.dylibs.get(dylib).is_some_and(|d| d.bundle_loader) {
+                    BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE
+                } else {
+                    synthetic.dylib_ordinals.get(dylib).copied().unwrap_or(0)
+                };
                 let weak_dylib = link
                     .dylibs
                     .get(dylib)
@@ -339,8 +391,7 @@ fn weak_bound(link: &Link<'_>, filter: &ExportFilter) -> Vec<bool> {
             continue;
         };
         *slot = entry.is_weak_def()
-            && !entry.is_private_external()
-            && !link.files.get(file).is_some_and(|f| f.hidden)
+            && !link.is_hidden(SymbolId::new(index), file, &entry)
             && filter.exports(entry.name);
     }
     out

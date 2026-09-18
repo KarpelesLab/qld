@@ -68,6 +68,9 @@ pub struct LoadedDylib {
     /// Linked implicitly, as a public re-export of another library: its load
     /// command is written only if the output uses it.
     pub implicit: bool,
+    /// The `-bundle_loader` executable: its exports resolve the bundle's
+    /// references, bound with the main-executable ordinal.
+    pub bundle_loader: bool,
 }
 
 /// What an input is.
@@ -192,6 +195,8 @@ enum Entry {
 pub struct InternalNames {
     /// Name and use of each.
     pub names: Vec<(Vec<u8>, SymbolUse)>,
+    /// `-alias` definitions among `names`: (alias, target).
+    pub aliases: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl InternalNames {
@@ -210,14 +215,35 @@ impl InternalNames {
         for name in options.undefined.iter().chain(&options.require_defined) {
             names.push((name.as_bytes().to_vec(), reference));
         }
+        // `-alias target alias`: the alias is defined here and takes its
+        // target's definition once resolution is done.
+        let aliases: Vec<(Vec<u8>, Vec<u8>)> = options
+            .darwin
+            .aliases
+            .iter()
+            .map(|(target, alias)| (alias.as_bytes().to_vec(), target.as_bytes().to_vec()))
+            .collect();
+        for (alias, target) in &aliases {
+            names.push((target.clone(), reference));
+            names.push((
+                alias.clone(),
+                SymbolUse::Definition {
+                    kind: DefinitionKind::Regular,
+                    aux: 0,
+                },
+            ));
+        }
         let header = match config.output_type {
             MachOutputType::Execute => b"__mh_execute_header".as_slice(),
             MachOutputType::Dylib => b"__mh_dylib_header",
             MachOutputType::Bundle => b"__mh_bundle_header",
+            // A relocatable object has no header of its own to point at:
+            // references stay undefined for the final link.
+            MachOutputType::Object => return Self { names, aliases },
         };
         names.push((header.to_vec(), definition));
         names.push((b"___dso_handle".to_vec(), definition));
-        Self { names }
+        Self { names, aliases }
     }
 }
 
@@ -523,6 +549,17 @@ pub fn collect<'t>(
             }
         }
     }
+    // The bundle loader comes first, as in lld.
+    if let Some(loader) = &options.darwin.bundle_loader {
+        specs.insert(
+            0,
+            DarwinInput {
+                kind: DarwinInputKind::File(loader.clone()),
+                mode: LoadMode::Normal,
+                force_load: false,
+            },
+        );
+    }
     specs.extend(options.darwin.inputs.iter().cloned());
 
     let mut walker = Walker {
@@ -557,9 +594,14 @@ pub fn collect<'t>(
     // Libraries and frameworks requested by `LC_LINKER_OPTION` in the
     // objects, searched after everything on the command line. Missing ones
     // are warnings, as in ld64.
+    // `-r` passes them on to the final link instead.
     let mut requested: Vec<DarwinInput> = Vec::new();
     let mut seen = HashSet::new();
-    for request in std::mem::take(&mut walker.linker_option_libraries) {
+    let linker_options = std::mem::take(&mut walker.linker_option_libraries);
+    for request in linker_options
+        .into_iter()
+        .filter(|_| !config.is_relocatable())
+    {
         if seen.insert(request.clone()) {
             requested.push(request);
         }
@@ -749,7 +791,17 @@ impl<'t> Walker<'_, 't> {
                     crate::macho::read::consts::MH_EXECUTE
                         if self.options.darwin.bundle_loader.is_some() =>
                     {
-                        Err(Error::Unimplemented("-bundle_loader".into()))
+                        if arch.cpu_type != self.config.arch.cpu_type {
+                            self.arch_mismatch(file, arch);
+                            return Ok(());
+                        }
+                        let image = Dylib::parse_image(file.data(), source_of(file))?;
+                        let path = file.path().to_path_buf();
+                        self.add_binary_dylib(&image, path, input.mode)?;
+                        if let Some(loader) = self.dylibs.last_mut() {
+                            loader.bundle_loader = true;
+                        }
+                        Ok(())
                     }
                     other => Err(file.malformed(
                         12,
@@ -923,6 +975,7 @@ impl<'t> Walker<'_, 't> {
             mode,
             exports,
             implicit: false,
+            bundle_loader: false,
         })?;
         // Implicitly linked re-exports follow their parent, as lld loads
         // them.
@@ -1022,6 +1075,7 @@ impl<'t> Walker<'_, 't> {
                 mode: LoadMode::Normal,
                 exports: own,
                 implicit: true,
+                bundle_loader: false,
             });
         }
         Ok(())
@@ -1143,6 +1197,7 @@ impl<'t> Walker<'_, 't> {
             mode,
             exports,
             implicit: false,
+            bundle_loader: false,
         })?;
         // Implicitly linked re-exports follow their parent, as lld loads
         // them.

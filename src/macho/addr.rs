@@ -165,6 +165,19 @@ impl Resolve for Addresses<'_, '_> {
         )
     }
 
+    fn local_got(&self, file: usize, symbol: u32) -> Option<u64> {
+        let index = *self
+            .synthetic
+            .local_got_index
+            .get(&(u32::try_from(file).ok()?, symbol))?;
+        let global = u32::try_from(self.synthetic.got.len()).ok()?;
+        slot(
+            self.layout.find(SectionKind::Got),
+            global.checked_add(index)?,
+            8,
+        )
+    }
+
     fn stub(&self, id: SymbolId) -> Option<u64> {
         slot(
             self.layout.find(SectionKind::Stubs),

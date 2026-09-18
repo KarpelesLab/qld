@@ -14,6 +14,11 @@
 //!   thread-local sections (so dyld copies one contiguous template) and the
 //!   zero-fill sections, which must end the segment.
 //!
+//! Literals are merged by content within each output section, as ld64 and
+//! lld merge them: C strings (`S_CSTRING_LITERALS`) and 4-, 8- and 16-byte
+//! literals. Duplicates take the place of the first copy in member order,
+//! which is aligned to the largest alignment among them.
+//!
 //! Addresses follow: the header and load commands start `__TEXT`, sections
 //! are aligned in both address and file offset, and every segment but
 //! `__LINKEDIT` is padded to the page size.
@@ -24,10 +29,11 @@ use hashbrown::HashMap;
 
 use crate::error::{Error, Result};
 use crate::macho::read::consts::{
-    S_ATTR_DEBUG, S_ATTR_EXT_RELOC, S_ATTR_LOC_RELOC, S_ATTR_PURE_INSTRUCTIONS,
-    S_ATTR_SOME_INSTRUCTIONS, S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS,
-    S_THREAD_LOCAL_REGULAR, S_THREAD_LOCAL_VARIABLE_POINTERS, S_THREAD_LOCAL_VARIABLES,
-    S_THREAD_LOCAL_ZEROFILL, S_ZEROFILL, SECTION_TYPE,
+    S_4BYTE_LITERALS, S_8BYTE_LITERALS, S_16BYTE_LITERALS, S_ATTR_DEBUG, S_ATTR_EXT_RELOC,
+    S_ATTR_LOC_RELOC, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS,
+    S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS, S_THREAD_LOCAL_REGULAR,
+    S_THREAD_LOCAL_VARIABLE_POINTERS, S_THREAD_LOCAL_VARIABLES, S_THREAD_LOCAL_ZEROFILL,
+    S_ZEROFILL, SECTION_TYPE,
 };
 
 use super::buf::align_up;
@@ -206,7 +212,80 @@ pub fn output_names<'s>(
 
 /// An atom placed in an output section: its sort key (order file position,
 /// cold), file and atom index.
-type Member = ((usize, bool), usize, usize);
+pub(super) type Member = ((usize, bool), usize, usize);
+
+/// Whether an output section with `flags` holds literals that are merged
+/// by content: C strings and 4-, 8- and 16-byte literals. (Literal pointer
+/// sections carry relocations and are kept as they are.)
+pub(super) fn is_literal_section(flags: u32) -> bool {
+    matches!(
+        flags & SECTION_TYPE,
+        S_CSTRING_LITERALS | S_4BYTE_LITERALS | S_8BYTE_LITERALS | S_16BYTE_LITERALS
+    )
+}
+
+/// The outcome of literal deduplication over one output section's members.
+#[derive(Debug, Default)]
+pub(super) struct Literals {
+    /// For each member position, the position of the first member with the
+    /// same contents (itself when it is the first). Empty when nothing was
+    /// merged.
+    first: Vec<usize>,
+    /// For each first copy, the largest alignment among its duplicates, so
+    /// that every reference keeps the alignment it was assembled with.
+    align: Vec<u32>,
+}
+
+impl Literals {
+    pub(super) fn canonical(&self, position: usize) -> usize {
+        self.first.get(position).copied().unwrap_or(position)
+    }
+
+    pub(super) fn align(&self, position: usize) -> Option<u32> {
+        self.align.get(position).copied()
+    }
+}
+
+/// Merges the literals of `list` (the sorted members of one output section)
+/// with equal contents into their first occurrence, as ld64 and lld do.
+/// The result depends only on the order of `list`.
+pub(super) fn dedup_literals(link: &Link<'_>, list: &[Member]) -> Result<Literals> {
+    let mut seen: HashMap<&[u8], usize> = HashMap::with_capacity(list.len());
+    let mut first = Vec::with_capacity(list.len());
+    let mut align = vec![0u32; list.len()];
+    let mut merged = false;
+    for (position, &(_, file, atom)) in list.iter().enumerate() {
+        let Some(object) = link.object(file) else {
+            first.push(position);
+            continue;
+        };
+        let Some(info) = object.atoms.atoms().get(atom) else {
+            first.push(position);
+            continue;
+        };
+        let data = object
+            .file
+            .section_data(usize::try_from(info.section).unwrap_or(usize::MAX))?;
+        let Some(bytes) = usize::try_from(info.offset)
+            .ok()
+            .zip(usize::try_from(info.range().end).ok())
+            .and_then(|(start, end)| data.get(start..end))
+        else {
+            first.push(position);
+            continue;
+        };
+        let canonical = *seen.entry(bytes).or_insert(position);
+        merged |= canonical != position;
+        first.push(canonical);
+        if let Some(slot) = align.get_mut(canonical) {
+            *slot = (*slot).max(info.align);
+        }
+    }
+    if !merged {
+        return Ok(Literals::default());
+    }
+    Ok(Literals { first, align })
+}
 
 /// The file and file-local index of global atom `atom`.
 #[must_use]
@@ -472,29 +551,55 @@ pub fn plan(
     let mut ordered: Vec<Vec<usize>> = vec![Vec::new(); builder.sections.len()];
     for (out, list) in members.iter_mut().enumerate() {
         list.sort_by_key(|&(key, _, _)| key);
-        if let Some(slot) = ordered.get_mut(out) {
-            *slot = list
-                .iter()
-                .map(|&(_, file, atom)| link.atom_id(file, atom))
-                .collect();
-        }
         let Some(out_section) = builder.sections.get_mut(out) else {
             continue;
         };
-        for &(_, file_index, atom) in list.iter() {
+        let literals = if is_literal_section(out_section.flags) {
+            dedup_literals(link, list)?
+        } else {
+            Literals::default()
+        };
+        if let Some(slot) = ordered.get_mut(out) {
+            *slot = list
+                .iter()
+                .enumerate()
+                .filter(|&(position, _)| literals.canonical(position) == position)
+                .map(|(_, &(_, file, atom))| link.atom_id(file, atom))
+                .collect();
+        }
+        for (position, &(_, file_index, atom)) in list.iter().enumerate() {
             let Some(info) = link
                 .object(file_index)
                 .and_then(|object| object.atoms.atoms().get(atom))
             else {
                 continue;
             };
-            out_section.align = out_section.align.max(info.align);
-            let alignment = 1u64.checked_shl(info.align).unwrap_or(1);
+            let id = link.atom_id(file_index, atom);
+            let canonical = literals.canonical(position);
+            if canonical != position {
+                // A duplicate literal shares the first copy's place, which
+                // comes earlier in the list and is already placed.
+                let first = list
+                    .get(canonical)
+                    .map(|&(_, file, atom)| link.atom_id(file, atom));
+                if let Some(first) = first {
+                    let offset = atom_offset.get(first).copied().unwrap_or(0);
+                    if let Some(slot) = atom_section.get_mut(id) {
+                        *slot = u32::try_from(out).unwrap_or(NONE);
+                    }
+                    if let Some(slot) = atom_offset.get_mut(id) {
+                        *slot = offset;
+                    }
+                }
+                continue;
+            }
+            let align = literals.align(position).unwrap_or(info.align);
+            out_section.align = out_section.align.max(align);
+            let alignment = 1u64.checked_shl(align).unwrap_or(1);
             let offset = align_up(out_section.size, alignment);
             out_section.size = offset
                 .checked_add(info.size)
                 .ok_or_else(|| Error::Limit("output section larger than 2^64".into()))?;
-            let id = link.atom_id(file_index, atom);
             if let Some(slot) = atom_section.get_mut(id) {
                 *slot = u32::try_from(out).unwrap_or(NONE);
             }

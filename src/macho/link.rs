@@ -18,6 +18,10 @@
 //!    collecting pointer fixups;
 //! 8. `__LINKEDIT`: fixups ([`fixups`]), the export trie, symbol tables;
 //!    then the header, `LC_UUID` and the code signature.
+//!
+//! With `-r`, steps 1–4 run (without dead stripping) and
+//! [`relocatable::write`](super::relocatable::write) writes an `MH_OBJECT`
+//! instead of steps 5–8.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -89,17 +93,6 @@ pub fn link_to_bytes(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) ->
         diagnostics.emit(Diagnostic::new(
             crate::diag::Severity::Note,
             crate::version_line(),
-        ));
-    }
-    if !options.darwin.aliases.is_empty() {
-        return Err(Error::Unimplemented("-alias (roadmap M8)".into()));
-    }
-    if options.darwin.bundle_loader.is_some() {
-        return Err(Error::Unimplemented("-bundle_loader (roadmap M8)".into()));
-    }
-    if options.init.is_some() {
-        return Err(Error::Unimplemented(
-            "-init (LC_ROUTINES_64, roadmap M8)".into(),
         ));
     }
     let archs = match options.darwin.archs.as_slice() {
@@ -241,21 +234,24 @@ fn link_arch_once(
 
     let mut symbols = SymbolTable::new();
     let resolution = resolve_symbols(&mut symbols, &MachRules, &mut files)?;
-    let more = inputs::missing_linker_options(options, &collected, &files, |index| {
-        resolution.is_live(crate::ids::FileId::new(index))
-    });
-    if !more.is_empty() {
-        return Ok(Attempt::MoreInputs(more));
-    }
-    let stubs: Vec<Vec<u8>> = resolution
-        .undefined()
-        .iter()
-        .filter_map(|u| u.name.bytes().strip_prefix(super::objc_stubs::PREFIX))
-        .filter(|selector| !selector.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect();
-    if !stubs.is_empty() {
-        return Ok(Attempt::Selectors(stubs));
+    // `-r` leaves both to the final link.
+    if !config.is_relocatable() {
+        let more = inputs::missing_linker_options(options, &collected, &files, |index| {
+            resolution.is_live(crate::ids::FileId::new(index))
+        });
+        if !more.is_empty() {
+            return Ok(Attempt::MoreInputs(more));
+        }
+        let stubs: Vec<Vec<u8>> = resolution
+            .undefined()
+            .iter()
+            .filter_map(|u| u.name.bytes().strip_prefix(super::objc_stubs::PREFIX))
+            .filter(|selector| !selector.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        if !stubs.is_empty() {
+            return Ok(Attempt::Selectors(stubs));
+        }
     }
     let duplicates = report_duplicates(
         resolution.duplicates(),
@@ -289,6 +285,9 @@ fn link_arch_once(
         diagnostics,
     )?;
     link.mark_live(options)?;
+    if config.is_relocatable() {
+        return super::relocatable::write(&link, options, diagnostics).map(Attempt::Done);
+    }
     let filter = ExportFilter::new(options)?;
     let synthetic = scan::scan(&link, options, &filter)?;
 
@@ -312,7 +311,7 @@ fn link_arch_once(
     let unwind_plan = super::unwind::plan(&link, unwind_entries);
     let sizes = SyntheticSizes {
         stubs: to_u64(synthetic.stubs.len()),
-        got: to_u64(synthetic.got.len()),
+        got: to_u64(synthetic.got_slots()),
         thread_ptrs: to_u64(synthetic.thread_ptrs.len()),
         unwind_info: unwind_plan.size(),
         eh_frame: eh_frame_plan.size(),
@@ -374,7 +373,9 @@ fn link_arch_once(
     }
     // Two-level namespace images set MH_NOUNDEFS even with flat lookups
     // (`-undefined dynamic_lookup`), as ld64 and lld do.
-    commands.no_undefs = true;
+    commands.no_undefs = !config.flat_namespace;
+    // `-init`: LC_ROUTINES_64, its address filled in once known.
+    commands.init_address = options.init.as_ref().map(|_| 0);
     let (_, commands_size) = write::commands_size(&config, &layout, &commands);
     let header_size = 32u64
         .saturating_add(commands_size)
@@ -424,6 +425,22 @@ fn link_arch_once(
         && let Some(crate::macho::reloc::Value::Address(address)) = addresses.symbol(id)
     {
         commands.entry_offset = address.saturating_sub(addresses.header_address());
+    }
+    if let Some(init) = &options.init {
+        let address = link
+            .symbols
+            .lookup(&crate::symbols::SymbolName::new(init.as_bytes()))
+            .and_then(|id| addresses.symbol(id));
+        match address {
+            Some(crate::macho::reloc::Value::Address(address)) => {
+                commands.init_address = Some(address);
+            }
+            _ => {
+                return Err(Error::Option(format!(
+                    "-init: {init} is not defined in the output"
+                )));
+            }
+        }
     }
 
     let linkedit_start = layout.segment(b"__LINKEDIT").map_or(0, |s| s.fileoff);
@@ -536,7 +553,7 @@ fn link_arch_once(
 
 /// Sets `reserved1` of the sections the indirect symbol table indexes.
 fn fill_section_indices(layout: &mut Layout, synthetic: &scan::Synthetic) {
-    let got = u32::try_from(synthetic.got.len()).unwrap_or(0);
+    let got = u32::try_from(synthetic.got_slots()).unwrap_or(0);
     let tlv = u32::try_from(synthetic.thread_ptrs.len()).unwrap_or(0);
     for section in &mut layout.sections {
         section.reserved1 = match section.kind {

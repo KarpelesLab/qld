@@ -73,12 +73,12 @@ pub fn report_duplicates(
         let winner = files
             .get(duplicate.winner.file.index())
             .map_or_else(|| "<unknown>".to_string(), MachInput::display);
-        diagnostic = diagnostic.detail(format!(">>> defined in {winner}"));
+        diagnostic = diagnostic.detail(format!("defined in {winner}"));
         for other in &duplicate.others {
             let file = files
                 .get(other.file.index())
                 .map_or_else(|| "<unknown>".to_string(), MachInput::display);
-            diagnostic = diagnostic.detail(format!(">>> defined in {file}"));
+            diagnostic = diagnostic.detail(format!("defined in {file}"));
         }
         diagnostics.emit(diagnostic);
         errors = errors.saturating_add(1);
