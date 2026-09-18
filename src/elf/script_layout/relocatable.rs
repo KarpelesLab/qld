@@ -1,7 +1,9 @@
-//! Linker scripts in relocatable links (`-r -T script`).
+//! Linker scripts in relocatable links (`-r`).
 //!
-//! A relocatable link has no addresses, but GNU ld still runs the script
-//! (the Linux kernel links every module with `-r -T scripts/module.lds`):
+//! A relocatable link has no addresses, but GNU ld still runs a script: the
+//! one `-T` names (the Linux kernel links every module with
+//! `-r -T scripts/module.lds`), or else its built-in relocatable layout
+//! ([`super::defaults::relocatable_script`], used on x86-64). Either way,
 //! output section statements collect the input sections their patterns
 //! match, in description order and with `SORT_*` applied; `/DISCARD/`
 //! removes sections; data commands, `FILL` and assignments to `.` add
