@@ -296,7 +296,7 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
             return (class, Value::Write(truncated(value)));
         }
         let owner = Addresses::owner(&target, self.section.file, rel.symbol);
-        let Some((mut s, a)) = addresses.symbol_address(&target, rel.addend) else {
+        let Some((mut s, a)) = symbol_address(addresses, &target, rel.addend) else {
             if self.alloc {
                 if report {
                     let name = write::symbol_name(refs, self.section.file, rel.symbol);
@@ -468,8 +468,7 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
                             desc_exec = true;
                             desc_to_le = true;
                             let tls = addresses.layout.tls.unwrap_or_default();
-                            desc_value = addresses
-                                .symbol_address(&target, rel.addend)
+                            desc_value = symbol_address(addresses, &target, rel.addend)
                                 .map_or(0, |(s, a)| s.wrapping_add_signed(a))
                                 .wrapping_sub(tls.tp(self.input.context.arch));
                         }
@@ -546,7 +545,7 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
                     skip_next = true;
                     let address = |r: &Relocation| {
                         self.target(r)
-                            .and_then(|(t, _)| addresses.symbol_address(&t, r.addend))
+                            .and_then(|(t, _)| symbol_address(addresses, &t, r.addend))
                             .map_or(0, |(s, a)| s.wrapping_add_signed(a))
                     };
                     let value = address(rel).wrapping_sub(address(sub));
@@ -630,6 +629,18 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
             }
         }
     }
+}
+
+/// `S` and the addend still to add for a relocation target, with section
+/// symbol offsets into relaxed code moved as labels are.
+fn symbol_address(
+    addresses: &Addresses<'_, '_>,
+    target: &Target,
+    addend: i64,
+) -> Option<(u64, i64)> {
+    addresses
+        .relaxed_section_symbol(target, addend)
+        .or_else(|| addresses.symbol_address(target, addend))
 }
 
 /// Whether an undefined weak target of `r_type` resolves to the place

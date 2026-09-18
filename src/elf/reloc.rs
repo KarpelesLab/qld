@@ -272,13 +272,12 @@ pub fn decide(
             // of a PC-relative pair (`adrp` plus `add`/`ldr`): it never
             // becomes a dynamic relocation, and the `adrp` half reports the
             // problem if there is one.
-            if matches!(class.width, Width::Field(field) if !field.is_data()) {
-                return Ok(decision);
-            }
-            // RISC-V label differences (`ADD`/`SUB`/`SET`) are final at
-            // link time.
-            if matches!(class.width, Width::RiscV(field) if field.is_label_math()) {
-                return Ok(decision);
+            // RISC-V label differences (`SET`, `SUB6`, `ULEB128`) are final
+            // at link time too.
+            match class.width {
+                Width::Field(field) if !field.is_data() => return Ok(decision),
+                Width::RiscV(field) if field.is_label_math() => return Ok(decision),
+                _ => {}
             }
             if !mode.dynamic {
                 return Ok(decision);

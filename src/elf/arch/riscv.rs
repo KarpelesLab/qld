@@ -85,6 +85,7 @@ pub const fn is_pcrel_hi(r_type: u32) -> bool {
 ///
 /// [`ClassifyError::Unsupported`] for dynamic-only types, the deprecated
 /// `RVC_LUI`/`GPREL_*`/`TPREL_I`/`TPREL_S` and unknown or vendor types.
+#[inline(never)]
 pub fn classify(r_type: u32, context: ClassifyContext) -> Result<Class, ClassifyError> {
     use Field as F;
     use Kind as K;
@@ -156,6 +157,28 @@ pub const fn is_branch(r_type: u32) -> bool {
 fn put(out: &mut [u8], at: u64, value: u32) -> Result<(), ApplyError> {
     let at = usize::try_from(at).map_err(|_| ApplyError::OutOfBounds)?;
     insn::write32(out, at, value).ok_or(ApplyError::OutOfBounds)
+}
+
+/// Packs `value` into RISC-V field `field` at `offset` of `out`
+/// ([`super::write_value`]; out of line, so that other architectures'
+/// relocation loops do not carry it).
+///
+/// # Errors
+///
+/// [`ApplyError::Overflow`] or [`ApplyError::OutOfBounds`].
+#[inline(never)]
+pub fn write_field(
+    out: &mut [u8],
+    offset: u64,
+    field: Field,
+    value: u64,
+) -> Result<(), ApplyError> {
+    let start = usize::try_from(offset).map_err(|_| ApplyError::OutOfBounds)?;
+    let data = out.get_mut(start..).ok_or(ApplyError::OutOfBounds)?;
+    field.apply(data, value).map_err(|error| match error {
+        insn::FieldError::Overflow => ApplyError::Overflow,
+        insn::FieldError::OutOfBounds => ApplyError::OutOfBounds,
+    })
 }
 
 /// Size of the PLT header.

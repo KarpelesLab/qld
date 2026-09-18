@@ -1761,23 +1761,13 @@ pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result
                     .map_or(0, |s| s.size);
                 return Ok((size, 1));
             }
-            // RISC-V: the merged `.riscv.attributes` takes the place of the
-            // first input section; the others are empty.
-            if section.header.sh_type == SHT_RISCV_ATTRIBUTES
-                && let Some(merged) = &input.synth.riscv_attributes
-            {
-                let size = if merged.first == id {
-                    u64::try_from(merged.bytes.len()).unwrap_or(u64::MAX)
-                } else {
-                    0
-                };
-                return Ok((size, 1));
+            // RISC-V: relaxation shrinks code, and the merged
+            // `.riscv.attributes` takes the place of the input sections.
+            if input.synth.arch == Arch::RiscV64 {
+                return Ok(riscv_member_size(input, id, section));
             }
-            let removed = input.relax.map_or(0, |relax| relax.removed(id));
-            (
-                section.header.sh_size.saturating_sub(removed),
-                section.header.sh_addralign,
-            )
+            let size = section.header.sh_size;
+            (size, section.header.sh_addralign)
         }
         Member::Merge(group) => {
             let merged = input
@@ -1789,6 +1779,33 @@ pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result
         }
         Member::Synthetic(kind) => input.synth.size_align(kind),
     })
+}
+
+/// [`member_size`] of RISC-V input section `id`: shrunk by linker
+/// relaxation, or the merged `.riscv.attributes` for the first attributes
+/// section (the others are empty).
+#[cold]
+#[inline(never)]
+fn riscv_member_size(
+    input: &LayoutInput<'_, '_>,
+    id: SectionId,
+    section: &super::object::InputSection<'_>,
+) -> (u64, u64) {
+    if section.header.sh_type == SHT_RISCV_ATTRIBUTES
+        && let Some(merged) = &input.synth.riscv_attributes
+    {
+        let size = if merged.first == id {
+            u64::try_from(merged.bytes.len()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        return (size, 1);
+    }
+    let removed = input.relax.map_or(0, |relax| relax.removed(id));
+    (
+        section.header.sh_size.saturating_sub(removed),
+        section.header.sh_addralign,
+    )
 }
 
 pub(crate) fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[Placed]) -> u64 {

@@ -1215,6 +1215,10 @@ fn section_dyn_relocs(
     let Some(id) = refs.sections.id(file_index, section_index) else {
         return out;
     };
+    // Merged pieces and code linker relaxation shrank (RISC-V) move
+    // offsets; other sections keep them.
+    let moved = refs.sections.kind_in(file_index, section_index) == Some(SectionKind::Merge)
+        || !addresses.layout.relax.is_empty();
     let data = if section.kind == SectionKind::Merge || section.is_nobits() {
         &[][..]
     } else {
@@ -1251,7 +1255,13 @@ fn section_dyn_relocs(
         if decision.problem.is_some() {
             continue;
         }
-        let place = offset_address(addresses, file_index, section_index, base, rel.offset);
+        let place = if moved {
+            addresses
+                .section_offset_address(file_index, section_index, rel.offset)
+                .unwrap_or(0)
+        } else {
+            base.wrapping_add(rel.offset)
+        };
         match decision.dynamic {
             Dynamic::None => {}
             Dynamic::Relative => {
@@ -1274,26 +1284,6 @@ fn section_dyn_relocs(
         }
     }
     out
-}
-
-/// The output address of offset `offset` of an input section at `base`
-/// (merge sections map through their pieces).
-fn offset_address(
-    addresses: &Addresses<'_, '_>,
-    file: usize,
-    section: u32,
-    base: u64,
-    offset: u64,
-) -> u64 {
-    // Callers pass a section of the output, which always has an ID.
-    let merge = addresses.refs.sections.kind_in(file, section) == Some(SectionKind::Merge);
-    // Merged pieces and relaxed code (RISC-V) move offsets.
-    if merge || !addresses.layout.relax.is_empty() {
-        return addresses
-            .section_offset_address(file, section, offset)
-            .unwrap_or(0);
-    }
-    base.wrapping_add(offset)
 }
 
 /// `(S, A)` for a relocation: IFUNCs resolve to their PLT stub, calls to
