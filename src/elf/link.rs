@@ -390,14 +390,11 @@ fn link_inputs<'a>(
     if mode.dynamic && !mode.shared {
         narrow.run(|| dso::mark_dependency_symbols(files, &symbols, &needed, options));
     }
-    let always: &[&str] = if mode.dynamic && mode.executable() && options.export_dynamic {
-        for name in defined::ALWAYS_DEFINED {
-            symbols.intern(SymbolName::new(name.as_bytes()));
-        }
-        defined::ALWAYS_DEFINED
-    } else {
-        &[]
-    };
+    let always = defined::always_defined(mode, script.is_some());
+    for name in &always {
+        symbols.intern(SymbolName::new(name.as_bytes()));
+    }
+    let always = always.as_slice();
 
     let rule_set = RuleSet::for_link(script, diagnostics);
     let mut placement = narrow.run(|| place::place(&rule_set, files, &sections, options));

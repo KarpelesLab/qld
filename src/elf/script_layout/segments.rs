@@ -60,6 +60,10 @@ pub struct SegmentInput<'s> {
     pub load_phdrs: bool,
     /// The program header table size the addresses were computed with.
     pub reserved_headers: u64,
+    /// Whether a table larger than `reserved_headers` is left for the
+    /// caller, which lays out again with the size it needs, rather than an
+    /// error.
+    pub defer_room_error: bool,
     /// The RELRO range from `DATA_SEGMENT_RELRO_END`.
     pub relro: Option<(u64, u64)>,
     /// Whether an input asked for an executable stack.
@@ -607,7 +611,10 @@ pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Resu
             p.filesz = EHDR_SIZE;
             p.memsz = EHDR_SIZE;
             if map.p_type == PT_LOAD && first.is_some() {
-                if p.vaddr < off || (map.paddr.is_none() && paddr < off) {
+                let short = p.vaddr < off || (map.paddr.is_none() && paddr < off);
+                if short && input.defer_room_error && table > estimate {
+                    // The caller lays out again with a larger table.
+                } else if short {
                     return Err(Error::Option(format!(
                         "{}: not enough room for program headers, try linking with -N",
                         options.output_path().display()

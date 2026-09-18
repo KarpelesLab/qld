@@ -125,6 +125,23 @@ const FIXED: &[(&str, Value)] = &[
 /// assigns them unconditionally; they are exported with `--export-dynamic`.
 pub const ALWAYS_DEFINED: &[&str] = &["_edata", "__bss_start", "_end"];
 
+/// The linker symbols a link defines even when nothing refers to them, as
+/// GNU ld does: its default scripts for executables assign `_edata`,
+/// `__bss_start` and `_end` outside `PROVIDE`, and its ELF backend defines
+/// `_DYNAMIC` whenever it creates dynamic sections. They are in `.symtab`
+/// (`_DYNAMIC` as a local), and in `.dynsym` only when exported.
+#[must_use]
+pub fn always_defined(mode: super::export::Mode, script: bool) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if mode.executable() && !script {
+        names.extend_from_slice(ALWAYS_DEFINED);
+    }
+    if mode.dynamic {
+        names.push("_DYNAMIC");
+    }
+    names
+}
+
 /// The linker-defined symbols of a link.
 #[derive(Debug, Default)]
 pub struct LinkerSymbols {
@@ -464,7 +481,15 @@ pub fn defsym_references(name: &str, expr: &str) -> Vec<Vec<u8>> {
 /// `STT_NOTYPE`.
 #[must_use]
 pub fn linker_type(refs: &super::refs::Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) -> u8 {
-    use crate::elf::read::consts::STT_NOTYPE;
+    use crate::elf::read::consts::{STT_NOTYPE, STT_OBJECT};
+    // GNU ld's ELF backend defines these as objects.
+    if linker
+        .entries
+        .iter()
+        .any(|(i, v)| *i == id && matches!(v, Value::GotBase | Value::Dynamic))
+    {
+        return STT_OBJECT;
+    }
     let mut id = id;
     // A chain of copies ends at an input's symbol; cycles stop.
     for _ in 0..8 {

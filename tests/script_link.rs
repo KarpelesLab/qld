@@ -1449,3 +1449,166 @@ fn defsym_syntax_errors_are_reported() {
     assert!(stderr.contains("--defsym"), "{stderr}");
     assert!(!stderr.contains("not implemented"), "{stderr}");
 }
+
+/// Position-independent executables through the script engine (an
+/// implicit script, `-Ttext`): the program headers outgrow GNU ld's first
+/// `SIZEOF_HEADERS` estimate, and layout runs again with the real size, as
+/// GNU ld's `ldelf_map_segments` does, instead of failing. The text
+/// addresses are GNU ld's. (The dynamic sections themselves differ from
+/// GNU ld's in size, which is not the script engine's doing.)
+#[test]
+fn pie_program_headers_outgrowing_the_estimate() {
+    require_tools!();
+    let dir = scratch("pie-headers");
+    assemble(
+        &dir,
+        "start",
+        "\t.text\n\t.globl _start\n_start:\n\tlea x_sym(%rip), %rax\n\tret\n",
+    );
+    fs::write(dir.join("extra.ld"), "x_sym = 1;\n").unwrap();
+    let gnu = comparable_gnu_ld();
+    for extra in ["extra.ld", "-Ttext=0x2000"] {
+        let mut args = vec!["-pie", "--dynamic-linker=/lib/ld.so", "start.o", extra];
+        if extra.starts_with("-T") {
+            args.push("--defsym=x_sym=1");
+        }
+        let mut qld_args = args.clone();
+        qld_args.extend(["-o", "qld.out"]);
+        let (ok, stderr) = qld_only(&dir, &qld_args);
+        assert!(ok, "{extra}: {stderr}");
+        let headers = stdout_ok(&dir, "readelf", &["-lW", "qld.out"]);
+        let count = headers
+            .lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                l.starts_with("LOAD")
+                    || l.starts_with("PHDR")
+                    || l.starts_with("GNU_")
+                    || l.starts_with("INTERP")
+                    || l.starts_with("DYNAMIC")
+                    || l.starts_with("NOTE")
+            })
+            .count();
+        let phdr = headers
+            .lines()
+            .find(|l| l.trim_start().starts_with("PHDR"))
+            .unwrap_or_else(|| panic!("{extra}: no PT_PHDR:\n{headers}"));
+        let size = phdr.split_whitespace().nth(4).unwrap_or_default();
+        assert_eq!(
+            u64::from_str_radix(size.trim_start_matches("0x"), 16).unwrap(),
+            56 * count as u64,
+            "{extra}: {headers}"
+        );
+        if let Some(ld) = &gnu {
+            let mut gnu_args = args.clone();
+            gnu_args.extend(["-o", "gnu.out"]);
+            assert!(run(&dir, ld, &gnu_args).status.success());
+            let text = |file: &str| {
+                stdout_ok(&dir, "readelf", &["-SW", file])
+                    .lines()
+                    .find(|l| l.contains(" .text "))
+                    .map(|l| {
+                        l.split(']')
+                            .nth(1)
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .nth(2)
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .unwrap_or_default()
+            };
+            assert_eq!(text("gnu.out"), text("qld.out"), "{extra}: .text address");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symbol table conventions: bindings, file symbols.
+// ---------------------------------------------------------------------------
+
+/// `.symtab` as sorted `name type binding visibility` lines, file symbols
+/// included (the unnamed one as `<none>`); values and section indexes
+/// differ between the linkers' layouts and are left out.
+fn symtab_lines(dir: &Path, file: &str) -> Vec<String> {
+    let text = stdout_ok(dir, "readelf", &["-sW", file]);
+    let mut out: Vec<String> = text
+        .lines()
+        .skip_while(|l| !l.contains("'.symtab'"))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 7 || !f[0].ends_with(':') || f[3] == "SECTION" || f[0] == "0:" {
+                return None;
+            }
+            Some(format!(
+                "{} {} {} {}",
+                f.get(7).copied().unwrap_or("<none>"),
+                f[3],
+                f[4],
+                f[5]
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// GNU ld keeps hidden symbols of input objects global in executables,
+/// makes them local in shared objects, always makes the hidden symbols it
+/// and linker scripts define local (without visibility, after an unnamed
+/// file symbol), adds a file symbol named after each input without one,
+/// and always defines `_edata`, `__bss_start` and `_end` in executables and
+/// `_DYNAMIC` in dynamic outputs.
+#[test]
+fn symbol_table_bindings_like_gnu_ld() {
+    require_tools!();
+    let Some(ld) = comparable_gnu_ld() else {
+        println!("SKIPPED: no GNU ld 2.44 or newer to compare against");
+        return;
+    };
+    let dir = scratch("symtab-bindings");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    assemble(
+        &dir,
+        "sub/x",
+        "\t.text\n\t.globl _start\n_start:\n\tlea hidden_fn(%rip), %rax\n\tlea __ehdr_start(%rip), %rax\n\tlea script_hidden(%rip), %rax\n\tcall local_fn\n\tret\nlocal_fn:\n\tret\n",
+    );
+    assemble(
+        &dir,
+        "y",
+        "\t.file \"y.c\"\n\t.text\n\t.globl hidden_fn\n\t.hidden hidden_fn\n\t.type hidden_fn, @function\nhidden_fn:\n\tret\n\t.size hidden_fn, 1\n\t.globl prot_fn\n\t.protected prot_fn\nprot_fn:\n\tret\n\t.data\n\t.globl hidden_data\n\t.hidden hidden_data\nhidden_data:\n\t.long 1\nylocal:\n\t.long 2\n",
+    );
+    fs::write(dir.join("hide.ld"), "HIDDEN(script_hidden = 0x10);\n").unwrap();
+    let cases: &[&[&str]] = &[
+        &["-static", "sub/x.o", "y.o", "hide.ld"],
+        &[
+            "-pie",
+            "--dynamic-linker=/lib/ld.so",
+            "sub/x.o",
+            "y.o",
+            "hide.ld",
+        ],
+        &["-shared", "sub/x.o", "y.o", "hide.ld"],
+        &["-r", "sub/x.o", "y.o"],
+    ];
+    for args in cases {
+        for (linker, out) in [(&ld, "gnu.out"), (&qld_path(), "qld.out")] {
+            let mut full = args.to_vec();
+            full.extend(["-o", out]);
+            let result = run(&dir, linker, &full);
+            assert!(
+                result.status.success(),
+                "{} {}: {}",
+                linker.display(),
+                full.join(" "),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        assert_eq!(
+            symtab_lines(&dir, "gnu.out"),
+            symtab_lines(&dir, "qld.out"),
+            "symbol tables differ for {}",
+            args.join(" ")
+        );
+    }
+}

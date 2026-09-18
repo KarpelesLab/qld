@@ -49,6 +49,7 @@ use hashbrown::hash_map::Entry;
 use rayon::prelude::*;
 
 use crate::args::{DiscardMode, LinkOptions, StripMode};
+use crate::elf::read::consts::STT_FILE;
 use crate::elf::read::consts::x86_64::R_X86_64_NONE;
 use crate::elf::read::consts::{
     ELFOSABI_GNU, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP, SHF_INFO_LINK,
@@ -369,7 +370,10 @@ enum Rewritten {
 struct FilePlan {
     /// Kept local symbol indices, ascending.
     locals: Vec<u32>,
-    /// Output symbol index of the first kept local.
+    /// The name of the `STT_FILE` symbol written before the locals of an
+    /// input that has none, as GNU ld does.
+    file_name: Option<Vec<u8>>,
+    /// Output symbol index of the first local (the file symbol, if any).
     base: u32,
     /// String table offset of the first kept local's name.
     names: u64,
@@ -891,10 +895,22 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         .collect();
     let mut next_symbol = add(1, outs.len() as u64)?;
     let mut names = 1u64;
-    for (plan, result) in file_plans.iter_mut().zip(kept_locals) {
-        let (locals, names_size) = result?;
+    for ((plan, result), file) in file_plans.iter_mut().zip(kept_locals).zip(files) {
+        let (locals, mut names_size) = result?;
+        plan.file_name = file
+            .object
+            .as_ref()
+            .filter(|o| !locals.is_empty() && !super::symtab::has_file_symbol(o))
+            .and_then(|_| super::symtab::file_symbol_name(file));
+        if let Some(name) = &plan.file_name {
+            names_size = add(names_size, add(name.len() as u64, 1)?)?;
+            next_symbol = add(next_symbol, 1)?;
+        }
         plan.base = u32::try_from(next_symbol)
             .map_err(|_| Error::Limit("more than 2^32 symbols".into()))?;
+        if plan.file_name.is_some() {
+            plan.base = plan.base.saturating_sub(1);
+        }
         plan.names = names;
         plan.names_size = names_size;
         next_symbol = add(next_symbol, locals.len() as u64)?;
@@ -1992,6 +2008,7 @@ fn local_index(plan: &Plan<'_>, file: usize, symbol: u32) -> u32 {
         Ok(at) => u32::try_from(at)
             .ok()
             .and_then(|at| file_plan.base.checked_add(at))
+            .and_then(|at| at.checked_add(u32::from(file_plan.file_name.is_some())))
             .unwrap_or(0),
         Err(_) => 0,
     }
@@ -2235,7 +2252,12 @@ fn split_symbols<'o>(
     let (first, mut rest) = out.split_at_mut(head.min(out.len()));
     let mut files = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
-        let len = file.locals.len().saturating_mul(width).min(rest.len());
+        let len = file
+            .locals
+            .len()
+            .saturating_add(usize::from(file.file_name.is_some()))
+            .saturating_mul(width)
+            .min(rest.len());
         let (this, tail) = std::mem::take(&mut rest).split_at_mut(len);
         files.push(this);
         rest = tail;
@@ -2279,7 +2301,16 @@ fn write_symtab<'a>(
             };
             let symbols = object.elf.symbols();
             let mut name = file_plan.names;
-            for (&index, entry) in file_plan.locals.iter().zip(out.as_chunks_mut::<24>().0) {
+            let mut entries = out.as_chunks_mut::<24>().0.iter_mut();
+            if let Some(file_name) = &file_plan.file_name
+                && let Some(entry) = entries.next()
+            {
+                put_sym(entry, name, (STB_LOCAL << 4) | STT_FILE, 0, SHN_ABS, 0, 0);
+                name = name
+                    .saturating_add(file_name.len() as u64)
+                    .saturating_add(1);
+            }
+            for (&index, entry) in file_plan.locals.iter().zip(entries) {
                 let Some(raw) = symbols.get_raw(index as usize) else {
                     continue;
                 };
@@ -2354,7 +2385,12 @@ fn write_shndx<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut 
                 return;
             };
             let symbols = object.elf.symbols();
-            for (&index, entry) in file_plan.locals.iter().zip(out.as_chunks_mut::<4>().0) {
+            let skip = usize::from(file_plan.file_name.is_some());
+            for (&index, entry) in file_plan
+                .locals
+                .iter()
+                .zip(out.as_chunks_mut::<4>().0.iter_mut().skip(skip))
+            {
                 let Some(raw) = symbols.get_raw(index as usize) else {
                     continue;
                 };
@@ -2411,6 +2447,9 @@ fn write_strtab<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut
             };
             let symbols = object.elf.symbols();
             let mut at = 0usize;
+            if let Some(file_name) = &file_plan.file_name {
+                at = put_bytes(out, at, file_name).saturating_add(1);
+            }
             for &index in &file_plan.locals {
                 let name = symbols
                     .get_raw(index as usize)

@@ -198,6 +198,9 @@ struct Engine<'e, 'l, 'a> {
     dataseg: DataSeg,
     fill_patterns: Vec<Vec<u8>>,
     headers_size: u64,
+    /// Whether `headers_size` is GNU ld's first estimate, which the caller
+    /// corrects by laying out again when the headers outgrow it.
+    headers_estimated: bool,
     max_page: u64,
     common_page: u64,
     /// `-z relro`, dropped as GNU ld does when no section with contents
@@ -1711,7 +1714,8 @@ pub fn layout<'a>(
 ) -> Result<Layout<'a>> {
     let layout = layout_with(input, script, placed, None)?;
     // GNU ld lays out again when the program headers outgrow the space
-    // SIZEOF_HEADERS estimated.
+    // SIZEOF_HEADERS estimated (`ldelf_map_segments`); the first layout
+    // then does not fail for lack of room.
     let needed = EHDR_SIZE.saturating_add(
         PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(u64::MAX)),
     );
@@ -1973,6 +1977,7 @@ fn layout_with<'a>(
         dataseg: DataSeg::default(),
         fill_patterns: Vec::new(),
         headers_size,
+        headers_estimated: headers_override.is_none(),
         max_page,
         common_page,
         relro: relro_effective,
@@ -2495,6 +2500,9 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         regions: &section_regions,
         load_phdrs: engine_used_sizeof_headers(script, placed),
         reserved_headers: engine.headers_size.max(EHDR_SIZE),
+        defer_room_error: engine.headers_estimated
+            && phdr_specs.is_none()
+            && engine_used_sizeof_headers(script, placed),
         relro,
         exec_stack: input.exec_stack,
         stack_note: input
