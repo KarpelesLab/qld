@@ -481,6 +481,20 @@ impl Arch {
         ))
     }
 
+    /// The ELF class and byte order of the output.
+    ///
+    /// Every encoder and decoder in the ELF backend is generic over the
+    /// matching [`ElfFormat`](crate::elf::read::ElfFormat), so the choice is
+    /// made once per link and the loops that follow never branch on it.
+    #[must_use]
+    pub fn kind(self) -> crate::elf::read::ElfKind {
+        match self {
+            Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
+                crate::elf::read::ElfKind::Elf64Le
+            }
+        }
+    }
+
     /// The `e_machine` of the output.
     #[must_use]
     pub fn machine(self) -> u16 {

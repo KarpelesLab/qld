@@ -672,7 +672,7 @@ fn link_inputs<'a>(
     lap("dynamic");
     options.check_cancelled()?;
 
-    let plan = narrow.run(|| symtab::plan(&refs, &linker, options));
+    let plan = narrow.run(|| symtab::plan(&refs, &linker, options, context.arch.kind()));
     let mut trailers = TrailerSizes {
         symtab: plan.symtab_size(),
         strtab: if plan.is_empty() {
@@ -721,7 +721,7 @@ fn link_inputs<'a>(
                 refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
             );
             let places = write::relr_addresses(&addresses, &context, &dynamic, &scan);
-            relr = write::encode_relr(&places);
+            relr = write::encode_relr(&places, context.arch.kind());
             let size = u64::try_from(relr.len())
                 .unwrap_or(u64::MAX)
                 .saturating_mul(8);

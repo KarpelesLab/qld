@@ -13,7 +13,7 @@
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
-use super::consts::{ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB};
+use super::consts::{ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, ELFMAG};
 use super::dynamic::DynEntry;
 use super::header::FileHeader;
 use super::reloc::Relocation;
@@ -35,6 +35,13 @@ pub trait Endian: Copy + Default + Debug + Eq + Send + Sync + 'static {
     fn u32(bytes: [u8; 4]) -> u32;
     /// Decodes a `u64`.
     fn u64(bytes: [u8; 8]) -> u64;
+
+    /// Encodes a `u16`.
+    fn put_u16(value: u16) -> [u8; 2];
+    /// Encodes a `u32`.
+    fn put_u32(value: u32) -> [u8; 4];
+    /// Encodes a `u64`.
+    fn put_u64(value: u64) -> [u8; 8];
 }
 
 /// Little-endian byte order.
@@ -61,6 +68,18 @@ impl Endian for Little {
     fn u64(bytes: [u8; 8]) -> u64 {
         u64::from_le_bytes(bytes)
     }
+    #[inline(always)]
+    fn put_u16(value: u16) -> [u8; 2] {
+        value.to_le_bytes()
+    }
+    #[inline(always)]
+    fn put_u32(value: u32) -> [u8; 4] {
+        value.to_le_bytes()
+    }
+    #[inline(always)]
+    fn put_u64(value: u64) -> [u8; 8] {
+        value.to_le_bytes()
+    }
 }
 
 impl Endian for Big {
@@ -78,6 +97,18 @@ impl Endian for Big {
     #[inline(always)]
     fn u64(bytes: [u8; 8]) -> u64 {
         u64::from_be_bytes(bytes)
+    }
+    #[inline(always)]
+    fn put_u16(value: u16) -> [u8; 2] {
+        value.to_be_bytes()
+    }
+    #[inline(always)]
+    fn put_u32(value: u32) -> [u8; 4] {
+        value.to_be_bytes()
+    }
+    #[inline(always)]
+    fn put_u64(value: u64) -> [u8; 8] {
+        value.to_be_bytes()
     }
 }
 
@@ -143,6 +174,21 @@ pub(crate) fn fixed_u64<E: Endian>(bytes: &[u8], offset: usize) -> u64 {
 #[inline(always)]
 pub(crate) fn fixed_u8(bytes: &[u8], offset: usize) -> u8 {
     bytes.get(offset).copied().unwrap_or(0)
+}
+
+/// Stores a fixed-size field at `offset`, and does nothing if it does not
+/// fit.
+///
+/// The records written here are of a size known at compile time, so the
+/// bounds check folds away exactly as it does in [`fixed_u16`].
+#[inline(always)]
+fn put<const N: usize>(bytes: &mut [u8], offset: usize, value: [u8; N]) {
+    if let Some(slot) = bytes
+        .get_mut(offset..)
+        .and_then(<[u8]>::first_chunk_mut::<N>)
+    {
+        *slot = value;
+    }
 }
 
 /// Reads a `u16` at `offset` of variable-length data.
@@ -226,6 +272,30 @@ pub trait ElfFormat: Copy + Default + Debug + Eq + Send + Sync + 'static {
     fn decode_chdr(raw: &Self::Chdr) -> CompressionHeader;
     /// Decodes an address-sized word.
     fn decode_word(raw: &Self::Word) -> u64;
+
+    /// Encodes an ELF header. `e_ident` past `EI_ABIVERSION` is zeroed, and
+    /// `e_ehsize`, `e_phentsize` and `e_shentsize` are taken from the class,
+    /// not from `header`.
+    fn encode_ehdr(header: &FileHeader) -> Self::Ehdr;
+    /// Encodes a section header.
+    fn encode_shdr(header: &SectionHeader) -> Self::Shdr;
+    /// Encodes a program header.
+    fn encode_phdr(header: &ProgramHeader) -> Self::Phdr;
+    /// Encodes a symbol table entry.
+    fn encode_sym(symbol: &RawSymbol) -> Self::Sym;
+    /// Encodes an `Elf_Rel` (the addend is dropped).
+    fn encode_rel(rel: &Relocation) -> Self::Rel;
+    /// Encodes an `Elf_Rela`.
+    fn encode_rela(rel: &Relocation) -> Self::Rela;
+    /// Encodes a dynamic entry.
+    fn encode_dyn(entry: &DynEntry) -> Self::Dyn;
+    /// Encodes a compression header.
+    fn encode_chdr(header: &CompressionHeader) -> Self::Chdr;
+    /// Encodes an address-sized word.
+    fn encode_word(value: u64) -> Self::Word;
+
+    /// Encodes the `r_info` field of a relocation.
+    fn r_info(symbol: u32, r_type: u32) -> u64;
 }
 
 /// The 64-bit ELF class with byte order `E`.
@@ -382,6 +452,116 @@ impl<E: Endian> ElfFormat for Elf64<E> {
     fn decode_word(b: &[u8; 8]) -> u64 {
         E::u64(*b)
     }
+
+    fn encode_ehdr(h: &FileHeader) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[..4].copy_from_slice(&ELFMAG);
+        b[4] = Self::CLASS;
+        b[5] = E::ELF_DATA;
+        b[6] = h.ident_version;
+        b[7] = h.os_abi;
+        b[8] = h.abi_version;
+        put(&mut b, 16, E::put_u16(h.e_type));
+        put(&mut b, 18, E::put_u16(h.e_machine));
+        put(&mut b, 20, E::put_u32(h.e_version));
+        put(&mut b, 24, E::put_u64(h.e_entry));
+        put(&mut b, 32, E::put_u64(h.e_phoff));
+        put(&mut b, 40, E::put_u64(h.e_shoff));
+        put(&mut b, 48, E::put_u32(h.e_flags));
+        put(&mut b, 52, E::put_u16(64));
+        put(&mut b, 54, E::put_u16(if h.e_phnum == 0 { 0 } else { 56 }));
+        put(&mut b, 56, E::put_u16(h.e_phnum));
+        put(&mut b, 58, E::put_u16(64));
+        put(&mut b, 60, E::put_u16(h.e_shnum));
+        put(&mut b, 62, E::put_u16(h.e_shstrndx));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_shdr(h: &SectionHeader) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        put(&mut b, 0, E::put_u32(h.sh_name));
+        put(&mut b, 4, E::put_u32(h.sh_type));
+        put(&mut b, 8, E::put_u64(h.sh_flags));
+        put(&mut b, 16, E::put_u64(h.sh_addr));
+        put(&mut b, 24, E::put_u64(h.sh_offset));
+        put(&mut b, 32, E::put_u64(h.sh_size));
+        put(&mut b, 40, E::put_u32(h.sh_link));
+        put(&mut b, 44, E::put_u32(h.sh_info));
+        put(&mut b, 48, E::put_u64(h.sh_addralign));
+        put(&mut b, 56, E::put_u64(h.sh_entsize));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_phdr(h: &ProgramHeader) -> [u8; 56] {
+        let mut b = [0u8; 56];
+        put(&mut b, 0, E::put_u32(h.p_type));
+        put(&mut b, 4, E::put_u32(h.p_flags));
+        put(&mut b, 8, E::put_u64(h.p_offset));
+        put(&mut b, 16, E::put_u64(h.p_vaddr));
+        put(&mut b, 24, E::put_u64(h.p_paddr));
+        put(&mut b, 32, E::put_u64(h.p_filesz));
+        put(&mut b, 40, E::put_u64(h.p_memsz));
+        put(&mut b, 48, E::put_u64(h.p_align));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_sym(s: &RawSymbol) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        put(&mut b, 0, E::put_u32(s.st_name));
+        b[4] = s.st_info;
+        b[5] = s.st_other;
+        put(&mut b, 6, E::put_u16(s.st_shndx));
+        put(&mut b, 8, E::put_u64(s.st_value));
+        put(&mut b, 16, E::put_u64(s.st_size));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_rel(r: &Relocation) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        put(&mut b, 0, E::put_u64(r.offset));
+        put(&mut b, 8, E::put_u64(Self::r_info(r.symbol, r.r_type)));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_rela(r: &Relocation) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        put(&mut b, 0, E::put_u64(r.offset));
+        put(&mut b, 8, E::put_u64(Self::r_info(r.symbol, r.r_type)));
+        put(&mut b, 16, E::put_u64(r.addend as u64));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_dyn(d: &DynEntry) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        put(&mut b, 0, E::put_u64(d.tag as u64));
+        put(&mut b, 8, E::put_u64(d.value));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_chdr(h: &CompressionHeader) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        put(&mut b, 0, E::put_u32(h.ch_type));
+        put(&mut b, 8, E::put_u64(h.ch_size));
+        put(&mut b, 16, E::put_u64(h.ch_addralign));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_word(value: u64) -> [u8; 8] {
+        E::put_u64(value)
+    }
+
+    #[inline(always)]
+    fn r_info(symbol: u32, r_type: u32) -> u64 {
+        (u64::from(symbol) << 32) | u64::from(r_type)
+    }
 }
 
 impl<E: Endian> ElfFormat for Elf32<E> {
@@ -510,19 +690,141 @@ impl<E: Endian> ElfFormat for Elf32<E> {
     fn decode_word(b: &[u8; 4]) -> u64 {
         u64::from(E::u32(*b))
     }
+
+    fn encode_ehdr(h: &FileHeader) -> [u8; 52] {
+        let mut b = [0u8; 52];
+        b[..4].copy_from_slice(&ELFMAG);
+        b[4] = Self::CLASS;
+        b[5] = E::ELF_DATA;
+        b[6] = h.ident_version;
+        b[7] = h.os_abi;
+        b[8] = h.abi_version;
+        put(&mut b, 16, E::put_u16(h.e_type));
+        put(&mut b, 18, E::put_u16(h.e_machine));
+        put(&mut b, 20, E::put_u32(h.e_version));
+        put(&mut b, 24, E::put_u32(h.e_entry as u32));
+        put(&mut b, 28, E::put_u32(h.e_phoff as u32));
+        put(&mut b, 32, E::put_u32(h.e_shoff as u32));
+        put(&mut b, 36, E::put_u32(h.e_flags));
+        put(&mut b, 40, E::put_u16(52));
+        put(&mut b, 42, E::put_u16(if h.e_phnum == 0 { 0 } else { 32 }));
+        put(&mut b, 44, E::put_u16(h.e_phnum));
+        put(&mut b, 46, E::put_u16(40));
+        put(&mut b, 48, E::put_u16(h.e_shnum));
+        put(&mut b, 50, E::put_u16(h.e_shstrndx));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_shdr(h: &SectionHeader) -> [u8; 40] {
+        let mut b = [0u8; 40];
+        put(&mut b, 0, E::put_u32(h.sh_name));
+        put(&mut b, 4, E::put_u32(h.sh_type));
+        put(&mut b, 8, E::put_u32(h.sh_flags as u32));
+        put(&mut b, 12, E::put_u32(h.sh_addr as u32));
+        put(&mut b, 16, E::put_u32(h.sh_offset as u32));
+        put(&mut b, 20, E::put_u32(h.sh_size as u32));
+        put(&mut b, 24, E::put_u32(h.sh_link));
+        put(&mut b, 28, E::put_u32(h.sh_info));
+        put(&mut b, 32, E::put_u32(h.sh_addralign as u32));
+        put(&mut b, 36, E::put_u32(h.sh_entsize as u32));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_phdr(h: &ProgramHeader) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        put(&mut b, 0, E::put_u32(h.p_type));
+        put(&mut b, 4, E::put_u32(h.p_offset as u32));
+        put(&mut b, 8, E::put_u32(h.p_vaddr as u32));
+        put(&mut b, 12, E::put_u32(h.p_paddr as u32));
+        put(&mut b, 16, E::put_u32(h.p_filesz as u32));
+        put(&mut b, 20, E::put_u32(h.p_memsz as u32));
+        put(&mut b, 24, E::put_u32(h.p_flags));
+        put(&mut b, 28, E::put_u32(h.p_align as u32));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_sym(s: &RawSymbol) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        put(&mut b, 0, E::put_u32(s.st_name));
+        put(&mut b, 4, E::put_u32(s.st_value as u32));
+        put(&mut b, 8, E::put_u32(s.st_size as u32));
+        b[12] = s.st_info;
+        b[13] = s.st_other;
+        put(&mut b, 14, E::put_u16(s.st_shndx));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_rel(r: &Relocation) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        put(&mut b, 0, E::put_u32(r.offset as u32));
+        put(
+            &mut b,
+            4,
+            E::put_u32(Self::r_info(r.symbol, r.r_type) as u32),
+        );
+        b
+    }
+
+    #[inline(always)]
+    fn encode_rela(r: &Relocation) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        put(&mut b, 0, E::put_u32(r.offset as u32));
+        put(
+            &mut b,
+            4,
+            E::put_u32(Self::r_info(r.symbol, r.r_type) as u32),
+        );
+        put(&mut b, 8, E::put_u32(r.addend as u32));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_dyn(d: &DynEntry) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        put(&mut b, 0, E::put_u32(d.tag as u32));
+        put(&mut b, 4, E::put_u32(d.value as u32));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_chdr(h: &CompressionHeader) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        put(&mut b, 0, E::put_u32(h.ch_type));
+        put(&mut b, 4, E::put_u32(h.ch_size as u32));
+        put(&mut b, 8, E::put_u32(h.ch_addralign as u32));
+        b
+    }
+
+    #[inline(always)]
+    fn encode_word(value: u64) -> [u8; 4] {
+        E::put_u32(value as u32)
+    }
+
+    #[inline(always)]
+    fn r_info(symbol: u32, r_type: u32) -> u64 {
+        u64::from(symbol.wrapping_shl(8) | (r_type & 0xff))
+    }
 }
 
 /// One of the four ELF class/byte-order combinations, known at run time.
 ///
 /// Use [`ElfKind::identify`] once per file, then dispatch to the generic
-/// readers with the matching [`ElfFormat`] type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// readers with the matching [`ElfFormat`] type. The default is
+/// [`Elf64Le`], the shape of every architecture qld linked before ELF32
+/// existed here; anything that writes an output sets it from
+/// [`Arch::kind`](crate::elf::arch::Arch::kind).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ElfKind {
     /// [`Elf32Le`].
     Elf32Le,
     /// [`Elf32Be`].
     Elf32Be,
     /// [`Elf64Le`].
+    #[default]
     Elf64Le,
     /// [`Elf64Be`].
     Elf64Be,
@@ -565,7 +867,99 @@ impl ElfKind {
             Self::Elf64Le | Self::Elf64Be => PointerWidth::Bits64,
         }
     }
+
+    /// Whether the class is 32-bit.
+    #[must_use]
+    #[inline]
+    pub fn is_32(self) -> bool {
+        matches!(self, Self::Elf32Le | Self::Elf32Be)
+    }
+
+    /// Size of an address, and of one `.got` or `.relr.dyn` entry.
+    #[must_use]
+    #[inline]
+    pub fn word_size(self) -> u64 {
+        if self.is_32() { 4 } else { 8 }
+    }
+
+    /// Size of the ELF header.
+    #[must_use]
+    #[inline]
+    pub fn ehdr_size(self) -> u64 {
+        if self.is_32() { 52 } else { 64 }
+    }
+
+    /// Size of one program header.
+    #[must_use]
+    #[inline]
+    pub fn phdr_size(self) -> u64 {
+        if self.is_32() { 32 } else { 56 }
+    }
+
+    /// Size of one section header.
+    #[must_use]
+    #[inline]
+    pub fn shdr_size(self) -> u64 {
+        if self.is_32() { 40 } else { 64 }
+    }
+
+    /// Size of one symbol table entry.
+    #[must_use]
+    #[inline]
+    pub fn sym_size(self) -> u64 {
+        if self.is_32() { 16 } else { 24 }
+    }
+
+    /// Size of one `Elf_Rel` entry.
+    #[must_use]
+    #[inline]
+    pub fn rel_size(self) -> u64 {
+        if self.is_32() { 8 } else { 16 }
+    }
+
+    /// Size of one `Elf_Rela` entry.
+    #[must_use]
+    #[inline]
+    pub fn rela_size(self) -> u64 {
+        if self.is_32() { 12 } else { 24 }
+    }
+
+    /// Size of one `.dynamic` entry.
+    #[must_use]
+    #[inline]
+    pub fn dyn_size(self) -> u64 {
+        if self.is_32() { 8 } else { 16 }
+    }
 }
+
+/// Runs `$body` with `$f` bound to the [`ElfFormat`] type of `$kind`.
+///
+/// The choice is made once, so the code inside is monomorphized and never
+/// branches on class or byte order.
+macro_rules! with_format {
+    ($kind:expr, |$f:ident| $body:block) => {{
+        use $crate::elf::read::{Elf32Be, Elf32Le, Elf64Be, Elf64Le, ElfKind};
+        match $kind {
+            ElfKind::Elf64Le => {
+                type $f = Elf64Le;
+                $body
+            }
+            ElfKind::Elf32Le => {
+                type $f = Elf32Le;
+                $body
+            }
+            ElfKind::Elf64Be => {
+                type $f = Elf64Be;
+                $body
+            }
+            ElfKind::Elf32Be => {
+                type $f = Elf32Be;
+                $body
+            }
+        }
+    }};
+}
+pub(crate) use with_format;
 
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)]
@@ -595,6 +989,142 @@ mod tests {
         be[8..].copy_from_slice(&(-8i32).to_be_bytes());
         let r = Elf32Be::decode_rela(&be);
         assert_eq!((r.offset, r.symbol, r.r_type, r.addend), (0x10, 5, 9, -8));
+    }
+
+    /// Every record encodes and decodes back to the same value, in both
+    /// classes and both byte orders.
+    fn round_trip<F: ElfFormat>(mask: u64) {
+        let header = FileHeader {
+            class: F::CLASS,
+            data: <F::Endian as Endian>::ELF_DATA,
+            ident_version: 1,
+            os_abi: 3,
+            abi_version: 0,
+            e_type: 3,
+            e_machine: 62,
+            e_version: 1,
+            e_entry: 0x1234_5678 & mask,
+            e_phoff: 0x40,
+            e_shoff: 0x9abc_def0 & mask,
+            e_flags: 0x55,
+            e_ehsize: u16::try_from(<F::Ehdr as RawRecord>::SIZE).unwrap(),
+            e_phentsize: u16::try_from(<F::Phdr as RawRecord>::SIZE).unwrap(),
+            e_phnum: 7,
+            e_shentsize: u16::try_from(<F::Shdr as RawRecord>::SIZE).unwrap(),
+            e_shnum: 11,
+            e_shstrndx: 10,
+        };
+        assert_eq!(F::decode_ehdr(&F::encode_ehdr(&header)), header);
+
+        let shdr = SectionHeader {
+            sh_name: 3,
+            sh_type: 1,
+            sh_flags: 0x6 & mask,
+            sh_addr: 0x1000 & mask,
+            sh_offset: 0x2000,
+            sh_size: 0x3000,
+            sh_link: 4,
+            sh_info: 5,
+            sh_addralign: 16,
+            sh_entsize: 24,
+        };
+        assert_eq!(F::decode_shdr(&F::encode_shdr(&shdr)), shdr);
+
+        let phdr = ProgramHeader {
+            p_type: 1,
+            p_flags: 5,
+            p_offset: 0x1000,
+            p_vaddr: 0x40_1000 & mask,
+            p_paddr: 0x40_1000 & mask,
+            p_filesz: 0x123,
+            p_memsz: 0x456,
+            p_align: 0x1000,
+        };
+        assert_eq!(F::decode_phdr(&F::encode_phdr(&phdr)), phdr);
+
+        let sym = RawSymbol {
+            st_name: 9,
+            st_info: 0x12,
+            st_other: 2,
+            st_shndx: 6,
+            st_value: 0xdead_beef & mask,
+            st_size: 0x40,
+        };
+        assert_eq!(F::decode_sym(&F::encode_sym(&sym)), sym);
+
+        // ELF32 has 24 bits of symbol index and 8 of type.
+        let (symbol, r_type) = if F::WORD_SIZE == 8 {
+            (0x0012_3456, 42)
+        } else {
+            (0x1234, 42)
+        };
+        let rela = Relocation {
+            offset: 0x2468 & mask,
+            symbol,
+            r_type,
+            addend: -12,
+        };
+        assert_eq!(F::decode_rela(&F::encode_rela(&rela)), rela);
+        let rel = Relocation { addend: 0, ..rela };
+        assert_eq!(F::decode_rel(&F::encode_rel(&rela)), rel);
+
+        let entry = DynEntry {
+            tag: 30,
+            value: 0x7fff_0000 & mask,
+        };
+        assert_eq!(F::decode_dyn(&F::encode_dyn(&entry)), entry);
+
+        let chdr = CompressionHeader {
+            ch_type: 1,
+            ch_size: 0x1_2345 & mask,
+            ch_addralign: 8,
+        };
+        assert_eq!(F::decode_chdr(&F::encode_chdr(&chdr)), chdr);
+
+        let word = 0x0123_4567_89ab_cdef & mask;
+        assert_eq!(F::decode_word(&F::encode_word(word)), word);
+    }
+
+    #[test]
+    fn records_round_trip() {
+        round_trip::<Elf64Le>(u64::MAX);
+        round_trip::<Elf64Be>(u64::MAX);
+        round_trip::<Elf32Le>(u64::from(u32::MAX));
+        round_trip::<Elf32Be>(u64::from(u32::MAX));
+    }
+
+    /// The encoders write the bytes the ABI puts at each offset.
+    #[test]
+    fn encodes_at_the_abi_offsets() {
+        let sym = RawSymbol {
+            st_name: 1,
+            st_info: 0x10,
+            st_other: 0,
+            st_shndx: 2,
+            st_value: 0x3040,
+            st_size: 8,
+        };
+        // Elf32_Sym reorders the fields: name, value, size, info, other,
+        // shndx.
+        let raw = Elf32Be::encode_sym(&sym);
+        assert_eq!(
+            raw,
+            [0, 0, 0, 1, 0, 0, 0x30, 0x40, 0, 0, 0, 8, 0x10, 0, 0, 2]
+        );
+
+        // Elf32_Phdr puts p_flags after p_memsz, not after p_type.
+        let phdr = ProgramHeader {
+            p_type: 1,
+            p_flags: 4,
+            p_offset: 0,
+            p_vaddr: 0,
+            p_paddr: 0,
+            p_filesz: 0,
+            p_memsz: 0,
+            p_align: 1,
+        };
+        let raw = Elf32Le::encode_phdr(&phdr);
+        assert_eq!(&raw[24..28], &4u32.to_le_bytes());
     }
 
     #[test]

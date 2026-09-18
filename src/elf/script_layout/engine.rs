@@ -25,8 +25,8 @@ use hashbrown::HashMap;
 use crate::args::MagicMode;
 use crate::diag::Diagnostic;
 use crate::elf::layout::{
-    CompressedOutput, EHDR_SIZE, Layout, LayoutInput, Member, OutSection, PHDR_SIZE, Placed,
-    Trailer, add_trailers, entsize_of, member_size, set_links, synthetic_flags,
+    CompressedOutput, Layout, LayoutInput, Member, OutSection, Placed, Trailer, add_trailers,
+    entsize_of, member_size, set_links, synthetic_flags,
 };
 use crate::elf::object::SectionKind;
 use crate::elf::read::consts::{SHF_ALLOC, SHF_TLS, SHF_WRITE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS};
@@ -1802,8 +1802,10 @@ pub fn layout<'a>(
     // GNU ld lays out again when the program headers outgrow the space
     // SIZEOF_HEADERS estimated (`ldelf_map_segments`); the first layout
     // then does not fail for lack of room.
-    let needed = EHDR_SIZE.saturating_add(
-        PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(u64::MAX)),
+    let kind = input.kind();
+    let needed = kind.ehdr_size().saturating_add(
+        kind.phdr_size()
+            .saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(u64::MAX)),
     );
     if script.phdrs.is_none()
         && engine_used_sizeof_headers(script, placed)
@@ -1936,7 +1938,12 @@ fn layout_with<'a>(
     } else if raw_output {
         0
     } else if let Some(phdrs) = &script.phdrs {
-        EHDR_SIZE.saturating_add(PHDR_SIZE.saturating_mul(u64::try_from(phdrs.len()).unwrap_or(0)))
+        input.kind().ehdr_size().saturating_add(
+            input
+                .kind()
+                .phdr_size()
+                .saturating_mul(u64::try_from(phdrs.len()).unwrap_or(0)),
+        )
     } else {
         let mut segs: u64 = 2;
         let synth_exists = |kind: Synthetic| {
@@ -1996,7 +2003,10 @@ fn layout_with<'a>(
         if tls {
             segs = segs.saturating_add(1);
         }
-        EHDR_SIZE.saturating_add(PHDR_SIZE.saturating_mul(segs))
+        input
+            .kind()
+            .ehdr_size()
+            .saturating_add(input.kind().phdr_size().saturating_mul(segs))
     };
 
     let mut regions: Vec<RegionState> = Vec::with_capacity(script.regions.len().saturating_add(1));
@@ -2585,7 +2595,8 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         section_phdrs: &section_phdrs,
         regions: &section_regions,
         load_phdrs: engine_used_sizeof_headers(script, placed),
-        reserved_headers: engine.headers_size.max(EHDR_SIZE),
+        kind: input.kind(),
+        reserved_headers: engine.headers_size.max(input.kind().ehdr_size()),
         defer_room_error: engine.headers_estimated
             && phdr_specs.is_none()
             && engine_used_sizeof_headers(script, placed),
@@ -2622,7 +2633,7 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
     let shnum = u64::try_from(out_sections.len().saturating_add(1)).unwrap_or(u64::MAX);
     let shoff = crate::elf::layout::align_up(file_end, 8)?;
     let file_size = shoff
-        .checked_add(shnum.saturating_mul(crate::elf::layout::SHDR_SIZE))
+        .checked_add(shnum.saturating_mul(input.kind().shdr_size()))
         .ok_or_else(|| Error::Limit("output larger than the address space".into()))?;
 
     // Per input section addresses.
@@ -2751,6 +2762,7 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
         .map(|w| Diagnostic::warning(w.clone()))
         .collect();
     Ok(Layout {
+        kind: input.kind(),
         sections: out_sections,
         // Script-driven layout does not insert range-extension thunks.
         thunks: Vec::new(),

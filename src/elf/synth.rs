@@ -561,6 +561,7 @@ impl Synth {
     pub fn size_align(&self, kind: Synthetic) -> (u64, u64) {
         let count = |list: &EntryList| u64_len(list.len());
         let dynamic = self.dynamic();
+        let word = self.arch.kind();
         match kind {
             Synthetic::None => (0, 1),
             Synthetic::BuildId => match self.build_id {
@@ -580,12 +581,15 @@ impl Synth {
                 .iter()
                 .find(|(k, ..)| *k == kind)
                 .map_or((0, 1), |&(_, size, align)| (size, align)),
-            Synthetic::RelaDyn => (self.rela_dyn_count().saturating_mul(24), 8),
+            Synthetic::RelaDyn => (
+                self.rela_dyn_count().saturating_mul(word.rela_size()),
+                word.word_size(),
+            ),
             Synthetic::RelrDyn => {
                 if self.relr_count() > 0 {
-                    (self.relr_size, 8)
+                    (self.relr_size, word.word_size())
                 } else {
-                    (0, 8)
+                    (0, word.word_size())
                 }
             }
             Synthetic::RelaPlt => {
@@ -596,7 +600,7 @@ impl Synth {
                 } else {
                     count(&self.iplt)
                 };
-                (entries.saturating_mul(24), 8)
+                (entries.saturating_mul(word.rela_size()), word.word_size())
             }
             Synthetic::Plt => {
                 let flags = self.plt_flags();
@@ -654,7 +658,10 @@ impl Synth {
                     .map_or(0, |n| u64::try_from(n.len()).unwrap_or(0)),
                 8,
             ),
-            Synthetic::Got => (self.got_words().saturating_mul(8), 8),
+            Synthetic::Got => (
+                self.got_words().saturating_mul(word.word_size()),
+                word.word_size(),
+            ),
             Synthetic::GotPlt => {
                 let slots = if dynamic {
                     self.plt_entries()
@@ -664,8 +671,8 @@ impl Synth {
                 (
                     slots
                         .saturating_add(self.got_plt_reserved)
-                        .saturating_mul(8),
-                    8,
+                        .saturating_mul(word.word_size()),
+                    word.word_size(),
                 )
             }
             Synthetic::DynBss => self.dynbss,

@@ -20,8 +20,11 @@ use rayon::prelude::*;
 use crate::args::LinkOptions;
 use crate::debug::tombstone::{DeadTarget, SectionTombstone, Tombstones};
 use crate::diag::{Collect, Diagnostic, DiagnosticSink, Severity};
-use crate::elf::read::Relocations;
 use crate::elf::read::consts::{ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR};
+use crate::elf::read::format::with_format;
+use crate::elf::read::{
+    ElfFormat, ElfKind, Endian, FileHeader, ProgramHeader, RawRecord, Relocations, SectionHeader,
+};
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::output::{ChunkRange, OutputFile};
@@ -34,7 +37,7 @@ use super::defined::LinkerSymbols;
 use super::dynsym::{self, DynamicPlan};
 use super::ehframe::EhSection;
 use super::export::PREEMPTIBLE;
-use super::layout::{EHDR_SIZE, Layout, Member, PHDR_SIZE, SHDR_SIZE, Trailer};
+use super::layout::{Layout, Member, Trailer};
 use super::object::SectionKind;
 use super::refs::Refs;
 use super::reloc::{self, Context, Dynamic};
@@ -189,8 +192,11 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
         .as_deref()
         .and_then(super::rawout::Format::from_name);
     let mut chunks: Vec<(ChunkRange, Chunk)> = Vec::new();
-    let headers = layout.phoff.max(EHDR_SIZE).saturating_add(
-        PHDR_SIZE.saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(0)),
+    let headers = layout.phoff.max(layout.kind.ehdr_size()).saturating_add(
+        layout
+            .kind
+            .phdr_size()
+            .saturating_mul(u64::try_from(layout.segments.len()).unwrap_or(0)),
     );
     chunks.push((ChunkRange::new(0, headers), Chunk::Headers));
     for (position, section) in layout.sections.iter().enumerate() {
@@ -291,7 +297,7 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     }
     let shnum = u64::try_from(layout.sections.len().saturating_add(1)).unwrap_or(0);
     chunks.push((
-        ChunkRange::new(layout.shoff, shnum.saturating_mul(SHDR_SIZE)),
+        ChunkRange::new(layout.shoff, shnum.saturating_mul(layout.kind.shdr_size())),
         Chunk::SectionHeaders,
     ));
     chunks.sort_by_key(|(range, _)| range.offset);
@@ -541,100 +547,118 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
 }
 
 fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+    with_format!(input.addresses.layout.kind, |F| {
+        write_headers_as::<F>(input, out)
+    })
+}
+
+fn write_headers_as<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     let layout = input.addresses.layout;
     let too_small = || Error::Internal("header chunk too small".into());
-    let header = out.get_mut(..64).ok_or_else(too_small)?;
-    header.fill(0);
-    header[..4].copy_from_slice(b"\x7fELF");
-    header[4] = 2; // ELFCLASS64
-    header[5] = 1; // ELFDATA2LSB
-    header[6] = 1; // EV_CURRENT
-    header[7] = if input.addresses.synth.iplt.is_empty() {
-        0
-    } else {
-        3
-    }; // ELFOSABI_GNU
+    let ehdr_size = usize::try_from(layout.kind.ehdr_size()).unwrap_or(64);
+    let header = out.get_mut(..ehdr_size).ok_or_else(too_small)?;
     let pic = input.addresses.synth.mode.is_some_and(|m| m.pic);
-    let e_type = if pic { ET_DYN } else { ET_EXEC };
-    header[16..18].copy_from_slice(&e_type.to_le_bytes());
-    header[18..20].copy_from_slice(&input.context.arch.machine().to_le_bytes());
-    header[20..24].copy_from_slice(&1u32.to_le_bytes());
-    header[24..32].copy_from_slice(&input.entry.to_le_bytes());
-    let e_flags = input.context.arch.output_flags(input.addresses.refs.files);
-    header[48..52].copy_from_slice(&e_flags.to_le_bytes());
     let phoff = if layout.segments.is_empty() {
         0
     } else {
         layout.phoff
     };
-    header[32..40].copy_from_slice(&phoff.to_le_bytes());
-    header[40..48].copy_from_slice(&layout.shoff.to_le_bytes());
-    header[52..54].copy_from_slice(&64u16.to_le_bytes());
-    let phentsize: u16 = if layout.segments.is_empty() { 0 } else { 56 };
-    header[54..56].copy_from_slice(&phentsize.to_le_bytes());
     let phnum = u16::try_from(layout.segments.len())
         .map_err(|_| Error::Limit("too many program headers".into()))?;
-    header[56..58].copy_from_slice(&phnum.to_le_bytes());
-    header[58..60].copy_from_slice(&64u16.to_le_bytes());
     let shnum = layout.sections.len().saturating_add(1);
     let (shnum_field, shstrndx) = match u16::try_from(shnum) {
         Ok(n) if n < 0xff00 => (n, u16::try_from(layout.sections.len()).unwrap_or(0)),
         _ => (0, 0xffff),
     };
-    header[60..62].copy_from_slice(&shnum_field.to_le_bytes());
-    header[62..64].copy_from_slice(&shstrndx.to_le_bytes());
+    let file_header = FileHeader {
+        class: F::CLASS,
+        data: <F::Endian as Endian>::ELF_DATA,
+        ident_version: 1, // EV_CURRENT
+        os_abi: if input.addresses.synth.iplt.is_empty() {
+            0
+        } else {
+            3 // ELFOSABI_GNU
+        },
+        abi_version: 0,
+        e_type: if pic { ET_DYN } else { ET_EXEC },
+        e_machine: input.context.arch.machine(),
+        e_version: 1,
+        e_entry: input.entry,
+        e_phoff: phoff,
+        e_shoff: layout.shoff,
+        e_flags: input.context.arch.output_flags(input.addresses.refs.files),
+        e_ehsize: 0,
+        e_phentsize: 0,
+        e_shentsize: 0,
+        e_phnum: phnum,
+        e_shnum: shnum_field,
+        e_shstrndx: shstrndx,
+    };
+    header.copy_from_slice(F::encode_ehdr(&file_header).as_bytes());
 
-    let table_start = usize::try_from(phoff.max(64).saturating_sub(0)).unwrap_or(64);
+    let table_start = usize::try_from(phoff.max(layout.kind.ehdr_size())).unwrap_or(ehdr_size);
     let phdrs = out.get_mut(table_start..).ok_or_else(too_small)?;
+    let size = <F::Phdr as RawRecord>::SIZE;
     for (segment, entry) in layout
         .segments
         .iter()
-        .zip(phdrs.as_chunks_mut::<56>().0.iter_mut())
+        .zip(phdrs.chunks_exact_mut(size.max(1)))
     {
-        entry[0..4].copy_from_slice(&segment.p_type.to_le_bytes());
-        entry[4..8].copy_from_slice(&segment.flags.to_le_bytes());
-        entry[8..16].copy_from_slice(&segment.offset.to_le_bytes());
-        entry[16..24].copy_from_slice(&segment.vaddr.to_le_bytes());
-        entry[24..32].copy_from_slice(&segment.paddr.unwrap_or(segment.vaddr).to_le_bytes());
-        entry[32..40].copy_from_slice(&segment.filesz.to_le_bytes());
-        entry[40..48].copy_from_slice(&segment.memsz.to_le_bytes());
-        entry[48..56].copy_from_slice(&segment.align.to_le_bytes());
+        let header = ProgramHeader {
+            p_type: segment.p_type,
+            p_flags: segment.flags,
+            p_offset: segment.offset,
+            p_vaddr: segment.vaddr,
+            p_paddr: segment.paddr.unwrap_or(segment.vaddr),
+            p_filesz: segment.filesz,
+            p_memsz: segment.memsz,
+            p_align: segment.align,
+        };
+        entry.copy_from_slice(F::encode_phdr(&header).as_bytes());
     }
     Ok(())
 }
 
 fn write_section_headers(layout: &Layout<'_>, out: &mut [u8]) -> Result<()> {
+    with_format!(layout.kind, |F| {
+        write_section_headers_as::<F>(layout, out)
+    })
+}
+
+fn write_section_headers_as<F: ElfFormat>(layout: &Layout<'_>, out: &mut [u8]) -> Result<()> {
     out.fill(0);
+    let size = <F::Shdr as RawRecord>::SIZE;
     let shnum = layout.sections.len().saturating_add(1);
-    if let Some(first) = out.get_mut(..64)
-        && u16::try_from(shnum).map_or(true, |n| n >= 0xff00)
+    if u16::try_from(shnum).map_or(true, |n| n >= 0xff00)
+        && let Some(first) = out.get_mut(..size)
     {
-        {
-            // Extended numbering: section 0 holds the count and the index.
-            first[32..40].copy_from_slice(&u64::try_from(shnum).unwrap_or(0).to_le_bytes());
-            first[40..44].copy_from_slice(
-                &u32::try_from(layout.sections.len())
-                    .unwrap_or(0)
-                    .to_le_bytes(),
-            );
-        }
+        // Extended numbering: section 0 holds the count and the index.
+        let header = SectionHeader {
+            sh_size: u64::try_from(shnum).unwrap_or(0),
+            sh_link: u32::try_from(layout.sections.len()).unwrap_or(0),
+            ..SectionHeader::default()
+        };
+        first.copy_from_slice(F::encode_shdr(&header).as_bytes());
     }
-    let entries = out.get_mut(64..).unwrap_or_default();
+    let entries = out.get_mut(size..).unwrap_or_default();
     for (section, entry) in layout
         .sections
         .iter()
-        .zip(entries.as_chunks_mut::<64>().0.iter_mut())
+        .zip(entries.chunks_exact_mut(size.max(1)))
     {
-        entry[0..4].copy_from_slice(&section.name_offset.to_le_bytes());
-        entry[4..8].copy_from_slice(&section.sh_type.to_le_bytes());
-        entry[8..16].copy_from_slice(&section.flags.to_le_bytes());
-        entry[16..24].copy_from_slice(&section.addr.to_le_bytes());
-        entry[24..32].copy_from_slice(&section.offset.to_le_bytes());
-        entry[32..40].copy_from_slice(&section.size.to_le_bytes());
-        entry[40..44].copy_from_slice(&section.link.to_le_bytes());
-        entry[44..48].copy_from_slice(&section.info.to_le_bytes());
-        entry[48..56].copy_from_slice(&section.align.to_le_bytes());
-        entry[56..64].copy_from_slice(&section.entsize.to_le_bytes());
+        let header = SectionHeader {
+            sh_name: section.name_offset,
+            sh_type: section.sh_type,
+            sh_flags: section.flags,
+            sh_addr: section.addr,
+            sh_offset: section.offset,
+            sh_size: section.size,
+            sh_link: section.link,
+            sh_info: section.info,
+            sh_addralign: section.align,
+            sh_entsize: section.entsize,
+        };
+        entry.copy_from_slice(F::encode_shdr(&header).as_bytes());
     }
     Ok(())
 }
@@ -646,6 +670,16 @@ fn copy_into(out: &mut [u8], bytes: &[u8]) {
 }
 
 fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u8]) -> Result<()> {
+    with_format!(input.addresses.layout.kind, |F| {
+        write_synthetic_as::<F>(input, kind, out)
+    })
+}
+
+fn write_synthetic_as<F: ElfFormat>(
+    input: &WriteInput<'_, '_, '_>,
+    kind: Synthetic,
+    out: &mut [u8],
+) -> Result<()> {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let plan = input.dynamic;
@@ -677,22 +711,26 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
                 .iter()
                 .zip(out.as_chunks_mut::<2>().0.iter_mut())
             {
-                *slot = value.to_le_bytes();
+                *slot = <F::Endian as Endian>::put_u16(*value);
             }
         }
-        Synthetic::DynSym => dynsym::write_dynsym(plan, addresses, out),
-        Synthetic::Dynamic => dynsym::write_dynamic(plan, addresses, out),
-        Synthetic::RelaDyn => write_rela_dyn(input, out)?,
+        Synthetic::DynSym => dynsym::write_dynsym::<F>(plan, addresses, out),
+        Synthetic::Dynamic => dynsym::write_dynamic::<F>(plan, addresses, out),
+        Synthetic::RelaDyn => write_rela_dyn::<F>(input, out)?,
         Synthetic::RelrDyn => {
             // Words past the encoding (the section keeps the size layout
             // planned) are empty bitmaps, which the dynamic linker skips.
             let mut words = input.relr.iter().copied();
-            for slot in out.as_chunks_mut::<8>().0.iter_mut() {
-                *slot = words.next().unwrap_or(1).to_le_bytes();
+            #[allow(
+                clippy::chunks_exact_to_as_chunks,
+                reason = "the size is an associated constant, not a literal"
+            )]
+            for slot in out.chunks_exact_mut(<F::Word as RawRecord>::SIZE.max(1)) {
+                slot.copy_from_slice(F::encode_word(words.next().unwrap_or(1)).as_bytes());
             }
         }
-        Synthetic::Got => write_got(input, out),
-        Synthetic::GotPlt => write_got_plt(input, out),
+        Synthetic::Got => write_got::<F>(input, out),
+        Synthetic::GotPlt => write_got_plt::<F>(input, out),
         Synthetic::Plt => write_plt(input, out)?,
         Synthetic::PltSec => {
             let arch = synth.arch;
@@ -740,9 +778,9 @@ fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u
                 .map_err(|_| Error::Internal("PLT GOT slot out of range".into()))?;
             }
         }
-        Synthetic::RelaPlt => write_rela_plt(input, out),
+        Synthetic::RelaPlt => write_rela_plt::<F>(input, out),
         Synthetic::EhFrameHdr => {
-            write_eh_frame_hdr(addresses, out);
+            write_eh_frame_hdr::<F>(addresses, out);
         }
     }
     Ok(())
@@ -768,7 +806,7 @@ fn symbol_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
     }
 }
 
-fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let Some((base, ..)) = addresses.layout.synthetic(Synthetic::Got) else {
@@ -776,12 +814,17 @@ fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     };
     let tls = addresses.layout.tls.unwrap_or_default();
     let mode = synth.mode;
-    let (words, _) = out.as_chunks_mut::<8>();
+    let size = <F::Word as RawRecord>::SIZE;
+    let size64 = u64::try_from(size).unwrap_or(8).max(1);
     let mut put = |address: u64, value: u64| {
-        let index = address.wrapping_sub(base) / 8;
-        if let Some(word) = usize::try_from(index).ok().and_then(|i| words.get_mut(i)) {
-            *word = value.to_le_bytes();
+        let start = address.wrapping_sub(base);
+        if let Some(word) = usize::try_from(start)
+            .ok()
+            .and_then(|s| out.get_mut(s..s.checked_add(size)?))
+        {
+            word.copy_from_slice(F::encode_word(value).as_bytes());
         }
+        let _ = size64;
     };
     let refs = &addresses.refs;
     // PowerPC64 keeps the TOC pointer's link-time value in the first word.
@@ -838,22 +881,22 @@ fn write_got(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     }
 }
 
-fn write_got_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
-    let (words, _) = out.as_chunks_mut::<8>();
+    let size = <F::Word as RawRecord>::SIZE.max(1);
     let reserved = usize::try_from(synth.got_plt_reserved).unwrap_or(0);
     if synth.dynamic() {
         if synth.arch.got_plt_holds_dynamic()
-            && let Some(first) = words.first_mut()
+            && let Some(first) = out.get_mut(..size)
         {
             let dynamic = addresses
                 .layout
                 .synthetic(Synthetic::Dynamic)
                 .map_or(0, |(addr, ..)| addr);
-            *first = dynamic.to_le_bytes();
+            first.copy_from_slice(F::encode_word(dynamic).as_bytes());
         }
-        let slots = words.iter_mut().skip(reserved);
+        let slots = out.chunks_exact_mut(size).skip(reserved);
         for (index, (owner, slot)) in synth
             .plt
             .iter()
@@ -872,16 +915,16 @@ fn write_got_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
                     .map_or(0, |(addr, ..)| addr);
                 synth.arch.lazy_slot_value(plt, lazy, synth.plt_flags())
             };
-            *slot = value.to_le_bytes();
+            slot.copy_from_slice(F::encode_word(value).as_bytes());
         }
         return;
     }
-    let slots = words.iter_mut().skip(reserved);
+    let slots = out.chunks_exact_mut(size).skip(reserved);
     for (owner, entry) in synth.iplt.iter().zip(slots) {
         // Filled by IRELATIVE at startup; hold the resolver address
         // meanwhile, as GNU ld does.
         let value = symbol_value(addresses, owner);
-        *entry = value.to_le_bytes();
+        entry.copy_from_slice(F::encode_word(value).as_bytes());
     }
 }
 
@@ -932,26 +975,34 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-fn put_rela(out: &mut [u8], offset: u64, symbol: u32, r_type: u32, addend: i64) {
-    let Some(entry) = out.first_chunk_mut::<24>() else {
+fn put_rela<F: ElfFormat>(out: &mut [u8], offset: u64, symbol: u32, r_type: u32, addend: i64) {
+    let Some(entry) = out.get_mut(..<F::Rela as RawRecord>::SIZE) else {
         return;
     };
-    let info = (u64::from(symbol) << 32) | u64::from(r_type);
-    entry[0..8].copy_from_slice(&offset.to_le_bytes());
-    entry[8..16].copy_from_slice(&info.to_le_bytes());
-    entry[16..24].copy_from_slice(&addend.to_le_bytes());
+    let rel = crate::elf::read::Relocation {
+        offset,
+        symbol,
+        r_type,
+        addend,
+    };
+    entry.copy_from_slice(F::encode_rela(&rel).as_bytes());
 }
 
-fn write_rela_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+fn write_rela_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let irelative = synth.arch.dyn_reloc(DynKind::Irelative);
-    let (entries, _) = out.as_chunks_mut::<24>();
+    let entry_size = <F::Rela as RawRecord>::SIZE.max(1);
     if !synth.dynamic() {
-        for (index, (owner, entry)) in synth.iplt.iter().zip(entries.iter_mut()).enumerate() {
+        for (index, (owner, entry)) in synth
+            .iplt
+            .iter()
+            .zip(out.chunks_exact_mut(entry_size))
+            .enumerate()
+        {
             let slot = addresses.igot_address(index).unwrap_or(0);
             let resolver = symbol_value(addresses, owner);
-            put_rela(entry, slot, 0, irelative, resolver as i64);
+            put_rela::<F>(entry, slot, 0, irelative, resolver as i64);
         }
         return;
     }
@@ -959,13 +1010,13 @@ fn write_rela_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
         .plt
         .iter()
         .chain(synth.iplt.iter())
-        .zip(entries.iter_mut())
+        .zip(out.chunks_exact_mut(entry_size))
         .enumerate()
     {
         let slot = addresses.igot_address(index).unwrap_or(0);
         match owner {
             Owner::Global(id) if synth.iplt.index(owner).is_none() => {
-                put_rela(
+                put_rela::<F>(
                     entry,
                     slot,
                     input.dynamic.index_of(id),
@@ -975,7 +1026,7 @@ fn write_rela_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
             }
             _ => {
                 let resolver = symbol_value(addresses, owner);
-                put_rela(entry, slot, 0, irelative, resolver as i64);
+                put_rela::<F>(entry, slot, 0, irelative, resolver as i64);
             }
         }
     }
@@ -1120,7 +1171,7 @@ fn collect_dyn_relocs(
     relocs
 }
 
-fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+fn write_rela_dyn<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
     let synth = input.addresses.synth;
     let mut relocs = collect_dyn_relocs(input.addresses, &input.context, input.dynamic, input.scan);
     if synth.relr {
@@ -1134,8 +1185,9 @@ fn write_rela_dyn(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> 
         )));
     }
     relocs.par_sort_unstable();
-    for (reloc, entry) in relocs.iter().zip(out.as_chunks_mut::<24>().0.iter_mut()) {
-        put_rela(
+    let entry_size = <F::Rela as RawRecord>::SIZE.max(1);
+    for (reloc, entry) in relocs.iter().zip(out.chunks_exact_mut(entry_size)) {
+        put_rela::<F>(
             entry,
             reloc.offset,
             reloc.symbol,
@@ -1167,29 +1219,32 @@ pub fn relr_addresses(
 /// Encodes sorted, even relocation addresses as `SHT_RELR` words: an
 /// address entry, then bitmaps of the following 63 words, repeatedly.
 #[must_use]
-pub fn encode_relr(places: &[u64]) -> Vec<u64> {
-    const BITS: u64 = 63;
+pub fn encode_relr(places: &[u64], kind: ElfKind) -> Vec<u64> {
+    let word = kind.word_size();
+    // One address bit, then one bitmap bit per following word.
+    let bits = word.saturating_mul(8).saturating_sub(1);
+    let span = bits.saturating_mul(word);
     let mut words = Vec::new();
     let mut i = 0usize;
     while let Some(&start) = places.get(i) {
         words.push(start);
-        let mut base = start.wrapping_add(8);
+        let mut base = start.wrapping_add(word);
         i = i.saturating_add(1);
         loop {
             let mut bitmap = 0u64;
             while let Some(&place) = places.get(i) {
                 let delta = place.wrapping_sub(base);
-                if place < base || delta >= BITS * 8 || delta % 8 != 0 {
+                if place < base || delta >= span || delta.checked_rem(word) != Some(0) {
                     break;
                 }
-                bitmap |= 1u64 << (delta / 8);
+                bitmap |= 1u64 << delta.checked_div(word).unwrap_or(0);
                 i = i.saturating_add(1);
             }
             if bitmap == 0 {
                 break;
             }
             words.push((bitmap << 1) | 1);
-            base = base.wrapping_add(BITS * 8);
+            base = base.wrapping_add(span);
         }
     }
     words
@@ -1305,7 +1360,7 @@ fn target_value(
     (s, a)
 }
 
-fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
+fn write_eh_frame_hdr<F: ElfFormat>(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
     let layout = addresses.layout;
     let Some((hdr, ..)) = layout.synthetic(Synthetic::EhFrameHdr) else {
         return;
@@ -1334,8 +1389,9 @@ fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
         }
     }
     table.sort_unstable();
-    let rel32 =
-        |value: u64, base: u64| -> [u8; 4] { (value.wrapping_sub(base) as i32).to_le_bytes() };
+    let rel32 = |value: u64, base: u64| -> [u8; 4] {
+        <F::Endian as Endian>::put_u32(value.wrapping_sub(base) as u32)
+    };
     let Some(head) = out.get_mut(..12) else {
         return;
     };
@@ -1344,7 +1400,9 @@ fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
     head[2] = 0x03; // DW_EH_PE_udata4
     head[3] = 0x3b; // DW_EH_PE_datarel | DW_EH_PE_sdata4
     head[4..8].copy_from_slice(&rel32(eh_frame, hdr.wrapping_add(4)));
-    head[8..12].copy_from_slice(&u32::try_from(table.len()).unwrap_or(0).to_le_bytes());
+    head[8..12].copy_from_slice(&<F::Endian as Endian>::put_u32(
+        u32::try_from(table.len()).unwrap_or(0),
+    ));
     let entries = out.get_mut(12..).unwrap_or_default();
     for ((location, fde), entry) in table.iter().zip(entries.as_chunks_mut::<8>().0.iter_mut()) {
         entry[0..4].copy_from_slice(&rel32(*location, hdr));
