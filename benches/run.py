@@ -14,7 +14,8 @@ For every spec and every (linker, thread count) configuration, each link
 is run N times (default 5). The configurations are interleaved run by run
 (run 1 of every configuration, then run 2, ...), so a change in machine
 load affects all of them alike. Before each run the previous output is
-deleted and the file system synced, outside the timing.
+deleted and the file system synced (not with --no-sync), outside the
+timing.
 
 Each run records wall time, the load average (1 minute) just before it,
 and, through wait4(), user+system CPU time and peak RSS of the linker
@@ -163,6 +164,8 @@ def main():
     p.add_argument("--hashes", help="with --determinism: compare with (or, if absent, write) this file")
     p.add_argument("--qld-args", default="")
     p.add_argument("--laps", action="store_true")
+    p.add_argument("--no-sync", action="store_true",
+                   help="do not sync the file system before each run (on a slow or shared disk)")
     p.add_argument("--perf", help="with --laps: perf binary, to count instructions")
     o = p.parse_args()
 
@@ -233,7 +236,8 @@ def main():
                     continue
                 out = out_of(c)
                 remove(out)
-                os.sync()
+                if not o.no_sync:
+                    os.sync()
                 r = run_one(argv_for(spec, c[0], linkers[c[0]], c[1], out, extra[c]), spec["cwd"], env)
                 if not r["ok"]:
                     cell["broken"] = "link failed: " + r["stderr"].strip().splitlines()[-1] if r["stderr"].strip() else "link failed"
@@ -250,7 +254,8 @@ def main():
             if c[0].startswith(FORKING):
                 for _ in range(o.rusage_runs):
                     remove(out)
-                    os.sync()
+                    if not o.no_sync:
+                        os.sync()
                     r = run_one(argv_for(spec, c[0], linkers[c[0]], c[1], out, ["--no-fork"]), spec["cwd"], env)
                     if r["ok"]:
                         cell["rusage"].append(r)
@@ -301,7 +306,8 @@ def laps(o, linkers, specs):
         for _ in range(o.runs):
             for c in configs:
                 remove(out)
-                os.sync()
+                if not o.no_sync:
+                    os.sync()
                 argv = argv_for(spec, c[0], linkers[c[0]], c[1], out, ["--no-fork", *shlex.split(o.qld_args)])
                 stat = os.path.join(o.outdir, "perf-stat.csv")
                 if o.perf:
