@@ -120,7 +120,7 @@ fn relocatable_output_to_memory() {
 fn raw_binary_output_to_memory() {
     let dir = scratch("raw");
     let mut options = in_memory_options(3);
-    options.output_format = Some("binary".into());
+    options.output_format = Some(qld::args::OutputFormat::Binary);
     options.output = Some(dir.join("image.bin"));
     let image = link_to_memory(&mut options).unwrap();
     assert!(!dir.join("image.bin").exists());
@@ -321,6 +321,107 @@ fn links_run_in_the_callers_pool_and_concurrently() {
             .collect()
     });
     assert!(images.iter().all(|image| *image == expected));
+}
+
+/// An input provider that records the size of the rayon pool the link is
+/// reading its inputs in.
+#[derive(Debug)]
+struct PoolSize {
+    files: MemoryFiles,
+    threads: AtomicUsize,
+}
+
+impl InputProvider for PoolSize {
+    fn read(&self, path: &Path) -> Option<Arc<[u8]>> {
+        self.threads
+            .store(rayon::current_num_threads(), Ordering::Relaxed);
+        self.files.read(path)
+    }
+}
+
+/// A pool the caller installed is the caller's to size: the driver runs in
+/// it as it is, however large, and creates no pool of its own. With
+/// `--threads` (`LinkOptions::threads`) the pool belongs to the link, and
+/// the driver may still narrow the stages that do not scale.
+#[test]
+fn a_large_caller_pool_is_used_as_it_is() {
+    // One more than the 16 threads the ELF driver would otherwise narrow to.
+    const THREADS: usize = 17;
+    let provider = Arc::new(PoolSize {
+        files: MemoryFiles::new()
+            .with("main.o", objects::main_object())
+            .with("answer.o", objects::answer_object(7)),
+        threads: AtomicUsize::new(0),
+    });
+    let mut options = LinkOptions::new();
+    options.kind = OutputKind::StaticExecutable;
+    options.input_provider = Some(provider.clone());
+    options.push_input(InputKind::File("main.o".into()), InputAttrs::default());
+    options.push_input(InputKind::File("answer.o".into()), InputAttrs::default());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(THREADS)
+        .build()
+        .unwrap();
+    let image = pool.install(|| link_to_memory(&mut options)).unwrap();
+    assert!(objects::entry_point(&image).is_some());
+    assert_eq!(provider.threads.load(Ordering::Relaxed), THREADS);
+}
+
+/// Nothing a link produces reaches the process's standard output on its
+/// own: `-M` goes where [`LinkOptions::map_output`] says, and a
+/// `LinkOptions` that never went through `use_process_defaults` names no
+/// destination at all.
+#[test]
+fn the_link_map_goes_to_a_caller_supplied_writer() {
+    use qld::args::TextOutput;
+
+    let mut options = in_memory_options(4);
+    options.print_map = true;
+    options.cref = true;
+    assert!(options.map_output.is_none(), "silent by default");
+    let map = Arc::new(std::sync::Mutex::new(String::new()));
+    let collected = Arc::clone(&map);
+    options.map_output = Some(TextOutput::new(move |text| {
+        collected.lock().unwrap().push_str(text);
+    }));
+    link_to_memory(&mut options).unwrap();
+    let text = map.lock().unwrap();
+    assert!(text.contains("VMA     Size Align Out"), "{text}");
+    assert!(text.contains("Cross Reference Table"), "{text}");
+    assert!(text.contains("main.o"), "{text}");
+}
+
+/// `use_process_defaults` is the only door to the environment and to the
+/// process's streams, and options that did not go through it have neither.
+#[test]
+fn process_defaults_are_opt_in() {
+    let hermetic = LinkOptions::new();
+    assert!(hermetic.map_output.is_none());
+    assert!(hermetic.timing.is_none());
+    assert!(hermetic.env_run_path.is_empty());
+    assert!(hermetic.env_library_path.is_empty());
+    assert!(!hermetic.zero_ar_date);
+    assert!(hermetic.output_backing.is_none());
+
+    let mut binary_like = LinkOptions::new();
+    binary_like.use_process_defaults();
+    assert!(binary_like.map_output.is_some());
+
+    // The GNU front end describes the link the `qld` binary runs, the
+    // hermetic one does not.
+    let argv = ["ld", "-o", "out", "a.o"];
+    let parsed = |outcome| match outcome {
+        Ok(qld::ParseOutcome::Link(options)) => options,
+        other => panic!("{other:?}"),
+    };
+    let hermetic = parsed(qld::parse_gnu_with(&argv, &|path: &Path| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("unexpected read of {}", path.display()),
+        ))
+    }));
+    assert!(hermetic.map_output.is_none());
+    assert!(parsed(qld::parse_gnu(&argv)).map_output.is_some());
 }
 
 #[test]

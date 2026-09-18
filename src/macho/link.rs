@@ -31,7 +31,10 @@
 use rayon::prelude::*;
 
 use crate::args::LinkOptions;
-use crate::args::darwin::{DarwinInputKind, PlatformVersion};
+use std::path::PathBuf;
+
+use crate::args::InputKind;
+use crate::args::darwin::PlatformVersion;
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
@@ -132,17 +135,29 @@ pub fn link_to_bytes(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) ->
     fat::assemble(slices.into_iter().collect::<Result<Vec<_>>>()?)
 }
 
+/// The bytes and display path of an input that names a file, for the
+/// header sniffing `infer_arch` and `infer_platform` do. `-l` libraries and
+/// frameworks are not searched here, as in ld64; in-memory inputs are read
+/// without touching the file system.
+fn named_file(options: &LinkOptions, kind: &InputKind) -> Option<(Vec<u8>, PathBuf)> {
+    match kind {
+        InputKind::File(path) => {
+            let data = inputs::read_input(options.input_provider.as_deref(), path).ok()?;
+            Some((data, path.clone()))
+        }
+        InputKind::Bytes { name, data } => Some((data.to_vec(), PathBuf::from(name))),
+        _ => None,
+    }
+}
+
 /// The architecture of the first object on the command line, for links
 /// without `-arch`.
 fn infer_arch(options: &LinkOptions) -> Result<Arch> {
-    for input in &options.darwin.inputs {
-        let DarwinInputKind::File(path) = &input.kind else {
+    for spec in &options.inputs {
+        let Some((data, path)) = named_file(options, &spec.kind) else {
             continue;
         };
-        let Ok(data) = inputs::read_input(options.input_provider.as_deref(), path) else {
-            continue;
-        };
-        if let Ok(file) = MachOFile::parse(&data, Source::new(path)) {
+        if let Ok(file) = MachOFile::parse(&data, Source::new(&path)) {
             return Ok(file.header().arch());
         }
     }
@@ -156,14 +171,11 @@ fn infer_platform(options: &LinkOptions, arch: Arch) -> Option<PlatformVersion> 
     if options.darwin.platform.is_some() {
         return None;
     }
-    for input in &options.darwin.inputs {
-        let DarwinInputKind::File(path) = &input.kind else {
+    for spec in &options.inputs {
+        let Some((data, path)) = named_file(options, &spec.kind) else {
             continue;
         };
-        let Ok(data) = inputs::read_input(options.input_provider.as_deref(), path) else {
-            continue;
-        };
-        let source = Source::new(path);
+        let source = Source::new(&path);
         let slice = if FatFile::is_fat(&data) {
             match FatFile::parse(&data, source)
                 .ok()
@@ -221,7 +233,12 @@ fn link_arch(
         }
         match link_arch_once(&options, arch, diagnostics, &generated, &selrefs)? {
             Attempt::Done(bytes) => return Ok(bytes),
-            Attempt::MoreInputs(more) => options.to_mut().darwin.inputs.extend(more),
+            Attempt::MoreInputs(more) => {
+                let options = options.to_mut();
+                for input in &more {
+                    input.push_onto(options);
+                }
+            }
             Attempt::Selectors(more) => {
                 selectors.extend(more);
                 selectors.sort();
@@ -241,7 +258,7 @@ fn link_arch(
 
 enum Attempt {
     Done(Vec<u8>),
-    MoreInputs(Vec<crate::args::darwin::DarwinInput>),
+    MoreInputs(Vec<inputs::DarwinInput>),
     Selectors(Vec<Vec<u8>>),
     SelRefs(Vec<Vec<u8>>),
 }

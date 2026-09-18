@@ -115,7 +115,8 @@ fn describe(addresses: &Addresses<'_, '_>, id: SectionId) -> String {
 }
 
 /// Writes the map requested by `-Map` or `-M`, followed by the `--cref`
-/// table when there is one (which goes to standard output without a map).
+/// table when there is one (which goes to [`LinkOptions::map_output`]
+/// without a map).
 ///
 /// # Errors
 ///
@@ -137,14 +138,14 @@ pub fn write(
         std::fs::write(path, &text).map_err(|e| Error::io(path, e))?;
     }
     if options.print_map {
-        print!("{text}");
+        options.print_text(&text);
     }
     Ok(())
 }
 
 /// Writes the `--cref` table alone: into the `-Map` file if one was named,
-/// otherwise to standard output. Used when no map is rendered (relocatable
-/// output, or no `-Map`/`-M`).
+/// otherwise to [`LinkOptions::map_output`]. Used when no map is rendered
+/// (relocatable output, or no `-Map`/`-M`).
 ///
 /// # Errors
 ///
@@ -156,7 +157,7 @@ pub fn write_cref(options: &LinkOptions, cref: Option<&str>) -> Result<()> {
     match &options.map_file {
         Some(path) => std::fs::write(path, cref).map_err(|e| Error::io(path, e)),
         None => {
-            print!("{cref}");
+            options.print_text(cref);
             Ok(())
         }
     }

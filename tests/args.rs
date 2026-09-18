@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 
 use qld::args::table::{self, ArgKind, GNU_OPTIONS, Status, Z_KEYWORDS, ZArg};
 use qld::args::{
-    BuildId, ColorChoice, DiscardMode, ExecStack, Flavor, HashStyle, InputAttrs, InputFormat,
-    InputKind, LinkOptions, MagicMode, OutputKind, ParseOutcome, SeparateCode, StripMode,
-    SymbolicMode, parse_gnu_with, select_flavor,
+    BuildId, ColorChoice, DebugCompression, DiscardMode, ExecStack, Flavor, HashStyle, IcfMode,
+    InputAttrs, InputFormat, InputKind, LinkOptions, MagicMode, OrphanHandling, OutputFormat,
+    OutputKind, ParseOutcome, SeparateCode, SortSection, StripMode, SymbolicMode, Visibility,
+    parse_gnu_with, select_flavor,
 };
 use qld::{Architecture, BinaryFormat, Endianness, Error, Target};
 
@@ -651,11 +652,11 @@ fn value_parsing() {
     assert_eq!(options.threads, None);
     assert_eq!(options.error_limit, Some(0));
     assert_eq!(options.exclude_libs, ["libfoo.a", "libbar.a", "ALL"]);
-    assert_eq!(options.icf.as_deref(), Some("safe"));
+    assert_eq!(options.icf, IcfMode::Safe);
 
     assert_eq!(link(&["--build-id", "a.o"]).build_id, BuildId::Sha1);
     assert_eq!(link(&["--build-id=none", "a.o"]).build_id, BuildId::None);
-    assert_eq!(link(&["--icf=all", "--icf=none", "a.o"]).icf, None);
+    assert_eq!(link(&["--icf=all", "--icf=none", "a.o"]).icf, IcfMode::None);
     assert_eq!(link(&["--thread-count", "3", "a.o"]).threads, Some(3));
     assert_eq!(link(&["--no-threads", "a.o"]).threads, Some(1));
     assert!(link(&["a.o"]).fork);
@@ -676,8 +677,129 @@ fn value_parsing() {
     );
     assert_eq!(
         link(&["--compress-debug-sections=none", "a.o"]).compress_debug_sections,
-        None
+        DebugCompression::None
     );
+    for (spelling, expected) in [
+        ("zlib", DebugCompression::Zlib),
+        ("zlib-gnu", DebugCompression::ZlibGnu),
+        ("zlib-gabi", DebugCompression::ZlibGabi),
+        ("zstd", DebugCompression::Zstd),
+    ] {
+        let argument = format!("--compress-debug-sections={spelling}");
+        assert_eq!(
+            link(&[&argument, "a.o"]).compress_debug_sections,
+            expected,
+            "{spelling}"
+        );
+        assert_eq!(expected.name(), spelling);
+    }
+}
+
+/// The options that used to be plain strings now parse into enums. Every
+/// spelling GNU ld accepts must still parse, and every value it rejects must
+/// still produce GNU ld's message.
+#[test]
+fn enum_valued_options_keep_their_spellings_and_errors() {
+    // --icf
+    for (value, expected) in [
+        ("none", IcfMode::None),
+        ("safe", IcfMode::Safe),
+        ("all", IcfMode::All),
+    ] {
+        let argument = format!("--icf={value}");
+        assert_eq!(link(&[&argument, "a.o"]).icf, expected, "{value}");
+    }
+    assert_eq!(
+        error(&["--icf=sometimes", "a.o"]),
+        "invalid value for --icf: sometimes"
+    );
+
+    // --orphan-handling
+    assert_eq!(link(&["a.o"]).orphan_handling, OrphanHandling::Place);
+    for (value, expected) in [
+        ("place", OrphanHandling::Place),
+        ("warn", OrphanHandling::Warn),
+        ("error", OrphanHandling::Error),
+        ("discard", OrphanHandling::Discard),
+    ] {
+        let argument = format!("--orphan-handling={value}");
+        assert_eq!(
+            link(&[&argument, "a.o"]).orphan_handling,
+            expected,
+            "{value}"
+        );
+    }
+    assert_eq!(
+        error(&["--orphan-handling=keep", "a.o"]),
+        "invalid value for --orphan-handling: keep"
+    );
+
+    // --sort-section
+    assert_eq!(link(&["a.o"]).sort_section, SortSection::None);
+    assert_eq!(
+        link(&["--sort-section=name", "a.o"]).sort_section,
+        SortSection::Name
+    );
+    assert_eq!(
+        link(&["--sort-section=alignment", "a.o"]).sort_section,
+        SortSection::Alignment
+    );
+    assert_eq!(
+        error(&["--sort-section=none", "a.o"]),
+        "invalid value for --sort-section: none"
+    );
+
+    // --compress-debug-sections
+    assert_eq!(
+        link(&["a.o"]).compress_debug_sections,
+        DebugCompression::None
+    );
+    assert_eq!(
+        error(&["--compress-debug-sections=lz4", "a.o"]),
+        "invalid value for --compress-debug-sections: lz4"
+    );
+
+    // -z start-stop-visibility, which is case-insensitive
+    assert_eq!(link(&["a.o"]).start_stop_visibility, None);
+    for (value, expected) in [
+        ("default", Visibility::Default),
+        ("internal", Visibility::Internal),
+        ("hidden", Visibility::Hidden),
+        ("protected", Visibility::Protected),
+        ("HIDDEN", Visibility::Hidden),
+    ] {
+        let keyword = format!("start-stop-visibility={value}");
+        assert_eq!(
+            link(&["-z", &keyword, "a.o"]).start_stop_visibility,
+            Some(expected),
+            "{value}"
+        );
+    }
+    assert_eq!(
+        error(&["-z", "start-stop-visibility=private", "a.o"]),
+        "invalid value for -z start-stop-visibility: private"
+    );
+
+    // --oformat: the three raw formats are variants, every other BFD name
+    // is kept as written for the format driver to check.
+    assert_eq!(link(&["a.o"]).output_format, None);
+    for (value, expected) in [
+        ("binary", OutputFormat::Binary),
+        ("ihex", OutputFormat::Ihex),
+        ("srec", OutputFormat::Srec),
+    ] {
+        let argument = format!("--oformat={value}");
+        let parsed = link(&[&argument, "a.o"]).output_format;
+        assert_eq!(parsed, Some(expected.clone()), "{value}");
+        assert_eq!(parsed.unwrap().name(), value);
+        assert!(expected.is_raw());
+    }
+    let bfd = link(&["--oformat=elf64-x86-64", "a.o"])
+        .output_format
+        .unwrap();
+    assert_eq!(bfd, OutputFormat::Bfd("elf64-x86-64".to_string()));
+    assert_eq!(bfd.name(), "elf64-x86-64");
+    assert!(!bfd.is_raw());
 }
 
 #[test]
@@ -1200,7 +1322,7 @@ fn linux_kernel() {
     assert_eq!(o.discard, DiscardMode::Locals);
     assert_eq!(o.strip, StripMode::Debug);
     assert_eq!(o.max_page_size, Some(0x20_0000));
-    assert_eq!(o.orphan_handling.as_deref(), Some("warn"));
+    assert_eq!(o.orphan_handling, OrphanHandling::Warn);
     assert_eq!(
         o.inputs[0].kind,
         InputKind::Script("./arch/x86/kernel/vmlinux.lds".into())
@@ -1226,7 +1348,7 @@ fn clang_lld_android_shared_library() {
     assert!(o.fatal_warnings);
     assert_eq!(o.no_undefined, Some(true));
     assert_eq!(o.soname.as_deref(), Some("libnative.so"));
-    assert_eq!(o.icf.as_deref(), Some("safe"));
+    assert_eq!(o.icf, IcfMode::Safe);
     assert_eq!(o.exclude_libs, ["libunwind.a", "libgcc.a"]);
     assert_eq!(
         o.search_paths,
@@ -1268,7 +1390,7 @@ fn mold_rust_release() {
     assert_eq!(o.hash_style, HashStyle::Both);
     assert_eq!(o.build_id, BuildId::Hex(vec![0xde, 0xad, 0xbe, 0xef]));
     assert!(o.gc_sections && o.print_gc_sections && o.pack_relative_relocs);
-    assert_eq!(o.icf.as_deref(), Some("all"));
+    assert_eq!(o.icf, IcfMode::All);
     assert_eq!(o.strip, StripMode::All);
     assert_eq!(o.separate_code, Some(SeparateCode::Loadable));
     assert_eq!(o.x86.isa_level, 3);

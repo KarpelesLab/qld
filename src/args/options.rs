@@ -275,9 +275,151 @@ pub enum ReportLevel {
     Error,
 }
 
-/// How the inputs that follow `-b` / `--format` are interpreted.
+/// `--icf=`: which identical sections are folded together.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IcfMode {
+    /// `--icf=none` (default): nothing is folded.
+    #[default]
+    None,
+    /// `--icf=safe`: fold only sections whose addresses cannot be observed.
+    Safe,
+    /// `--icf=all`: fold every identical section.
+    All,
+}
+
+/// `--orphan-handling=`: what happens to an input section that no output
+/// section description of a linker script claims.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OrphanHandling {
+    /// `place` (default): place it next to a section of the same kind.
+    #[default]
+    Place,
+    /// `warn`: place it and warn.
+    Warn,
+    /// `error`: report an error.
+    Error,
+    /// `discard`: drop it.
+    Discard,
+}
+
+/// `--sort-section=`: how the input sections of a wildcard are ordered.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortSection {
+    /// Not given (default): only the script's own `SORT_*` keywords sort.
+    #[default]
+    None,
+    /// `name`: sort by input section name.
+    Name,
+    /// `alignment`: sort by decreasing alignment.
+    Alignment,
+}
+
+/// `--compress-debug-sections=`: the compression applied to the output's
+/// `.debug_*` sections.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugCompression {
+    /// `none` (default): the debug sections are written uncompressed.
+    #[default]
+    None,
+    /// `zlib`: deflate, in the ELF gABI `SHF_COMPRESSED` form.
+    Zlib,
+    /// `zlib-gnu`: deflate, in the older `.zdebug_*` form.
+    ZlibGnu,
+    /// `zlib-gabi`: the same thing as `zlib`, spelled the way GNU ld spells
+    /// it.
+    ZlibGabi,
+    /// `zstd`: Zstandard, in the `SHF_COMPRESSED` form.
+    Zstd,
+}
+
+impl DebugCompression {
+    /// The spelling `--compress-debug-sections` takes.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Zlib => "zlib",
+            Self::ZlibGnu => "zlib-gnu",
+            Self::ZlibGabi => "zlib-gabi",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+/// An ELF symbol visibility, as `-z start-stop-visibility=` names one.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Visibility {
+    /// `default`: `STV_DEFAULT`.
+    #[default]
+    Default,
+    /// `internal`: `STV_INTERNAL`.
+    Internal,
+    /// `hidden`: `STV_HIDDEN`.
+    Hidden,
+    /// `protected`: `STV_PROTECTED`.
+    Protected,
+}
+
+/// `--oformat=`, or a script's `OUTPUT_FORMAT`: the BFD target name of the
+/// output.
+///
+/// The three raw formats have their own variants because the drivers act on
+/// them; every other BFD name, such as `elf64-x86-64`, is an
+/// [`OutputFormat::Bfd`], which the format driver checks against its own
+/// target.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// `binary`: the loadable image with no headers.
+    Binary,
+    /// `ihex`: Intel HEX text.
+    Ihex,
+    /// `srec`: Motorola S-records.
+    Srec,
+    /// A BFD target name, such as `elf64-x86-64` or `pei-x86-64`.
+    Bfd(String),
+}
+
+impl OutputFormat {
+    /// The format a BFD target name names. Unknown names become
+    /// [`OutputFormat::Bfd`]; the driver reports the ones it cannot write.
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "binary" => Self::Binary,
+            "ihex" => Self::Ihex,
+            "srec" => Self::Srec,
+            other => Self::Bfd(other.to_owned()),
+        }
+    }
+
+    /// The BFD target name, as it was written.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Binary => "binary",
+            Self::Ihex => "ihex",
+            Self::Srec => "srec",
+            Self::Bfd(name) => name,
+        }
+    }
+
+    /// Whether this is one of the raw formats, which carry no ELF headers
+    /// and no symbol table.
+    #[must_use]
+    pub fn is_raw(&self) -> bool {
+        !matches!(self, Self::Bfd(_))
+    }
+}
+
+/// How the inputs that follow `-b` / `--format` are interpreted.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InputFormat {
     /// Identify the format from the file contents (default).
     #[default]
@@ -289,9 +431,15 @@ pub enum InputFormat {
 
 /// Attributes that positional options attach to the input files that follow
 /// them on the command line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Build one with [`InputAttrs::default`] and set the fields you need: the
+/// struct is `#[non_exhaustive]`, because later milestones keep adding
+/// positional options.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct InputAttrs {
-    /// `--whole-archive` was in effect.
+    /// `--whole-archive` was in effect. On a Mach-O link this is
+    /// `-force_load`, which `-all_load` sets for every input.
     pub whole_archive: bool,
     /// `--as-needed` was in effect.
     pub as_needed: bool,
@@ -306,16 +454,28 @@ pub struct InputAttrs {
     pub lazy: bool,
     /// The `-b` / `--format` in effect.
     pub format: InputFormat,
+    /// How a Mach-O link loads this input (`-weak-l`, `-reexport_library`,
+    /// `-needed_framework`, `-hidden-l`). Other formats ignore it.
+    pub load: crate::args::darwin::LoadMode,
 }
 
 /// What an input entry refers to.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum InputKind {
     /// A file named directly on the command line.
     File(PathBuf),
     /// `-lfoo`: search for `libfoo.so` and `libfoo.a` in the search paths.
+    /// On a Mach-O link, `libfoo.tbd`, `libfoo.dylib` and `libfoo.a`.
     Library(String),
+    /// `-framework Foo[,suffix]`: `Foo.framework/Foo` in the framework
+    /// search paths. Mach-O links only.
+    Framework {
+        /// The framework name.
+        name: String,
+        /// The optional suffix (`-framework Foo,_debug`).
+        suffix: Option<String>,
+    },
     /// `-l:libfoo.a`: search for that exact file name.
     LibraryExact(String),
     /// `-T script`, or a script named as an input file.
@@ -358,6 +518,10 @@ impl InputKind {
 }
 
 /// One input, with the positional state that applied to it.
+///
+/// [`LinkOptions::push_input`] is how an input joins a link;
+/// [`InputSpec::new`] builds one on its own.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSpec {
     /// What the input is.
@@ -366,7 +530,22 @@ pub struct InputSpec {
     pub attrs: InputAttrs,
     /// Zero-based position on the command line. Used for precedence decisions
     /// and to order diagnostics deterministically.
+    ///
+    /// [`LinkOptions::push_input`] assigns it; setting it by hand only makes
+    /// sense for a spec that is not in a [`LinkOptions::inputs`] list.
     pub position: usize,
+}
+
+impl InputSpec {
+    /// One input at position 0, outside any input list.
+    #[must_use]
+    pub fn new(kind: InputKind, attrs: InputAttrs) -> Self {
+        Self {
+            kind,
+            attrs,
+            position: 0,
+        }
+    }
 }
 
 /// The PE/COFF options of GNU ld's MinGW emulations (`i386pep`, `i386pe`,
@@ -761,6 +940,121 @@ impl CancelToken {
     }
 }
 
+/// Receives text a link would otherwise print, set in
+/// [`LinkOptions::map_output`] and [`LinkOptions::timing`].
+///
+/// A link never writes to the process's standard output or standard error
+/// on its own: the two options above are the only text it produces outside
+/// its [`DiagnosticSink`](crate::DiagnosticSink), and both are `None` by
+/// default, which drops the text. [`LinkOptions::use_process_defaults`]
+/// sets them the way the `qld` binary does.
+///
+/// The callback may run on any thread, including a worker of the link's
+/// thread pool, and is called with whole lines or larger pieces.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+/// use qld::args::{LinkOptions, TextOutput};
+///
+/// let map = Arc::new(Mutex::new(String::new()));
+/// let collected = Arc::clone(&map);
+/// let mut options = LinkOptions::new();
+/// options.print_map = true;
+/// options.map_output = Some(TextOutput::new(move |text| {
+///     collected.lock().unwrap().push_str(text);
+/// }));
+/// ```
+#[derive(Clone)]
+pub struct TextOutput {
+    write: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    what: &'static str,
+}
+
+impl TextOutput {
+    /// Sends the text to `write`.
+    #[must_use]
+    pub fn new(write: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            write: std::sync::Arc::new(write),
+            what: "callback",
+        }
+    }
+
+    /// Sends the text to the process's standard output, as GNU ld does.
+    #[must_use]
+    pub fn stdout() -> Self {
+        Self {
+            write: std::sync::Arc::new(|text: &str| {
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(text.as_bytes());
+            }),
+            what: "stdout",
+        }
+    }
+
+    /// Sends the text to the process's standard error.
+    #[must_use]
+    pub fn stderr() -> Self {
+        Self {
+            write: std::sync::Arc::new(|text: &str| {
+                use std::io::Write as _;
+                let mut out = std::io::stderr().lock();
+                let _ = out.write_all(text.as_bytes());
+            }),
+            what: "stderr",
+        }
+    }
+
+    /// Writes `text`.
+    pub fn write(&self, text: &str) {
+        (self.write)(text);
+    }
+
+    /// Writes `text` followed by a newline.
+    pub fn write_line(&self, text: &str) {
+        (self.write)(&format!("{text}\n"));
+    }
+}
+
+impl std::fmt::Debug for TextOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TextOutput").field(&self.what).finish()
+    }
+}
+
+/// How the output image is held while the link writes it
+/// (`QLD_OUTPUT_BACKING`).
+///
+/// A benchmarking knob: every backing writes the same bytes. `None` in
+/// [`LinkOptions::output_backing`] lets the writer choose.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputBacking {
+    /// `mmap`: map the output file writable.
+    Mapped,
+    /// `write`: write the chunks with positional writes.
+    Written,
+    /// `memory`: build the image in a heap buffer and write it on commit.
+    Buffered,
+}
+
+impl OutputBacking {
+    /// Parses a `QLD_OUTPUT_BACKING` value. `auto` and unknown values give
+    /// `None`, which leaves the choice to the writer.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "mmap" | "mapped" => Some(Self::Mapped),
+            "write" | "written" | "pwrite" => Some(Self::Written),
+            "memory" | "buffer" | "buffered" => Some(Self::Buffered),
+            _ => None,
+        }
+    }
+}
+
 /// Everything a link is configured by.
 ///
 /// Construct one with [`LinkOptions::new`] and the builder methods, or parse
@@ -768,7 +1062,17 @@ impl CancelToken {
 ///
 /// Fields typed `Option<bool>` distinguish "not given" (`None`, meaning the
 /// target's or output kind's default applies) from an explicit choice.
-#[derive(Clone, Debug, Default)]
+///
+/// [`LinkOptions::default`] is [`LinkOptions::new`]: both describe the link
+/// GNU ld performs when the command line says nothing, so the ten options
+/// GNU ld has on by default (`-z relro`, `--demangle`, `--relax`, …) are on
+/// in both.
+///
+/// The struct is `#[non_exhaustive]`: qld adds fields as it implements more
+/// options, so build one with [`LinkOptions::new`] and assign the fields you
+/// need.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
 pub struct LinkOptions {
     /// Command-line dialect this was parsed from.
     pub flavor: Flavor,
@@ -779,8 +1083,8 @@ pub struct LinkOptions {
     pub endian: Option<Endianness>,
     /// Output path (`-o`). `None` means the flavor's default (`a.out`).
     pub output: Option<PathBuf>,
-    /// Output format name (`--oformat`), such as `binary` or `elf64-x86-64`.
-    pub output_format: Option<String>,
+    /// Output format (`--oformat`), such as `binary` or `elf64-x86-64`.
+    pub output_format: Option<OutputFormat>,
     /// What kind of output to produce.
     pub kind: OutputKind,
     /// Inputs, in command-line order.
@@ -834,9 +1138,8 @@ pub struct LinkOptions {
     pub gc_keep_exported: bool,
     /// `--why-live` symbol patterns.
     pub why_live: Vec<String>,
-    /// Identical code folding (`--icf`): `"all"` or `"safe"`. `None` means
-    /// no folding (`--icf=none`, the default).
-    pub icf: Option<String>,
+    /// Identical code folding (`--icf`).
+    pub icf: IcfMode,
     /// `--print-icf-sections`.
     pub print_icf_sections: bool,
     /// `--keep-unique` symbols, never folded by ICF.
@@ -931,9 +1234,9 @@ pub struct LinkOptions {
     pub dynamic_flags: DynamicFlags,
     /// `-z start-stop-gc` (`Some(true)`) / `-z nostart-stop-gc`.
     pub start_stop_gc: Option<bool>,
-    /// `-z start-stop-visibility=`: `default`, `internal`, `hidden` or
-    /// `protected`.
-    pub start_stop_visibility: Option<String>,
+    /// `-z start-stop-visibility=`. `None` when the keyword was not given,
+    /// which leaves the linker's own default.
+    pub start_stop_visibility: Option<Visibility>,
     /// `-z keep-text-section-prefix`.
     pub keep_text_section_prefix: bool,
     /// `-z dynamic-undefined-weak` (`Some(true)`) /
@@ -983,13 +1286,12 @@ pub struct LinkOptions {
     pub rodata_segment: Option<u64>,
     /// `-Tldata-segment`.
     pub ldata_segment: Option<u64>,
-    /// `--orphan-handling=`: `place`, `warn`, `error` or `discard`.
-    pub orphan_handling: Option<String>,
-    /// `--sort-section=`: `name` or `alignment`.
-    pub sort_section: Option<String>,
-    /// `--compress-debug-sections=`: `none`, `zlib`, `zlib-gnu`,
-    /// `zlib-gabi` or `zstd`.
-    pub compress_debug_sections: Option<String>,
+    /// `--orphan-handling=`.
+    pub orphan_handling: OrphanHandling,
+    /// `--sort-section=`.
+    pub sort_section: SortSection,
+    /// `--compress-debug-sections=`.
+    pub compress_debug_sections: DebugCompression,
     /// `--package-metadata=`: contents of `.note.package`.
     pub package_metadata: Option<String>,
     /// `--symbol-ordering-file`: order input sections by the symbols listed
@@ -1022,7 +1324,15 @@ pub struct LinkOptions {
     pub dependent_libraries: bool,
     /// Optimization level (`-O`).
     pub optimize: u8,
-    /// Thread count. `None` means one thread per available core.
+    /// Thread count (`--threads`). `Some(n)` runs the link in a pool of
+    /// `n` threads that [`crate::link`] creates for it.
+    ///
+    /// `None`, the default, leaves the choice to the format driver: the ELF
+    /// driver sizes a pool from the input (small links run faster on few
+    /// threads), at most 16 threads and at most the available parallelism.
+    /// Called inside a rayon pool of your own
+    /// ([`rayon::ThreadPool::install`]), a link with `None` runs in that
+    /// pool and creates none, however large it is.
     pub threads: Option<usize>,
     /// Write a link map to this path (`-Map`).
     pub map_file: Option<PathBuf>,
@@ -1088,6 +1398,33 @@ pub struct LinkOptions {
     /// Stop the link with an error once this token is cancelled; see
     /// [`CancelToken`]. `None` by default.
     pub cancel: Option<CancelToken>,
+    /// Receives the link map of `-M` / `--print-map`, and the `--cref`
+    /// table when no `-Map` file was named. `None` by default, which drops
+    /// that text: a library link writes nothing to the process's standard
+    /// output. See [`LinkOptions::use_process_defaults`].
+    pub map_output: Option<TextOutput>,
+    /// Receives one line per pipeline stage with the time it took, the way
+    /// `QLD_TIMING` asks the `qld` binary for. `None` by default, which
+    /// measures nothing. See [`LinkOptions::use_process_defaults`].
+    pub timing: Option<TextOutput>,
+    /// `LD_RUN_PATH`, split into directories: searched for the dependencies
+    /// of shared libraries when no `-rpath` was given, as GNU ld does.
+    /// Empty by default; a library link reads no environment of its own.
+    /// See [`LinkOptions::use_process_defaults`].
+    pub env_run_path: Vec<PathBuf>,
+    /// `LD_LIBRARY_PATH`, split into directories: searched for the
+    /// dependencies of shared libraries, as GNU ld does. Empty by default.
+    /// See [`LinkOptions::use_process_defaults`].
+    pub env_library_path: Vec<PathBuf>,
+    /// Record zero modification times in a Mach-O debug map, for
+    /// reproducible output; `ZERO_AR_DATE` in the environment asks ld64,
+    /// lld and the `qld` binary for it. Off by default. See
+    /// [`LinkOptions::use_process_defaults`].
+    pub zero_ar_date: bool,
+    /// How the output image is held while it is written. `None`, the
+    /// default, leaves the choice to the writer; `QLD_OUTPUT_BACKING` sets
+    /// it for the `qld` binary. See [`LinkOptions::use_process_defaults`].
+    pub output_backing: Option<OutputBacking>,
     /// Options that were recognized but have no effect yet, kept so that
     /// `--verbose` and tests can report them.
     pub ignored: Vec<OsString>,
@@ -1097,8 +1434,16 @@ pub struct LinkOptions {
     pub warnings: Vec<String>,
 }
 
+impl Default for LinkOptions {
+    /// Identical to [`LinkOptions::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinkOptions {
-    /// Creates options with every field at its default.
+    /// Creates the options of a link whose command line said nothing: every
+    /// field at the default GNU ld uses.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1113,7 +1458,218 @@ impl LinkOptions {
             relax_gp: false,
             dependent_libraries: true,
             fork: true,
-            ..Self::default()
+            ..Self::blank()
+        }
+    }
+
+    /// Every field at its own type's default, which is not the same thing:
+    /// the options GNU ld has on by default are off here. Only
+    /// [`LinkOptions::new`] uses it, and it is private so that no caller can
+    /// build the half-off options a derived `Default` would have given.
+    ///
+    /// A new field has to be listed here, which is where its default is
+    /// decided; add it to `new` above as well when GNU ld has it on.
+    fn blank() -> Self {
+        Self {
+            flavor: Default::default(),
+            target: Default::default(),
+            endian: Default::default(),
+            output: Default::default(),
+            output_format: Default::default(),
+            kind: Default::default(),
+            inputs: Default::default(),
+            search_paths: Default::default(),
+            nostdlib: Default::default(),
+            sysroot: Default::default(),
+            default_script: Default::default(),
+            entry: Default::default(),
+            soname: Default::default(),
+            dynamic_linker: Default::default(),
+            no_dynamic_linker: Default::default(),
+            rpaths: Default::default(),
+            rpath_links: Default::default(),
+            new_dtags: Default::default(),
+            undefined: Default::default(),
+            undefined_glob: Default::default(),
+            require_defined: Default::default(),
+            defsym: Default::default(),
+            wrap: Default::default(),
+            init: Default::default(),
+            fini: Default::default(),
+            auxiliary: Default::default(),
+            filter: Default::default(),
+            gc_sections: Default::default(),
+            print_gc_sections: Default::default(),
+            gc_keep_exported: Default::default(),
+            why_live: Default::default(),
+            icf: Default::default(),
+            print_icf_sections: Default::default(),
+            keep_unique: Default::default(),
+            ignore_data_address_equality: Default::default(),
+            ignore_function_address_equality: Default::default(),
+            strip: Default::default(),
+            discard: Default::default(),
+            retain_symbols_file: Default::default(),
+            build_id: Default::default(),
+            hash_style: Default::default(),
+            eh_frame_hdr: Default::default(),
+            export_dynamic: Default::default(),
+            export_dynamic_symbols: Default::default(),
+            export_dynamic_symbol_lists: Default::default(),
+            dynamic_lists: Default::default(),
+            exclude_libs: Default::default(),
+            version_scripts: Default::default(),
+            undefined_version: Default::default(),
+            default_symver: Default::default(),
+            symbolic: Default::default(),
+            no_undefined: Default::default(),
+            allow_shlib_undefined: Default::default(),
+            unresolved_symbols: Default::default(),
+            warn_unresolved_symbols: Default::default(),
+            ignore_unresolved_symbols: Default::default(),
+            allow_multiple_definition: Default::default(),
+            warn_common: Default::default(),
+            warn_backrefs: Default::default(),
+            warn_backrefs_exclude: Default::default(),
+            warn_textrel: Default::default(),
+            error_textrel: Default::default(),
+            bind_now: Default::default(),
+            relro: Default::default(),
+            separate_code: Default::default(),
+            rosegment: Default::default(),
+            exec_stack: Default::default(),
+            gnu_stack: Default::default(),
+            stack_size: Default::default(),
+            max_page_size: Default::default(),
+            common_page_size: Default::default(),
+            copy_relocs: Default::default(),
+            combine_relocs: Default::default(),
+            pack_relative_relocs: Default::default(),
+            apply_dynamic_relocs: Default::default(),
+            dynamic_flags: Default::default(),
+            start_stop_gc: Default::default(),
+            start_stop_visibility: Default::default(),
+            keep_text_section_prefix: Default::default(),
+            dynamic_undefined_weak: Default::default(),
+            extern_protected_data: Default::default(),
+            mark_plt: Default::default(),
+            section_header: Default::default(),
+            memory_seal: Default::default(),
+            dead_reloc_in_nonalloc: Default::default(),
+            x86: Default::default(),
+            fix_cortex_a53_843419: Default::default(),
+            aarch64: Default::default(),
+            spare_dynamic_tags: Default::default(),
+            emit_relocs: Default::default(),
+            define_common: Default::default(),
+            magic: Default::default(),
+            relax: Default::default(),
+            relax_gp: Default::default(),
+            image_base: Default::default(),
+            section_starts: Default::default(),
+            text_segment: Default::default(),
+            rodata_segment: Default::default(),
+            ldata_segment: Default::default(),
+            orphan_handling: Default::default(),
+            sort_section: Default::default(),
+            compress_debug_sections: Default::default(),
+            package_metadata: Default::default(),
+            symbol_ordering_file: Default::default(),
+            no_warn_symbol_ordering: Default::default(),
+            call_graph_profile_sort: Default::default(),
+            call_graph_ordering_file: Default::default(),
+            print_symbol_order: Default::default(),
+            gdb_index: Default::default(),
+            debug_names: Default::default(),
+            separate_debug_file: Default::default(),
+            dependency_file: Default::default(),
+            dependent_libraries: Default::default(),
+            optimize: Default::default(),
+            threads: Default::default(),
+            map_file: Default::default(),
+            print_map: Default::default(),
+            cref: Default::default(),
+            trace: Default::default(),
+            trace_symbols: Default::default(),
+            verbose: Default::default(),
+            demangle: Default::default(),
+            fatal_warnings: Default::default(),
+            no_warnings: Default::default(),
+            error_limit: Default::default(),
+            color: Default::default(),
+            noinhibit_exec: Default::default(),
+            pe: Default::default(),
+            darwin: Default::default(),
+            plugins: Default::default(),
+            plugin_save_temps: Default::default(),
+            exit_on_plugin_fatal: Default::default(),
+            fork: Default::default(),
+            on_output_complete: Default::default(),
+            input_provider: Default::default(),
+            output_buffer: Default::default(),
+            cancel: Default::default(),
+            map_output: Default::default(),
+            timing: Default::default(),
+            env_run_path: Default::default(),
+            env_library_path: Default::default(),
+            zero_ar_date: Default::default(),
+            output_backing: Default::default(),
+            ignored: Default::default(),
+            warnings: Default::default(),
+        }
+    }
+
+    /// Makes these options describe a link run the way the `qld` binary
+    /// runs one, by taking from the process what a library link must be
+    /// told explicitly.
+    ///
+    /// Nothing else in qld reads the environment or writes to standard
+    /// output or standard error, so a `LinkOptions` that never went through
+    /// this method describes a hermetic, silent link. [`parse_gnu`] and
+    /// [`parse_darwin`] call it, because they parse a command line the way
+    /// the binary does; [`parse_gnu_with`], [`parse_darwin_with`] and
+    /// [`LinkOptions::new`] do not.
+    ///
+    /// It sets:
+    ///
+    /// - [`map_output`](Self::map_output) to standard output, where GNU ld
+    ///   writes the map of `-M` and a `--cref` table with no `-Map` file;
+    /// - [`timing`](Self::timing) to standard error when `QLD_TIMING` is
+    ///   set in the environment;
+    /// - [`env_run_path`](Self::env_run_path) from `LD_RUN_PATH` and
+    ///   [`env_library_path`](Self::env_library_path) from
+    ///   `LD_LIBRARY_PATH`, which GNU ld also searches;
+    /// - [`zero_ar_date`](Self::zero_ar_date) from `ZERO_AR_DATE`, which
+    ///   ld64 and lld also read;
+    /// - [`output_backing`](Self::output_backing) from
+    ///   `QLD_OUTPUT_BACKING`, a benchmarking knob.
+    ///
+    /// [`parse_gnu`]: crate::args::parse_gnu
+    /// [`parse_darwin`]: crate::args::parse_darwin
+    /// [`parse_gnu_with`]: crate::args::parse_gnu_with
+    /// [`parse_darwin_with`]: crate::args::parse_darwin_with
+    pub fn use_process_defaults(&mut self) {
+        self.map_output = Some(TextOutput::stdout());
+        if std::env::var_os("QLD_TIMING").is_some() {
+            self.timing = Some(TextOutput::stderr());
+        }
+        if let Some(run_path) = std::env::var_os("LD_RUN_PATH") {
+            self.env_run_path = std::env::split_paths(&run_path).collect();
+        }
+        if let Some(library_path) = std::env::var_os("LD_LIBRARY_PATH") {
+            self.env_library_path = std::env::split_paths(&library_path).collect();
+        }
+        self.zero_ar_date =
+            std::env::var_os("ZERO_AR_DATE").is_some_and(|v| !v.is_empty() && v != "0");
+        self.output_backing = std::env::var("QLD_OUTPUT_BACKING")
+            .ok()
+            .and_then(|value| OutputBacking::from_name(value.trim()));
+    }
+
+    /// Writes `text` to [`map_output`](Self::map_output), if there is one.
+    pub(crate) fn print_text(&self, text: &str) {
+        if let Some(output) = &self.map_output {
+            output.write(text);
         }
     }
 
@@ -1248,6 +1804,28 @@ mod tests {
         assert!(options.relax);
         assert!(options.is_dynamic());
         assert!(!options.is_pic());
+    }
+
+    /// `Default` must not be a second, half-configured constructor: a
+    /// caller who writes `LinkOptions::default()` gets the same link as one
+    /// who writes `LinkOptions::new()`.
+    #[test]
+    fn default_is_new() {
+        assert_eq!(
+            format!("{:?}", LinkOptions::default()),
+            format!("{:?}", LinkOptions::new())
+        );
+        let options = LinkOptions::default();
+        assert!(options.relro);
+        assert!(options.demangle);
+        assert!(options.relax);
+        assert!(options.gnu_stack);
+        assert!(options.copy_relocs);
+        assert!(options.combine_relocs);
+        assert!(options.extern_protected_data);
+        assert!(options.section_header);
+        assert!(options.dependent_libraries);
+        assert!(options.fork);
     }
 
     #[test]

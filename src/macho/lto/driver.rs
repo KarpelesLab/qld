@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
 
+use crate::args::InputKind as ArgInputKind;
 use crate::args::LinkOptions;
-use crate::args::darwin::{DarwinInputKind, LoadMode};
+use crate::args::darwin::LoadMode;
 use crate::diag::{Collect, Diagnostic, DiagnosticSink, Severity};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
@@ -45,19 +46,11 @@ const SCOPE_DEFAULT: u32 = 0x0000_1800;
 /// one: the name LLVM gives the merged module.
 const FULL_LTO_NAME: &str = "ld-temp.o";
 
-/// Which command-line list an input is in, and where.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Spec {
-    /// `LinkOptions::inputs`.
-    Gnu(usize),
-    /// `DarwinArgs::inputs`.
-    Darwin(usize),
-}
-
 /// A command-line input, found.
 #[derive(Debug)]
 struct Candidate {
-    spec: Spec,
+    /// Index in [`LinkOptions::inputs`].
+    spec: usize,
     path: PathBuf,
     /// `-force_load` (or `-all_load`).
     force: bool,
@@ -74,33 +67,19 @@ fn candidates(options: &LinkOptions) -> Vec<Candidate> {
     let mut out = Vec::new();
     for (index, spec) in options.inputs.iter().enumerate() {
         let path = match &spec.kind {
-            crate::args::InputKind::File(path) => Some(path.clone()),
-            crate::args::InputKind::Library(name) => search.find_library(name),
+            ArgInputKind::File(path) => Some(path.clone()),
+            ArgInputKind::Library(name) => search.find_library(name),
+            ArgInputKind::Framework { name, suffix } => {
+                search.find_framework(name, suffix.as_deref())
+            }
             _ => None,
         };
         if let Some(path) = path {
             out.push(Candidate {
-                spec: Spec::Gnu(index),
+                spec: index,
                 path,
                 force: spec.attrs.whole_archive || all_load,
-                hidden: false,
-            });
-        }
-    }
-    for (index, input) in options.darwin.inputs.iter().enumerate() {
-        let path = match &input.kind {
-            DarwinInputKind::File(path) => Some(path.clone()),
-            DarwinInputKind::Library(name) => search.find_library(name),
-            DarwinInputKind::Framework { name, suffix } => {
-                search.find_framework(name, suffix.as_deref())
-            }
-        };
-        if let Some(path) = path {
-            out.push(Candidate {
-                spec: Spec::Darwin(index),
-                path,
-                force: input.force_load || all_load,
-                hidden: input.mode == LoadMode::Hidden,
+                hidden: spec.attrs.load == LoadMode::Hidden,
             });
         }
     }
@@ -493,7 +472,10 @@ fn resolve(
         if !config.is_relocatable() {
             let more = inputs::missing_linker_options(&options, &collected, &files, live);
             if !more.is_empty() {
-                options.to_mut().darwin.inputs.extend(more);
+                let options = options.to_mut();
+                for input in &more {
+                    input.push_onto(options);
+                }
                 continue;
             }
         }
@@ -810,28 +792,13 @@ pub(super) fn prepare<'o>(
 
     // The options without the replaced inputs.
     let mut without = options.clone();
-    let mut gnu = HashSet::new();
-    let mut darwin = HashSet::new();
-    for item in &replaced {
-        match candidates.get(item.candidate).map(|c| c.spec) {
-            Some(Spec::Gnu(index)) => {
-                gnu.insert(index);
-            }
-            Some(Spec::Darwin(index)) => {
-                darwin.insert(index);
-            }
-            None => {}
-        }
-    }
+    let replaced_inputs: HashSet<usize> = replaced
+        .iter()
+        .filter_map(|item| candidates.get(item.candidate).map(|c| c.spec))
+        .collect();
     let mut index = 0usize;
     without.inputs.retain(|_| {
-        let keep = !gnu.contains(&index);
-        index = index.saturating_add(1);
-        keep
-    });
-    let mut index = 0usize;
-    without.darwin.inputs.retain(|_| {
-        let keep = !darwin.contains(&index);
+        let keep = !replaced_inputs.contains(&index);
         index = index.saturating_add(1);
         keep
     });

@@ -558,13 +558,10 @@ fn library_search_on_disk() {
         naming: LibraryNaming::Elf,
         fs: &RealFileSystem,
     };
-    let spec = |kind, static_only| InputSpec {
-        kind,
-        attrs: InputAttrs {
-            static_only,
-            ..InputAttrs::default()
-        },
-        position: 0,
+    let spec = |kind, static_only| {
+        let mut attrs = InputAttrs::default();
+        attrs.static_only = static_only;
+        InputSpec::new(kind, attrs)
     };
     let resolve = |kind, static_only| match context.resolve(&spec(kind, static_only)) {
         Ok(Source::Path(path)) => Some(path),

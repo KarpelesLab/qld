@@ -506,14 +506,10 @@ fn dependency_dirs(options: &LinkOptions) -> Vec<PathBuf> {
         .map(|p| options.resolve_sysroot(p))
         .collect();
     dirs.extend(options.rpaths.iter().cloned());
-    if options.rpaths.is_empty()
-        && let Some(run_path) = std::env::var_os("LD_RUN_PATH")
-    {
-        dirs.extend(std::env::split_paths(&run_path));
+    if options.rpaths.is_empty() {
+        dirs.extend(options.env_run_path.iter().cloned());
     }
-    if let Some(library_path) = std::env::var_os("LD_LIBRARY_PATH") {
-        dirs.extend(std::env::split_paths(&library_path));
-    }
+    dirs.extend(options.env_library_path.iter().cloned());
     for default in ["/lib64", "/usr/lib64", "/lib", "/usr/lib"] {
         dirs.push(options.resolve_sysroot(Path::new(&format!("={default}"))));
     }
