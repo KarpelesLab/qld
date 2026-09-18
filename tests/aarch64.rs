@@ -959,27 +959,249 @@ fn emulation_selects_the_backend() {
     );
 }
 
-/// The Cortex-A53 erratum workaround is not implemented, and says so.
+/// The instruction words of `file` (`objdump -d`), by address.
+fn words_by_address(tools: &Tools, dir: &Path, file: &str) -> BTreeMap<u64, u32> {
+    let text = run_ok(dir, &tools.objdump, &["-d", file]);
+    text.lines()
+        .filter_map(|line| {
+            let (address, rest) = line.trim_start().split_once(":\t")?;
+            let address = u64::from_str_radix(address, 16).ok()?;
+            let word = u32::from_str_radix(rest.split('\t').next()?.trim(), 16).ok()?;
+            Some((address, word))
+        })
+        .collect()
+}
+
+/// The address of symbol `name` in `file`.
+fn symbol_address(tools: &Tools, dir: &Path, file: &str, name: &str) -> u64 {
+    let symbols = run_ok(dir, &tools.readelf, &["-sW", file]);
+    symbols
+        .lines()
+        .find(|l| l.ends_with(&format!(" {name}")))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| u64::from_str_radix(v, 16).ok())
+        .unwrap_or_else(|| panic!("no {name} in {file}"))
+}
+
+fn is_b(word: u32) -> bool {
+    word >> 26 == 0b00_0101
+}
+
+fn b_target(at: u64, word: u32) -> u64 {
+    let offset = i64::from(((word & 0x03ff_ffff) << 6).cast_signed() >> 6) * 4;
+    at.wrapping_add_signed(offset)
+}
+
+/// The offsets from `_start` of the instructions of `object`'s `.text` that
+/// `linked` replaced with a branch to an erratum patch.
+fn patched_sites(tools: &Tools, dir: &Path, object: &str, linked: &str) -> Vec<u64> {
+    let original = words_by_address(tools, dir, object);
+    let words = words_by_address(tools, dir, linked);
+    let start = symbol_address(tools, dir, linked, "_start");
+    original
+        .iter()
+        .filter(|&(&offset, &word)| {
+            !is_b(word) && words.get(&(start + offset)).is_some_and(|&w| is_b(w))
+        })
+        .map(|(&offset, _)| offset)
+        .collect()
+}
+
+/// Checks that every patch of `linked` holds the instruction it replaced
+/// (only a relocated immediate may differ) and branches back after it.
+fn assert_patches_return(tools: &Tools, dir: &Path, object: &str, linked: &str, sites: &[u64]) {
+    let original = words_by_address(tools, dir, object);
+    let words = words_by_address(tools, dir, linked);
+    let start = symbol_address(tools, dir, linked, "_start");
+    for &offset in sites {
+        let site = start + offset;
+        let patch = b_target(site, words[&site]);
+        let moved = words[&patch];
+        let imm12 = 0xfff << 10;
+        assert_eq!(
+            moved & !imm12,
+            original[&offset] & !imm12,
+            "patch at {patch:#x}"
+        );
+        let back = words[&(patch + 4)];
+        assert!(is_b(back), "patch at {patch:#x} does not end in a branch");
+        assert_eq!(b_target(patch + 4, back), site + 4, "patch at {patch:#x}");
+    }
+}
+
+/// Code whose `adrp` lands at page offsets `0xff8`/`0xffc`: every page of
+/// `.text` (aligned to 4 KiB) ends with one candidate sequence.
+fn page_end_sequences(sequences: &[(u32, &[&str])]) -> String {
+    let mut source = String::from(
+        "\t.text\n\t.global _start\n\t.type _start, %function\n_start:\n\tret\n\t.balign 4096\n",
+    );
+    for (page_offset, body) in sequences {
+        source.push_str(&format!("\t.rept {}\n\tnop\n\t.endr\n", page_offset / 4));
+        for line in *body {
+            source.push_str(&format!("\t{line}\n"));
+        }
+        source.push_str("1:\n\t.balign 4096\n");
+    }
+    source.push_str("\t.section .rodata\n\t.balign 8\ntarget_qld:\n\t.xword 0\n");
+    source
+}
+
+/// `--fix-cortex-a53-843419` patches the sequences lld patches, and only
+/// those; the patch runs the moved instruction and returns.
 #[test]
-fn cortex_a53_erratum_is_reported_as_unimplemented() {
+fn cortex_a53_843419_matches_lld() {
     let tools = require!();
-    let dir = scratch("cortex-a53");
+    let dir = scratch("cortex-a53-843419");
+    let sequences: [(u32, &[&str]); 8] = [
+        // Three instructions from 0xff8: patched.
+        (
+            0xff8,
+            &["adrp x0, target_qld", "ldr x1, [x2]", "ldr x3, [x0, #8]"],
+        ),
+        // Four from 0xffc, with a relocated last access: patched.
+        (
+            0xffc,
+            &[
+                "adrp x0, target_qld",
+                "stp x1, x2, [sp]",
+                "add x5, x6, x7",
+                "str w3, [x0, :lo12:target_qld]",
+            ],
+        ),
+        // The second instruction writes the `adrp` register: safe.
+        (
+            0xff8,
+            &["adrp x0, target_qld", "ldr x0, [x2]", "ldr x3, [x0]"],
+        ),
+        // A branch in third place ends the sequence.
+        (
+            0xff8,
+            &[
+                "adrp x0, target_qld",
+                "str x1, [x2]",
+                "b 1f",
+                "ldr x3, [x0]",
+            ],
+        ),
+        // Not at the end of a page.
+        (
+            0xff0,
+            &["adrp x0, target_qld", "str x1, [x2]", "ldr x3, [x0]"],
+        ),
+        // Another base register.
+        (
+            0xffc,
+            &["adrp x0, target_qld", "str x1, [x2]", "ldr x3, [x1]"],
+        ),
+        // Store exclusive, then a vector load: patched.
+        (
+            0xffc,
+            &[
+                "adrp x4, target_qld",
+                "stxr w5, x1, [x2]",
+                "ldr q3, [x4, #16]",
+            ],
+        ),
+        // Writeback of the base register: safe.
+        (
+            0xff8,
+            &["adrp x0, target_qld", "ldr x1, [x0, #8]!", "ldr x3, [x0]"],
+        ),
+    ];
+    compile(&tools, &dir, "seq", &page_end_sequences(&sequences), &[]);
+    let args = ["--fix-cortex-a53-843419", "seq.o", "-e", "_start"];
+    qld_ok(&dir, &[&["-o", "fixed"][..], &args[..]].concat());
+    let sites = patched_sites(&tools, &dir, "seq.o", "fixed");
+    // The first, second and seventh sequences. A sequence that runs past
+    // its page takes two pages: they start on pages 1, 3 and 12 (the page
+    // of `_start` is page 0).
+    assert_eq!(
+        sites,
+        [0x1000 + 0xff8 + 8, 0x3000 + 0xffc + 12, 0xc000 + 0xffc + 8]
+    );
+    assert_patches_return(&tools, &dir, "seq.o", "fixed", &sites);
+    // The relocated `str` in the patch stores to `target_qld`.
+    let words = words_by_address(&tools, &dir, "fixed");
+    let start = symbol_address(&tools, &dir, "fixed", "_start");
+    let site = start + sites[1];
+    let moved = words[&b_target(site, words[&site])];
+    let target = symbol_address(&tools, &dir, "fixed", "target_qld");
+    assert_eq!(u64::from((moved >> 10) & 0xfff), (target & 0xfff) >> 2);
+    // Without the option, nothing moves.
+    qld_ok(&dir, &[&["-o", "plain"][..], &args[1..]].concat());
+    assert!(patched_sites(&tools, &dir, "seq.o", "plain").is_empty());
+    if let Some(lld) = lld() {
+        run_ok(&dir, &lld, &[&["-o", "lld"][..], &args[..]].concat());
+        assert_eq!(patched_sites(&tools, &dir, "seq.o", "lld"), sites);
+    }
+}
+
+/// `--fix-cortex-a53-835769` patches the multiply-accumulates GNU ld
+/// patches: those right after a memory access they do not depend on.
+#[test]
+fn cortex_a53_835769_matches_gnu_ld() {
+    let tools = require!();
+    let dir = scratch("cortex-a53-835769");
+    let source = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	ldr	x1, [x2]
+	madd	x3, x4, x5, x6
+	ldr	x1, [x2]
+	madd	x3, x1, x5, x6
+	str	x1, [x2]
+	msub	x3, x1, x5, x6
+	ldp	x1, x7, [x2]
+	smaddl	x3, w4, w7, x6
+	ldr	q1, [x2]
+	umsubl	x3, w1, w5, x6
+	ldr	x1, [x2]
+	mul	x3, x4, x5
+	ldr	x1, [x2]
+	madd	w3, w4, w5, w6
+	add	x1, x2, x3
+	madd	x3, x4, x5, x6
+	ldr	x1, [x2], #8
+	madd	x3, x4, x5, x1
+	ret
+	.4byte	0xf9400041
+	.4byte	0x9b041c23
+"#;
+    compile(&tools, &dir, "mac", source, &[]);
+    let args = ["--fix-cortex-a53-835769", "mac.o", "-e", "_start"];
+    let (gnu, ours) = link_both(&tools, &dir, &args);
+    let sites = patched_sites(&tools, &dir, "mac.o", &ours);
+    // The independent `madd`, the one after a store, the vector load's.
+    assert_eq!(sites, [0x4, 0x14, 0x24]);
+    assert_eq!(patched_sites(&tools, &dir, "mac.o", &gnu), sites);
+    assert_patches_return(&tools, &dir, "mac.o", &ours, &sites);
+}
+
+/// A linker script layout has no pool for erratum patches, and says so.
+#[test]
+fn cortex_a53_fix_with_a_script_is_unimplemented() {
+    let tools = require!();
+    let dir = scratch("cortex-a53-script");
     compile(&tools, &dir, "relocs", RELOCATIONS, &[]);
-    let output = qld(
-        &dir,
-        &[
-            "--fix-cortex-a53-843419",
-            "-o",
-            "out",
-            "relocs.o",
-            "-e",
-            "_start",
-        ],
-    );
-    let message = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "the option was silently ignored");
-    assert!(
-        message.contains("843419") && message.contains("not implemented"),
-        "unclear message: {message}"
-    );
+    fs::write(
+        dir.join("link.ld"),
+        "SECTIONS { . = 0x10000; .text : { *(.text) } .data : { *(.data) } }\n",
+    )
+    .unwrap();
+    for option in ["--fix-cortex-a53-843419", "--fix-cortex-a53-835769"] {
+        let output = qld(
+            &dir,
+            &[
+                option, "-T", "link.ld", "-o", "out", "relocs.o", "-e", "_start",
+            ],
+        );
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{option} was silently ignored");
+        assert!(
+            message.contains("linker script") && message.contains("not implemented"),
+            "unclear message: {message}"
+        );
+    }
 }

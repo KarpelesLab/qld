@@ -283,8 +283,9 @@ pub struct Layout<'a> {
     /// `NOCROSSREFS` lists: output section names, and whether the list is
     /// `NOCROSSREFS_TO` (only references to the first section are checked).
     pub nocrossrefs: Vec<(bool, Vec<Vec<u8>>)>,
-    /// Range-extension thunks with their addresses, sorted by output
-    /// section and destination.
+    /// Range-extension thunks and Cortex-A53 erratum patches with their
+    /// addresses, sorted by output section and destination (for a patch,
+    /// the instruction it replaces).
     pub thunks: Vec<thunk::Placed>,
 }
 
@@ -310,9 +311,13 @@ impl Layout<'_> {
     pub fn thunk_for(&self, output: u32, target: u64) -> Option<u64> {
         let at = self
             .thunks
-            .binary_search_by_key(&(output, target), |t| (t.output, t.target))
-            .ok()?;
-        self.thunks.get(at).map(|t| t.address)
+            .partition_point(|t| (t.output, t.target) < (output, target));
+        self.thunks
+            .get(at..)?
+            .iter()
+            .take_while(|t| (t.output, t.target) == (output, target))
+            .find(|t| t.patch.is_none())
+            .map(|t| t.address)
     }
 
     /// The output section (its index in `Placement::outputs`) that holds
@@ -411,6 +416,7 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     input.synth.arch.check_options(input.options)?;
     if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
+        input.synth.arch.check_script_options(input.options)?;
         return crate::elf::script_layout::layout(input, script, placed);
     }
     if !input.synth.arch.needs_thunks() {
@@ -1000,6 +1006,33 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
                 output: entry.output,
                 target: entry.target,
                 address: section.addr.wrapping_add(entry.offset),
+                patch: None,
+            });
+        }
+        // Erratum patches: one block after the thunks, which the writer
+        // fills once the patched sections are relocated.
+        for section in &mut out_sections {
+            let size = thunks.patch_bytes(section.output);
+            if let Some(first) = thunks
+                .patches
+                .iter()
+                .find(|p| p.site.output == section.output)
+                && size > 0
+            {
+                section
+                    .data
+                    .push((first.offset, vec![0; usize::try_from(size).unwrap_or(0)]));
+            }
+        }
+        for patch in &thunks.patches {
+            let Some(section) = out_sections.iter().find(|s| s.output == patch.site.output) else {
+                continue;
+            };
+            placed_thunks.push(thunk::Placed {
+                output: patch.site.output,
+                target: patch.site.address,
+                address: section.addr.wrapping_add(patch.offset),
+                patch: Some((patch.site.section, patch.site.offset)),
             });
         }
         placed_thunks.sort_unstable();

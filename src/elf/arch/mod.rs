@@ -18,6 +18,7 @@
 //!   copy needs, without naming its number.
 
 pub mod aarch64;
+pub mod aarch64_errata;
 pub mod thunk;
 pub mod x86_64;
 
@@ -426,12 +427,24 @@ impl Arch {
     ///
     /// # Errors
     ///
+    /// None at present.
+    pub fn check_options(self, options: &LinkOptions) -> crate::error::Result<()> {
+        let _ = options;
+        Ok(())
+    }
+
+    /// Rejects options a linker script layout does not implement: it
+    /// places no thunk pool, so it has nowhere to put Cortex-A53 erratum
+    /// patches.
+    ///
+    /// # Errors
+    ///
     /// [`crate::error::Error::Unimplemented`] for the Cortex-A53 erratum
     /// workarounds.
-    pub fn check_options(self, options: &LinkOptions) -> crate::error::Result<()> {
-        if self == Self::AArch64 && options.fix_cortex_a53_843419 {
+    pub fn check_script_options(self, options: &LinkOptions) -> crate::error::Result<()> {
+        if self == Self::AArch64 && aarch64_errata::enabled(options) {
             return Err(crate::error::Error::Unimplemented(
-                "--fix-cortex-a53-843419 (roadmap M4: the erratum workaround)".into(),
+                "--fix-cortex-a53-843419 and --fix-cortex-a53-835769 with a linker script".into(),
             ));
         }
         Ok(())

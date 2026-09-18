@@ -413,6 +413,393 @@ pub const fn add_immediate(insn: u32) -> u64 {
     ((insn >> 10) & 0xfff) as u64
 }
 
+// ---- Cortex-A53 errata ----
+//
+// Both workarounds replace one instruction of an affected sequence with a
+// branch to a patch that holds that instruction followed by a branch back,
+// which breaks the sequence. Detection follows lld for 843419 (the
+// sequence and its limits are the same in GNU ld and gold) and GNU ld for
+// 835769, which lld does not implement.
+
+/// The size of an erratum patch: the moved instruction and `b` back.
+pub const ERRATUM_PATCH_SIZE: u64 = 8;
+
+/// Whether `insn` is in the load/store encoding class.
+const fn is_load_store_class(insn: u32) -> bool {
+    insn & 0x0a00_0000 == 0x0800_0000
+}
+
+const fn is_st1_multiple_opcode(insn: u32) -> bool {
+    matches!(insn & 0xf000, 0x2000 | 0x6000 | 0x7000 | 0xa000)
+}
+
+const fn is_st1_single_opcode(insn: u32) -> bool {
+    matches!(insn & 0x0040_e000, 0 | 0x4000 | 0x8000)
+}
+
+const fn is_st1_multiple(insn: u32) -> bool {
+    insn & 0xbfff_0000 == 0x0c00_0000 && is_st1_multiple_opcode(insn)
+}
+
+const fn is_st1_multiple_post(insn: u32) -> bool {
+    insn & 0xbfe0_0000 == 0x0c80_0000 && is_st1_multiple_opcode(insn)
+}
+
+const fn is_st1_single(insn: u32) -> bool {
+    insn & 0xbfff_0000 == 0x0d00_0000 && is_st1_single_opcode(insn)
+}
+
+const fn is_st1_single_post(insn: u32) -> bool {
+    insn & 0xbfe0_0000 == 0x0d80_0000 && is_st1_single_opcode(insn)
+}
+
+const fn is_st1(insn: u32) -> bool {
+    is_st1_multiple(insn)
+        || is_st1_multiple_post(insn)
+        || is_st1_single(insn)
+        || is_st1_single_post(insn)
+}
+
+const fn is_load_store_exclusive(insn: u32) -> bool {
+    insn & 0x3f00_0000 == 0x0800_0000
+}
+
+const fn is_load_exclusive(insn: u32) -> bool {
+    insn & 0x3f40_0000 == 0x0840_0000
+}
+
+const fn is_load_literal(insn: u32) -> bool {
+    insn & 0x3b00_0000 == 0x1800_0000
+}
+
+const fn is_stnp(insn: u32) -> bool {
+    insn & 0x3bc0_0000 == 0x2800_0000
+}
+
+const fn is_stp_post(insn: u32) -> bool {
+    insn & 0x3bc0_0000 == 0x2880_0000
+}
+
+const fn is_stp_offset(insn: u32) -> bool {
+    insn & 0x3bc0_0000 == 0x2900_0000
+}
+
+const fn is_stp_pre(insn: u32) -> bool {
+    insn & 0x3bc0_0000 == 0x2980_0000
+}
+
+const fn is_stp(insn: u32) -> bool {
+    is_stp_post(insn) || is_stp_offset(insn) || is_stp_pre(insn)
+}
+
+const fn is_load_store_unscaled(insn: u32) -> bool {
+    insn & 0x3b00_0c00 == 0x3800_0000
+}
+
+const fn is_load_store_post(insn: u32) -> bool {
+    insn & 0x3b20_0c00 == 0x3800_0400
+}
+
+const fn is_load_store_unprivileged(insn: u32) -> bool {
+    insn & 0x3b20_0c00 == 0x3800_0800
+}
+
+const fn is_load_store_pre(insn: u32) -> bool {
+    insn & 0x3b20_0c00 == 0x3800_0c00
+}
+
+const fn is_load_store_register_offset(insn: u32) -> bool {
+    insn & 0x3b20_0c00 == 0x3820_0800
+}
+
+const fn is_single_register_load_store(insn: u32) -> bool {
+    is_load_store_unscaled(insn)
+        || is_load_store_post(insn)
+        || is_load_store_unprivileged(insn)
+        || is_load_store_pre(insn)
+        || is_load_store_register_offset(insn)
+        || is_load_store_unsigned(insn)
+}
+
+/// Whether `insn` is an Armv8.0 load that is not a structure load.
+const fn is_non_structure_load(insn: u32) -> bool {
+    if is_load_exclusive(insn) || is_load_literal(insn) {
+        return true;
+    }
+    if !is_single_register_load_store(insn) {
+        return false;
+    }
+    let size = (insn >> 30) & 3;
+    let vector = (insn >> 26) & 1;
+    let opc = (insn >> 22) & 3;
+    // opc 0 stores; opc 2 is a store for 128-bit vectors and a prefetch for
+    // 64-bit integer registers.
+    opc != 0 && !(size == 0 && vector == 1 && opc == 2) && !(size == 3 && vector == 0 && opc == 2)
+}
+
+const fn has_writeback(insn: u32) -> bool {
+    is_load_store_pre(insn)
+        || is_load_store_post(insn)
+        || is_stp_pre(insn)
+        || is_stp_post(insn)
+        || is_st1_single_post(insn)
+        || is_st1_multiple_post(insn)
+}
+
+const fn load_store_writes(insn: u32, register: u32) -> bool {
+    (is_non_structure_load(insn) && destination_register(insn) == register)
+        || (has_writeback(insn) && base_register(insn) == register)
+}
+
+/// Whether `insn` is a branch, which ends a straight-line sequence.
+const fn is_branch(insn: u32) -> bool {
+    insn & 0xfe00_0000 == 0xd600_0000
+        || insn & 0xfe00_0000 == 0x5400_0000
+        || insn & 0x7c00_0000 == 0x1400_0000
+        || insn & 0x7c00_0000 == 0x3400_0000
+}
+
+/// Whether `adrp`, `second` and `last` form the Cortex-A53 erratum 843419
+/// sequence: an `adrp` writing `xn`, a load or store that does not write
+/// `xn`, and a load or store with an unsigned offset based on `xn`.
+#[must_use]
+pub const fn is_843419_sequence(adrp: u32, second: u32, last: u32) -> bool {
+    if !is_adrp(adrp) {
+        return false;
+    }
+    let register = destination_register(adrp);
+    is_load_store_class(second)
+        && (is_load_store_exclusive(second)
+            || is_load_literal(second)
+            || is_single_register_load_store(second)
+            || is_stp(second)
+            || is_stnp(second)
+            || is_st1(second))
+        && !load_store_writes(second, register)
+        && is_load_store_unsigned(last)
+        && base_register(last) == register
+}
+
+/// The offsets (from the start of `code`) of the instructions erratum
+/// 843419 affects in `code[start..end]`, when `code` starts at `address`:
+/// the last load or store of each sequence whose `adrp` is at a page
+/// offset of `0xff8` or `0xffc`. This is lld's scan.
+#[must_use]
+pub fn scan_843419(code: &[u8], address: u64, start: u64, end: u64) -> Vec<u64> {
+    let mut sites = Vec::new();
+    let end = end.min(u64::try_from(code.len()).unwrap_or(u64::MAX));
+    let word = |offset: u64| {
+        usize::try_from(offset)
+            .ok()
+            .and_then(|o| read_insn(code, o))
+    };
+    let mut offset = start;
+    while offset < end {
+        // Advance to the next page offset of at least 0xff8.
+        let page_offset = address.wrapping_add(offset) & 0xfff;
+        if page_offset < 0xff8 {
+            offset = offset.saturating_add(0xff8u64.wrapping_sub(page_offset));
+        }
+        let Some(left) = end.checked_sub(offset).filter(|&left| left >= 12) else {
+            break;
+        };
+        let (Some(first), Some(second), Some(third)) = (
+            word(offset),
+            word(offset.saturating_add(4)),
+            word(offset.saturating_add(8)),
+        ) else {
+            break;
+        };
+        if is_843419_sequence(first, second, third) {
+            sites.push(offset.saturating_add(8));
+        } else if left > 12
+            && !is_branch(third)
+            && let Some(fourth) = word(offset.saturating_add(12))
+            && is_843419_sequence(first, second, fourth)
+        {
+            sites.push(offset.saturating_add(12));
+        }
+        offset = if address.wrapping_add(offset) & 0xfff == 0xff8 {
+            offset.saturating_add(4)
+        } else {
+            offset.saturating_add(0xffc)
+        };
+    }
+    sites
+}
+
+/// Whether `insn` is a 64-bit multiply-accumulate (`madd`, `msub`,
+/// `smaddl`, `smsubl`, `umaddl`, `umsubl`), not a plain multiply.
+#[must_use]
+pub const fn is_multiply_accumulate(insn: u32) -> bool {
+    let op31 = (insn >> 21) & 7;
+    insn & 0xff00_0000 == 0x9b00_0000 && matches!(op31, 0 | 1 | 5) && (insn >> 10) & 0x1f != 0x1f
+}
+
+/// What a memory access instruction transfers, for erratum 835769.
+struct MemoryAccess {
+    rt: u32,
+    rt2: u32,
+    pair: bool,
+    load: bool,
+}
+
+/// Decodes `insn` as a memory access, as GNU ld's `aarch64_mem_op_p` does.
+const fn memory_access(insn: u32) -> Option<MemoryAccess> {
+    if insn & 0x0a00_0000 != 0x0800_0000 {
+        return None;
+    }
+    let rt = insn & 0x1f;
+    let rt2_field = (insn >> 10) & 0x1f;
+    let load_bit = (insn >> 22) & 1 == 1;
+    if insn & 0x3f00_0000 == 0x0800_0000 {
+        // Exclusive: a pair when bit 21 is set.
+        let pair = (insn >> 21) & 1 == 1;
+        let rt2 = if pair { rt2_field } else { rt };
+        return Some(MemoryAccess {
+            rt,
+            rt2,
+            pair,
+            load: load_bit,
+        });
+    }
+    let masked = insn & 0x3b80_0000;
+    if matches!(
+        masked,
+        0x2800_0000 | 0x2880_0000 | 0x2900_0000 | 0x2980_0000
+    ) {
+        return Some(MemoryAccess {
+            rt,
+            rt2: rt2_field,
+            pair: true,
+            load: load_bit,
+        });
+    }
+    let single = insn & 0x3b20_0c00;
+    if insn & 0x3b00_0000 == 0x1800_0000
+        || matches!(
+            single,
+            0x3800_0000 | 0x3800_0400 | 0x3800_0800 | 0x3800_0c00 | 0x3820_0800
+        )
+        || insn & 0x3b00_0000 == 0x3900_0000
+    {
+        let opc = (insn >> 22) & 3;
+        let vector = (insn >> 26) & 1;
+        let opc_v = opc | (vector << 2);
+        return Some(MemoryAccess {
+            rt,
+            rt2: rt,
+            pair: false,
+            load: matches!(opc_v, 1 | 2 | 3 | 5 | 7),
+        });
+    }
+    if insn & 0xbfbf_0000 == 0x0c00_0000 || insn & 0xbfa0_0000 == 0x0c80_0000 {
+        // Advanced SIMD load/store multiple structures.
+        let count = match (insn >> 12) & 0xf {
+            0 | 2 => 3,
+            4 | 6 => 2,
+            7 => 0,
+            8 | 10 => 1,
+            _ => return None,
+        };
+        return Some(MemoryAccess {
+            rt,
+            rt2: rt.wrapping_add(count),
+            pair: false,
+            load: load_bit,
+        });
+    }
+    if insn & 0xbf9f_0000 == 0x0d00_0000 || insn & 0xbf80_0000 == 0x0d80_0000 {
+        // Advanced SIMD load/store single structure.
+        let r = (insn >> 21) & 1;
+        let count = match (insn >> 13) & 7 {
+            0 | 2 | 4 | 6 => r,
+            _ => {
+                if r == 0 {
+                    2
+                } else {
+                    3
+                }
+            }
+        };
+        return Some(MemoryAccess {
+            rt,
+            rt2: rt.wrapping_add(count),
+            pair: false,
+            load: load_bit,
+        });
+    }
+    None
+}
+
+/// Whether `first` followed by `second` is the Cortex-A53 erratum 835769
+/// sequence: a memory access, then a 64-bit multiply-accumulate that does
+/// not depend on a register the access loaded. GNU ld's test.
+#[must_use]
+pub fn is_835769_sequence(first: u32, second: u32) -> bool {
+    if !is_multiply_accumulate(second) {
+        return false;
+    }
+    let Some(access) = memory_access(first) else {
+        return false;
+    };
+    // A SIMD access is independent of the multiply-accumulate.
+    if (first >> 26) & 1 == 1 {
+        return true;
+    }
+    let rn = (second >> 5) & 0x1f;
+    let ra = (second >> 10) & 0x1f;
+    let rm = (second >> 16) & 0x1f;
+    let uses = |r: u32| r == rn || r == rm || r == ra;
+    // A true dependency on a loaded register makes the sequence safe.
+    !(access.load && (uses(access.rt) || (access.pair && uses(access.rt2))))
+}
+
+/// The offsets of the multiply-accumulate instructions erratum 835769
+/// affects in `code[start..end]`.
+#[must_use]
+pub fn scan_835769(code: &[u8], start: u64, end: u64) -> Vec<u64> {
+    let end = end.min(u64::try_from(code.len()).unwrap_or(u64::MAX));
+    let word = |offset: u64| {
+        usize::try_from(offset)
+            .ok()
+            .and_then(|o| read_insn(code, o))
+    };
+    let mut sites = Vec::new();
+    let mut offset = start;
+    while offset.saturating_add(4) < end {
+        let next = offset.saturating_add(4);
+        if let (Some(first), Some(second)) = (word(offset), word(next))
+            && is_835769_sequence(first, second)
+        {
+            sites.push(next);
+        }
+        offset = next;
+    }
+    sites
+}
+
+/// The two words of an erratum patch at `patch` that runs `moved` (the
+/// instruction it replaces at `site`) and branches back after `site`.
+///
+/// # Errors
+///
+/// [`Overflow`] when the patch is more than 128 MiB from the site.
+pub fn erratum_patch(patch: u64, site: u64, moved: u32) -> Result<[u32; 2], Overflow> {
+    let back = (site.wrapping_add(4) as i64).wrapping_sub(patch.wrapping_add(4) as i64);
+    Ok([moved, Field::Branch26.encode(B, back)?])
+}
+
+/// The branch that replaces the instruction at `site` with a jump to its
+/// erratum patch at `patch`.
+///
+/// # Errors
+///
+/// [`Overflow`] when the patch is more than 128 MiB from the site.
+pub fn erratum_branch(site: u64, patch: u64) -> Result<u32, Overflow> {
+    Field::Branch26.encode(B, (patch as i64).wrapping_sub(site as i64))
+}
+
 /// Number of bytes a range-extension thunk occupies.
 pub const THUNK_SIZE: u64 = 12;
 
@@ -559,6 +946,73 @@ mod tests {
         assert!(is_load_store_unsigned(ldr_offset(0, 1)));
         assert_eq!(base_register(ldr_offset(0, 7)), 7);
         assert!(!is_load_store_unsigned(add));
+    }
+
+    fn code(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn erratum_843419_sequences_are_found_at_page_ends() {
+        let adrp_x0 = adrp(0);
+        let ldr_x1_x2 = ldr_offset(1, 2);
+        let ldr_x3_x0 = ldr_offset(3, 0);
+        let ldr_x0_x2 = ldr_offset(0, 2);
+        assert!(is_843419_sequence(adrp_x0, ldr_x1_x2, ldr_x3_x0));
+        // The second instruction writes the base register.
+        assert!(!is_843419_sequence(adrp_x0, ldr_x0_x2, ldr_x3_x0));
+        // Another base register.
+        assert!(!is_843419_sequence(adrp_x0, ldr_x1_x2, ldr_offset(3, 1)));
+        // `adrp; ldr; ldr` at 0xff8 in a section at 0x1000: the site is the
+        // last `ldr`.
+        let mut words = vec![NOP; 0xff8 / 4];
+        words.extend([adrp_x0, ldr_x1_x2, ldr_x3_x0, NOP]);
+        let bytes = code(&words);
+        let end = bytes.len() as u64;
+        assert_eq!(scan_843419(&bytes, 0x1000, 0, end), [0x1000]);
+        // Eight bytes later the `adrp` starts a page: nothing.
+        assert!(scan_843419(&bytes, 0x1008, 0, end).is_empty());
+        // Four bytes later it is at 0xffc: still affected.
+        assert_eq!(scan_843419(&bytes, 0x1004, 0, end), [0x1000]);
+        // Four instructions, and a branch in third place.
+        let mut words = vec![NOP; 0xffc / 4];
+        words.extend([adrp_x0, ldr_x1_x2, NOP, ldr_x3_x0]);
+        assert_eq!(scan_843419(&code(&words), 0, 0, 0x100c), [0x1008]);
+        words[0xffc / 4 + 2] = B;
+        assert!(scan_843419(&code(&words), 0, 0, 0x100c).is_empty());
+        // Truncated or empty ranges do not panic.
+        assert!(scan_843419(&bytes[..0xffa], 0x1000, 0, end).is_empty());
+        assert!(scan_843419(&bytes, 0x1000, end, 0).is_empty());
+    }
+
+    #[test]
+    fn erratum_835769_sequences_follow_gnu_ld() {
+        // madd x3, x4, x5, x6 and madd x3, x1, x5, x6.
+        let madd = 0x9b05_1883;
+        let madd_x1 = 0x9b05_1823;
+        let ldr_x1 = ldr_offset(1, 2);
+        assert!(is_multiply_accumulate(madd));
+        assert!(!is_multiply_accumulate(0x9b05_7c83), "mul is madd with xzr");
+        assert!(is_835769_sequence(ldr_x1, madd));
+        // A load the multiply-accumulate depends on is safe.
+        assert!(!is_835769_sequence(ldr_x1, madd_x1));
+        // A store is not a dependency.
+        assert!(is_835769_sequence(0xf900_0041, madd_x1));
+        assert!(!is_835769_sequence(add_imm(1, 2), madd));
+        assert_eq!(scan_835769(&code(&[ldr_x1, madd, NOP]), 0, 12), [4]);
+        assert!(scan_835769(&code(&[ldr_x1, madd]), 0, 4).is_empty());
+    }
+
+    #[test]
+    fn erratum_patches_branch_back() {
+        let [moved, back] = erratum_patch(0x2000, 0x1000, 0xf940_0003).unwrap();
+        assert_eq!(moved, 0xf940_0003);
+        assert_eq!(back, Field::Branch26.encode(B, 0x1004 - 0x2004).unwrap());
+        assert_eq!(
+            erratum_branch(0x1000, 0x2000).unwrap(),
+            Field::Branch26.encode(B, 0x1000).unwrap()
+        );
+        assert_eq!(erratum_branch(0, 0x1000_0000), Err(Overflow));
     }
 
     #[test]
