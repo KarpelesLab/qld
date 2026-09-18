@@ -53,8 +53,8 @@ See [architecture.md](architecture.md#module-layout) for the layout and
 ## `unsafe` policy
 
 - The crate sets `#![deny(unsafe_code)]`. Only `src/input/` (mapping),
-  `src/output/` (mapping) and `src/plugin/` (FFI: the private `dl` and `host`
-  modules) may lift it, module by module, with a comment saying why. The
+  `src/output/` (mapping) and `src/plugin/` (FFI: the private `dl`, `host`
+  and `liblto` modules) may lift it, module by module, with a comment saying why. The
   plugin host declares `dlopen`/`dlsym`/`dlerror` itself rather than
   depending on `libloading` or `libc`.
 - Every `unsafe` block has a `// SAFETY:` comment stating the invariant.

@@ -19,6 +19,9 @@ use super::read::consts::{
 };
 use super::read::{CoffObject, SectionHeader, SectionNumber, Symbol};
 
+/// The section listing an i386 object's registered exception handlers.
+pub const SXDATA_SECTION: &[u8] = b".sxdata";
+
 /// Alignment used for a section whose header gives none. MSVC and GNU `ld`
 /// use 16 bytes; lld uses 1.
 pub const DEFAULT_ALIGNMENT: u32 = 16;
@@ -187,6 +190,9 @@ pub struct ParsedObject<'a> {
     pub directives: Vec<&'a [u8]>,
     /// Whether the object declares SafeSEH compatibility (`@feat.00`).
     pub safe_seh: bool,
+    /// The i386 exception handlers the object registers: the symbol table
+    /// record indices its `.sxdata` sections list.
+    pub sxdata: Vec<u32>,
 }
 
 impl<'a> ParsedObject<'a> {
@@ -200,6 +206,7 @@ impl<'a> ParsedObject<'a> {
         let count = object.section_count();
         let mut sections = Vec::with_capacity(count as usize);
         let mut directives = Vec::new();
+        let mut sxdata = Vec::new();
         for number in 1..=count {
             let section = object.section(number)?;
             let header = section.header;
@@ -211,6 +218,12 @@ impl<'a> ParsedObject<'a> {
             };
             if kind == SectionKind::Directive {
                 directives.push(data);
+            }
+            // `.sxdata` is an `IMAGE_SCN_LNK_INFO` section, dropped from the
+            // image; its words are symbol indices of registered handlers.
+            if section.name == SXDATA_SECTION {
+                let (words, _) = data.as_chunks::<4>();
+                sxdata.extend(words.iter().map(|word| u32::from_le_bytes(*word)));
             }
             sections.push(InputSection {
                 number,
@@ -325,7 +338,23 @@ impl<'a> ParsedObject<'a> {
             targets,
             directives,
             safe_seh,
+            sxdata,
         })
+    }
+
+    /// Whether the object may take part in a SafeSEH image: it declares
+    /// itself compatible in `@feat.00`, or it cannot hold an exception
+    /// handler at all (it has no code, or it is an import library member,
+    /// whose only code is a jump through the import address table).
+    #[must_use]
+    pub fn safe_seh_compatible(&self) -> bool {
+        if self.safe_seh {
+            return true;
+        }
+        let live = || self.sections.iter().filter(|section| section.is_live());
+        let has_code = live().any(|section| section.header.is_code() && section.size > 0);
+        let import_member = live().any(|section| section.name.starts_with(b".idata$"));
+        !has_code || import_member
     }
 
     /// The section with COFF number `number` (1-based).

@@ -787,6 +787,18 @@ impl GnuParser {
     /// target is, and only a PE link reads them.
     fn apply_pe(&mut self, m: &Matched, action: PeAction) -> Result<()> {
         let pe = &mut self.options.pe;
+        // Options whose default depends on the emulation (W33).
+        match action {
+            PeAction::Flag(PeFlag::LargeAddressAware, _) => pe.explicit.large_address_aware = true,
+            PeAction::MajorOsVersion | PeAction::MinorOsVersion => pe.explicit.os_version = true,
+            PeAction::MajorImageVersion | PeAction::MinorImageVersion => {
+                pe.explicit.image_version = true;
+            }
+            PeAction::MajorSubsystemVersion | PeAction::MinorSubsystemVersion => {
+                pe.explicit.subsystem_version = true;
+            }
+            _ => {}
+        }
         match action {
             PeAction::Flag(flag, on) => match flag {
                 PeFlag::Dynamicbase => pe.dynamicbase = on,
@@ -815,6 +827,7 @@ impl GnuParser {
                 let (subsystem, version) = crate::coff::options::parse_subsystem(&value)?;
                 pe.subsystem = Some(subsystem);
                 if let Some(version) = version {
+                    pe.explicit.subsystem_version = true;
                     pe.major_subsystem_version = version.major;
                     pe.minor_subsystem_version = version.minor;
                 }

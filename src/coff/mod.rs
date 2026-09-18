@@ -8,6 +8,7 @@
 //! | --- | --- |
 //! | [`read`] | Zero-copy readers for objects, import libraries, PE images, `.drectve` and `.def` (workstream W14) |
 //! | [`options`] | The PE options [`LinkOptions`](crate::args::LinkOptions) does not carry yet |
+//! | [`machine`] | What differs between x86-64, i386 and ARM64 images, and i386 symbol decoration |
 //! | [`inputs`] | Search paths, objects and archives, and the resolution file list |
 //! | [`object`] | A parsed object: sections, COMDAT groups and a flat symbol list |
 //! | [`resolve`] | COFF symbol precedence and COMDAT selection |
@@ -18,14 +19,20 @@
 //! | [`layout`] | Output sections, grouped-section ordering, RVAs |
 //! | [`defined`] | The symbols MinGW's C runtime expects the linker to define |
 //! | [`reloc`] | Symbol addresses, relocation application, base relocations |
+//! | [`arm64`] | ARM64 relocations and range-extension thunks |
+//! | [`safeseh`] | The i386 SafeSEH handler table |
 //! | [`symtab`] | The image's COFF symbol table |
 //! | [`write`](mod@write) | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
 //!
-//! Not implemented yet: `-r`, `--gc-sections`, local symbols in the output
-//! symbol table, auto-import of PC-relative references, and architectures
-//! other than x86-64.
+//! Machines: x86-64 and ARM64 (PE32+) and i386 (PE32), the emulations
+//! `i386pep`, `arm64pe` and `i386pe`; [`machine`] lists what differs.
+//! ARM64EC, ARM64X and 32-bit ARM are refused.
+//!
+//! Not implemented yet: `-r`, `--gc-sections`, and local symbols in the
+//! output symbol table.
 
+pub mod arm64;
 pub mod defined;
 pub mod directives;
 pub mod edata;
@@ -34,11 +41,13 @@ pub mod imports;
 pub mod inputs;
 pub mod layout;
 pub mod link;
+pub mod machine;
 pub mod object;
 pub mod options;
 pub mod read;
 pub mod reloc;
 pub mod resolve;
+pub mod safeseh;
 pub mod symtab;
 pub mod write;
 

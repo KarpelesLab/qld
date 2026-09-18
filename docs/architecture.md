@@ -246,7 +246,10 @@ doesn't hold up the link.
 
 ### Mach-O pipeline
 
-`macho::link` follows the same stages with Mach-O semantics. Each `-arch`
+`macho::link` follows the same stages with Mach-O semantics. With bitcode
+inputs, `macho::lto` runs first: resolution with stand-in objects decides
+what LTO preserves, libLTO (`plugin::liblto`) generates native objects, and
+the link proceeds with them. Each `-arch`
 value is an independent link; several run in parallel and `fat.rs` joins
 them into a universal binary. Per architecture:
 

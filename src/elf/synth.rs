@@ -303,7 +303,7 @@ impl Synth {
         // A static executable has no dynamic linker to use the reserved
         // `.got.plt` words.
         self.got_plt_reserved = if dynamic && has_got_plt {
-            self.arch.got_plt_header_words()
+            self.arch.got_plt_reserved()
         } else {
             0
         };

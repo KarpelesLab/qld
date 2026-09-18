@@ -439,6 +439,27 @@ pub struct PeArgs {
     pub exports: Vec<String>,
     /// `--warn-duplicate-exports`.
     pub warn_duplicate_exports: bool,
+    /// Which options with a per-emulation default the command line set.
+    ///
+    /// The fields above start at the `i386pep` defaults; `i386pe` and
+    /// `arm64pe` differ in a few of them, and the PE backend applies the
+    /// target's own default where the command line said nothing.
+    pub explicit: PeExplicit,
+}
+
+/// The PE options whose default depends on the emulation, and whether the
+/// command line set each of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeExplicit {
+    /// `--large-address-aware` or `--disable-large-address-aware`.
+    pub large_address_aware: bool,
+    /// `--major-os-version` or `--minor-os-version`.
+    pub os_version: bool,
+    /// `--major-image-version` or `--minor-image-version`.
+    pub image_version: bool,
+    /// `--major-subsystem-version`, `--minor-subsystem-version`, or a
+    /// version in `--subsystem`.
+    pub subsystem_version: bool,
 }
 
 impl Default for PeArgs {
@@ -482,6 +503,7 @@ impl Default for PeArgs {
             runtime_pseudo_reloc: true,
             exports: Vec::new(),
             warn_duplicate_exports: false,
+            explicit: PeExplicit::default(),
         }
     }
 }

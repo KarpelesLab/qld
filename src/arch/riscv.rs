@@ -219,24 +219,9 @@ pub enum Field {
     RvcJump,
     /// An `auipc` + `jalr` pair (eight bytes).
     Call,
-    /// Adds the value to 8 bits of data.
-    Add8,
-    /// Adds the value to 16 bits of data.
-    Add16,
-    /// Adds the value to 32 bits of data.
-    Add32,
-    /// Adds the value to 64 bits of data.
-    Add64,
-    /// Subtracts the value from the low 6 bits of a byte.
+    /// Subtracts the value from the low 6 bits of a byte (`ADD`/`SUB` of
+    /// other widths are plain data fields combined by the ELF backend).
     Sub6,
-    /// Subtracts the value from 8 bits of data.
-    Sub8,
-    /// Subtracts the value from 16 bits of data.
-    Sub16,
-    /// Subtracts the value from 32 bits of data.
-    Sub32,
-    /// Subtracts the value from 64 bits of data.
-    Sub64,
     /// Sets the low 6 bits of a byte.
     Set6,
     /// Sets 8 bits of data.
@@ -294,15 +279,9 @@ impl Field {
     #[must_use]
     pub const fn bytes(self) -> usize {
         match self {
-            Self::Add8 | Self::Sub6 | Self::Sub8 | Self::Set6 | Self::Set8 => 1,
-            Self::RvcBranch | Self::RvcJump | Self::Add16 | Self::Sub16 | Self::Set16 => 2,
-            Self::Word64
-            | Self::Add64
-            | Self::Sub64
-            | Self::Dtprel64
-            | Self::Call
-            | Self::SetUleb128
-            | Self::SubUleb128 => 8,
+            Self::Sub6 | Self::Set6 | Self::Set8 => 1,
+            Self::RvcBranch | Self::RvcJump | Self::Set16 => 2,
+            Self::Word64 | Self::Dtprel64 | Self::Call | Self::SetUleb128 | Self::SubUleb128 => 8,
             _ => 4,
         }
     }
@@ -321,15 +300,7 @@ impl Field {
     pub const fn is_label_math(self) -> bool {
         matches!(
             self,
-            Self::Add8
-                | Self::Add16
-                | Self::Add32
-                | Self::Add64
-                | Self::Sub6
-                | Self::Sub8
-                | Self::Sub16
-                | Self::Sub32
-                | Self::Sub64
+            Self::Sub6
                 | Self::Set6
                 | Self::Set8
                 | Self::Set16
@@ -372,11 +343,6 @@ impl Field {
         let put8 = |data: &mut [u8], v: u8| -> Result<(), FieldError> {
             *data.first_mut().ok_or(oob)? = v;
             Ok(())
-        };
-        let get64 = |data: &[u8]| {
-            data.first_chunk::<8>()
-                .map(|w| u64::from_le_bytes(*w))
-                .ok_or(oob)
         };
         let put64 = |data: &mut [u8], v: u64| -> Result<(), FieldError> {
             *data.first_chunk_mut::<8>().ok_or(oob)? = v.to_le_bytes();
@@ -477,44 +443,12 @@ impl Field {
                 put32(data, (auipc & 0xfff) | (hi20(value) << 12))?;
                 write32(data, 4, set_lo12_i(jalr, lo12(value))).ok_or(oob)
             }
-            Self::Add8 => {
-                let v = byte(data)?.wrapping_add(value as u8);
-                put8(data, v)
-            }
-            Self::Add16 => {
-                let v = get16(data)?.wrapping_add(value as u16);
-                put16(data, v)
-            }
-            Self::Add32 => {
-                let v = get32(data)?.wrapping_add(value as u32);
-                put32(data, v)
-            }
-            Self::Add64 => {
-                let v = get64(data)?.wrapping_add(value);
-                put64(data, v)
-            }
             Self::Sub6 => {
                 let old = byte(data)?;
                 put8(
                     data,
                     (old & 0xc0) | ((old & 0x3f).wrapping_sub(value as u8) & 0x3f),
                 )
-            }
-            Self::Sub8 => {
-                let v = byte(data)?.wrapping_sub(value as u8);
-                put8(data, v)
-            }
-            Self::Sub16 => {
-                let v = get16(data)?.wrapping_sub(value as u16);
-                put16(data, v)
-            }
-            Self::Sub32 => {
-                let v = get32(data)?.wrapping_sub(value as u32);
-                put32(data, v)
-            }
-            Self::Sub64 => {
-                let v = get64(data)?.wrapping_sub(value);
-                put64(data, v)
             }
             Self::Set6 => {
                 let old = byte(data)?;
@@ -627,10 +561,6 @@ mod tests {
 
     #[test]
     fn label_arithmetic_combines_with_the_contents() {
-        let mut data = 10u32.to_le_bytes();
-        Field::Add32.apply(&mut data, 0x1000).unwrap();
-        Field::Sub32.apply(&mut data, 0x0f00).unwrap();
-        assert_eq!(u32::from_le_bytes(data), 0x10a);
         let mut byte = [0x40 | 0x3f];
         Field::Set6.apply(&mut byte, 0x5).unwrap();
         assert_eq!(byte, [0x45]);

@@ -37,7 +37,7 @@ use crate::error::{Error, Result};
 use crate::ids::SectionId;
 
 use super::arch::Arch;
-use super::arch::riscv::relax::Relaxation;
+use super::arch::shrink::Relaxation;
 use super::arch::thunk::{self, Thunks};
 use super::ehframe::EhFrames;
 use super::export::Mode;
@@ -287,8 +287,8 @@ pub struct Layout<'a> {
     /// Range-extension thunks with their addresses, sorted by output
     /// section and destination.
     pub thunks: Vec<thunk::Placed>,
-    /// Linker relaxation edits (RISC-V): the bytes deleted from each code
-    /// section, which symbol addresses and the writer follow.
+    /// Linker relaxation edits ([`super::arch::shrink`]): the bytes deleted
+    /// from each code section, which symbol addresses and the writer follow.
     pub relax: Relaxation,
 }
 
@@ -357,7 +357,7 @@ pub struct LayoutInput<'l, 'a> {
     /// Output sections written compressed (`--compress-debug-sections`).
     pub compressed: &'l [CompressedOutput],
     /// The linker relaxation edits to lay out with; set by
-    /// [`crate::elf::arch::riscv::relax::layout`] while it iterates.
+    /// [`crate::elf::arch::shrink::layout`] while it iterates.
     pub relax: Option<&'l Relaxation>,
 }
 
@@ -418,7 +418,7 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
     input.synth.arch.check_options(input.options)?;
     if input.relax.is_none() && input.synth.arch.relaxes() {
-        return super::arch::riscv::relax::layout(input, &|input| layout(input));
+        return super::arch::shrink::layout(input, &|input| layout(input));
     }
     if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
         return crate::elf::script_layout::layout(input, script, placed);

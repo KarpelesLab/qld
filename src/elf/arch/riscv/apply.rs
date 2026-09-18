@@ -20,8 +20,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::arch::riscv::{
-    self as insn, A0, ADDI, AUIPC, C_NOP, FieldError, LD, LUI, NOP, fits_signed, hi20, itype, lo12,
-    utype,
+    self as insn, A0, ADDI, AUIPC, FieldError, LD, LUI, NOP, fits_signed, hi20, itype, lo12, utype,
 };
 use crate::debug::tombstone::DeadTarget;
 use crate::diag::Diagnostic;
@@ -39,8 +38,9 @@ use crate::error::{Error, Result};
 use crate::ids::SectionId;
 use crate::symbols::SymbolFlags;
 
+use super::super::shrink::{self, Rewrite, SectionRelax};
 use super::super::{ApplyError, Class, GotKind, Kind, Width};
-use super::relax::{Rewrite, SectionRelax, sorted_order};
+use super::relax::{X0REL, fill_nops};
 
 /// One input section being written.
 pub struct SectionWrite<'s> {
@@ -122,18 +122,10 @@ pub fn write_section(
         Some(Relocations::Rela(relas)) => relas.iter().collect::<Vec<Relocation>>(),
         _ => Vec::new(),
     };
-    let offsets: Vec<u64> = relas.iter().map(|r| r.offset).collect();
-    let order = sorted_order(&offsets);
-    let ordered: Vec<Relocation> = match &order {
-        Some(order) => order
-            .iter()
-            .filter_map(|&i| relas.get(i as usize).copied())
-            .collect(),
-        None => relas,
-    };
+    let (ordered, _) = shrink::ordered(relas);
     let relax = addresses.layout.relax.section(section.id);
     match relax {
-        Some(relax) => copy_relaxed(section.data, relax, &ordered, out),
+        Some(relax) => shrink::copy(section.data, relax, out, fill_nops),
         None => {
             if let Some(dest) = out.get_mut(..section.data.len()) {
                 dest.copy_from_slice(section.data);
@@ -158,67 +150,6 @@ pub fn write_section(
     };
     writer.relocate(&ordered, out);
     Ok(())
-}
-
-/// Copies `data` into `out` with the edits of `relax`, lld's
-/// `finalizeRelax`: bytes an edit deletes are dropped, trimmed alignment
-/// padding is rewritten as `nop`s when the trim splits one, and relaxed
-/// instructions are replaced.
-fn copy_relaxed(data: &[u8], relax: &SectionRelax, relocs: &[Relocation], out: &mut [u8]) {
-    let mut from = 0usize;
-    let mut to = 0usize;
-    let copy = |out: &mut [u8], from: usize, until: usize, to: &mut usize| {
-        let len = until.saturating_sub(from);
-        if let (Some(src), Some(dest)) = (
-            data.get(from..until),
-            out.get_mut(*to..to.saturating_add(len)),
-        ) {
-            dest.copy_from_slice(src);
-        }
-        *to = to.saturating_add(len);
-    };
-    for edit in &relax.edits {
-        let Ok(at) = usize::try_from(edit.offset) else {
-            break;
-        };
-        if at < from {
-            continue;
-        }
-        copy(out, from, at, &mut to);
-        let remove = edit.remove as usize;
-        let mut kept = 0usize;
-        match edit.rewrite {
-            Rewrite::Align => {
-                let addend = relocs
-                    .get(edit.seq as usize)
-                    .and_then(|r| usize::try_from(r.addend).ok())
-                    .unwrap_or(remove);
-                if !remove.is_multiple_of(4) || !addend.is_multiple_of(4) {
-                    kept = addend.saturating_sub(remove);
-                    let mut filled = 0usize;
-                    while filled.saturating_add(4) <= kept {
-                        let _ = insn::write32(out, to.saturating_add(filled), NOP);
-                        filled = filled.saturating_add(4);
-                    }
-                    if filled < kept {
-                        let _ = insn::write16(out, to.saturating_add(filled), C_NOP);
-                    }
-                }
-            }
-            Rewrite::Jal(word) | Rewrite::Replace(word) => {
-                let _ = insn::write32(out, to, word);
-                kept = 4;
-            }
-            Rewrite::CJump(word) => {
-                let _ = insn::write16(out, to, word);
-                kept = 2;
-            }
-            Rewrite::Delete | Rewrite::X0Rel => {}
-        }
-        to = to.saturating_add(kept);
-        from = at.saturating_add(kept).saturating_add(remove);
-    }
-    copy(out, from, data.len(), &mut to);
 }
 
 impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
@@ -270,6 +201,19 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
 
     fn put(&self, out: &mut [u8], rel: &Relocation, at: u64, width: Width, value: u64) {
         if let Err(error) = super::super::write_value(out, at, width, value) {
+            self.report_apply(rel, error);
+        }
+    }
+
+    /// Writes a relocation's value: into its field, or added to (`ADD*`)
+    /// or subtracted from (`SUB*`) the field's contents.
+    fn store(&self, out: &mut [u8], rel: &Relocation, at: u64, class: Class, value: u64) {
+        let result = match class.kind {
+            Kind::Add => super::super::add_value(out, at, class.width, value),
+            Kind::Sub => super::super::add_value(out, at, class.width, value.wrapping_neg()),
+            _ => super::super::write_value(out, at, class.width, value),
+        };
+        if let Err(error) = result {
             self.report_apply(rel, error);
         }
     }
@@ -338,7 +282,8 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
         if class.kind == Kind::None || (self.alloc && decision.problem.is_some()) {
             return (class, Value::Skip);
         }
-        let label_math = matches!(class.width, Width::RiscV(field) if field.is_label_math());
+        let label_math = matches!(class.kind, Kind::Add | Kind::Sub)
+            || matches!(class.width, Width::RiscV(field) if field.is_label_math());
         let truncated = |value: u64| {
             crate::debug::tombstone::truncate(value, super::super::width_bytes(class.width))
         };
@@ -391,6 +336,7 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
         let tp = tls.tp(self.input.context.arch);
         let got = |kind: GotKind| addresses.got_entry_address(owner, kind);
         let value = match class.kind {
+            Kind::Add | Kind::Sub => sa,
             Kind::Abs => match decision.dynamic {
                 Dynamic::Symbolic(_) => return (class, Value::Skip),
                 _ => sa,
@@ -635,20 +581,21 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
             }
             match edit.map(|e| e.rewrite) {
                 // Deleted, or already written whole by the copy.
-                Some(Rewrite::Delete | Rewrite::Align | Rewrite::Replace(_)) => continue,
-                Some(Rewrite::Jal(_)) => {
+                Some(
+                    Rewrite::Delete | Rewrite::Align { .. } | Rewrite::Replace { r_type: 0, .. },
+                ) => continue,
+                Some(Rewrite::Replace { r_type, .. }) => {
+                    let field = if r_type == R_RISCV_RVC_JUMP {
+                        insn::Field::RvcJump
+                    } else {
+                        insn::Field::Jal
+                    };
                     if let (_, Value::Write(value)) = self.value(rel, place, true) {
-                        self.put(out, rel, at, Width::RiscV(insn::Field::Jal), value);
+                        self.put(out, rel, at, Width::RiscV(field), value);
                     }
                     continue;
                 }
-                Some(Rewrite::CJump(_)) => {
-                    if let (_, Value::Write(value)) = self.value(rel, place, true) {
-                        self.put(out, rel, at, Width::RiscV(insn::Field::RvcJump), value);
-                    }
-                    continue;
-                }
-                Some(Rewrite::X0Rel) => {
+                Some(Rewrite::Retype(X0REL)) => {
                     let field = if rel.r_type == R_RISCV_LO12_S {
                         insn::Field::X0RelS
                     } else {
@@ -659,10 +606,10 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
                     }
                     continue;
                 }
-                None => {}
+                Some(Rewrite::Retype(_)) | None => {}
             }
             if let (class, Value::Write(value)) = self.value(rel, place, true) {
-                self.put(out, rel, at, class.width, value);
+                self.store(out, rel, at, class, value);
             }
         }
     }
@@ -682,67 +629,4 @@ fn is_branch_like(r_type: u32) -> bool {
             | R_RISCV_RVC_JUMP
             | R_RISCV_PLT32
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::relax::Edit;
-    use super::*;
-
-    fn rel(offset: u64, r_type: u32, addend: i64) -> Relocation {
-        Relocation {
-            offset,
-            symbol: 0,
-            r_type,
-            addend,
-        }
-    }
-
-    #[test]
-    fn relaxed_copy_drops_and_rewrites_bytes() {
-        // call f (auipc+jalr) at 0, then 6 bytes of alignment padding at 8
-        // (nop; c.nop), then an instruction at 14.
-        let mut data = Vec::new();
-        data.extend_from_slice(&0x0000_0097u32.to_le_bytes());
-        data.extend_from_slice(&0x0000_80e7u32.to_le_bytes());
-        data.extend_from_slice(&NOP.to_le_bytes());
-        data.extend_from_slice(&C_NOP.to_le_bytes());
-        data.extend_from_slice(&0x1234_5678u32.to_le_bytes());
-        let relocs = [
-            rel(0, R_RISCV_CALL_PLT, 0),
-            rel(0, R_RISCV_RELAX, 0),
-            rel(8, R_RISCV_ALIGN, 6),
-        ];
-        let relax = SectionRelax {
-            id: SectionId::new(0),
-            sorted: true,
-            edits: vec![
-                Edit {
-                    seq: 0,
-                    index: 0,
-                    offset: 0,
-                    remove: 4,
-                    delta: 4,
-                    rewrite: Rewrite::Jal(0xef),
-                },
-                // At 4 after the call shrank, 8-byte alignment needs 4 bytes
-                // of padding: 2 of the 6 go.
-                Edit {
-                    seq: 2,
-                    index: 2,
-                    offset: 8,
-                    remove: 2,
-                    delta: 6,
-                    rewrite: Rewrite::Align,
-                },
-            ],
-        };
-        let mut out = vec![0xaa; data.len() - 6];
-        copy_relaxed(&data, &relax, &relocs, &mut out);
-        let mut expect = Vec::new();
-        expect.extend_from_slice(&0xefu32.to_le_bytes());
-        expect.extend_from_slice(&NOP.to_le_bytes());
-        expect.extend_from_slice(&0x1234_5678u32.to_le_bytes());
-        assert_eq!(out, expect);
-    }
 }

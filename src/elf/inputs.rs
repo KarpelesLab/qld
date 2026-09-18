@@ -33,7 +33,7 @@ use crate::input::identify::FileFormat;
 use crate::input::{FileTable, InputFile, LibraryNaming, MemberEntry, SearchContext, Source};
 use crate::script::{self, CommandKind, InputName};
 use crate::symbols::{DefinitionKind, InputPosition, ResolveFile, SymbolName, SymbolUse};
-use crate::target::{Architecture, Target};
+use crate::target::Target;
 
 use super::dso::SharedInput;
 use super::lto::{self, IrKind, IrSymbols};
@@ -625,9 +625,7 @@ pub fn collect<'a>(
     }
     walker.finish()?;
     let target = walker.target.unwrap_or(Target::X86_64_LINUX);
-    let riscv64 =
-        target.arch == Architecture::Riscv64 && target.endian == crate::target::Endianness::Little;
-    if !matches!(target.arch, Architecture::X86_64 | Architecture::Aarch64) && !riscv64 {
+    if super::arch::Arch::from_target(target).is_none() {
         return Err(Error::Unimplemented(format!(
             "linking for {:?} (roadmap M4: more ELF architectures)",
             target.arch

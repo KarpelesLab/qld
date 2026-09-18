@@ -4,6 +4,8 @@
 //! For each architecture (in parallel when several `-arch` values ask for a
 //! universal binary):
 //!
+//! 0. [`lto::prepare`](super::lto::prepare): bitcode inputs are compiled
+//!    through libLTO, and the objects it produces join the inputs;
 //! 1. [`inputs::collect`]: search paths, objects, archives, dylibs and text
 //!    stubs, with universal slices selected;
 //! 2. [`resolve_symbols`] with [`MachRules`];
@@ -186,17 +188,19 @@ fn link_arch(
     // libraries with LC_LINKER_OPTION; link again with them.
     // Selector stubs (`_objc_msgSend$sel`) left undefined are generated in
     // an extra object; link again with it.
-    let mut options = std::borrow::Cow::Borrowed(options);
+    // Bitcode inputs are compiled by LTO first; its objects follow the
+    // command line.
+    let lto = super::lto::prepare(options, arch, diagnostics)?;
+    let mut options = lto.options;
     let mut selectors: Vec<Vec<u8>> = Vec::new();
     for _ in 0..8 {
-        let generated: Vec<(std::path::PathBuf, std::sync::Arc<[u8]>)> = if selectors.is_empty() {
-            Vec::new()
-        } else {
-            vec![(
+        let mut generated = lto.inputs.clone();
+        if !selectors.is_empty() {
+            generated.push((
                 std::path::PathBuf::from("<objc selector stubs>"),
                 std::sync::Arc::from(super::objc_stubs::object(arch, &selectors)),
-            )]
-        };
+            ));
+        }
         match link_arch_once(&options, arch, diagnostics, &generated)? {
             Attempt::Done(bytes) => return Ok(bytes),
             Attempt::MoreInputs(more) => options.to_mut().darwin.inputs.extend(more),
