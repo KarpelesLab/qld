@@ -1706,7 +1706,14 @@ fn i386_dll_and_client() {
         assert!(imports.contains(name), "{name} is not imported:\n{imports}");
     }
     // One 32-bit runtime pseudo-relocation, for `auto_value`.
-    let Some(symbols) = run(&mingw32("nm"), &["client.exe"], &dir) else {
+    // MSYS2's MINGW32 environment has no prefixed `nm`; Windows runners
+    // have LLVM's.
+    let nm = if tool("llvm-nm").is_some() {
+        "llvm-nm".to_owned()
+    } else {
+        mingw32("nm")
+    };
+    let Some(symbols) = run(&nm, &["client.exe"], &dir) else {
         return;
     };
     let text = String::from_utf8_lossy(&symbols.stdout).into_owned();
