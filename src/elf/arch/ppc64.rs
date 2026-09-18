@@ -27,9 +27,14 @@
 //! after the `bl` becomes `ld r2, 24(r1)` to restore it. `bl` reaches
 //! ±32 MiB; farther branches go through the range-extension thunks of
 //! [`crate::elf::arch::thunk`], which compute their target from the program
-//! counter and so also serve callers that do not maintain `r2`
-//! (`R_PPC64_REL24_NOTOC`), which call a function needing the TOC at its
-//! global entry point through one.
+//! counter and so also serve Power10 callers that do not maintain `r2`
+//! (`R_PPC64_REL24_NOTOC`): through one they call a function needing the
+//! TOC at its global entry point, or a PLT entry by loading its word
+//! PC-relatively. A caller that keeps `r2` calls a function that clobbers
+//! it (`st_other` 1) through a thunk that saves `r2` first, restored by
+//! the `nop` after the call as for PLT calls. Every called preemptible
+//! function gets its own PLT slot (no `.plt.got`), and a dynamic output's
+//! `IRELATIVE` relocations go to `.rela.dyn`, as with GNU ld.
 //!
 //! **The PLT.** `.plt` is the lazy-binding code the ABI calls `.glink`: a
 //! 60-byte resolver, then one `b` back to it per PLT slot. `.got.plt` holds
