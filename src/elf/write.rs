@@ -1610,6 +1610,23 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
             report(message);
         }
     }
+    if alloc && arch == Arch::AArch64 && input.context.relax {
+        // AArch64 ADRP relaxations: they look at pairs of relocations, so
+        // they run over the relocated section rather than in the loop.
+        let got_target = |symbol: u32| -> Option<u64> {
+            let target = refs.target(file_index, symbol as usize)?;
+            let flags = target
+                .global
+                .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+            if target.is_tls() || !reloc::classify_context(&input.context, &target, flags).relax_got
+            {
+                return None;
+            }
+            let (s, a) = addresses.symbol_address(&target, 0)?;
+            Some(s.wrapping_add_signed(a))
+        };
+        arch::aarch64::relax_adrp_pairs(out, relas.iter(), base, &[], &got_target);
+    }
     Ok(())
 }
 

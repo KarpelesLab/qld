@@ -363,6 +363,56 @@ pub fn br(rn: u32) -> u32 {
     0xd61f_0000 | ((rn & 0x1f) << 5)
 }
 
+/// `adr <Xd>, #0`, before the offset is packed in.
+#[must_use]
+pub fn adr(rd: u32) -> u32 {
+    0x1000_0000 | (rd & 0x1f)
+}
+
+/// `b #0`, before the offset is packed in.
+pub const B: u32 = 0x1400_0000;
+
+/// Whether `insn` is `adrp`.
+#[must_use]
+pub const fn is_adrp(insn: u32) -> bool {
+    insn & 0x9f00_0000 == 0x9000_0000
+}
+
+/// Whether `insn` is a 64-bit `add <Xd>, <Xn>, #imm` without a shift.
+#[must_use]
+pub const fn is_add_imm64(insn: u32) -> bool {
+    insn & 0xffc0_0000 == 0x9100_0000
+}
+
+/// Whether `insn` is a load or store with a scaled 12-bit unsigned offset
+/// (`ldr <Xt>, [<Xn>, #imm]` and its relatives).
+#[must_use]
+pub const fn is_load_store_unsigned(insn: u32) -> bool {
+    insn & 0x3b00_0000 == 0x3900_0000
+}
+
+/// The register number an instruction's `Rn` (base) field holds.
+#[must_use]
+pub const fn base_register(insn: u32) -> u32 {
+    (insn >> 5) & 0x1f
+}
+
+/// The byte offset an `adrp` adds to the page of its own address.
+#[must_use]
+pub fn adrp_offset(insn: u32) -> i64 {
+    let low = i64::from((insn >> 29) & 3);
+    let high = i64::from((insn >> 5) & 0x7ffff);
+    // Sign-extend the 21-bit page count, then scale it to bytes.
+    let pages = ((high << 2) | low) << 43 >> 43;
+    pages << 12
+}
+
+/// The unshifted 12-bit immediate of an `add`.
+#[must_use]
+pub const fn add_immediate(insn: u32) -> u64 {
+    ((insn >> 10) & 0xfff) as u64
+}
+
 /// Number of bytes a range-extension thunk occupies.
 pub const THUNK_SIZE: u64 = 12;
 
@@ -493,6 +543,22 @@ mod tests {
             .encode(movz0, 0x1_0000),
             Err(Overflow)
         );
+    }
+
+    #[test]
+    fn adrp_and_add_immediates_decode() {
+        for pages in [0i64, 1, -1, 0x7ffff, -0x10_0000] {
+            let insn = Field::Adrp21.encode(adrp(3), pages << 12).unwrap();
+            assert!(is_adrp(insn));
+            assert_eq!(adrp_offset(insn), pages << 12, "{pages:#x} pages");
+        }
+        let add = Field::Add12.encode(add_imm(1, 1), 0x1234).unwrap();
+        assert!(is_add_imm64(add));
+        assert_eq!(add_immediate(add), 0x234);
+        assert!(!is_add_imm64(0x1100_0000), "a 32-bit add");
+        assert!(is_load_store_unsigned(ldr_offset(0, 1)));
+        assert_eq!(base_register(ldr_offset(0, 7)), 7);
+        assert!(!is_load_store_unsigned(add));
     }
 
     #[test]

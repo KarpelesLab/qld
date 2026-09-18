@@ -221,16 +221,81 @@ fn section_size(tools: &Tools, dir: &Path, file: &str, name: &str) -> Option<u64
 
 /// Links `objects` with GNU ld and with qld, and returns the two outputs'
 /// names.
+///
+/// qld gets `--no-relax`: by default it relaxes ADRP pairs as lld does
+/// (see [`adrp_relaxations_match_lld`]), which GNU ld never does.
 fn link_both(tools: &Tools, dir: &Path, args: &[&str]) -> (String, String) {
     let gnu = "out.gnu".to_string();
     let ours = "out.qld".to_string();
     let mut gnu_args: Vec<&str> = vec!["-o", &gnu];
     gnu_args.extend_from_slice(args);
     run_ok(dir, &tools.ld, &gnu_args);
-    let mut our_args: Vec<&str> = vec!["-o", &ours];
+    let mut our_args: Vec<&str> = vec!["-o", &ours, "--no-relax"];
     our_args.extend_from_slice(args);
     qld_ok(dir, &our_args);
     (gnu, ours)
+}
+
+/// lld, the reference for what GNU ld does not implement: `QLD_TEST_LLD`,
+/// or `ld.lld` in `PATH`.
+fn lld() -> Option<PathBuf> {
+    match std::env::var_os("QLD_TEST_LLD") {
+        Some(path) if path.is_empty() => None,
+        Some(path) => Some(PathBuf::from(path)),
+        None => in_path("ld.lld"),
+    }
+}
+
+/// The instruction words (hex, as `objdump -d` prints them) of symbol
+/// `name`.
+fn words_of(text: &str, name: &str) -> Vec<String> {
+    let header = format!("<{name}>:");
+    text.lines()
+        .skip_while(|line| !line.ends_with(&header))
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split('\t').nth(1))
+        .map(|word| word.trim().to_string())
+        .collect()
+}
+
+/// The instructions of symbol `name`: mnemonics and registers, with every
+/// number and symbolic address replaced by `ADDR`.
+fn mnemonics_of(text: &str, name: &str) -> Vec<String> {
+    let header = format!("<{name}>:");
+    text.lines()
+        .skip_while(|line| !line.ends_with(&header))
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split('\t').skip(2);
+            let mnemonic = fields.next()?.trim();
+            let operands = fields.next().unwrap_or_default();
+            let operands = operands.split("//").next().unwrap_or_default();
+            let normalized: Vec<String> = operands
+                .split_whitespace()
+                .map(|token| {
+                    let bare = token.trim_start_matches('[');
+                    if bare.starts_with('#')
+                        || bare.starts_with('<')
+                        || bare.starts_with(|c: char| c.is_ascii_digit())
+                    {
+                        let close = if token.ends_with(']') { "]" } else { "" };
+                        let comma = if token.ends_with(',') { "," } else { "" };
+                        let open = if token.starts_with('[') { "[" } else { "" };
+                        format!("{open}ADDR{close}{comma}")
+                    } else {
+                        token.to_string()
+                    }
+                })
+                .collect();
+            Some(
+                format!("{mnemonic} {}", normalized.join(" "))
+                    .trim()
+                    .to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Every data and instruction relocation of the ABI that GNU `as` will
@@ -523,6 +588,194 @@ dead_function_qld:
         !symbols.contains("dead_function_qld"),
         "--gc-sections kept an unreachable function:\n{symbols}"
     );
+}
+
+/// ADRP pairs that lld relaxes, and ones it must leave alone.
+const ADRP_PAIRS: &str = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	adrp	x0, :got:var_qld
+	ldr	x0, [x0, :got_lo12:var_qld]
+	adrp	x1, var_qld
+	add	x1, x1, :lo12:var_qld
+	adrp	x2, :got:weak_qld
+	ldr	x2, [x2, :got_lo12:weak_qld]
+	adrp	x3, var_qld
+	add	x4, x3, :lo12:var_qld
+	adrp	x5, :got:var_qld
+	ldr	x6, [x5, :got_lo12:var_qld]
+	adrp	x7, far_qld
+	add	x7, x7, :lo12:far_qld
+	adrp	x8, :got:far_qld
+	ldr	x8, [x8, :got_lo12:far_qld]
+	adrp	x9, :got:near_qld
+	ldr	x9, [x9, :got_lo12:near_qld]
+	adrp	x10, :got:big_qld
+	ldr	x10, [x10, :got_lo12:big_qld]
+	adrp	x11, near_qld + 8
+	add	x11, x11, :lo12:near_qld + 8
+	ret
+	.size _start, . - _start
+
+	.data
+	.global var_qld
+var_qld:
+	.xword	1
+	.global near_qld
+near_qld:
+	.xword	2, 3
+	.bss
+	.space	0x200000
+	.global big_qld
+big_qld:
+	.xword	0
+	.weak weak_qld
+	.global far_qld
+	.set far_qld, 0x10000000
+"#;
+
+/// What lld 23 makes of [`ADRP_PAIRS`] in a static executable.
+const ADRP_PAIRS_RELAXED: [&str; 23] = [
+    // `var_qld` has one GOT access that cannot be relaxed (x5/x6), so none
+    // of its GOT accesses are.
+    "adrp x0, ADDR ADDR",
+    "ldr x0, [x0, ADDR]",
+    // ADRP+ADD within 1 MiB: `nop; adr`.
+    "nop",
+    "adr x1, ADDR ADDR",
+    // An undefined weak symbol keeps its GOT entry.
+    "adrp x2, ADDR ADDR",
+    "ldr x2, [x2, ADDR]",
+    // Two registers: not a pair.
+    "adrp x3, ADDR ADDR",
+    "add x4, x3, ADDR",
+    "adrp x5, ADDR ADDR",
+    "ldr x6, [x5, ADDR]",
+    // 256 MiB away: out of `adr` range.
+    "adrp x7, ADDR ADDR",
+    "add x7, x7, ADDR",
+    // GOT to ADRP+ADD, then not to ADR.
+    "adrp x8, ADDR ADDR",
+    "add x8, x8, ADDR",
+    // GOT to ADRP+ADD to ADR.
+    "nop",
+    "adr x9, ADDR ADDR",
+    // 2 MiB away: ADRP+ADD only.
+    "adrp x10, ADDR ADDR",
+    "add x10, x10, ADDR",
+    // An addend: lld leaves it.
+    "adrp x11, ADDR ADDR",
+    "add x11, x11, ADDR",
+    "ret",
+    "",
+    "",
+];
+
+/// `--relax` (the default) rewrites ADRP pairs as lld does; `--no-relax`
+/// leaves them as GNU ld does.
+#[test]
+fn adrp_relaxations_match_lld() {
+    let tools = require!();
+    let dir = scratch("adrp-relax");
+    compile(&tools, &dir, "pairs", ADRP_PAIRS, &[]);
+    qld_ok(&dir, &["-o", "relaxed", "pairs.o", "-e", "_start"]);
+    let text = run_ok(&dir, &tools.objdump, &["-d", "relaxed"]);
+    let ours = mnemonics_of(&text, "_start");
+    let expected: Vec<&str> = ADRP_PAIRS_RELAXED
+        .iter()
+        .copied()
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(ours, expected, "\n{text}");
+    // Every relaxed sequence still computes the address it did.
+    let symbols = run_ok(&dir, &tools.readelf, &["-sW", "relaxed"]);
+    let address_of = |name: &str| {
+        symbols
+            .lines()
+            .find(|l| l.ends_with(&format!(" {name}")))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| u64::from_str_radix(v, 16).ok())
+            .unwrap()
+    };
+    let near = format!("{:x} <near_qld>", address_of("near_qld"));
+    assert!(text.contains(&format!("adr\tx9, {near}")), "{text}");
+    // `--no-relax`: GNU ld's code.
+    let (gnu, ours) = link_both(&tools, &dir, &["pairs.o", "-e", "_start"]);
+    assert_same_code(&tools, &dir, &gnu, &ours);
+    let plain = run_ok(&dir, &tools.objdump, &["-d", &ours]);
+    assert!(!words_of(&plain, "_start").contains(&"d503201f".to_string()));
+    // And lld itself, when it is installed.
+    let Some(lld) = lld() else {
+        println!("SKIPPED: lld comparison (no ld.lld)");
+        return;
+    };
+    run_ok(&dir, &lld, &["-o", "lld", "pairs.o", "-e", "_start"]);
+    let lld_text = run_ok(&dir, &tools.objdump, &["-d", "lld"]);
+    assert_eq!(mnemonics_of(&lld_text, "_start"), expected, "\n{lld_text}");
+}
+
+/// In a PIE, an absolute symbol's GOT entry is not relaxed (ADRP+ADD
+/// would make its address PC-relative), but everything else is.
+#[test]
+fn adrp_relaxations_in_a_pie() {
+    let tools = require!();
+    let dir = scratch("adrp-relax-pie");
+    let source = r#"
+	.text
+	.global _start
+	.type _start, %function
+_start:
+	adrp	x0, :got:abs_qld
+	ldr	x0, [x0, :got_lo12:abs_qld]
+	adrp	x1, :got:local_qld
+	ldr	x1, [x1, :got_lo12:local_qld]
+	adrp	x2, :got:hidden_qld
+	ldr	x2, [x2, :got_lo12:hidden_qld]
+	ret
+	.data
+local_qld:
+	.xword	1
+	.global hidden_qld
+	.hidden hidden_qld
+hidden_qld:
+	.xword	2
+	.global abs_qld
+	.set abs_qld, 0x1234
+"#;
+    compile(&tools, &dir, "pie", source, &[]);
+    for (output, flags) in [("pie", &["-pie"][..]), ("so", &["-shared"][..])] {
+        let mut args = vec!["-o", output, "pie.o", "-e", "_start"];
+        args.extend_from_slice(flags);
+        qld_ok(&dir, &args);
+        let text = run_ok(&dir, &tools.objdump, &["-d", output]);
+        assert_eq!(
+            mnemonics_of(&text, "_start"),
+            [
+                "adrp x0, ADDR ADDR",
+                "ldr x0, [x0, ADDR]",
+                "nop",
+                "adr x1, ADDR ADDR",
+                "nop",
+                "adr x2, ADDR ADDR",
+                "ret",
+            ],
+            "{output}:\n{text}"
+        );
+        if let Some(lld) = lld() {
+            let lld_out = format!("{output}.lld");
+            let mut args = vec!["-o", &lld_out, "pie.o", "-e", "_start"];
+            args.extend_from_slice(flags);
+            run_ok(&dir, &lld, &args);
+            let lld_text = run_ok(&dir, &tools.objdump, &["-d", &lld_out]);
+            assert_eq!(
+                mnemonics_of(&lld_text, "_start"),
+                mnemonics_of(&text, "_start"),
+                "lld differs for {output}"
+            );
+        }
+    }
 }
 
 /// `-r` keeps the machine and the relocations.
