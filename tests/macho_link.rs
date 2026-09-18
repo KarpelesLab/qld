@@ -1666,6 +1666,334 @@ fn literal_deduplication() {
     }
 }
 
+/// Merges `objects` with `-r` into `output` and returns the bytes.
+fn link_relocatable(arch: &str, objects: &[&Path], output: &Path) -> Vec<u8> {
+    let mut args = os(&[
+        "-arch",
+        arch,
+        "-platform_version",
+        "macos",
+        "13.0",
+        "13.0",
+        "-r",
+    ]);
+    for object in objects {
+        args.push(object.into());
+    }
+    args.extend(os(&["-o", output.to_str().unwrap()]));
+    let (bytes, _) = link_bytes(&args).unwrap_or_else(|e| panic!("-r failed: {e}"));
+    std::fs::write(output, &bytes).unwrap();
+    bytes
+}
+
+/// The external symbols of an image or object: (name, defined), sorted.
+fn external_symbols(data: &[u8]) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = symbols(data)
+        .into_iter()
+        .filter(Nlist::is_external)
+        .map(|s| {
+            let defined = s.n_type & 0x0e != 0;
+            (s.name, defined)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Checks a relocatable object with qld's reader: an `MH_OBJECT` whose
+/// relocations all decode and pair, and whose sections atomize.
+fn check_object(data: &[u8], subsections: bool) {
+    use qld::macho::read::{Atomization, ObjectFile};
+    let file = MachOFile::parse(data, Source::new(Path::new("merged.o"))).unwrap();
+    assert_eq!(file.header().file_type, qld::macho::read::consts::MH_OBJECT);
+    assert_eq!(
+        file.header().flags & qld::macho::read::consts::MH_SUBSECTIONS_VIA_SYMBOLS != 0,
+        subsections
+    );
+    let object = ObjectFile::parse(data, Source::new(Path::new("merged.o"))).unwrap();
+    Atomization::new(&object).unwrap();
+    for index in 0..object.sections().len() {
+        for relocation in object.paired_relocations(index).unwrap() {
+            relocation.unwrap();
+        }
+    }
+}
+
+/// `-r`: two C++ objects (weak definitions in both, exceptions, statics, a
+/// thread-local, string literals) merged into one object, which is then
+/// linked into an executable. The executable matches a link of the two
+/// objects themselves; `ld64.lld` (which has no `-r`) links the merged
+/// object too and is compared. On macOS the executable runs, the merged
+/// object's external symbols match Apple's `ld -r`, and Apple's linker
+/// links the merged object into a program that runs as well.
+#[test]
+fn relocatable_output() {
+    const EXPECTED: &str = "hello from a total -50 counter 3 local 5 tls 7 flag 1\n";
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "relocatable_output",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("relocatable");
+        let a = compile("relocatable", "relocatable_a.cpp", arch, &[]);
+        let b = compile("relocatable", "relocatable_b.cpp", arch, &[]);
+        let merged = dir.join(format!("merged-{arch}.o"));
+        let bytes = link_relocatable(arch, &[&a, &b], &merged);
+        check_object(&bytes, true);
+        assert_eq!(
+            link_relocatable(arch, &[&a, &b], &merged),
+            bytes,
+            "{arch}: -r output is not deterministic"
+        );
+
+        // One copy of each weak definition; undefined references stay.
+        let externals = external_symbols(&bytes);
+        let count = |name: &str| externals.iter().filter(|s| s.0 == name).count();
+        assert_eq!(count("__ZNK3BoxIiE5twiceEv"), 1, "{arch}: {externals:?}");
+        assert_eq!(count("__ZZ14shared_countervE5count"), 1, "{arch}");
+        for undefined in ["___cxa_throw", "___gxx_personality_v0", "_printf"] {
+            assert!(
+                externals.iter().any(|s| s.0 == undefined && !s.1),
+                "{arch}: {undefined} not undefined: {externals:?}"
+            );
+        }
+        let names = section_names(&bytes);
+        for wanted in [
+            "__text",
+            "__compact_unwind",
+            "__gcc_except_tab",
+            "__cstring",
+        ] {
+            assert!(
+                names.iter().any(|n| n == wanted),
+                "{arch}: no {wanted} in {names:?}"
+            );
+        }
+        let cstrings = section_contents(&bytes, "__cstring").unwrap();
+        assert_eq!(occurrences(cstrings, b"hello from a\0"), 1, "{arch}");
+
+        // Linked, the merged object gives the program the objects give.
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lc++", "-lSystem"]));
+        let exe = dir.join(format!("merged-{arch}"));
+        link_and_compare(&args, &exe);
+        let mut args = base_args(arch);
+        args.extend(strings(&[
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-lc++",
+            "-lSystem",
+        ]));
+        let direct = dir.join(format!("direct-{arch}"));
+        link_and_compare(&args, &direct);
+        if let (Some(ours), Some(theirs)) = (summarize(&exe), summarize(&direct)) {
+            assert_eq!(ours, theirs, "{arch}: linked from -r vs from the objects");
+            // `Box<int>::twice` is `.weak_def_can_be_hidden` in both
+            // objects: not exported, as with ld64.
+            assert!(
+                !ours.exports.contains("__ZNK3BoxIiE5twiceEv"),
+                "{arch}: {:?}",
+                ours.exports
+            );
+        }
+        if let (Some(ours), Some(theirs)) = (
+            objdump(&["--macho", "--section-headers"], &exe),
+            objdump(&["--macho", "--section-headers"], &direct),
+        ) {
+            // The same sections at the same addresses (the stubs and
+            // `__got` slots may come in another order).
+            let body = |text: &str| text.lines().skip(1).collect::<Vec<_>>().join("\n");
+            assert_eq!(body(&ours), body(&theirs), "{arch}: layouts differ");
+        }
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), EXPECTED, "{arch}");
+        }
+
+        if cfg!(target_os = "macos") && host_can_run(arch) {
+            apple_relocatable(arch, &[&a, &b], &bytes, &merged, EXPECTED);
+        }
+    }
+}
+
+/// On macOS: compares the external symbols of `ours` (qld's `-r` output,
+/// at `merged`) with Apple's `ld -r` of the same `objects`, then links
+/// `merged` with Apple's linker and runs it.
+fn apple_relocatable(arch: &str, objects: &[&Path], ours: &[u8], merged: &Path, expected: &str) {
+    let dir = merged.parent().unwrap();
+    let apple = dir.join(format!("apple-{arch}.o"));
+    let status = Command::new("ld")
+        .args(["-r", "-arch", arch])
+        .args(objects)
+        .arg("-o")
+        .arg(&apple)
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            let theirs = std::fs::read(&apple).unwrap();
+            assert_eq!(
+                external_symbols(ours),
+                external_symbols(&theirs),
+                "{arch}: external symbols, qld -r vs Apple ld -r"
+            );
+        }
+        _ => skip("relocatable_output", "Apple ld -r failed or is missing"),
+    }
+    let exe = dir.join(format!("apple-linked-{arch}"));
+    let status = Command::new("clang++")
+        .args(["-arch", arch])
+        .arg(merged)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{arch}: Apple's linker rejects qld's -r output"
+    );
+    assert_eq!(run(&exe).unwrap(), expected, "{arch}: linked by Apple's ld");
+}
+
+/// More `-r` inputs: Objective-C metadata (selector references into merged
+/// method names), `LC_LINKER_OPTION` carried to the final link, x86_64
+/// `SIGNED_n` stores, private externs (made local, or kept with
+/// `-keep_private_externs`), and debug information (dropped, with a
+/// warning).
+#[test]
+fn relocatable_variants() {
+    for arch in ["arm64", "x86_64"] {
+        if !clang_for(arch) {
+            skip(
+                "relocatable_variants",
+                &format!("clang cannot target {arch}-apple-macos"),
+            );
+            continue;
+        }
+        let dir = scratch("relocatable_variants");
+
+        // Objective-C, and statics stored to with immediates.
+        let objc = compile("relocatable_variants", "objc.m", arch, &[]);
+        let merged = dir.join(format!("objc-{arch}.o"));
+        let bytes = link_relocatable(arch, &[&objc], &merged);
+        check_object(&bytes, true);
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lobjc", "-lSystem"]));
+        let exe = dir.join(format!("objc-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "objc 42\n");
+        }
+        let statics = compile("relocatable_variants", "statics.c", arch, &[]);
+        let merged = dir.join(format!("statics-{arch}.o"));
+        link_relocatable(arch, &[&statics], &merged);
+        let mut args = base_args(arch);
+        args.extend(strings(&[merged.to_str().unwrap(), "-lSystem"]));
+        let exe = dir.join(format!("statics-{arch}"));
+        link_and_compare(&args, &exe);
+        if host_can_run(arch) {
+            assert_eq!(run(&exe).unwrap(), "1 12345678 1122334455667788\n");
+        }
+
+        // Private externs, and debug information.
+        let source = dir.join("hidden.c");
+        std::fs::write(
+            &source,
+            "__attribute__((visibility(\"hidden\"))) int hidden_answer(void) { return 42; }\n\
+             int visible_answer(void) { return hidden_answer(); }\n",
+        )
+        .unwrap();
+        let hidden = dir.join(format!("hidden-{arch}.o"));
+        assert!(tool_works(
+            "clang",
+            &[
+                &format!("--target={arch}-apple-macos13"),
+                "-g",
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                hidden.to_str().unwrap()
+            ]
+        ));
+        for keep in [false, true] {
+            let merged = dir.join(format!("hidden-{arch}-{keep}.o"));
+            let mut args = os(&[
+                "-arch",
+                arch,
+                "-platform_version",
+                "macos",
+                "13.0",
+                "13.0",
+                "-r",
+            ]);
+            args.push(hidden.clone().into());
+            if keep {
+                args.push("-keep_private_externs".into());
+            }
+            args.extend(os(&["-o", merged.to_str().unwrap()]));
+            let (bytes, messages) = link_bytes(&args).unwrap();
+            assert!(
+                messages.iter().any(|m| m.contains("DWARF")),
+                "{arch}: no warning about debug sections: {messages:?}"
+            );
+            assert!(
+                !section_names(&bytes)
+                    .iter()
+                    .any(|n| n.starts_with("__debug")),
+                "{arch}: debug sections copied"
+            );
+            let symbol = symbols(&bytes)
+                .into_iter()
+                .find(|s| s.name == "_hidden_answer")
+                .expect("_hidden_answer");
+            // N_PEXT | N_EXT when kept, a plain local otherwise.
+            assert_eq!(
+                symbol.n_type & 0x11,
+                if keep { 0x11 } else { 0 },
+                "{arch}: keep_private_externs {keep}: {:#x}",
+                symbol.n_type
+            );
+        }
+
+        // LC_LINKER_OPTION reaches the final link through -r.
+        if arch == "arm64" {
+            let autolink = compile("relocatable_variants", "autolink-arm64.s", arch, &[]);
+            let main = dir.join("autolink_main.c");
+            std::fs::write(
+                &main,
+                "void release(void *);\nint main(void) { release(0); return 0; }\n",
+            )
+            .unwrap();
+            let main_object = dir.join("autolink_main.o");
+            assert!(tool_works(
+                "clang",
+                &[
+                    "--target=arm64-apple-macos13",
+                    "-c",
+                    main.to_str().unwrap(),
+                    "-o",
+                    main_object.to_str().unwrap()
+                ]
+            ));
+            let merged = dir.join("autolink.o");
+            let bytes = link_relocatable(arch, &[&main_object, &autolink], &merged);
+            let options: Vec<u32> = load_commands(&bytes).iter().map(|c| c.0).collect();
+            assert!(
+                options.contains(&qld::macho::read::consts::LC_LINKER_OPTION),
+                "{options:x?}"
+            );
+            let mut args = base_args(arch);
+            args.extend(strings(&[merged.to_str().unwrap(), "-lSystem"]));
+            let exe = dir.join("autolink");
+            link_and_compare(&args, &exe);
+            if let Some(dylibs) = objdump(&["--macho", "--dylibs-used"], &exe) {
+                assert!(dylibs.contains("libc++"), "{dylibs}");
+            }
+        }
+    }
+}
+
 /// Whether `rustc` has the standard library for `target`.
 fn rust_std_for(target: &str) -> bool {
     let Ok(output) = Command::new("rustc")

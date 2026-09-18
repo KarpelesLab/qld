@@ -351,7 +351,6 @@ pub fn write(addresses: &Addresses<'_, '_>, plan: &EhFramePlan, image: &mut [u8]
         return Ok(());
     }
     let layout: &Layout = addresses.layout;
-    let link = addresses.link;
     let section = layout
         .find(SectionKind::EhFrame)
         .ok_or_else(|| Error::Internal("__eh_frame was not laid out".into()))?;
@@ -359,6 +358,86 @@ pub fn write(addresses: &Addresses<'_, '_>, plan: &EhFramePlan, image: &mut [u8]
     let out = image
         .get_mut(start..start.saturating_add(to_usize(section.size)))
         .ok_or_else(|| Error::Internal("__eh_frame outside the image".into()))?;
+    let arm64 = addresses.link.config.is_arm64();
+    write_records(
+        addresses,
+        plan,
+        section.addr,
+        out,
+        &mut |id, addend, _, _| {
+            let slot = addresses.got(id).ok_or_else(|| {
+                Error::Internal("__eh_frame personality without a __got slot".into())
+            })?;
+            // The x86_64 GOT relocation is relative to the end of the
+            // field; its addend compensates.
+            let adjust = if arm64 { 0 } else { addend.wrapping_sub(4) };
+            Ok(Some(slot.wrapping_add(adjust as u64)))
+        },
+    )
+}
+
+/// A CIE's personality pointer in a relocatable `__eh_frame`: it keeps its
+/// relocation, against the personality routine's symbol.
+#[derive(Clone, Copy, Debug)]
+pub struct PersonalityRelocation {
+    /// Offset of the field in the output `__eh_frame`.
+    pub offset: u64,
+    /// The input relocation (`POINTER_TO_GOT` or `X86_64_RELOC_GOT`).
+    pub relocation: crate::macho::read::Relocation,
+    /// The personality routine.
+    pub symbol: SymbolId,
+}
+
+/// Writes a relocatable (`-r`) `__eh_frame` into `out`, the section's
+/// bytes at address `address`: pointers to functions and LSDAs become
+/// PC-relative values without relocations (as x86_64 assemblers write
+/// them), and personality pointers keep their relocations, which are
+/// returned.
+///
+/// # Errors
+///
+/// Unsupported pointer encodings and out-of-range values.
+pub fn write_relocatable(
+    addresses: &Addresses<'_, '_>,
+    plan: &EhFramePlan,
+    address: u64,
+    out: &mut [u8],
+) -> Result<Vec<PersonalityRelocation>> {
+    let mut personalities = Vec::new();
+    write_records(
+        addresses,
+        plan,
+        address,
+        out,
+        &mut |symbol, _, pointer, offset| {
+            if let Some(paired) = pointer.relocation {
+                personalities.push(PersonalityRelocation {
+                    offset,
+                    relocation: paired.relocation,
+                    symbol,
+                });
+            }
+            Ok(None)
+        },
+    )?;
+    Ok(personalities)
+}
+
+/// A personality pointer reached through `__got`: given the symbol, the
+/// relocation's addend, the field and its offset in the output section,
+/// returns the address to store, or `None` to leave the field as it is.
+type GotPointer<'f> = dyn FnMut(SymbolId, i64, &EhPointer, u64) -> Result<Option<u64>> + 'f;
+
+/// Copies the planned records into `out` (the section's bytes, at address
+/// `address`) and rewrites their pointers.
+fn write_records(
+    addresses: &Addresses<'_, '_>,
+    plan: &EhFramePlan,
+    address: u64,
+    out: &mut [u8],
+    got: &mut GotPointer<'_>,
+) -> Result<()> {
+    let link = addresses.link;
     let mut current: Option<(usize, usize, EhFrame<'_>)> = None;
     for piece in &plan.pieces {
         let Some(object) = link.object(piece.file) else {
@@ -381,31 +460,21 @@ pub fn write(addresses: &Addresses<'_, '_>, plan: &EhFramePlan, image: &mut [u8]
         out.get_mut(at..at.saturating_add(record.data.len()))
             .ok_or_else(|| Error::Internal("__eh_frame record outside the section".into()))?
             .copy_from_slice(record.data);
-        let field_address = |pointer: &EhPointer| {
-            section
-                .addr
-                .saturating_add(piece.offset)
+        let field_offset = |pointer: &EhPointer| {
+            piece
+                .offset
                 .saturating_add(to_u64(pointer.offset.saturating_sub(record.offset)))
         };
+        let field_address = |pointer: &EhPointer| address.saturating_add(field_offset(pointer));
         let field_at =
             |pointer: &EhPointer| at.saturating_add(pointer.offset.saturating_sub(record.offset));
-        let resolve = |target: Option<Target>, field: u64| -> Result<Option<u64>> {
+        let mut resolve = |target: Option<Target>, pointer: &EhPointer| -> Result<Option<u64>> {
             Ok(match target {
                 Some(Target::Place(place)) => match addresses.value(place, 0)? {
                     Value::Address(address) | Value::Absolute(address) => Some(address),
                     Value::Import(..) => None,
                 },
-                Some(Target::Got(id, addend)) => {
-                    let slot = addresses.got(id).ok_or_else(|| {
-                        Error::Internal("__eh_frame personality without a __got slot".into())
-                    })?;
-                    // The x86_64 GOT relocation is relative to the end of
-                    // the field; its addend compensates.
-                    let arm64 = link.config.is_arm64();
-                    let adjust = if arm64 { 0 } else { addend.wrapping_sub(4) };
-                    let _ = field;
-                    Some(slot.wrapping_add(adjust as u64))
-                }
+                Some(Target::Got(id, addend)) => got(id, addend, pointer, field_offset(pointer))?,
                 None => None,
             })
         };
@@ -421,7 +490,7 @@ pub fn write(addresses: &Addresses<'_, '_>, plan: &EhFramePlan, image: &mut [u8]
                         personality,
                     )?;
                     let field = field_address(personality);
-                    if let Some(address) = resolve(target, field)? {
+                    if let Some(address) = resolve(target, personality)? {
                         write_pointer(out, field_at(personality), personality, address, field)?;
                     }
                 }
@@ -440,7 +509,7 @@ pub fn write(addresses: &Addresses<'_, '_>, plan: &EhFramePlan, image: &mut [u8]
                     let target =
                         pointer_target(link, piece.file, object, *section_index, data, pointer)?;
                     let field = field_address(pointer);
-                    if let Some(address) = resolve(target, field)? {
+                    if let Some(address) = resolve(target, pointer)? {
                         write_pointer(out, field_at(pointer), pointer, address, field)?;
                     }
                 }

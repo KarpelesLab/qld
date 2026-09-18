@@ -21,7 +21,7 @@ use crate::macho::read::consts::{
     LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_REEXPORT_DYLIB, LC_RPATH,
     LC_SEGMENT_64, LC_SYMTAB, LC_UUID, MH_BINDS_TO_WEAK, MH_BUNDLE, MH_DEAD_STRIPPABLE_DYLIB,
     MH_DYLDLINK, MH_DYLIB, MH_EXECUTE, MH_HAS_TLV_DESCRIPTORS, MH_MAGIC_64,
-    MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_PIE, MH_TWOLEVEL, MH_WEAK_DEFINES,
+    MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_OBJECT, MH_PIE, MH_TWOLEVEL, MH_WEAK_DEFINES,
     S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, TOOL_LD,
 };
 
@@ -113,7 +113,7 @@ pub fn commands_size(config: &Config, layout: &Layout, commands: &Commands) -> (
     match config.output_type {
         MachOutputType::Execute => add(padded_string_size(12, b"/usr/lib/dyld")),
         MachOutputType::Dylib => add(padded_string_size(24, &config.install_name)),
-        MachOutputType::Bundle => {}
+        MachOutputType::Bundle | MachOutputType::Object => {}
     }
     if config.uuid {
         add(24);
@@ -367,6 +367,7 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
         MachOutputType::Execute => MH_EXECUTE,
         MachOutputType::Dylib => MH_DYLIB,
         MachOutputType::Bundle => MH_BUNDLE,
+        MachOutputType::Object => MH_OBJECT,
     };
     let mut flags = MH_DYLDLINK | MH_TWOLEVEL | commands.extra_flags;
     if commands.no_undefs {
@@ -490,7 +491,7 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
                 compatibility_version: config.compatibility_version.0,
             },
         ),
-        MachOutputType::Bundle => {}
+        MachOutputType::Bundle | MachOutputType::Object => {}
     }
     let mut uuid_at = None;
     if config.uuid {

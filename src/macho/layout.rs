@@ -212,12 +212,12 @@ pub fn output_names<'s>(
 
 /// An atom placed in an output section: its sort key (order file position,
 /// cold), file and atom index.
-type Member = ((usize, bool), usize, usize);
+pub(super) type Member = ((usize, bool), usize, usize);
 
 /// Whether an output section with `flags` holds literals that are merged
 /// by content: C strings and 4-, 8- and 16-byte literals. (Literal pointer
 /// sections carry relocations and are kept as they are.)
-fn is_literal_section(flags: u32) -> bool {
+pub(super) fn is_literal_section(flags: u32) -> bool {
     matches!(
         flags & SECTION_TYPE,
         S_CSTRING_LITERALS | S_4BYTE_LITERALS | S_8BYTE_LITERALS | S_16BYTE_LITERALS
@@ -226,7 +226,7 @@ fn is_literal_section(flags: u32) -> bool {
 
 /// The outcome of literal deduplication over one output section's members.
 #[derive(Debug, Default)]
-struct Literals {
+pub(super) struct Literals {
     /// For each member position, the position of the first member with the
     /// same contents (itself when it is the first). Empty when nothing was
     /// merged.
@@ -237,11 +237,11 @@ struct Literals {
 }
 
 impl Literals {
-    fn canonical(&self, position: usize) -> usize {
+    pub(super) fn canonical(&self, position: usize) -> usize {
         self.first.get(position).copied().unwrap_or(position)
     }
 
-    fn align(&self, position: usize) -> Option<u32> {
+    pub(super) fn align(&self, position: usize) -> Option<u32> {
         self.align.get(position).copied()
     }
 }
@@ -249,7 +249,7 @@ impl Literals {
 /// Merges the literals of `list` (the sorted members of one output section)
 /// with equal contents into their first occurrence, as ld64 and lld do.
 /// The result depends only on the order of `list`.
-fn dedup_literals(link: &Link<'_>, list: &[Member]) -> Result<Literals> {
+pub(super) fn dedup_literals(link: &Link<'_>, list: &[Member]) -> Result<Literals> {
     let mut seen: HashMap<&[u8], usize> = HashMap::with_capacity(list.len());
     let mut first = Vec::with_capacity(list.len());
     let mut align = vec![0u32; list.len()];

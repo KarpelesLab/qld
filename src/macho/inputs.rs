@@ -214,6 +214,9 @@ impl InternalNames {
             MachOutputType::Execute => b"__mh_execute_header".as_slice(),
             MachOutputType::Dylib => b"__mh_dylib_header",
             MachOutputType::Bundle => b"__mh_bundle_header",
+            // A relocatable object has no header of its own to point at:
+            // references stay undefined for the final link.
+            MachOutputType::Object => return Self { names },
         };
         names.push((header.to_vec(), definition));
         names.push((b"___dso_handle".to_vec(), definition));
@@ -557,9 +560,14 @@ pub fn collect<'t>(
     // Libraries and frameworks requested by `LC_LINKER_OPTION` in the
     // objects, searched after everything on the command line. Missing ones
     // are warnings, as in ld64.
+    // `-r` passes them on to the final link instead.
     let mut requested: Vec<DarwinInput> = Vec::new();
     let mut seen = HashSet::new();
-    for request in std::mem::take(&mut walker.linker_option_libraries) {
+    let linker_options = std::mem::take(&mut walker.linker_option_libraries);
+    for request in linker_options
+        .into_iter()
+        .filter(|_| !config.is_relocatable())
+    {
         if seen.insert(request.clone()) {
             requested.push(request);
         }

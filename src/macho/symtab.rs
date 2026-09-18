@@ -276,9 +276,7 @@ pub fn build(
                         continue;
                     }
                 }
-                let hidden = entry.is_private_external()
-                    || link.files.get(file).is_some_and(|f| f.hidden)
-                    || !filter.exports(name);
+                let hidden = link.is_hidden(id, file, &entry) || !filter.exports(name);
                 let (n_type, n_sect, address) = match value {
                     Value::Absolute(v) => (N_ABS, 0, v),
                     Value::Address(a) => (N_SECT, section_ordinal(sections, a), a),

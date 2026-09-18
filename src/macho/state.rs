@@ -91,6 +91,10 @@ pub struct Link<'a> {
     pub defs: Vec<SymbolDef>,
     /// Whether any live file refers to each symbol without `N_WEAK_REF`.
     pub strong_ref: Vec<bool>,
+    /// Weak definitions every copy of which may be hidden automatically
+    /// (`N_WEAK_DEF | N_WEAK_REF`, `.weak_def_can_be_hidden`): a final
+    /// link makes them private externs, as ld64 does.
+    pub auto_hidden: Vec<bool>,
     /// Index of each file's first atom in the global atom numbering.
     pub atom_base: Vec<u32>,
     /// Total number of atoms.
@@ -179,6 +183,7 @@ impl<'a> Link<'a> {
             internal,
             defs: Vec::new(),
             strong_ref: Vec::new(),
+            auto_hidden: Vec::new(),
             atom_base,
             atom_count: usize::try_from(count).unwrap_or(usize::MAX),
             live: Vec::new(),
@@ -308,11 +313,15 @@ impl<'a> Link<'a> {
             }
         }
 
-        // Undefined symbols.
+        // Undefined symbols. A relocatable object keeps them undefined for
+        // the final link, boundary symbols included.
         let darwin = &options.darwin;
         let mut errors = 0usize;
         for (index, def) in defs.iter_mut().enumerate() {
-            if *def != SymbolDef::Undefined || !referenced.get(index).copied().unwrap_or(false) {
+            if *def != SymbolDef::Undefined
+                || !referenced.get(index).copied().unwrap_or(false)
+                || self.config.is_relocatable()
+            {
                 continue;
             }
             let id = SymbolId::new(index);
@@ -352,10 +361,61 @@ impl<'a> Link<'a> {
         }
         self.defs = defs;
         self.strong_ref = strong_ref;
+        self.auto_hidden = self.auto_hidden_definitions();
         if errors > 0 && !options.noinhibit_exec {
             return Err(Error::Reported { errors });
         }
         Ok(())
+    }
+
+    /// Which symbols have only definitions that can be hidden
+    /// automatically. A relocatable object keeps the marks for the final
+    /// link instead.
+    fn auto_hidden_definitions(&self) -> Vec<bool> {
+        let count = self.symbols.len();
+        if self.config.is_relocatable() {
+            return vec![false; count];
+        }
+        let mut defined = vec![false; count];
+        let mut all = vec![true; count];
+        for index in 0..self.files.len() {
+            let Some(object) = self.object(index) else {
+                continue;
+            };
+            let ids = self.resolution.symbol_ids(FileId::new(index));
+            for (&symbol, id) in object.global_symbols.iter().zip(ids) {
+                let Ok(entry) = object.file.symbols().get(symbol) else {
+                    continue;
+                };
+                if !entry.is_defined() && !entry.is_common() {
+                    continue;
+                }
+                if let Some(slot) = defined.get_mut(id.index()) {
+                    *slot = true;
+                }
+                if !(entry.is_weak_def() && entry.is_weak_ref())
+                    && let Some(slot) = all.get_mut(id.index())
+                {
+                    *slot = false;
+                }
+            }
+        }
+        defined.iter().zip(all).map(|(&d, a)| d && a).collect()
+    }
+
+    /// Whether the definition of `id` (symbol table entry `entry` of file
+    /// `file`) stays out of the exports: a private extern, a member of a
+    /// `-hidden-l` archive, or an automatically hidden weak definition.
+    #[must_use]
+    pub fn is_hidden(
+        &self,
+        id: SymbolId,
+        file: usize,
+        entry: &crate::macho::read::Symbol<'_>,
+    ) -> bool {
+        entry.is_private_external()
+            || self.files.get(file).is_some_and(|f| f.hidden)
+            || self.auto_hidden.get(id.index()).copied().unwrap_or(false)
     }
 
     fn referencing_files(&self, id: SymbolId) -> Vec<String> {
@@ -502,7 +562,16 @@ impl<'a> Link<'a> {
                         .copied()
                         .unwrap_or(NOT_GLOBAL);
                     if global == NOT_GLOBAL {
-                        all_lost = false;
+                        // Assembler-temporary labels (`ltmp0`, `l_…`, as
+                        // arm64 assemblers put at section starts) do not
+                        // keep a coalesced definition alive, as in ld64.
+                        let temporary =
+                            object.file.symbols().get(symbol).is_ok_and(|s| {
+                                s.name.starts_with(b"l") || s.name.starts_with(b"L")
+                            });
+                        if !temporary {
+                            all_lost = false;
+                        }
                         continue;
                     }
                     any_global = true;
@@ -665,7 +734,7 @@ impl<'a> Link<'a> {
                 root_symbol(id, &mut roots);
             }
         }
-        for (file_index, file) in self.files.iter().enumerate() {
+        for file_index in 0..self.files.len() {
             let Some(object) = self.object(file_index) else {
                 continue;
             };
@@ -691,12 +760,13 @@ impl<'a> Link<'a> {
                     .get(usize::try_from(symbol.index).unwrap_or(usize::MAX))
                     .copied()
                     .unwrap_or(NOT_GLOBAL);
+                let exported = global != NOT_GLOBAL
+                    && self
+                        .global_id(file_index, global)
+                        .is_some_and(|id| !self.is_hidden(id, file_index, &symbol));
                 let keep = symbol.is_no_dead_strip()
                     || symbol.is_referenced_dynamically()
-                    || (exports_are_roots
-                        && global != NOT_GLOBAL
-                        && !symbol.is_private_external()
-                        && !file.hidden);
+                    || (exports_are_roots && exported);
                 if !keep {
                     continue;
                 }

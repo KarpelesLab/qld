@@ -177,6 +177,7 @@ impl Config {
             (None, MachOutputType::Dylib) => output.as_os_str().as_encoded_bytes().to_vec(),
             (None, _) => Vec::new(),
         };
+        let relocatable = output_type == MachOutputType::Object;
         Ok(Self {
             arch,
             output_type,
@@ -190,7 +191,8 @@ impl Config {
             image_base,
             headerpad: darwin.headerpad.unwrap_or(32),
             headerpad_max_install_names: darwin.headerpad_max_install_names,
-            sign: darwin.adhoc_codesign.unwrap_or(is_arm64),
+            // Objects are signed by the final link, not by `-r`.
+            sign: !relocatable && darwin.adhoc_codesign.unwrap_or(is_arm64),
             entry,
             install_name,
             current_version: darwin
@@ -199,9 +201,10 @@ impl Config {
             compatibility_version: darwin
                 .compatibility_version
                 .unwrap_or(PackedVersion::new(1, 0, 0)),
-            dead_strip: options.gc_sections,
+            // ld64 ignores `-dead_strip` with `-r`: the final link strips.
+            dead_strip: options.gc_sections && !relocatable,
             undefined: darwin.undefined,
-            uuid: darwin.uuid == UuidMode::Content,
+            uuid: darwin.uuid == UuidMode::Content && !relocatable,
             identifier,
             debug_map: options.strip == crate::args::StripMode::None,
             oso_prefix: darwin.oso_prefix.clone(),
@@ -218,6 +221,12 @@ impl Config {
     #[must_use]
     pub fn is_exec(&self) -> bool {
         self.output_type == MachOutputType::Execute
+    }
+
+    /// Whether the output is a relocatable object (`-r`).
+    #[must_use]
+    pub fn is_relocatable(&self) -> bool {
+        self.output_type == MachOutputType::Object
     }
 
     /// Size of `__stubs` entries.

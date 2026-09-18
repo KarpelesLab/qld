@@ -344,8 +344,7 @@ fn weak_bound(link: &Link<'_>, filter: &ExportFilter) -> Vec<bool> {
             continue;
         };
         *slot = entry.is_weak_def()
-            && !entry.is_private_external()
-            && !link.files.get(file).is_some_and(|f| f.hidden)
+            && !link.is_hidden(SymbolId::new(index), file, &entry)
             && filter.exports(entry.name);
     }
     out

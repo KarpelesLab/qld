@@ -18,6 +18,10 @@
 //!    collecting pointer fixups;
 //! 8. `__LINKEDIT`: fixups ([`fixups`]), the export trie, symbol tables;
 //!    then the header, `LC_UUID` and the code signature.
+//!
+//! With `-r`, steps 1–4 run (without dead stripping) and
+//! [`relocatable::write`](super::relocatable::write) writes an `MH_OBJECT`
+//! instead of steps 5–8.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -241,21 +245,24 @@ fn link_arch_once(
 
     let mut symbols = SymbolTable::new();
     let resolution = resolve_symbols(&mut symbols, &MachRules, &mut files)?;
-    let more = inputs::missing_linker_options(options, &collected, &files, |index| {
-        resolution.is_live(crate::ids::FileId::new(index))
-    });
-    if !more.is_empty() {
-        return Ok(Attempt::MoreInputs(more));
-    }
-    let stubs: Vec<Vec<u8>> = resolution
-        .undefined()
-        .iter()
-        .filter_map(|u| u.name.bytes().strip_prefix(super::objc_stubs::PREFIX))
-        .filter(|selector| !selector.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect();
-    if !stubs.is_empty() {
-        return Ok(Attempt::Selectors(stubs));
+    // `-r` leaves both to the final link.
+    if !config.is_relocatable() {
+        let more = inputs::missing_linker_options(options, &collected, &files, |index| {
+            resolution.is_live(crate::ids::FileId::new(index))
+        });
+        if !more.is_empty() {
+            return Ok(Attempt::MoreInputs(more));
+        }
+        let stubs: Vec<Vec<u8>> = resolution
+            .undefined()
+            .iter()
+            .filter_map(|u| u.name.bytes().strip_prefix(super::objc_stubs::PREFIX))
+            .filter(|selector| !selector.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        if !stubs.is_empty() {
+            return Ok(Attempt::Selectors(stubs));
+        }
     }
     let duplicates = report_duplicates(
         resolution.duplicates(),
@@ -289,6 +296,9 @@ fn link_arch_once(
         diagnostics,
     )?;
     link.mark_live(options)?;
+    if config.is_relocatable() {
+        return super::relocatable::write(&link, options, diagnostics).map(Attempt::Done);
+    }
     let filter = ExportFilter::new(options)?;
     let synthetic = scan::scan(&link, options, &filter)?;
 

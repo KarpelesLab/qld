@@ -20,6 +20,7 @@
 //! | [`scan`] | Stubs, `__got`, `__thread_ptrs`, imports, dylib ordinals |
 //! | [`layout`] | Output sections, segments, addresses |
 //! | [`reloc`] | Relocation decoding and application (arm64, x86_64) |
+//! | [`relocatable`] | `-r`: relocatable `MH_OBJECT` output |
 //! | [`thunks`] | arm64 range-extension thunks |
 //! | [`addr`] | Final addresses of symbols and synthetic entries |
 //! | [`sections`] | Section contents |
@@ -47,6 +48,7 @@ pub mod objc_stubs;
 pub mod object;
 pub mod read;
 pub mod reloc;
+pub mod relocatable;
 pub mod resolve;
 pub mod scan;
 pub mod sections;
