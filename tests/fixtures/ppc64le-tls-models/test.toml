@@ -1,0 +1,19 @@
+# M4: the four TLS models in a PowerPC64 LE executable. Everything is in
+# the executable, so general-dynamic, local-dynamic and initial-exec all
+# relax to local-exec: no TLS dynamic relocation may be left, and
+# `__tls_get_addr` must not be called.
+description = "PowerPC64 LE TLS: general-dynamic, local-dynamic, initial-exec and local-exec relaxed to local-exec"
+compile = ["cc -O2 -fPIE -c tls.c"]
+driver = "cc"
+link = "-pie -o out tls.o"
+run = "./out"
+expect.stdout = "tls 31\n"
+expect.readelf = [
+  "PowerPC64",
+  "TLS",
+  "!R_PPC64_DTPMOD64",
+  "!R_PPC64_TPREL64",
+  "!__tls_get_addr",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true

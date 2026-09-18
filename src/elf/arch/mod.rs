@@ -4,7 +4,7 @@
 //! instruction sequences and writes linker-generated stubs. The rest of the
 //! ELF backend never names a relocation constant: it asks [`Arch`], which is
 //! chosen once per link ([`Arch::of`]) and dispatches to the module for
-//! x86-64, AArch64, RISC-V 64 or LoongArch64.
+//! x86-64, AArch64, RISC-V 64, LoongArch64 or PowerPC64.
 //!
 //! The vocabulary is shared, so the relocation scan and the writer run one
 //! loop for every architecture:
@@ -13,15 +13,16 @@
 //!   Page(P)`, a GOT slot's address, a thread pointer offset, …) and
 //!   [`GotKind`] which GOT entry it goes through;
 //! - [`Width`] says how the result is stored: a data field, or an AArch64
-//!   RISC-V or LoongArch instruction field
+//!   RISC-V, LoongArch or PowerPC64 instruction field
 //!   ([`crate::arch::aarch64::Field`], [`crate::arch::riscv::Field`],
-//!   [`crate::arch::loongarch::Field`]);
+//!   [`crate::arch::loongarch::Field`], [`crate::arch::ppc64::Field`]);
 //! - [`DynKind`] names the dynamic relocation a GOT slot, a PLT slot or a
 //!   copy needs, without naming its number.
 
 pub mod aarch64;
 pub mod aarch64_errata;
 pub mod loongarch;
+pub mod ppc64;
 pub mod riscv;
 pub mod shrink;
 pub mod thunk;
@@ -30,7 +31,7 @@ pub mod x86_64;
 use crate::args::LinkOptions;
 use crate::elf::read::Relocation;
 use crate::elf::read::consts::{
-    EM_AARCH64, EM_LOONGARCH, EM_RISCV, EM_X86_64, SHF_EXECINSTR, reloc_name,
+    EM_AARCH64, EM_LOONGARCH, EM_PPC64, EM_RISCV, EM_X86_64, SHF_EXECINSTR, reloc_name,
 };
 use crate::target::{Architecture, Target};
 
@@ -46,6 +47,8 @@ pub enum Arch {
     RiscV64,
     /// LoongArch64 (LP64D, little-endian).
     LoongArch64,
+    /// PowerPC64, little-endian, ELFv2 ABI.
+    Ppc64,
 }
 
 /// What a relocation computes.
@@ -118,6 +121,9 @@ pub enum Kind {
     /// `S + A` and the place ([`Arch::relax`]; LoongArch: a GOT load turned
     /// into an address computation, or linker relaxation to `pcaddi`).
     Relax,
+    /// `A` alone: a hint whose addend locates a related instruction
+    /// (PowerPC64 `R_PPC64_PCREL_OPT`).
+    Addend,
 }
 
 /// What a GOT entry holds.
@@ -164,6 +170,8 @@ pub enum Width {
     RiscV(crate::arch::riscv::Field),
     /// A LoongArch instruction (or data) field.
     LoongArch(crate::arch::loongarch::Field),
+    /// A PowerPC64 instruction (or data) field.
+    Ppc(crate::arch::ppc64::Field),
 }
 
 /// A classified relocation.
@@ -353,6 +361,26 @@ pub struct RelaxValues {
     pub place: u64,
 }
 
+/// A direct branch, as range-extension thunk planning and the writer both
+/// see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Branch {
+    /// The relocation type.
+    pub r_type: u32,
+    /// The address of the branch instruction.
+    pub place: u64,
+    /// The symbol's address plus addend, or the stub's when the branch
+    /// goes through one.
+    pub target: u64,
+    /// The callee's `st_other` (0 when unknown).
+    pub st_other: u8,
+    /// The branch goes to a PLT or IFUNC stub.
+    pub via_stub: bool,
+    /// The GOT word that stub jumps through, for calls that need a stub of
+    /// their own (PowerPC64 code without a TOC pointer).
+    pub slot: Option<u64>,
+}
+
 /// Options that change the shape of PLT entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PltFlags {
@@ -380,6 +408,7 @@ impl Arch {
             EM_AARCH64 => Some(Self::AArch64),
             EM_RISCV => Some(Self::RiscV64),
             EM_LOONGARCH => Some(Self::LoongArch64),
+            EM_PPC64 => Some(Self::Ppc64),
             _ => None,
         }
     }
@@ -392,6 +421,9 @@ impl Arch {
             Architecture::Aarch64 => Some(Self::AArch64),
             Architecture::Riscv64 => Some(Self::RiscV64),
             Architecture::LoongArch64 => Some(Self::LoongArch64),
+            Architecture::PowerPc64 if target.endian == crate::target::Endianness::Little => {
+                Some(Self::Ppc64)
+            }
             _ => None,
         }
     }
@@ -454,6 +486,7 @@ impl Arch {
             Self::AArch64 => EM_AARCH64,
             Self::RiscV64 => EM_RISCV,
             Self::LoongArch64 => EM_LOONGARCH,
+            Self::Ppc64 => EM_PPC64,
         }
     }
 
@@ -465,6 +498,7 @@ impl Arch {
             Self::AArch64 => "aarch64linux",
             Self::RiscV64 => "elf64lriscv",
             Self::LoongArch64 => "elf64loongarch",
+            Self::Ppc64 => "elf64lppc",
         }
     }
 
@@ -482,6 +516,7 @@ impl Arch {
     pub fn reloc_label(self, r_type: u32) -> String {
         let r_type = match self {
             Self::LoongArch64 => loongarch::base_type(r_type),
+            Self::Ppc64 => ppc64::base_type(r_type),
             _ => r_type,
         };
         self.reloc_name(r_type)
@@ -494,7 +529,7 @@ impl Arch {
     pub fn default_max_page(self) -> u64 {
         match self {
             Self::X86_64 | Self::RiscV64 => 0x1000,
-            Self::AArch64 => 0x1_0000,
+            Self::AArch64 | Self::Ppc64 => 0x1_0000,
             // GNU ld's; lld assumes 64 KiB.
             Self::LoongArch64 => 0x4000,
         }
@@ -508,24 +543,30 @@ impl Arch {
             Self::X86_64 | Self::AArch64 => super::layout::DEFAULT_BASE,
             Self::RiscV64 => 0x1_0000,
             Self::LoongArch64 => 0x1_2000_0000,
+            // The first 256 MiB segment boundary.
+            Self::Ppc64 => 0x1000_0000,
         }
     }
 
     /// The number of words `.got.plt` reserves for the dynamic linker:
     /// `_DYNAMIC`, the link map and the resolver on x86-64 and AArch64; the
-    /// resolver and the link map on RISC-V and LoongArch.
+    /// resolver and the link map on RISC-V, LoongArch and PowerPC64.
     #[must_use]
     pub fn got_plt_reserved(self) -> u64 {
         match self {
             Self::X86_64 | Self::AArch64 => 3,
-            Self::RiscV64 | Self::LoongArch64 => 2,
+            Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => 2,
         }
     }
 
     /// The `e_flags` of the output, from the input objects: the LoongArch
-    /// ABI and object ABI version, the RISC-V ABI flags; zero elsewhere.
+    /// ABI and object ABI version, or the PowerPC64 ABI version (2); zero
+    /// elsewhere.
     #[must_use]
     pub fn output_flags(self, files: &[super::inputs::ElfInput<'_>]) -> u32 {
+        if self == Self::Ppc64 {
+            return ppc64::ABI_VERSION;
+        }
         if self == Self::RiscV64 {
             return riscv::output_flags(
                 files
@@ -551,12 +592,25 @@ impl Arch {
         }))
     }
 
+    /// Whether [`Arch::annotate`] changes anything on this architecture, so
+    /// relocation loops must look one relocation ahead
+    /// ([`for_each_relocation!`]).
+    #[must_use]
+    pub fn annotates(self) -> bool {
+        matches!(self, Self::LoongArch64 | Self::Ppc64)
+    }
+
     /// `rel` with what the architecture needs to know about the relocation
     /// that follows it (`next`) folded into its type: on LoongArch, whether
     /// an `R_LARCH_RELAX` allows the instructions to be relaxed
-    /// ([`loongarch::RELAX_HINT`]). Other architectures get `rel` back.
+    /// ([`loongarch::RELAX_HINT`]); on PowerPC64, whether a
+    /// `__tls_get_addr` marker is on a PC-relative call
+    /// ([`ppc64::PCREL_CALL_HINT`]). Other architectures get `rel` back.
     #[must_use]
     pub fn annotate(self, rel: Relocation, next: Option<&Relocation>) -> Relocation {
+        if self == Self::Ppc64 {
+            return ppc64::annotate(rel, next);
+        }
         if self == Self::LoongArch64
             && let Some(next) = next
             && next.r_type == loongarch::R_LARCH_RELAX
@@ -577,7 +631,7 @@ impl Arch {
     pub fn page_delta(self, target: u64, place: u64, r_type: u32) -> u64 {
         match self {
             Self::LoongArch64 => loongarch::page_delta(target, place, r_type),
-            Self::X86_64 | Self::AArch64 | Self::RiscV64 => {
+            Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::Ppc64 => {
                 let page = crate::arch::aarch64::page;
                 page(target).wrapping_sub(page(place))
             }
@@ -600,7 +654,9 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::LoongArch64 => loongarch::relax(out, offset, r_type, target, place),
-            Self::X86_64 | Self::AArch64 | Self::RiscV64 => Err(ApplyError::BadInstruction),
+            Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::Ppc64 => {
+                Err(ApplyError::BadInstruction)
+            }
         }
     }
 
@@ -615,16 +671,6 @@ impl Arch {
     #[must_use]
     pub fn got_plt_holds_dynamic(self) -> bool {
         self.got_plt_reserved() == 3
-    }
-
-    /// The bias stored in a static `DTPREL` value: the offset the TLS
-    /// runtime adds back (0x800 on RISC-V).
-    #[must_use]
-    pub fn dtp_offset(self) -> u64 {
-        match self {
-            Self::X86_64 | Self::AArch64 | Self::LoongArch64 => 0,
-            Self::RiscV64 => crate::arch::riscv::DTP_OFFSET,
-        }
     }
 
     /// Rejects options whose AArch64 effect is not implemented, rather
@@ -659,7 +705,93 @@ impl Arch {
     /// range-extension thunks.
     #[must_use]
     pub fn needs_thunks(self) -> bool {
-        self == Self::AArch64
+        matches!(self, Self::AArch64 | Self::Ppc64)
+    }
+
+    /// Number of bytes one range-extension thunk occupies.
+    #[must_use]
+    pub fn thunk_size(self) -> u64 {
+        match self {
+            Self::Ppc64 => crate::arch::ppc64::THUNK_SIZE,
+            _ => crate::arch::aarch64::THUNK_SIZE,
+        }
+    }
+
+    /// Writes the range-extension thunk at address `address` for thunk key
+    /// `key` ([`Arch::branch_thunk`]) into `out` at `at`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplyError::Overflow`] when the target is out of the thunk's reach.
+    pub fn write_thunk(
+        self,
+        out: &mut [u8],
+        at: u64,
+        address: u64,
+        key: u64,
+    ) -> Result<(), ApplyError> {
+        match self {
+            Self::Ppc64 => crate::arch::ppc64::write_thunk(out, at, address, key)
+                .map_err(|_| ApplyError::Overflow),
+            _ => crate::arch::aarch64::write_thunk(out, at, address, key)
+                .map_err(|_| ApplyError::Overflow),
+        }
+    }
+
+    /// Whether relocation `r_type` is a direct branch that range-extension
+    /// thunks serve.
+    #[must_use]
+    pub fn is_thunk_branch(self, r_type: u32) -> bool {
+        use crate::elf::read::consts::aarch64 as a64;
+        match self {
+            Self::X86_64 | Self::RiscV64 | Self::LoongArch64 => false,
+            Self::AArch64 => matches!(r_type, a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26),
+            Self::Ppc64 => ppc64::is_thunk_branch(r_type),
+        }
+    }
+
+    /// The address a direct branch jumps to, before any thunk: PowerPC64
+    /// enters a function of this output at its local entry point.
+    #[must_use]
+    pub fn branch_destination(self, branch: Branch) -> u64 {
+        match self {
+            Self::Ppc64 => ppc64::branch_destination(branch),
+            _ => branch.target,
+        }
+    }
+
+    /// The key of the range-extension thunk `branch` goes through, if it
+    /// needs one: its destination (thunks are shared by key), on PowerPC64
+    /// with the kind of thunk in the low bits.
+    #[must_use]
+    pub fn branch_thunk(self, branch: Branch) -> Option<u64> {
+        match self {
+            Self::X86_64 | Self::RiscV64 | Self::LoongArch64 => None,
+            Self::AArch64 => (self.is_thunk_branch(branch.r_type)
+                && !crate::arch::aarch64::branch_in_range(branch.place, branch.target))
+            .then_some(branch.target),
+            Self::Ppc64 => ppc64::branch_thunk(branch),
+        }
+    }
+
+    /// Rewrites what a direct call at `offset` needs besides its
+    /// displacement: on PowerPC64, the `nop` after a call through a stub
+    /// becomes the reload of the TOC pointer.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplyError::BadInstruction`] for calls the architecture cannot
+    /// link.
+    pub fn finish_call(
+        self,
+        out: &mut [u8],
+        offset: u64,
+        branch: Branch,
+    ) -> Result<(), ApplyError> {
+        match self {
+            Self::Ppc64 => ppc64::finish_call(out, offset, branch),
+            _ => Ok(()),
+        }
     }
 
     /// Whether `-z separate-code` is the default, as it is for GNU ld's
@@ -677,6 +809,7 @@ impl Arch {
             Self::AArch64 => "/lib/ld-linux-aarch64.so.1",
             Self::RiscV64 => riscv::interpreter(riscv::EF_RISCV_FLOAT_ABI),
             Self::LoongArch64 => "/lib64/ld-linux-loongarch-lp64d.so.1",
+            Self::Ppc64 => "/lib64/ld64.so.2",
         }
     }
 
@@ -684,7 +817,10 @@ impl Arch {
     /// after a two-word thread control block) rather than variant II.
     #[must_use]
     pub fn tls_variant1(self) -> bool {
-        matches!(self, Self::AArch64 | Self::RiscV64 | Self::LoongArch64)
+        matches!(
+            self,
+            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64
+        )
     }
 
     /// The size of the thread control block variant I reserves below the
@@ -692,15 +828,107 @@ impl Arch {
     #[must_use]
     pub fn tcb_size(self) -> u64 {
         match self {
-            Self::X86_64 | Self::RiscV64 | Self::LoongArch64 => 0,
+            Self::X86_64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => 0,
             Self::AArch64 => 16,
         }
+    }
+
+    /// Where the thread pointer is relative to the start of the TLS block,
+    /// when the ABI fixes it there (PowerPC64: 0x7000 bytes past it)
+    /// rather than past a thread control block.
+    #[must_use]
+    pub fn tp_past_tls_start(self) -> Option<u64> {
+        match self {
+            Self::Ppc64 => Some(crate::arch::ppc64::TP_OFFSET),
+            _ => None,
+        }
+    }
+
+    /// How far past the start of a module's TLS block the dynamic thread
+    /// vector points (PowerPC64: 0x8000, RISC-V: 0x800), which biases
+    /// `@dtprel` values.
+    #[must_use]
+    pub fn dtv_offset(self) -> u64 {
+        match self {
+            Self::Ppc64 => crate::arch::ppc64::DTV_OFFSET,
+            Self::RiscV64 => crate::arch::riscv::DTP_OFFSET,
+            _ => 0,
+        }
+    }
+
+    /// Where the GOT base that GOT-relative relocations use is, from the
+    /// start of `.got`, when it is not `.got.plt` (PowerPC64: the TOC
+    /// pointer, `.got + 0x8000`).
+    #[must_use]
+    pub fn toc_bias(self) -> Option<u64> {
+        match self {
+            Self::Ppc64 => Some(crate::arch::ppc64::TOC_BIAS),
+            _ => None,
+        }
+    }
+
+    /// Words reserved at the start of `.got` (PowerPC64 keeps the TOC
+    /// pointer's link-time value there).
+    #[must_use]
+    pub fn got_header_words(self) -> u64 {
+        match self {
+            Self::Ppc64 => 1,
+            _ => 0,
+        }
+    }
+
+    /// The `DT_PPC64_GLINK` value, as an offset from the start of `.plt`:
+    /// 32 bytes before the first lazy entry, where glibc expects it.
+    #[must_use]
+    pub fn glink_offset(self) -> Option<u64> {
+        match self {
+            Self::Ppc64 => Some(crate::arch::ppc64::GLINK_HEADER_SIZE.wrapping_sub(32)),
+            _ => None,
+        }
+    }
+
+    /// Whether a dynamic output calls PLT entries through `.plt.sec`:
+    /// x86-64 with IBT, and PowerPC64 always, its call stubs being there
+    /// while `.plt` holds the lazy-binding entries.
+    #[must_use]
+    pub fn has_plt_sec(self, ibt: bool) -> bool {
+        match self {
+            Self::X86_64 => ibt,
+            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 => false,
+            Self::Ppc64 => true,
+        }
+    }
+
+    /// Size of one `.plt.sec` entry.
+    #[must_use]
+    pub fn plt_sec_entry_size(self, flags: PltFlags) -> u64 {
+        match self {
+            Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            _ => self.plt_entry_size(flags),
+        }
+    }
+
+    /// Whether a preemptible function that also has a GOT entry is called
+    /// through `.plt.got` (jumping through that entry) rather than getting
+    /// a PLT slot. PowerPC64 linkers give every called function a slot.
+    #[must_use]
+    pub fn uses_plt_got(self) -> bool {
+        self != Self::Ppc64
+    }
+
+    /// Whether a dynamic output's `IRELATIVE` relocations go to
+    /// `.rela.plt`, with the lazy PLT relocations. PowerPC64's dynamic
+    /// linker sets the lazy slots up itself and never applies `.rela.plt`
+    /// entries one by one, so GNU ld puts them in `.rela.dyn` there.
+    #[must_use]
+    pub fn irelative_in_rela_plt(self) -> bool {
+        self != Self::Ppc64
     }
 
     /// The number written for dynamic relocation `kind`.
     #[must_use]
     pub fn dyn_reloc(self, kind: DynKind) -> u32 {
-        use crate::elf::read::consts::{aarch64 as a64, riscv as rv, x86_64 as x64};
+        use crate::elf::read::consts::{aarch64 as a64, ppc64 as p64, riscv as rv, x86_64 as x64};
         match self {
             Self::X86_64 => match kind {
                 DynKind::Relative => x64::R_X86_64_RELATIVE,
@@ -750,6 +978,19 @@ impl Arch {
                 DynKind::TpOff => loongarch::R_LARCH_TLS_TPREL64,
                 DynKind::TlsDesc => loongarch::R_LARCH_TLS_DESC64,
             },
+            Self::Ppc64 => match kind {
+                DynKind::Relative => p64::R_PPC64_RELATIVE,
+                DynKind::Irelative => p64::R_PPC64_IRELATIVE,
+                DynKind::JumpSlot => p64::R_PPC64_JMP_SLOT,
+                DynKind::GlobDat => p64::R_PPC64_GLOB_DAT,
+                DynKind::Copy => p64::R_PPC64_COPY,
+                DynKind::Abs64 => p64::R_PPC64_ADDR64,
+                DynKind::DtpMod => p64::R_PPC64_DTPMOD64,
+                DynKind::DtpOff => p64::R_PPC64_DTPREL64,
+                DynKind::TpOff => p64::R_PPC64_TPREL64,
+                // PowerPC64 has no TLS descriptors.
+                DynKind::TlsDesc => p64::R_PPC64_NONE,
+            },
         }
     }
 
@@ -758,9 +999,13 @@ impl Arch {
     /// address (so `--icf=safe` may fold its target).
     #[must_use]
     pub fn is_branch(self, r_type: u32) -> bool {
-        use crate::elf::read::consts::{aarch64 as a64, x86_64 as x64};
+        use crate::elf::read::consts::{aarch64 as a64, ppc64 as p64, x86_64 as x64};
         match self {
             Self::X86_64 => matches!(r_type, x64::R_X86_64_PLT32 | x64::R_X86_64_PLT32_BND),
+            Self::Ppc64 => matches!(
+                ppc64::base_type(r_type),
+                p64::R_PPC64_REL24 | p64::R_PPC64_REL24_NOTOC
+            ),
             Self::AArch64 => matches!(
                 r_type,
                 a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26 | a64::R_AARCH64_PLT32
@@ -788,6 +1033,7 @@ impl Arch {
             Self::AArch64 => aarch64::classify(r_type, context),
             Self::RiscV64 => riscv::classify(r_type, context),
             Self::LoongArch64 => loongarch::classify(r_type, addend, data, offset, context),
+            Self::Ppc64 => ppc64::classify(r_type, data, offset, context),
         }
     }
 
@@ -806,7 +1052,9 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::X86_64 => x86_64::relax_got(out, offset, kind, value),
-            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 => Err(ApplyError::BadInstruction),
+            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
+                Err(ApplyError::BadInstruction)
+            }
         }
     }
 
@@ -829,6 +1077,7 @@ impl Arch {
             // RISC-V sections are written by `riscv::apply`.
             Self::RiscV64 => Err(ApplyError::BadInstruction),
             Self::LoongArch64 => loongarch::relax_tls(out, offset, kind, r_type, values),
+            Self::Ppc64 => ppc64::relax_tls(out, offset, kind, r_type, values),
         }
     }
 
@@ -843,6 +1092,7 @@ impl Arch {
             }
             Self::RiscV64 => riscv::PLT_HEADER_SIZE,
             Self::LoongArch64 => loongarch::PLT_HEADER_SIZE,
+            Self::Ppc64 => crate::arch::ppc64::GLINK_HEADER_SIZE,
         }
     }
 
@@ -854,6 +1104,7 @@ impl Arch {
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
+            Self::Ppc64 => 4,
         }
     }
 
@@ -866,6 +1117,7 @@ impl Arch {
             Self::AArch64 => aarch64::plt_entry_size(aarch64::plt_got_flags(flags)),
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
+            Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
         }
     }
 
@@ -883,6 +1135,7 @@ impl Arch {
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
+            Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
         }
     }
 
@@ -898,6 +1151,8 @@ impl Arch {
             // The header pushes and jumps; entries do not. On LoongArch the
             // header finds the index from the entry's return address.
             Self::AArch64 | Self::RiscV64 | Self::LoongArch64 => plt,
+            // The dynamic linker points every slot at its lazy entry.
+            Self::Ppc64 => 0,
         }
     }
 
@@ -919,6 +1174,7 @@ impl Arch {
             Self::AArch64 => aarch64::write_plt_header(out, plt, got_plt, flags),
             Self::RiscV64 => riscv::write_plt_header(out, plt, got_plt),
             Self::LoongArch64 => loongarch::write_plt_header(out, plt, got_plt),
+            Self::Ppc64 => ppc64::write_plt_header(out, plt, got_plt),
         }
     }
 
@@ -944,11 +1200,14 @@ impl Arch {
             Self::AArch64 => aarch64::write_plt_entry(out, entry, slot, flags),
             Self::RiscV64 => riscv::write_plt_entry(out, entry, slot),
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
+            Self::Ppc64 => ppc64::write_plt_entry(out, entry, plt),
         }
     }
 
     /// Writes a `.plt.sec` or `.plt.got` entry at `entry` that jumps through
-    /// the GOT word at `slot`.
+    /// the GOT word at `slot`. `got_base` is the GOT base
+    /// ([`crate::elf::values::Addresses::got_base`]), from which PowerPC64
+    /// stubs address the slot.
     ///
     /// # Errors
     ///
@@ -959,6 +1218,7 @@ impl Arch {
         entry: u64,
         slot: u64,
         flags: PltFlags,
+        got_base: u64,
     ) -> Result<(), ApplyError> {
         match self {
             Self::X86_64 => x86_64::write_plt_jump(out, entry, slot, flags.landing_pad),
@@ -967,11 +1227,12 @@ impl Arch {
             }
             Self::RiscV64 => riscv::write_plt_entry(out, entry, slot),
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
+            Self::Ppc64 => ppc64::write_call_stub(out, slot, got_base),
         }
     }
 
     /// Writes an IFUNC stub at `stub` that jumps through the GOT slot at
-    /// `slot_address`.
+    /// `slot_address`; `got_base` as for [`Arch::write_plt_jump`].
     ///
     /// # Errors
     ///
@@ -982,6 +1243,7 @@ impl Arch {
         stub: u64,
         slot_address: u64,
         flags: PltFlags,
+        got_base: u64,
     ) -> Result<(), ApplyError> {
         match self {
             Self::X86_64 => x86_64::write_iplt(out, stub, slot_address),
@@ -990,6 +1252,7 @@ impl Arch {
             Self::AArch64 => aarch64::write_plt_entry(out, stub, slot_address, flags),
             Self::RiscV64 => riscv::write_plt_entry(out, stub, slot_address),
             Self::LoongArch64 => loongarch::write_plt_entry(out, stub, slot_address),
+            Self::Ppc64 => ppc64::write_call_stub(out, slot_address, got_base),
         }
     }
 
@@ -1011,6 +1274,7 @@ impl Arch {
             Self::X86_64 | Self::RiscV64 => Ok(false),
             Self::LoongArch64 => loongarch::undefined_weak_branch(out, offset, r_type),
             Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
+            Self::Ppc64 => ppc64::nop_undefined_branch(out, offset, r_type),
         }
     }
 
@@ -1022,6 +1286,7 @@ impl Arch {
             Self::AArch64 => aarch64::write_nops(out),
             Self::RiscV64 => riscv::write_nops(out),
             Self::LoongArch64 => loongarch::write_nops(out),
+            Self::Ppc64 => ppc64::write_nops(out),
         }
     }
 }
@@ -1107,6 +1372,55 @@ pub fn write_value(
             }
         }
         Width::LoongArch(field) => loongarch::write_field(out, offset, field, value)?,
+        Width::Ppc(field) => write_ppc64(out, offset, field, signed)?,
+    }
+    Ok(())
+}
+
+/// Writes PowerPC64 field `field` at `offset`.
+fn write_ppc64(
+    out: &mut [u8],
+    offset: u64,
+    field: crate::arch::ppc64::Field,
+    value: i64,
+) -> Result<(), ApplyError> {
+    use crate::arch::ppc64::EncodeError;
+    let error = |e: EncodeError| match e {
+        EncodeError::Overflow => ApplyError::Overflow,
+        EncodeError::BadInstruction => ApplyError::BadInstruction,
+    };
+    if field == crate::arch::ppc64::Field::PcrelOpt {
+        // Rewrites two instructions, `value` bytes apart.
+        return ppc64::relax_pcrel_opt(out, offset, value);
+    }
+    match field.bytes() {
+        2 => {
+            let half = slot::<2>(out, offset)?;
+            *half = field
+                .encode16(u16::from_le_bytes(*half), value)
+                .map_err(error)?
+                .to_le_bytes();
+        }
+        8 => {
+            let words = slot::<8>(out, offset)?;
+            let (prefix, suffix) = words.split_at_mut(4);
+            let old = (u64::from(u32::from_le_bytes([
+                prefix[0], prefix[1], prefix[2], prefix[3],
+            ])) << 32)
+                | u64::from(u32::from_le_bytes([
+                    suffix[0], suffix[1], suffix[2], suffix[3],
+                ]));
+            let encoded = field.encode64(old, value).map_err(error)?;
+            prefix.copy_from_slice(&((encoded >> 32) as u32).to_le_bytes());
+            suffix.copy_from_slice(&(encoded as u32).to_le_bytes());
+        }
+        _ => {
+            let word = slot::<4>(out, offset)?;
+            *word = field
+                .encode32(u32::from_le_bytes(*word), value)
+                .map_err(error)?
+                .to_le_bytes();
+        }
     }
     Ok(())
 }
@@ -1142,10 +1456,35 @@ pub fn add_value(out: &mut [u8], offset: u64, width: Width, delta: u64) -> Resul
             *byte = byte.wrapping_add(delta as u8);
         }
         Width::LoongArch(field) => loongarch::add_field(out, offset, field, delta)?,
-        Width::None | Width::Field(_) | Width::RiscV(_) => return Err(ApplyError::BadInstruction),
+        Width::None | Width::Field(_) | Width::RiscV(_) | Width::Ppc(_) => {
+            return Err(ApplyError::BadInstruction);
+        }
     }
     Ok(())
 }
+
+/// Runs `$body` for every relocation of `$relas` (a relocation slice), with
+/// `$rel` bound to it, as a `for` loop does (`continue` and `break` work).
+///
+/// On architectures that [`Arch::annotates`], `$rel` is
+/// [`Arch::annotate`]d with the relocation that follows it. The choice is
+/// made once, and the body is expanded into two loops, so architectures
+/// without annotation pay nothing per relocation.
+macro_rules! for_each_relocation {
+    ($arch:expr, $relas:expr, |$rel:ident| $body:block) => {{
+        let arch: $crate::elf::arch::Arch = $arch;
+        if arch.annotates() {
+            let mut relocations = $relas.iter().peekable();
+            while let Some(current) = relocations.next() {
+                let $rel = arch.annotate(current, relocations.peek());
+                $body
+            }
+        } else {
+            for $rel in $relas.iter() $body
+        }
+    }};
+}
+pub(crate) use for_each_relocation;
 
 /// The byte width of a relocation field.
 #[must_use]
@@ -1159,5 +1498,6 @@ pub fn width_bytes(width: Width) -> usize {
         Width::Field(field) => field.bytes(),
         Width::RiscV(field) => field.bytes(),
         Width::LoongArch(field) => field.bytes(),
+        Width::Ppc(field) => field.bytes(),
     }
 }

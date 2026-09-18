@@ -1,0 +1,19 @@
+# M4: static glibc on PowerPC64 LE. Every TLS access in libc relaxes to
+# local-exec, TOC-indirect loads through `.toc` become TOC-relative, and
+# the IFUNC string functions are called through stubs that save r2, their
+# slots filled by IRELATIVE relocations.
+description = "static hello world in C, for PowerPC64 LE"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "PowerPC64",
+  "EXEC (Executable file)",
+  "!INTERP",
+  "!.dynamic",
+  "!R_PPC64_JMP_SLOT",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true

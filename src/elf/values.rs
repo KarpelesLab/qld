@@ -189,6 +189,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
             Value::OutputEnd(output) => {
                 layout.output_places.get(output as usize).map_or(0, |p| p.1)
             }
+            Value::GotBase if self.synth.arch.toc_bias().is_some() => self.got_base(),
             Value::GotBase => layout
                 .synthetic(Synthetic::GotPlt)
                 .or_else(|| layout.synthetic(Synthetic::Got))
@@ -399,9 +400,16 @@ impl<'x, 'a> Addresses<'x, 'a> {
         base.checked_add(slot.checked_mul(8)?)
     }
 
-    /// The GOT base (`_GLOBAL_OFFSET_TABLE_`).
+    /// The GOT base (`_GLOBAL_OFFSET_TABLE_`; on PowerPC64 the TOC pointer
+    /// `.TOC.`, 0x8000 bytes into `.got`).
     #[must_use]
     pub fn got_base(&self) -> u64 {
+        if let Some(bias) = self.synth.arch.toc_bias() {
+            return self
+                .layout
+                .synthetic(Synthetic::Got)
+                .map_or(0, |(addr, ..)| addr.wrapping_add(bias));
+        }
         self.layout
             .synthetic(Synthetic::GotPlt)
             .or_else(|| self.layout.synthetic(Synthetic::Got))
@@ -453,9 +461,26 @@ pub fn plt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u
     }
     let index = synth.plt_index(owner)?;
     if let Some((base, ..)) = layout.synthetic(Synthetic::PltSec) {
-        return base.checked_add(index.checked_mul(arch.plt_entry_size(flags))?);
+        return base.checked_add(index.checked_mul(arch.plt_sec_entry_size(flags))?);
     }
     lazy_plt_address(synth, layout, index)
+}
+
+/// The address of the GOT word `owner`'s PLT entry (or IFUNC stub) jumps
+/// through: its `.got.plt` slot, or its GOT entry for `.plt.got`.
+#[must_use]
+pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
+    if synth.plt_got.index(owner).is_some() {
+        let (base, ..) = layout.synthetic(Synthetic::Got)?;
+        return base.checked_add(synth.got_word(owner, GotKind::Address)?.checked_mul(8)?);
+    }
+    let index = if synth.dynamic() {
+        synth.plt_index(owner)?
+    } else {
+        u64::try_from(synth.iplt.index(owner)?).ok()?
+    };
+    let (base, ..) = layout.synthetic(Synthetic::GotPlt)?;
+    base.checked_add(index.checked_add(synth.got_plt_reserved)?.checked_mul(8)?)
 }
 
 /// The address of lazy `.plt` entry `index`, after the header.
