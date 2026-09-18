@@ -15,7 +15,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-use crate::args::options::{DiscardMode, Flavor, LinkOptions, StripMode};
+use crate::args::options::{DiscardMode, Flavor, InputAttrs, InputKind, LinkOptions, StripMode};
 use crate::args::parse::ParseOutcome;
 use crate::args::response::{self, FileReader, Quoting};
 use crate::args::table::Status;
@@ -94,42 +94,17 @@ pub enum LoadMode {
     Hidden,
 }
 
-/// What a Darwin input names.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum DarwinInputKind {
-    /// A file path.
-    File(PathBuf),
-    /// `-l<name>`: `lib<name>.tbd`, `.dylib`, `.a` in the library search
-    /// paths.
-    Library(String),
-    /// `-framework <name>[,<suffix>]`: `<name>.framework/<name>` in the
-    /// framework search paths.
-    Framework {
-        /// The framework name.
-        name: String,
-        /// The optional suffix (`-framework Foo,_debug`).
-        suffix: Option<String>,
-    },
-}
-
-/// One Darwin input, in command-line order.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DarwinInput {
-    /// What the input names.
-    pub kind: DarwinInputKind,
-    /// How it is linked.
-    pub mode: LoadMode,
-    /// `-force_load`: load every member of this archive.
-    pub force_load: bool,
-}
-
 /// The options of an ld64-flavor link that have no GNU equivalent.
 ///
 /// The flavor-neutral parts of an ld64 command line go into the ordinary
 /// [`LinkOptions`] fields: `-o` into `output`, `-e` into `entry`,
 /// `-install_name` into `soname`, `-rpath` into `rpaths`, `-L` into
 /// `search_paths`, `-dead_strip` into `gc_sections`, `-u` into `undefined`,
-/// `-S` into `strip`, `-x` into `discard`, `-init` into `init`.
+/// `-S` into `strip`, `-x` into `discard`, `-init` into `init`. Inputs go
+/// into [`LinkOptions::inputs`] like every other format's, with
+/// `-framework` as [`InputKind::Framework`], `-force_load` as
+/// [`InputAttrs::whole_archive`] and `-weak-l` and its relatives as
+/// [`InputAttrs::load`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DarwinArgs {
     /// `-arch` values, in order and without duplicates. Several make a
@@ -149,8 +124,6 @@ pub struct DarwinArgs {
     /// looking for an archive (the default searches each directory for
     /// both).
     pub search_dylibs_first: bool,
-    /// Inputs, in command-line order.
-    pub inputs: Vec<DarwinInput>,
     /// `-all_load`: load every member of every archive.
     pub all_load: bool,
     /// `-ObjC`: load archive members that define Objective-C classes or
@@ -246,7 +219,6 @@ impl Default for DarwinArgs {
             framework_paths: Vec::new(),
             no_default_search_paths: false,
             search_dylibs_first: false,
-            inputs: Vec::new(),
             all_load: false,
             objc: false,
             current_version: None,
@@ -1157,10 +1129,7 @@ pub fn parse(args: &[&OsStr], reader: &dyn FileReader) -> Result<ParseOutcome> {
         index = index.saturating_add(1);
         let text = bytes_to_string(arg)?;
         let Some(name) = text.strip_prefix('-').filter(|n| !n.is_empty()) else {
-            state.push(
-                DarwinInputKind::File(PathBuf::from(os(arg))),
-                LoadMode::Normal,
-            );
+            state.push(InputKind::File(PathBuf::from(os(arg))), LoadMode::Normal);
             any_input = true;
             continue;
         };
@@ -1373,12 +1342,21 @@ fn parse_platform(text: &str) -> Option<u32> {
 }
 
 impl Parser<'_> {
-    fn push(&mut self, kind: DarwinInputKind, mode: LoadMode) {
-        self.options.darwin.inputs.push(DarwinInput {
-            kind,
-            mode,
-            force_load: false,
-        });
+    fn push(&mut self, kind: InputKind, mode: LoadMode) {
+        let attrs = InputAttrs {
+            load: mode,
+            ..InputAttrs::default()
+        };
+        self.options.push_input(kind, attrs);
+    }
+
+    /// `-force_load <archive>`: every member of it is loaded.
+    fn push_force_load(&mut self, path: PathBuf) {
+        let attrs = InputAttrs {
+            whole_archive: true,
+            ..InputAttrs::default()
+        };
+        self.options.push_input(InputKind::File(path), attrs);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1411,20 +1389,16 @@ impl Parser<'_> {
             Act::Rpath => self.options.rpaths.push(PathBuf::from(first)),
             Act::LibraryPath => self.options.search_paths.push(PathBuf::from(first)),
             Act::FrameworkPath => darwin.framework_paths.push(PathBuf::from(first)),
-            Act::Library(mode) => self.push(DarwinInputKind::Library(first.to_owned()), mode),
+            Act::Library(mode) => self.push(InputKind::Library(first.to_owned()), mode),
             Act::Framework(mode) => {
                 let (name, suffix) = match first.split_once(',') {
                     Some((name, suffix)) => (name.to_owned(), Some(suffix.to_owned())),
                     None => (first.to_owned(), None),
                 };
-                self.push(DarwinInputKind::Framework { name, suffix }, mode);
+                self.push(InputKind::Framework { name, suffix }, mode);
             }
-            Act::LibraryFile(mode) => self.push(DarwinInputKind::File(PathBuf::from(first)), mode),
-            Act::ForceLoad => darwin.inputs.push(DarwinInput {
-                kind: DarwinInputKind::File(PathBuf::from(first)),
-                mode: LoadMode::Normal,
-                force_load: true,
-            }),
+            Act::LibraryFile(mode) => self.push(InputKind::File(PathBuf::from(first)), mode),
+            Act::ForceLoad => self.push_force_load(PathBuf::from(first)),
             Act::AllLoad => darwin.all_load = true,
             Act::ObjC => darwin.objc = true,
             Act::Syslibroot => darwin.syslibroots.push(PathBuf::from(first)),
@@ -1598,7 +1572,7 @@ impl Parser<'_> {
                 Some(dir) => dir.join(path),
                 None => path,
             };
-            self.push(DarwinInputKind::File(path), LoadMode::Normal);
+            self.push(InputKind::File(path), LoadMode::Normal);
         }
         Ok(())
     }
@@ -1796,11 +1770,9 @@ mod tests {
         );
         assert_eq!(options.output, Some(PathBuf::from("hello")));
         assert_eq!(options.search_paths, [PathBuf::from("/usr/local/lib")]);
-        assert_eq!(darwin.inputs.len(), 3);
-        assert_eq!(
-            darwin.inputs[1].kind,
-            DarwinInputKind::Library("System".into())
-        );
+        assert_eq!(options.inputs.len(), 3);
+        assert_eq!(options.inputs[1].kind, InputKind::Library("System".into()));
+        assert_eq!(options.inputs[1].position, 1);
         assert!(darwin.lto_library.is_some());
         assert_eq!(darwin.lto.mllvm, ["-enable-linkonceodr-outlining"]);
     }
@@ -1811,7 +1783,7 @@ mod tests {
         for level in ["-O", "-O0", "-O2", "-O3", "-Os", "-Oz", "-Ofast"] {
             let options = parse_ok(&["-arch", "arm64", level, "a.o"]);
             assert_eq!(options.ignored, [OsString::from(level)], "{level}");
-            assert_eq!(options.darwin.inputs.len(), 1, "{level}");
+            assert_eq!(options.inputs.len(), 1, "{level}");
         }
         assert!(parse_err(&["-Ox", "a.o"]).contains("-Ox"));
         assert!(parse_ok(&["-ObjC", "a.o"]).darwin.objc);
@@ -1850,20 +1822,18 @@ mod tests {
         assert_eq!(darwin.output_type, MachOutputType::Dylib);
         assert_eq!(options.soname.as_deref(), Some("@rpath/libfoo.dylib"));
         assert_eq!(darwin.current_version, Some(PackedVersion::new(1, 2, 3)));
-        assert_eq!(darwin.inputs[0].mode, LoadMode::Weak);
+        let inputs = &options.inputs;
+        assert_eq!(inputs[0].attrs.load, LoadMode::Weak);
+        assert_eq!(inputs[1].kind, InputKind::Library("bar".into()));
+        assert_eq!(inputs[1].attrs.load, LoadMode::Reexport);
         assert_eq!(
-            darwin.inputs[1].kind,
-            DarwinInputKind::Library("bar".into())
-        );
-        assert_eq!(darwin.inputs[1].mode, LoadMode::Reexport);
-        assert_eq!(
-            darwin.inputs[3].kind,
-            DarwinInputKind::Framework {
+            inputs[3].kind,
+            InputKind::Framework {
                 name: "AppKit".into(),
                 suffix: Some("_debug".into())
             }
         );
-        assert!(darwin.inputs[4].force_load);
+        assert!(inputs[4].attrs.whole_archive);
         assert_eq!(darwin.undefined, UndefinedTreatment::DynamicLookup);
         assert_eq!(darwin.archs, [Arch::X86_64, Arch::ARM64]);
         assert_eq!(darwin.headerpad, Some(0x100));
@@ -1952,8 +1922,8 @@ mod tests {
             panic!("filelist did not parse");
         };
         assert_eq!(
-            options.darwin.inputs[1].kind,
-            DarwinInputKind::File(PathBuf::from("objs/b.o"))
+            options.inputs[1].kind,
+            InputKind::File(PathBuf::from("objs/b.o"))
         );
     }
 }

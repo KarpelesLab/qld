@@ -261,7 +261,7 @@ struct Loader<'o> {
     scripts: Vec<(Script, bool)>,
     /// `ENTRY` from the scripts, the last one winning.
     entry: Option<Vec<u8>>,
-    output_format: Option<String>,
+    output_format: Option<crate::args::OutputFormat>,
     startup: Vec<PathBuf>,
 }
 
@@ -304,7 +304,9 @@ impl Loader<'_> {
                         }
                         None => default,
                     };
-                    self.output_format = Some(String::from_utf8_lossy(chosen).into_owned());
+                    self.output_format = Some(crate::args::OutputFormat::from_name(
+                        &String::from_utf8_lossy(chosen),
+                    ));
                 }
                 CommandKind::SearchDir(dir) => {
                     if !self.options.nostdlib {

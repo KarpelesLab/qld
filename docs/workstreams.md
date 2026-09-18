@@ -79,7 +79,7 @@ can work at the same time without colliding.
 | W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | merged |
 | W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | merged |
 | W40 | ELF32 and big-endian ELF (M4) | the ELF reader/writer generics in `src/elf/**`, `src/elf/arch/{i386,arm}*`, `src/arch/{i386,arm}*`, `tests/elf32*`, `tests/fixtures/{i386,arm,s390x,ppc64be}-*` | W30, W31, W32, W37 | in progress |
-| W41 | Library API decisions for 1.0 (M9) | `src/args/options.rs`, `examples/**`, `tests/api*`, `tests/projects/api-review.md`; proposals for `lib.rs` | W36 | in progress |
+| W41 | Library API decisions for 1.0 (M9) | `src/args/options.rs`, `examples/**`, `tests/api*`, `tests/projects/api-review.md`; proposals for `lib.rs` | W36 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.

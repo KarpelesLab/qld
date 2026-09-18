@@ -83,14 +83,14 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     let prepared = super::script_layout::prepare(options)?;
     let options = &prepared.options;
     check_supported(options)?;
-    let timing = std::env::var_os("QLD_TIMING").is_some();
+    let timing = options.timing.as_ref();
     let start = Instant::now();
     let lap = |what: &str| {
-        if timing {
-            eprintln!(
+        if let Some(timing) = timing {
+            timing.write_line(&format!(
                 "qld: {what}: {:.1} ms",
                 start.elapsed().as_secs_f64() * 1000.0
-            );
+            ));
         }
     };
 
@@ -104,16 +104,22 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         wrap: &wrap,
         table: &table,
     };
+    // Running inside a pool the caller installed, without `--threads`:
+    // that pool is the caller's to size, so the link uses it as it is and
+    // builds none of its own. `--threads` means the pool around this call
+    // is one qld built for this link (see `crate::link`), which qld may
+    // narrow.
+    let caller_pool = options.threads.is_none() && rayon::current_thread_index().is_some();
     // Without `--threads` and outside a caller's pool, the link runs in
     // pools of its own and never starts rayon's global pool (one thread per
     // core): mapping the inputs gains nothing from more than a few threads,
     // and 849 objects took 50 ms on 64 threads against 10 ms on 16.
-    let own_pools = options.threads.is_none() && rayon::current_thread_index().is_none();
-    // In a larger pool (`--threads` above MAX_DEFAULT_THREADS, or a
-    // caller's pool), the stages that get slower with more threads run in a
-    // pool of MAX_DEFAULT_THREADS; see `Narrow`.
+    let own_pools = options.threads.is_none() && !caller_pool;
+    // With `--threads` above MAX_DEFAULT_THREADS, the stages that get
+    // slower with more threads run in a pool of MAX_DEFAULT_THREADS; see
+    // `Narrow`.
     let mut narrow = Narrow {
-        pool: (!own_pools && rayon::current_num_threads() > MAX_DEFAULT_THREADS)
+        pool: (options.threads.is_some() && rayon::current_num_threads() > MAX_DEFAULT_THREADS)
             .then(|| thread_pool(MAX_DEFAULT_THREADS))
             .transpose()?,
         widen: None,
@@ -165,8 +171,9 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
 }
 
 /// A pool of [`MAX_DEFAULT_THREADS`] threads for the stages that do not
-/// scale past it, when the link runs in a larger pool (an explicit
-/// `--threads`, or a caller's pool); `None` otherwise.
+/// scale past it, when `--threads` asked for a larger pool; `None`
+/// otherwise, including in a pool the caller installed, which is the
+/// caller's to size.
 ///
 /// Past 16 threads, most stages get slower on the 32-core development
 /// machine, not faster: idle rayon workers spin looking for work between
@@ -227,17 +234,14 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     };
     if let Some(format) = &options.output_format
         && !matches!(
-            format.as_str(),
+            format.name(),
             "elf64-x86-64" | "elf64-x86_64" | "binary" | "ihex" | "srec"
         )
     {
-        return unimplemented(&format!("--oformat {format}"), "M4");
+        return unimplemented(&format!("--oformat {}", format.name()), "M4");
     }
     if options.kind == OutputKind::Relocatable
-        && options
-            .compress_debug_sections
-            .as_deref()
-            .is_some_and(|c| c != "none")
+        && options.compress_debug_sections != crate::args::DebugCompression::None
     {
         return unimplemented("--compress-debug-sections with -r", "M5");
     }
@@ -265,8 +269,8 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
         && (options.kind == OutputKind::Relocatable
             || options
                 .output_format
-                .as_deref()
-                .is_some_and(|f| super::rawout::Format::from_name(f).is_some()))
+                .as_ref()
+                .is_some_and(crate::args::OutputFormat::is_raw))
     {
         return Err(Error::Option(
             "--separate-debug-file needs an ELF executable or shared object output".into(),
@@ -285,8 +289,9 @@ const MAX_DEFAULT_THREADS: usize = 16;
 
 /// The thread count for a link whose thread count was not set explicitly:
 /// one thread per [`BYTES_PER_THREAD`] of input, at most
-/// [`MAX_DEFAULT_THREADS`] and the current pool's size (with `own_pools`,
-/// the available parallelism). `None` keeps the current pool.
+/// [`MAX_DEFAULT_THREADS`] and the available parallelism. `None` keeps the
+/// current pool, which is what a link inside a caller's pool always gets:
+/// that pool is the caller's to size.
 ///
 /// Small links are dominated by the fixed cost of spreading tiny tasks over
 /// many threads (a static "hello world" takes 10 ms on one thread and 28 ms
@@ -316,10 +321,7 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
     let wanted = usize::try_from(bytes.div_ceil(BYTES_PER_THREAD))
         .unwrap_or(usize::MAX)
         .clamp(1, MAX_DEFAULT_THREADS);
-    if own_pools {
-        return Some(wanted.min(available_threads()));
-    }
-    (wanted < rayon::current_num_threads()).then_some(wanted)
+    own_pools.then(|| wanted.min(available_threads()))
 }
 
 /// How many bytes the compressed sections of a relocatable ELF input grow
@@ -378,8 +380,8 @@ fn link_inputs<'a>(
     }
     if options
         .output_format
-        .as_deref()
-        .is_some_and(|f| super::rawout::Format::from_name(f).is_some())
+        .as_ref()
+        .is_some_and(crate::args::OutputFormat::is_raw)
     {
         // Raw formats link through BFD's generic linker, which copies
         // property notes rather than merging them.
@@ -580,9 +582,9 @@ fn link_inputs<'a>(
     let merged = merged?;
     lap("merge");
     options.check_cancelled()?;
-    let icf_mode = match options.icf.as_deref() {
-        Some("all") => Some(IcfMode::All),
-        Some("safe") => Some(IcfMode::Safe),
+    let icf_mode = match options.icf {
+        crate::args::IcfMode::All => Some(IcfMode::All),
+        crate::args::IcfMode::Safe => Some(IcfMode::Safe),
         _ => None,
     };
     if let Some(icf_mode) = icf_mode {
@@ -772,17 +774,17 @@ fn link_inputs<'a>(
     // --compress-debug-sections: render and compress the debug sections
     // with the final addresses, then lay out again with their new sizes
     // (they follow every allocated section, so no address moves).
-    let compression = options
-        .compress_debug_sections
-        .as_deref()
-        .and_then(|value| {
-            let level = if options.optimize >= 2 {
-                crate::debug::compress::deflate::Level::DEFAULT
-            } else {
-                crate::debug::compress::deflate::Level::FASTEST
-            };
-            crate::debug::section::OutputCompression::from_option(value, level)
-        });
+    let compression = {
+        let level = if options.optimize >= 2 {
+            crate::debug::compress::deflate::Level::DEFAULT
+        } else {
+            crate::debug::compress::deflate::Level::FASTEST
+        };
+        crate::debug::section::OutputCompression::from_option(
+            options.compress_debug_sections,
+            level,
+        )
+    };
     let mut prerendered = Vec::new();
     if let Some(compression) = compression {
         let addresses = Addresses::new(

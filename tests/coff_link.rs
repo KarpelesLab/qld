@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use qld::args::{InputAttrs, InputKind, InputSpec, LinkOptions};
+use qld::args::{InputAttrs, InputKind, LinkOptions};
 use qld::coff::PeOptions;
 use qld::diag::Collect;
 use qld::target::{Architecture, BinaryFormat, Endianness, OperatingSystem, PointerWidth, Target};
@@ -425,16 +425,10 @@ fn missing_symbols_are_reported() {
     ) else {
         return;
     };
-    let mut options = LinkOptions {
-        target: Some(pe_target()),
-        output: Some(dir.join("out.exe")),
-        ..LinkOptions::default()
-    };
-    options.inputs.push(InputSpec {
-        kind: InputKind::File(dir.join(&object)),
-        attrs: InputAttrs::default(),
-        position: 0,
-    });
+    let mut options = LinkOptions::new();
+    options.target = Some(pe_target());
+    options.output = Some(dir.join("out.exe"));
+    options.push_input(InputKind::File(dir.join(&object)), InputAttrs::default());
     let pe = PeOptions::from_link_options(&options);
     let error = qld_link(&options, &pe).unwrap_err();
     assert!(error.contains("nowhere"), "{error}");
@@ -530,11 +524,7 @@ fn dll_with_import_library() {
     };
     let mut options = options_from(&argv, &dir.join("client.exe"));
     let implib = dir.join("libsample.dll.a");
-    options.inputs.push(InputSpec {
-        kind: InputKind::File(implib.clone()),
-        attrs: InputAttrs::default(),
-        position: options.inputs.len(),
-    });
+    options.push_input(InputKind::File(implib.clone()), InputAttrs::default());
     let pe = PeOptions::from_link_options(&options);
     if let Err(error) = qld_link(&options, &pe) {
         panic!("qld failed to link against its own import library:\n{error}");
@@ -952,33 +942,18 @@ fn def_file_exports() {
 #[test]
 fn unimplemented_options_are_refused() {
     let dir = scratch("unimplemented-options");
-    let base = LinkOptions {
-        target: Some(pe_target()),
-        output: Some(dir.join("out.exe")),
-        ..LinkOptions::default()
+    let mut base = LinkOptions::new();
+    base.target = Some(pe_target());
+    base.output = Some(dir.join("out.exe"));
+    let with = |change: fn(&mut LinkOptions)| {
+        let mut options = base.clone();
+        change(&mut options);
+        options
     };
     for (name, options) in [
-        (
-            "-r",
-            LinkOptions {
-                kind: qld::args::OutputKind::Relocatable,
-                ..base.clone()
-            },
-        ),
-        (
-            "--gc-sections",
-            LinkOptions {
-                gc_sections: true,
-                ..base.clone()
-            },
-        ),
-        (
-            "--icf",
-            LinkOptions {
-                icf: Some("all".into()),
-                ..base.clone()
-            },
-        ),
+        ("-r", with(|o| o.kind = qld::args::OutputKind::Relocatable)),
+        ("--gc-sections", with(|o| o.gc_sections = true)),
+        ("--icf", with(|o| o.icf = qld::args::IcfMode::All)),
     ] {
         let pe = PeOptions::from_link_options(&options);
         let error = qld_link(&options, &pe).unwrap_err();
@@ -1061,11 +1036,7 @@ fn short_import_library_and_direct_dll() {
     ] {
         let output = dir.join(format!("client-{}.exe", name.replace(' ', "-")));
         let mut options = options_from(&argv, &output);
-        options.inputs.push(InputSpec {
-            kind: InputKind::File(input),
-            attrs: InputAttrs::default(),
-            position: options.inputs.len(),
-        });
+        options.push_input(InputKind::File(input), InputAttrs::default());
         let pe = PeOptions::from_link_options(&options);
         if let Err(error) = qld_link(&options, &pe) {
             panic!("qld failed to link against {name}:\n{error}");
@@ -1221,11 +1192,10 @@ fn auto_import_and_runtime_pseudo_relocs() {
         return;
     };
     let mut options = options_from(&argv, &dir.join("auto.exe"));
-    options.inputs.push(InputSpec {
-        kind: InputKind::File(dir.join("libsample.dll.a")),
-        attrs: InputAttrs::default(),
-        position: options.inputs.len(),
-    });
+    options.push_input(
+        InputKind::File(dir.join("libsample.dll.a")),
+        InputAttrs::default(),
+    );
     let pe = PeOptions::from_link_options(&options);
     if let Err(error) = qld_link(&options, &pe) {
         panic!("qld failed to auto-import a DLL's data:\n{error}");
@@ -1684,11 +1654,7 @@ fn i386_dll_and_client() {
     };
     let mut options = options_for(&argv, &dir.join("client.exe"), i386_target());
     let implib = dir.join("libsample.dll.a");
-    options.inputs.push(InputSpec {
-        kind: InputKind::File(implib.clone()),
-        attrs: InputAttrs::default(),
-        position: options.inputs.len(),
-    });
+    options.push_input(InputKind::File(implib.clone()), InputAttrs::default());
     let pe = PeOptions::from_link_options(&options);
     if let Err(error) = qld_link(&options, &pe) {
         panic!("qld failed to link the i386 client:\n{error}");
@@ -1940,21 +1906,12 @@ fn link_safeseh(
     output: &str,
     tweak: impl FnOnce(&mut PeOptions),
 ) -> Result<String, String> {
-    let mut options = LinkOptions {
-        target: Some(i386_target()),
-        output: Some(dir.join(output)),
-        entry: Some("_start".into()),
-        ..LinkOptions::default()
-    };
-    for (position, path) in [fixture(object), kernel32.to_path_buf()]
-        .into_iter()
-        .enumerate()
-    {
-        options.inputs.push(InputSpec {
-            kind: InputKind::File(path),
-            attrs: InputAttrs::default(),
-            position,
-        });
+    let mut options = LinkOptions::new();
+    options.target = Some(i386_target());
+    options.output = Some(dir.join(output));
+    options.entry = Some("_start".into());
+    for path in [fixture(object), kernel32.to_path_buf()] {
+        options.push_input(InputKind::File(path), InputAttrs::default());
     }
     let mut pe = PeOptions::from_link_options(&options);
     tweak(&mut pe);
@@ -2046,25 +2003,16 @@ fn i386_safeseh() {
     else {
         return;
     };
-    let mut options = LinkOptions {
-        target: Some(i386_target()),
-        output: Some(dir.join("strict.exe")),
-        entry: Some("_start".into()),
-        ..LinkOptions::default()
-    };
-    for (position, path) in [
+    let mut options = LinkOptions::new();
+    options.target = Some(i386_target());
+    options.output = Some(dir.join("strict.exe"));
+    options.entry = Some("_start".into());
+    for path in [
         fixture("safeseh-i386.o"),
         PathBuf::from(&object),
         kernel32.clone(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        options.inputs.push(InputSpec {
-            kind: InputKind::File(path),
-            attrs: InputAttrs::default(),
-            position,
-        });
+    ] {
+        options.push_input(InputKind::File(path), InputAttrs::default());
     }
     let mut pe = PeOptions::from_link_options(&options);
     pe.safe_seh = Some(true);

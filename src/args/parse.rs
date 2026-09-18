@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 
 use crate::args::emulation;
 use crate::args::options::{
-    BuildId, ColorChoice, HashStyle, InputAttrs, InputFormat, InputKind, LinkOptions, OutputKind,
-    ReportLevel, UnresolvedSymbols,
+    BuildId, ColorChoice, DebugCompression, HashStyle, IcfMode, InputAttrs, InputFormat, InputKind,
+    LinkOptions, OrphanHandling, OutputFormat, OutputKind, ReportLevel, SortSection,
+    UnresolvedSymbols, Visibility,
 };
 use crate::args::options::{CallGraphSort, Flavor};
 use crate::args::response::{self, FileReader, FsReader};
@@ -41,6 +42,12 @@ pub enum ParseOutcome {
 /// such as `ld64.qld` (see [`select_flavor`]). Response files are read with
 /// [`std::fs::read`]; use [`parse_gnu_with`] to supply them another way.
 ///
+/// The options describe a link run the way the `qld` binary runs one:
+/// [`LinkOptions::use_process_defaults`] is applied, so the link map goes to
+/// standard output and `LD_LIBRARY_PATH` and the other variables GNU ld
+/// reads are taken from the environment. [`parse_gnu_with`] parses the same
+/// command line into a hermetic, silent link.
+///
 /// Warnings found while parsing, such as unknown `-z` keywords, are returned
 /// in [`LinkOptions::warnings`] for the caller to report.
 ///
@@ -50,7 +57,20 @@ pub enum ParseOutcome {
 /// [`Error::Io`] for an unreadable response file, and
 /// [`Error::Unimplemented`] for a flavor qld does not parse yet.
 pub fn parse_gnu<S: AsRef<OsStr>>(args: &[S]) -> Result<ParseOutcome> {
-    parse_gnu_with(args, &FsReader)
+    process_defaults(parse_gnu_with(args, &FsReader)?)
+}
+
+/// Applies [`LinkOptions::use_process_defaults`] to a parsed link, which is
+/// what makes [`parse_gnu`] and [`parse_darwin`] describe the binary's link
+/// rather than a hermetic one.
+fn process_defaults(outcome: ParseOutcome) -> Result<ParseOutcome> {
+    Ok(match outcome {
+        ParseOutcome::Link(mut options) => {
+            options.use_process_defaults();
+            ParseOutcome::Link(options)
+        }
+        other => other,
+    })
 }
 
 /// Like [`parse_gnu`], but reads `@response` files through `reader`.
@@ -85,14 +105,15 @@ pub fn parse_gnu_with<S: AsRef<OsStr>>(
 ///
 /// `args` includes `argv[0]` (and may start with `-flavor darwin`).
 /// Response files and `-filelist` files are read with [`std::fs::read`];
-/// see [`crate::args::darwin`] for the option table.
+/// see [`crate::args::darwin`] for the option table. As in [`parse_gnu`],
+/// the options carry [`LinkOptions::use_process_defaults`].
 ///
 /// # Errors
 ///
 /// Returns [`Error::Option`] for unknown, unsupported or malformed options
 /// and [`Error::Io`] for unreadable response files.
 pub fn parse_darwin<S: AsRef<OsStr>>(args: &[S]) -> Result<ParseOutcome> {
-    parse_darwin_with(args, &FsReader)
+    process_defaults(parse_darwin_with(args, &FsReader)?)
 }
 
 /// Like [`parse_darwin`], but reads `@response` and `-filelist` files through
@@ -559,7 +580,7 @@ impl GnuParser {
                 }
             }
             Action::Endian(endian) => o.endian = Some(endian),
-            Action::OutputFormat => o.output_format = Some(text(m)?),
+            Action::OutputFormat => o.output_format = Some(OutputFormat::from_name(&text(m)?)),
             Action::Shared => {
                 self.shared = true;
                 if self.pie == Some(true) {
@@ -642,8 +663,9 @@ impl GnuParser {
             Action::WhyLive => o.why_live.push(text(m)?),
             Action::Icf => {
                 o.icf = match text(m)?.as_str() {
-                    "none" => None,
-                    mode @ ("all" | "safe") => Some(mode.to_owned()),
+                    "none" => IcfMode::None,
+                    "safe" => IcfMode::Safe,
+                    "all" => IcfMode::All,
                     other => return Err(bad_value(m, other)),
                 };
             }
@@ -677,9 +699,20 @@ impl GnuParser {
             Action::RodataSegment => o.rodata_segment = Some(hex(m)?),
             Action::LdataSegment => o.ldata_segment = Some(hex(m)?),
             Action::OrphanHandling => {
-                o.orphan_handling = Some(one_of(m, &["place", "warn", "error", "discard"])?);
+                o.orphan_handling =
+                    match one_of(m, &["place", "warn", "error", "discard"])?.as_str() {
+                        "warn" => OrphanHandling::Warn,
+                        "error" => OrphanHandling::Error,
+                        "discard" => OrphanHandling::Discard,
+                        _ => OrphanHandling::Place,
+                    };
             }
-            Action::SortSection => o.sort_section = Some(one_of(m, &["name", "alignment"])?),
+            Action::SortSection => {
+                o.sort_section = match one_of(m, &["name", "alignment"])?.as_str() {
+                    "alignment" => SortSection::Alignment,
+                    _ => SortSection::Name,
+                };
+            }
             Action::Rosegment(on) => o.rosegment = Some(on),
             Action::EhFrameHdr(on) => o.eh_frame_hdr = on,
             Action::BuildId => o.build_id = build_id(m)?,
@@ -692,8 +725,14 @@ impl GnuParser {
                 };
             }
             Action::CompressDebugSections => {
-                let kind = one_of(m, &["none", "zlib", "zlib-gnu", "zlib-gabi", "zstd"])?;
-                o.compress_debug_sections = (kind != "none").then_some(kind);
+                o.compress_debug_sections =
+                    match one_of(m, &["none", "zlib", "zlib-gnu", "zlib-gabi", "zstd"])?.as_str() {
+                        "zlib" => DebugCompression::Zlib,
+                        "zlib-gnu" => DebugCompression::ZlibGnu,
+                        "zlib-gabi" => DebugCompression::ZlibGabi,
+                        "zstd" => DebugCompression::Zstd,
+                        _ => DebugCompression::None,
+                    };
             }
             Action::PackageMetadata => {
                 o.package_metadata = match &m.value {
@@ -974,14 +1013,13 @@ impl GnuParser {
             }
             ZAction::StartStopGc(on) => o.start_stop_gc = Some(on),
             ZAction::StartStopVisibility => {
-                let visibility = value.to_ascii_lowercase();
-                if !matches!(
-                    visibility.as_str(),
-                    "default" | "internal" | "hidden" | "protected"
-                ) {
-                    return Err(bad());
-                }
-                o.start_stop_visibility = Some(visibility);
+                o.start_stop_visibility = Some(match value.to_ascii_lowercase().as_str() {
+                    "default" => Visibility::Default,
+                    "internal" => Visibility::Internal,
+                    "hidden" => Visibility::Hidden,
+                    "protected" => Visibility::Protected,
+                    _ => return Err(bad()),
+                });
             }
             ZAction::KeepTextSectionPrefix(on) => o.keep_text_section_prefix = on,
             ZAction::Ibt => o.x86.ibt = true,

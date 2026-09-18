@@ -189,8 +189,8 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
     let raw = input
         .options
         .output_format
-        .as_deref()
-        .and_then(super::rawout::Format::from_name);
+        .as_ref()
+        .and_then(|format| super::rawout::Format::from_name(format.name()));
     let mut chunks: Vec<(ChunkRange, Chunk)> = Vec::new();
     let headers = layout.phoff.max(layout.kind.ehdr_size()).saturating_add(
         layout

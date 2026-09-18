@@ -821,15 +821,16 @@ mod plugin_link {
             claims: 0,
             claim_time: Duration::ZERO,
         };
-        // `QLD_TIMING`, as in the driver: where LTO links spend their time.
-        let timing = std::env::var_os("QLD_TIMING").is_some();
+        // `LinkOptions::timing`, as in the driver: where LTO links spend
+        // their time.
+        let timing = options.timing.as_ref();
         let start = Instant::now();
         let lap = |what: &str| {
-            if timing {
-                eprintln!(
+            if let Some(timing) = timing {
+                timing.write_line(&format!(
                     "qld: lto {what}: {:.1} ms",
                     start.elapsed().as_secs_f64() * 1000.0
-                );
+                ));
             }
         };
 
@@ -862,12 +863,12 @@ mod plugin_link {
         let Some(mut session) = driver.session.take() else {
             return Ok((symbols, resolution, LtoLink::default()));
         };
-        if timing {
-            eprintln!(
+        if let Some(timing) = timing {
+            timing.write_line(&format!(
                 "qld: lto claims ({} files, plugin loading included): {:.1} ms",
                 driver.claims,
                 driver.claim_time.as_secs_f64() * 1000.0
-            );
+            ));
         }
         lap("first resolution");
         if !inputs.files.iter().any(|file| file.ir.is_some()) {

@@ -520,7 +520,9 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - References to exported weak definitions bind through weak lookup, as ld64
   does. Implicit re-exports (a public sub-library such as `libc++abi` under
   `libc++`) are followed.
-- `ZERO_AR_DATE` in the environment zeroes the debug-map (`N_OSO`)
+- `ZERO_AR_DATE` in the environment (read by the `qld` binary, not by a
+  library link; the same holds for `LD_RUN_PATH` and `LD_LIBRARY_PATH`)
+  zeroes the debug-map (`N_OSO`)
   timestamps.
 - `-order_file` accepts ld64's syntax: one symbol per line, optional
   `arch:` and `object.o:` prefixes, `#` comments.

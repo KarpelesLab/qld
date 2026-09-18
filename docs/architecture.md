@@ -217,7 +217,9 @@ The final file size is known before any byte is written. The writer then:
 1. Creates the output as a temporary file next to the final path and sets
    its length. By default the contents are then written with positional
    writes (`pwrite`); mapping the file writable is the alternative, and
-   `QLD_OUTPUT_BACKING=write|mmap|memory` selects one for benchmarking. On
+   `QLD_OUTPUT_BACKING=write|mmap|memory` selects one for benchmarking; the
+   binary reads it into `LinkOptions::output_backing`, and the library reads
+   no environment variable of its own. On
    btrfs, mapped writes slow down as threads are added (page-fault
    contention), while positional writes do not: clang-23's 137 MB link takes
    0.29 s written versus 0.34–0.38 s mapped, with identical bytes; on tmpfs

@@ -463,10 +463,11 @@ fn check_supported(options: &LinkOptions, pe: &PeOptions) -> Result<()> {
     let machine = super::machine::Machine::from_coff(pe.machine)?;
     // `--oformat` names a BFD target, which must be this machine's.
     if let Some(format) = &options.output_format
-        && !machine.bfd_names().contains(&format.as_str())
+        && !machine.bfd_names().contains(&format.name())
     {
         return Err(Error::Option(format!(
-            "--oformat {format} does not match the {} emulation (expected {})",
+            "--oformat {} does not match the {} emulation (expected {})",
+            format.name(),
             match machine {
                 super::machine::Machine::Amd64 => "i386pep",
                 super::machine::Machine::I386 => "i386pe",
@@ -478,7 +479,7 @@ fn check_supported(options: &LinkOptions, pe: &PeOptions) -> Result<()> {
     if options.gc_sections {
         return unimplemented("--gc-sections");
     }
-    if options.icf.is_some() {
+    if options.icf != crate::args::IcfMode::None {
         return unimplemented("--icf");
     }
     if !options.wrap.is_empty() {

@@ -24,12 +24,13 @@ pub mod parse;
 pub mod response;
 pub mod table;
 
-pub use darwin::DarwinArgs;
+pub use darwin::{DarwinArgs, LoadMode};
 pub use options::{
-    BuildId, CancelToken, ColorChoice, DiscardMode, DynamicFlags, ExecStack, Flavor, HashStyle,
-    InputAttrs, InputFormat, InputKind, InputSpec, LinkOptions, MagicMode, OutputBuffer,
-    OutputCompleteHook, OutputKind, PeArgs, ReportLevel, SeparateCode, StripMode, SymbolicMode,
-    UnresolvedSymbols, X86Features,
+    BuildId, CancelToken, ColorChoice, DebugCompression, DiscardMode, DynamicFlags, ExecStack,
+    Flavor, HashStyle, IcfMode, InputAttrs, InputFormat, InputKind, InputSpec, LinkOptions,
+    MagicMode, OrphanHandling, OutputBacking, OutputBuffer, OutputCompleteHook, OutputFormat,
+    OutputKind, PeArgs, ReportLevel, SeparateCode, SortSection, StripMode, SymbolicMode,
+    TextOutput, UnresolvedSymbols, Visibility, X86Features,
 };
 pub use parse::{
     ParseOutcome, parse_darwin, parse_darwin_with, parse_gnu, parse_gnu_with, select_flavor, usage,

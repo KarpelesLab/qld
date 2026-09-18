@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use qld::args::{InputAttrs, InputKind, InputSpec, LinkOptions, OutputBuffer, OutputKind};
+use qld::args::{InputAttrs, InputKind, LinkOptions, OutputBuffer, OutputKind};
 use qld::coff::PeOptions;
 use qld::diag::Collect;
 use qld::target::{Architecture, BinaryFormat, Endianness, OperatingSystem, PointerWidth, Target};
@@ -142,17 +142,11 @@ fn program_inputs(dir: &Path) -> Vec<PathBuf> {
 
 /// Link options for `inputs` into `output`.
 fn options(inputs: &[PathBuf], output: &Path) -> LinkOptions {
-    let mut options = LinkOptions {
-        target: Some(arm64_target()),
-        output: Some(output.to_path_buf()),
-        ..LinkOptions::default()
-    };
-    for (position, path) in inputs.iter().enumerate() {
-        options.inputs.push(InputSpec {
-            kind: InputKind::File(path.clone()),
-            attrs: InputAttrs::default(),
-            position,
-        });
+    let mut options = LinkOptions::new();
+    options.target = Some(arm64_target());
+    options.output = Some(output.to_path_buf());
+    for path in inputs {
+        options.push_input(InputKind::File(path.clone()), InputAttrs::default());
     }
     options
 }
@@ -440,11 +434,9 @@ fn arm64_dll_and_import_library() {
 fn arm64_links_from_and_to_memory() {
     let dir = scratch("arm64-memory");
     let inputs = link_program(&dir, "file.exe");
-    let mut options = LinkOptions {
-        target: Some(arm64_target()),
-        output: Some(dir.join("unused.exe")),
-        ..LinkOptions::default()
-    };
+    let mut options = LinkOptions::new();
+    options.target = Some(arm64_target());
+    options.output = Some(dir.join("unused.exe"));
     for path in &inputs {
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
         options.push_input(
