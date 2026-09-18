@@ -36,6 +36,12 @@
 //! would need the same sort, plus remapping every ID-indexed structure built
 //! in between.
 //!
+//! This general algorithm serves batches in which two jobs share a
+//! position. Large batches whose jobs all have distinct positions (always
+//! the case for the resolution driver) take a faster path with the same
+//! result, which partitions names by shard and numbers them with a prefix
+//! sum instead of a sort (the private `partition` module).
+//!
 //! IDs across batches follow batch order: every ID from one batch is lower
 //! than every ID from the next. The resolution driver makes each round one
 //! batch, and the set of files in each round is itself deterministic.
@@ -93,6 +99,10 @@ use super::name::{InputPosition, SymbolName};
 use super::util::select_mut;
 use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
+
+mod partition;
+
+pub use partition::LookupView;
 
 /// Number of bits of the name hash that select a shard.
 ///
@@ -504,15 +514,19 @@ impl<'a> SymbolTable<'a> {
             MIN_PARALLEL_LOOKUP_KNOWN
         };
         // On one thread, the in-order path is always cheaper: no pending
-        // records, sort or rewrite.
-        if total < min_parallel || rayon::current_num_threads() == 1 {
-            let mut order: Vec<usize> = (0..jobs.len()).collect();
-            order.sort_unstable_by_key(|&j| jobs[j].position);
-            if order
-                .windows(2)
-                .all(|pair| jobs[pair[0]].position != jobs[pair[1]].position)
-            {
+        // records, sort or rewrite. Larger batches with distinct positions
+        // are partitioned by shard.
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        order.sort_unstable_by_key(|&j| jobs[j].position);
+        if order
+            .windows(2)
+            .all(|pair| jobs[pair[0]].position != jobs[pair[1]].position)
+        {
+            if total < min_parallel || rayon::current_num_threads() == 1 {
                 return self.intern_in_order(jobs, &order);
+            }
+            if Self::can_partition(total) {
+                return self.intern_partitioned(jobs, &order, total);
             }
         }
 
@@ -974,16 +988,18 @@ impl<'a> SymbolTable<'a> {
 
     #[inline]
     fn load_definition(&self, index: usize) -> Definition {
-        let kind = DefinitionKind::from_u8(self.def_kind[index].load(Ordering::Relaxed));
-        if kind == DefinitionKind::Undefined {
-            return Definition::undefined();
-        }
-        Definition {
-            kind,
-            file: FileId::from_u32(self.def_file[index].load(Ordering::Relaxed)),
-            index: self.def_index[index].load(Ordering::Relaxed),
-            position: InputPosition::from_raw(self.def_position[index].load(Ordering::Relaxed)),
-            aux: self.def_aux[index].load(Ordering::Relaxed),
+        self.definitions().get(index)
+    }
+
+    /// The definition vectors, for reading.
+    #[inline]
+    fn definitions(&self) -> Definitions<'_> {
+        Definitions {
+            kind: &self.def_kind,
+            file: &self.def_file,
+            index: &self.def_index,
+            position: &self.def_position,
+            aux: &self.def_aux,
         }
     }
 
@@ -994,6 +1010,33 @@ impl<'a> SymbolTable<'a> {
         self.def_position[index].store(definition.position.raw(), Ordering::Relaxed);
         self.def_aux[index].store(definition.aux, Ordering::Relaxed);
         self.def_kind[index].store(definition.kind as u8, Ordering::Relaxed);
+    }
+}
+
+/// The per-field definition vectors of a table, borrowed for reading.
+#[derive(Clone, Copy)]
+struct Definitions<'t> {
+    kind: &'t [AtomicU8],
+    file: &'t [AtomicU32],
+    index: &'t [AtomicU32],
+    position: &'t [AtomicU64],
+    aux: &'t [AtomicU64],
+}
+
+impl Definitions<'_> {
+    #[inline]
+    fn get(&self, index: usize) -> Definition {
+        let kind = DefinitionKind::from_u8(self.kind[index].load(Ordering::Relaxed));
+        if kind == DefinitionKind::Undefined {
+            return Definition::undefined();
+        }
+        Definition {
+            kind,
+            file: FileId::from_u32(self.file[index].load(Ordering::Relaxed)),
+            index: self.index[index].load(Ordering::Relaxed),
+            position: InputPosition::from_raw(self.position[index].load(Ordering::Relaxed)),
+            aux: self.aux[index].load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1317,5 +1360,54 @@ mod tests {
             }
         }
         assert!(ordered == expected, "ordered path");
+    }
+
+    #[test]
+    fn partitioned_batches_match_sequential_interning() {
+        // A first batch into an empty table, then large batches that mix
+        // known names with enough new ones (repeated, across and within
+        // jobs, and some empty jobs) to be partitioned again.
+        let base = leaked_names("p", 60_000);
+        let batches: Vec<Vec<SymbolName<'static>>> = (0..3)
+            .map(|b| {
+                (0..70_000)
+                    .map(|i| base[(i * 7919 + b * 20_000) % (20_000 * (b + 1))])
+                    .collect()
+            })
+            .collect();
+        let mut model = SymbolTable::new();
+        let expected: Vec<Vec<SymbolId>> = batches
+            .iter()
+            .map(|names| names.iter().map(|name| model.intern(*name)).collect())
+            .collect();
+        for threads in [2, 4] {
+            let got: Vec<Vec<SymbolId>> = pool(threads).install(|| {
+                let mut table = SymbolTable::new();
+                batches
+                    .iter()
+                    .map(|names| {
+                        let mut ids = vec![SymbolId::new(0); names.len()];
+                        // Uneven jobs, one of them empty, given out of order.
+                        let cuts = [0, 1, 999, 999, 30_000, names.len()];
+                        let mut jobs: Vec<InternJob<'static, '_>> = Vec::new();
+                        let mut rest: &mut [SymbolId] = &mut ids;
+                        for (j, pair) in cuts.windows(2).enumerate() {
+                            let (head, tail) = rest.split_at_mut(pair[1] - pair[0]);
+                            rest = tail;
+                            jobs.push(InternJob {
+                                position: InputPosition::new(j as u32, 0),
+                                names: &names[pair[0]..pair[1]],
+                                ids: head,
+                            });
+                        }
+                        jobs.reverse();
+                        table.try_intern_batch(&mut jobs).unwrap();
+                        drop(jobs);
+                        ids
+                    })
+                    .collect()
+            });
+            assert!(got == expected, "{threads} threads");
+        }
     }
 }

@@ -7,12 +7,15 @@ Usage:
          [--only LINKER,...] [--qld-args ARGS]
   run.py SPECS [NAME...] --determinism QLD [--det-threads 1,2,8,64]
          [--hashes FILE]
+  run.py SPECS [NAME...] --laps [--linker NAME=PATH ...] [--only qld,...]
+         [--threads 16] [--runs N] [--perf PERF]
 
 For every spec and every (linker, thread count) configuration, each link
 is run N times (default 5). The configurations are interleaved run by run
 (run 1 of every configuration, then run 2, ...), so a change in machine
 load affects all of them alike. Before each run the previous output is
-deleted and the file system synced, outside the timing.
+deleted and the file system synced (not with --no-sync), outside the
+timing.
 
 Each run records wall time, the load average (1 minute) just before it,
 and, through wait4(), user+system CPU time and peak RSS of the linker
@@ -33,6 +36,15 @@ With --hashes FILE, the output hashes are also compared with FILE, or
 written to it if it does not exist: that is how an optimization is checked
 to leave every output unchanged.
 
+--laps runs only qld-like linkers (names starting with "qld"), with
+`--no-fork` and QLD_TIMING=1, interleaved like the timed runs, and reports
+per configuration the minimum and median of each stage lap (the stage's
+own time, from the cumulative `qld: STAGE: N ms` lines), of any
+`qld-lap: NAME: N ms` line (a duration printed by instrumentation), of
+wall and CPU time, and, with --perf PATH, the user-space instruction
+count from `perf stat`. Stage laps and instruction counts vary much less
+than wall time on a loaded machine.
+
 Linker defaults: gnu=ld.bfd, lld, mold and wild from ~/.cache/qld-bench/tools
 and the static LLVM tree, qld=target/release/qld. Thread flags: GNU ld has
 none (only "default" is run); the others take `--threads=N`.
@@ -42,6 +54,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import statistics
 import subprocess
@@ -100,9 +113,11 @@ def run_one(argv, cwd, env):
     proc.returncode = os.waitstatus_to_exitcode(status)
     return {
         "ok": proc.returncode == 0,
-        "stderr": stderr.decode(errors="replace")[-2000:],
+        "stderr": stderr.decode(errors="replace"),
         "wall": wall,
         "cpu": usage.ru_utime + usage.ru_stime,
+        "sys": usage.ru_stime,
+        "minflt": usage.ru_minflt,
         "rss_kib": usage.ru_maxrss,
         "load": load,
     }
@@ -148,6 +163,10 @@ def main():
     p.add_argument("--det-threads", default="1,2,8,64")
     p.add_argument("--hashes", help="with --determinism: compare with (or, if absent, write) this file")
     p.add_argument("--qld-args", default="")
+    p.add_argument("--laps", action="store_true")
+    p.add_argument("--no-sync", action="store_true",
+                   help="do not sync the file system before each run (on a slow or shared disk)")
+    p.add_argument("--perf", help="with --laps: perf binary, to count instructions")
     o = p.parse_args()
 
     linkers = dict(DEFAULT_LINKERS)
@@ -173,7 +192,7 @@ def main():
                 remove(out)
                 r = run_one(argv_for(spec, "qld", o.determinism, t, out, shlex.split(o.qld_args)), spec["cwd"], env)
                 if not r["ok"]:
-                    sys.stderr.write(r["stderr"])
+                    sys.stderr.write(r["stderr"][-2000:])
                     raise SystemExit(f"{spec['name']}: qld failed at {t} threads")
                 sums.append(digest(out))
                 remove(out)
@@ -188,6 +207,9 @@ def main():
             with open(o.hashes, "w") as f:
                 json.dump(found, f, indent=1)
         return 1 if failed else 0
+
+    if o.laps:
+        return laps(o, linkers, specs)
 
     wanted = o.only.split(",")
     threads = o.threads.split(",")
@@ -214,7 +236,8 @@ def main():
                     continue
                 out = out_of(c)
                 remove(out)
-                os.sync()
+                if not o.no_sync:
+                    os.sync()
                 r = run_one(argv_for(spec, c[0], linkers[c[0]], c[1], out, extra[c]), spec["cwd"], env)
                 if not r["ok"]:
                     cell["broken"] = "link failed: " + r["stderr"].strip().splitlines()[-1] if r["stderr"].strip() else "link failed"
@@ -231,7 +254,8 @@ def main():
             if c[0].startswith(FORKING):
                 for _ in range(o.rusage_runs):
                     remove(out)
-                    os.sync()
+                    if not o.no_sync:
+                        os.sync()
                     r = run_one(argv_for(spec, c[0], linkers[c[0]], c[1], out, ["--no-fork"]), spec["cwd"], env)
                     if r["ok"]:
                         cell["rusage"].append(r)
@@ -263,6 +287,71 @@ def main():
     if o.json:
         with open(o.json, "w") as f:
             json.dump(results, f, indent=1)
+    return 0
+
+
+LAP = re.compile(r"^qld: (.+): ([0-9.]+) ms$")
+DURATION = re.compile(r"^qld-lap: (.+): ([0-9.]+) ms$")
+
+
+def laps(o, linkers, specs):
+    """The --laps mode; see the module documentation."""
+    wanted = [k for k in o.only.split(",") if k.startswith("qld")]
+    threads = o.threads.split(",")
+    for spec in specs:
+        env = dict(os.environ, **spec.get("env", {}), QLD_TIMING="1")
+        configs = [(k, t) for k in wanted for t in threads]
+        cells = {c: [] for c in configs}
+        out = os.path.join(o.outdir, f"{spec['name']}.laps")
+        for _ in range(o.runs):
+            for c in configs:
+                remove(out)
+                if not o.no_sync:
+                    os.sync()
+                argv = argv_for(spec, c[0], linkers[c[0]], c[1], out, ["--no-fork", *shlex.split(o.qld_args)])
+                stat = os.path.join(o.outdir, "perf-stat.csv")
+                if o.perf:
+                    argv = [o.perf, "stat", "-x", ",", "-e", "instructions:u", "-o", stat, "--", *argv]
+                r = run_one(argv, spec["cwd"], env)
+                if not r["ok"]:
+                    sys.stderr.write(r["stderr"][-2000:])
+                    raise SystemExit(f"{spec['name']}: {c[0]} failed at {c[1]} threads")
+                values = {}
+                previous = 0.0
+                for line in r["stderr"].splitlines():
+                    if m := LAP.match(line):
+                        at = float(m.group(2))
+                        values[m.group(1)] = at - previous
+                        previous = at
+                    elif m := DURATION.match(line):
+                        values["· " + m.group(1)] = values.get("· " + m.group(1), 0.0) + float(m.group(2))
+                values["wall"] = r["wall"] * 1000
+                values["CPU"] = r["cpu"] * 1000
+                values["CPU in the kernel"] = r["sys"] * 1000
+                values["page faults (k)"] = r["minflt"] / 1000
+                if o.perf:
+                    with open(stat) as f:
+                        for line in f:
+                            fields = line.split(",")
+                            if len(fields) > 2 and fields[2].startswith("instructions"):
+                                values["instructions (M)"] = float(fields[0]) / 1e6
+                cells[c].append(values)
+        remove(out)
+        print(f"\n### {spec['name']} (stage laps in ms, min / median of {o.runs}, `--no-fork`)\n")
+        names = []
+        for c in configs:
+            for v in cells[c]:
+                for k in v:
+                    if k not in names:
+                        names.append(k)
+        print("| stage | " + " | ".join(f"{k} {t}" for k, t in configs) + " |")
+        print("| --- |" + " --- |" * len(configs))
+        for name in names:
+            row = []
+            for c in configs:
+                xs = [v[name] for v in cells[c] if name in v]
+                row.append(f"{min(xs):.1f} / {statistics.median(xs):.1f}" if xs else "-")
+            print(f"| {name} | " + " | ".join(row) + " |", flush=True)
     return 0
 
 

@@ -50,12 +50,15 @@ use rayon::prelude::*;
 
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::SectionIndex;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::ids::FileId;
 use crate::symbols::{
-    Definition, DefinitionKind, GroupClaims, Resolution, Resolver, RoundFile, RoundHook, SymbolName,
+    ClaimRound, Definition, DefinitionKind, GroupClaims, GroupSlots, InputPosition, LoadHook,
+    Resolution, Resolver, RoundFile, RoundHook, SymbolName,
 };
 
-use super::inputs::ElfInput;
+use super::inputs::{ElfInput, LtoMode};
+use super::object::ObjectInput;
 use super::sections::Sections;
 
 /// Bit of [`Definition::aux`] set for definitions in COMDAT group sections.
@@ -111,58 +114,217 @@ impl Resolver for ElfRules {
 
 /// Claims COMDAT groups as resolution rounds load files; see the [module
 /// documentation](self).
+///
+/// Regular objects look their groups up in a [`GroupSlots`] table as they
+/// load (maybe before their round, when resolution loads them early), and
+/// offer them in the round that makes them live, one atomic operation per
+/// group. Inside LTO's claim hook, which does not forward the load hook,
+/// every file offers its groups by key in `after_load` instead, into a
+/// [`GroupClaims`] table, where the COMDAT keys of IR files and the group
+/// signatures of regular objects compete. A resolution uses one table or
+/// the other, never both.
 #[derive(Debug, Default)]
 pub struct ComdatHook<'a> {
     claims: GroupClaims<'a>,
+    slots: GroupSlots<'a>,
+}
+
+/// A group of [`ObjectInput::group_slots`] that makes no offer.
+const NO_SLOT: u32 = u32::MAX;
+
+/// The offers a file made for its groups in a round, as
+/// [`ComdatHook::after_load`] settles them.
+enum Offers {
+    /// No groups (neither an object nor an IR file).
+    None,
+    /// By slot, as the object loaded ([`ObjectInput::group_slots`]).
+    OnLoad,
+    /// By slot, in `after_load`, with the file's rank (`NO_SLOT` for groups
+    /// that made no offer).
+    Slots(Vec<u32>, u32),
+    /// By key: whether each offer held its key when it was made.
+    Keys(Vec<bool>),
+}
+
+/// The slots of an object's groups (`NO_SLOT` for groups discarded before).
+fn group_slots<'a>(slots: &GroupSlots<'a>, object: &ObjectInput<'a>) -> Result<Vec<u32>> {
+    (0..object.groups.len())
+        .map(|index| {
+            if discarded_before(object, index) {
+                return Ok(NO_SLOT);
+            }
+            slots
+                .slot(object.groups[index].key)
+                .filter(|&slot| slot != NO_SLOT)
+                .ok_or_else(too_many_groups)
+        })
+        .collect()
+}
+
+fn too_many_groups() -> Error {
+    Error::Limit("more than 2^32 - 1 COMDAT groups".into())
+}
+
+impl<'a> ComdatHook<'a> {
+    /// Offers the groups of a regular object by key; returns whether each
+    /// offer held the key when it was made. An offer that did not has lost
+    /// for good (the claim can only go lower); one that did must look again
+    /// once every offer of the round is in.
+    fn offer_groups(
+        round: &ClaimRound<'_, 'a>,
+        object: &ObjectInput<'a>,
+        file: FileId,
+        position: InputPosition,
+    ) -> Vec<bool> {
+        object
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                !discarded_before(object, index) && round.offer(group.key, position, file)
+            })
+            .collect()
+    }
+}
+
+/// Whether an earlier resolution (the one before LTO) discarded group
+/// `index`: it stays discarded, as the kept copy may now be in code LTO
+/// generated without a group.
+fn discarded_before(object: &ObjectInput<'_>, index: usize) -> bool {
+    object.discarded_groups.get(index).copied().unwrap_or(false)
+}
+
+/// The claim round of resolution round `round`.
+fn claim_round(round: usize) -> u32 {
+    u32::try_from(round).unwrap_or(u32::MAX).saturating_add(1)
+}
+
+impl<'a> LoadHook<ElfInput<'a>> for ComdatHook<'a> {
+    /// Only LTO's claim hook changes names, of the IR files it claims.
+    fn keeps_names(&self, file: &ElfInput<'a>) -> bool {
+        file.lto_mode() != LtoMode::Claim || file.pending_ir().is_none()
+    }
+
+    fn prepare(&self, _: FileId, file: &mut ElfInput<'a>) -> Result<()> {
+        // A file LTO may claim offers in `after_load`, once it is known
+        // whether its groups are native or IR.
+        if file.ir.is_none() && self.keeps_names(file) {
+            let slots = &self.slots;
+            if let Some(object) = &mut file.object {
+                object.group_slots = Some(group_slots(slots, object)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_load(&self, round: usize, _: FileId, rank: u32, file: &mut ElfInput<'a>) -> Result<()> {
+        if let Some(object) = &mut file.object
+            && let Some(slots) = &object.group_slots
+        {
+            let round = claim_round(round);
+            for &slot in slots {
+                if slot != NO_SLOT {
+                    self.slots.offer(slot, round, rank);
+                }
+            }
+            object.claim_rank = Some(rank);
+        }
+        Ok(())
+    }
 }
 
 impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
+    fn load_hook(&self) -> Option<&dyn LoadHook<ElfInput<'a>>> {
+        Some(self)
+    }
+
     fn after_load(
         &mut self,
-        _round: usize,
+        round: usize,
         files: &mut [RoundFile<'_, ElfInput<'a>>],
     ) -> Result<()> {
-        let round = self.claims.begin_round();
-        // Whether each group's offer held the key when it was made. An offer
-        // that did not has lost for good (the claim can only go lower); one
-        // that did must look again once every offer is in.
-        let held: Vec<Vec<bool>> = files
+        let claim_round = claim_round(round);
+        let by_key = self.claims.in_round(claim_round);
+        let slots = &self.slots;
+        // The offers made now: those of IR files (claimed by LTO's hook in
+        // this round), and those of objects that offered no slots as they
+        // loaded (when the driver uses no load hook). By slot when the
+        // driver gives ranks (it then uses the load hook, so every object
+        // offered by slot), by key otherwise.
+        let held: Vec<Result<Offers>> = files
             .par_iter()
             .map(|round_file| {
                 let file = &round_file.file;
                 // An IR file's COMDAT keys compete with the group signatures
                 // of regular objects: they name the same groups.
                 if let Some(ir) = &file.ir {
-                    return ir
-                        .comdats
-                        .iter()
-                        .map(|&key| round.offer(SymbolName::new(key), file.position, round_file.id))
-                        .collect();
+                    return Ok(match round_file.rank {
+                        Some(rank) => {
+                            let group_slots = ir
+                                .comdats
+                                .iter()
+                                .map(|&key| {
+                                    let slot = slots
+                                        .slot(SymbolName::new(key))
+                                        .filter(|&slot| slot != NO_SLOT)
+                                        .ok_or_else(too_many_groups)?;
+                                    slots.offer(slot, claim_round, rank);
+                                    Ok(slot)
+                                })
+                                .collect::<Result<Vec<u32>>>()?;
+                            Offers::Slots(group_slots, rank)
+                        }
+                        None => Offers::Keys(
+                            ir.comdats
+                                .iter()
+                                .map(|&key| {
+                                    by_key.offer(SymbolName::new(key), file.position, round_file.id)
+                                })
+                                .collect(),
+                        ),
+                    });
                 }
                 let Some(object) = &file.object else {
-                    return Vec::new();
+                    return Ok(Offers::None);
                 };
-                object
-                    .groups
-                    .iter()
-                    .enumerate()
-                    .map(|(index, group)| {
-                        // A copy discarded by an earlier resolution (the one
-                        // before LTO) stays discarded: the kept copy may now
-                        // be in code LTO generated without a group.
-                        !object.discarded_groups.get(index).copied().unwrap_or(false)
-                            && round.offer(group.key, file.position, round_file.id)
-                    })
-                    .collect()
+                if object.group_slots.is_some() && object.claim_rank.is_some() {
+                    return Ok(Offers::OnLoad);
+                }
+                if let Some(rank) = round_file.rank {
+                    // An object that LTO could have claimed but did not.
+                    let group_slots = group_slots(slots, object)?;
+                    for &slot in &group_slots {
+                        if slot != NO_SLOT {
+                            slots.offer(slot, claim_round, rank);
+                        }
+                    }
+                    return Ok(Offers::Slots(group_slots, rank));
+                }
+                Ok(Offers::Keys(Self::offer_groups(
+                    &by_key,
+                    object,
+                    round_file.id,
+                    file.position,
+                )))
             })
             .collect();
+        let held = held.into_iter().collect::<Result<Vec<Offers>>>()?;
         files
             .par_iter_mut()
             .zip(held)
             .for_each(|(round_file, held)| {
                 let id = round_file.id;
-                let kept = |index: usize, key: &SymbolName<'_>| {
-                    held.get(index).copied().unwrap_or(false) && round.owner(key) == Some(id)
+                // Whether the group at `index` (with `key`) is kept.
+                let kept = |index: usize, key: &SymbolName<'_>| match &held {
+                    Offers::Keys(held) => {
+                        held.get(index).copied().unwrap_or(false) && by_key.owner(key) == Some(id)
+                    }
+                    Offers::Slots(group_slots, rank) => {
+                        group_slots.get(index).is_some_and(|&slot| {
+                            slot != NO_SLOT && slots.holds(slot, claim_round, *rank)
+                        })
+                    }
+                    Offers::OnLoad | Offers::None => false,
                 };
                 if let Some(ir) = &mut round_file.file.ir {
                     let discarded: Vec<bool> = ir
@@ -179,12 +341,19 @@ impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
                 let Some(object) = &mut round_file.file.object else {
                     return;
                 };
-                let discarded: Vec<bool> = object
-                    .groups
-                    .iter()
-                    .enumerate()
-                    .map(|(index, group)| !kept(index, &group.key))
-                    .collect();
+                let discarded: Vec<bool> =
+                    match (&held, object.group_slots.take(), object.claim_rank.take()) {
+                        (Offers::OnLoad, Some(group_slots), Some(rank)) => group_slots
+                            .iter()
+                            .map(|&slot| slot == NO_SLOT || !slots.holds(slot, claim_round, rank))
+                            .collect(),
+                        _ => object
+                            .groups
+                            .iter()
+                            .enumerate()
+                            .map(|(index, group)| !kept(index, &group.key))
+                            .collect(),
+                    };
                 if discarded.contains(&true) {
                     object.discard_groups(discarded);
                 }

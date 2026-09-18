@@ -260,7 +260,7 @@ mod plugin_link {
         ClaimedFile, InputFile, PluginMessage, Session, SessionOptions, SymbolKind, Visibility,
     };
     use crate::script::Pattern;
-    use crate::symbols::{DefinitionKind, RoundFile, RoundHook, SymbolFlags};
+    use crate::symbols::{DefinitionKind, LoadHook, RoundFile, RoundHook, SymbolFlags};
 
     /// Pass-one flag: a live regular object or the linker names the symbol.
     const LTO_REGULAR: SymbolFlags = SymbolFlags::backend(8);
@@ -576,6 +576,12 @@ mod plugin_link {
     }
 
     impl<'a> RoundHook<ElfInput<'a>> for ClaimHook<'_, '_, 'a> {
+        // Regular objects offer their groups as they load; IR files, which
+        // are claimed below, in `after_load`.
+        fn load_hook(&self) -> Option<&dyn LoadHook<ElfInput<'a>>> {
+            self.comdat.load_hook()
+        }
+
         fn after_load(
             &mut self,
             round: usize,
