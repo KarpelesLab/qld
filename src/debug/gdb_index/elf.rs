@@ -6,6 +6,7 @@ use crate::args::LinkOptions;
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::inputs::ElfInput;
 use crate::elf::layout::Trailer;
+use crate::elf::object::ObjectInput;
 use crate::elf::sections::Sections;
 use crate::elf::values::Addresses;
 use crate::elf::write::Prerendered;
@@ -22,32 +23,42 @@ pub struct DebugIndexes<'a> {
 }
 
 impl<'a> DebugIndexes<'a> {
-    /// Reads what the indexes need from the inputs, and drops the input
-    /// sections they consume from `sections`. Call it once liveness is
-    /// final (after `--gc-sections`; ICF may come before or after).
+    /// Reads what the indexes need from the inputs. Call it once
+    /// `--gc-sections` has run (ICF may come before or after: sections it
+    /// folds count as live); it only reads, so it can run alongside the
+    /// relocation scan. Then call [`apply`](Self::apply).
     ///
     /// # Errors
     ///
     /// Returns errors for unreadable inputs and oversized indexes.
-    pub fn plan(
+    pub fn build(
         files: &[ElfInput<'a>],
         resolution: &Resolution<'_>,
-        sections: &mut Sections,
+        sections: &Sections,
         options: &LinkOptions,
-        diagnostics: &dyn DiagnosticSink,
     ) -> Result<Self> {
         let mut this = Self::default();
         if !options.gdb_index {
             return Ok(this);
         }
-        let objects: Vec<(usize, &crate::elf::object::ObjectInput<'a>)> = files
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| resolution.is_live(FileId::new(*index)))
-            .filter_map(|(index, file)| Some((index, file.object.as_ref()?)))
-            .collect();
+        let objects = live_objects(files, resolution);
         let live = |file: usize, section: u32| sections.is_present_in(file, section);
-        let index = GdbIndex::build(&objects, &live)?;
+        this.gdb_index = Some(GdbIndex::build(&objects, &live)?);
+        Ok(this)
+    }
+
+    /// Reports the problems found in the inputs, and drops the input
+    /// sections the indexes consume from `sections`.
+    pub fn apply(
+        &mut self,
+        files: &[ElfInput<'a>],
+        resolution: &Resolution<'_>,
+        sections: &mut Sections,
+        diagnostics: &dyn DiagnosticSink,
+    ) {
+        let Some(index) = &self.gdb_index else {
+            return;
+        };
         for (file, section, problem) in &index.problems {
             let (name, object) = files
                 .get(*file)
@@ -64,20 +75,19 @@ impl<'a> DebugIndexes<'a> {
             )));
         }
         // `.debug_gnu_pub{names,types}` exist only to build the index.
-        for (file, object) in &objects {
+        for (file, object) in live_objects(files, resolution) {
             for (index, section) in object.sections.iter().enumerate() {
                 if super::is_consumed(section.name)
-                    && let Some(id) = sections.id(*file, u32::try_from(index).unwrap_or(u32::MAX))
+                    && let Some(id) = sections.id(file, u32::try_from(index).unwrap_or(u32::MAX))
                     && let Some(slot) = sections.live.get_mut(id.index())
                 {
                     *slot = false;
                 }
             }
         }
-        if !index.is_empty() {
-            this.gdb_index = Some(index);
+        if index.is_empty() {
+            self.gdb_index = None;
         }
-        Ok(this)
     }
 
     /// The size of `.debug_names` (0: none).
@@ -115,6 +125,19 @@ impl<'a> DebugIndexes<'a> {
         });
         Ok(())
     }
+}
+
+/// The live objects of the link, as (file index, object).
+fn live_objects<'x, 'a>(
+    files: &'x [ElfInput<'a>],
+    resolution: &Resolution<'_>,
+) -> Vec<(usize, &'x ObjectInput<'a>)> {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| resolution.is_live(FileId::new(*index)))
+        .filter_map(|(index, file)| Some((index, file.object.as_ref()?)))
+        .collect()
 }
 
 /// The position in the layout of the generated section `name`.

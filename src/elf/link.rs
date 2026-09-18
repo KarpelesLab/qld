@@ -491,15 +491,28 @@ fn link_inputs<'a>(
     // changes (symbol flags), and neither stage keeps every thread busy on
     // its own: they run side by side. A merge error counts only if the scan
     // reports none, as when the merge ran after it.
-    let (scan, merged) = rayon::join(
+    // The debug indexes only read the inputs: they are built alongside.
+    let (scan, (merged, debug_indexes)) = rayon::join(
         || scan::scan(&refs, &context),
         || {
-            merge::merge(
-                files,
-                &sections,
-                &placement,
-                options.optimize >= 2,
-                narrow.widen,
+            rayon::join(
+                || {
+                    merge::merge(
+                        files,
+                        &sections,
+                        &placement,
+                        options.optimize >= 2,
+                        narrow.widen,
+                    )
+                },
+                || {
+                    crate::debug::gdb_index::elf::DebugIndexes::build(
+                        files,
+                        &resolution,
+                        &sections,
+                        options,
+                    )
+                },
             )
         },
     );
@@ -566,15 +579,8 @@ fn link_inputs<'a>(
         lap("icf");
         options.check_cancelled()?;
     }
-    let debug_indexes = narrow.run(|| {
-        crate::debug::gdb_index::elf::DebugIndexes::plan(
-            files,
-            &resolution,
-            &mut sections,
-            options,
-            diagnostics,
-        )
-    })?;
+    let mut debug_indexes = debug_indexes?;
+    debug_indexes.apply(files, &resolution, &mut sections, diagnostics);
     let refs = Refs {
         files,
         symbols: &symbols,
