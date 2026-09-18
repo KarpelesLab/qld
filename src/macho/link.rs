@@ -466,10 +466,21 @@ fn link_arch_once(
             &mut image,
         )?;
     } else {
-        let (rebase, bind) =
-            fixups::opcodes(&layout, &pointer_fixups, &synthetic.imports, &mut image)?;
-        linkedit.rebase = rebase;
-        linkedit.bind = bind;
+        let weak_targets: Vec<Option<u64>> = synthetic
+            .imports
+            .iter()
+            .map(|i| addresses.weak_definition(i.symbol))
+            .collect();
+        let opcodes = fixups::opcodes(
+            &layout,
+            &pointer_fixups,
+            &synthetic.imports,
+            &weak_targets,
+            &mut image,
+        )?;
+        linkedit.rebase = opcodes.rebase;
+        linkedit.bind = opcodes.bind;
+        linkedit.weak_bind = opcodes.weak_bind;
     }
     let tables = symtab::build(&addresses, options, &filter, config.debug_map);
     linkedit.exports = trie::build(&tables.exports);

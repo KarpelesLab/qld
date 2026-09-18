@@ -955,6 +955,18 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
     ignored("objc_category_merging", Flag),
     ignored("objc_abi_version", V1),
     ignored("ld_classic", Flag),
+    // Obsolete options ld64 accepts and ignores.
+    ignored("single_module", Flag),
+    ignored("multi_module", Flag),
+    ignored("prebind", Flag),
+    ignored("noprebind", Flag),
+    ignored("nofixprebinding", Flag),
+    ignored("twolevel_namespace_hints", Flag),
+    ignored("nomultidefs", Flag),
+    ignored("whatsloaded", Flag),
+    ignored("force_cpusubtype_ALL", Flag),
+    ignored("seglinkedit", Flag),
+    ignored("noseglinkedit", Flag),
     ignored("ld_new", Flag),
     ignored("merge_zero_fill_sections", Flag),
     ignored("ignore_optimization_hints", Flag),
@@ -1103,6 +1115,16 @@ pub fn parse(args: &[&OsStr], reader: &dyn FileReader) -> Result<ParseOutcome> {
             any_input = true;
             continue;
         };
+        // `-O<level>`: Apple clang passes the compiler's optimization level
+        // to a linker named with `-fuse-ld=<path>`, and ld64.lld accepts
+        // it. It has no effect on a Mach-O link.
+        if is_optimization_level(name) {
+            state
+                .options
+                .ignored
+                .push(OsString::from(format!("-{name}")));
+            continue;
+        }
         let (option, joined) = lookup(name)?;
         let mut values: Vec<String> = Vec::new();
         match option.arg {
@@ -1229,6 +1251,15 @@ fn bytes_to_string(bytes: &[u8]) -> Result<String> {
 
 fn missing(name: &str) -> Error {
     Error::Option(format!("-{name}: missing argument"))
+}
+
+/// Whether `name` (without its dash) is an optimization level: `O`, `O0`
+/// to `O3` (any number), `Os`, `Oz` or `Ofast`.
+fn is_optimization_level(name: &str) -> bool {
+    let Some(level) = name.strip_prefix('O') else {
+        return false;
+    };
+    level.bytes().all(|b| b.is_ascii_digit()) || matches!(level, "s" | "z" | "fast")
 }
 
 /// Finds the option for `name` (the argument without its dash), returning
@@ -1671,6 +1702,18 @@ mod tests {
         );
         assert!(darwin.lto_library.is_some());
         assert_eq!(darwin.lto.mllvm, ["-enable-linkonceodr-outlining"]);
+    }
+
+    #[test]
+    fn optimization_levels_are_ignored() {
+        // Apple clang passes `-O<n>` to a linker given with `-fuse-ld=`.
+        for level in ["-O", "-O0", "-O2", "-O3", "-Os", "-Oz", "-Ofast"] {
+            let options = parse_ok(&["-arch", "arm64", level, "a.o"]);
+            assert_eq!(options.ignored, [OsString::from(level)], "{level}");
+            assert_eq!(options.darwin.inputs.len(), 1, "{level}");
+        }
+        assert!(parse_err(&["-Ox", "a.o"]).contains("-Ox"));
+        assert!(parse_ok(&["-ObjC", "a.o"]).darwin.objc);
     }
 
     #[test]
