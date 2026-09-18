@@ -61,7 +61,16 @@ impl Merged<'_, '_> {
     }
 }
 
-/// Deduplicates the live mergeable sections.
+/// Pieces from which deduplication runs in a pool of `widen` threads, when
+/// the caller offers one: it still gains from threads past 16 (clang with
+/// debug information, 18 million pieces: 183 ms on 16 threads, 155 on
+/// 64), where starting the pool costs a few hundred microseconds. Links
+/// without debug information have far fewer pieces (clang: under a
+/// million), and more threads only slow their merge down.
+const WIDE_MERGE_PIECES: usize = 4 << 20;
+
+/// Deduplicates the live mergeable sections, in a pool of `widen` threads
+/// if given and there are at least 4 Mi pieces (see `WIDE_MERGE_PIECES`).
 ///
 /// # Errors
 ///
@@ -71,6 +80,7 @@ pub fn merge<'s, 'a>(
     sections: &Sections,
     placement: &Placement<'_>,
     tail_merge: bool,
+    widen: Option<usize>,
 ) -> Result<Merged<'s, 'a>> {
     let mut groups = Vec::new();
     let mut group_output = Vec::new();
@@ -128,7 +138,15 @@ pub fn merge<'s, 'a>(
         }
         inputs.push(MergeInput { group, split });
     }
-    let merged = merge_split_sections(&groups, &inputs, None)?;
+    let pieces: usize = inputs.iter().map(|input| input.split.num_pieces()).sum();
+    let merged = match widen.filter(|_| pieces >= WIDE_MERGE_PIECES) {
+        Some(threads) => rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| crate::error::Error::Internal(format!("cannot create thread pool: {e}")))?
+            .install(|| merge_split_sections(&groups, &inputs, None))?,
+        None => merge_split_sections(&groups, &inputs, None)?,
+    };
     Ok(Merged {
         groups,
         group_output,

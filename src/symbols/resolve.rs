@@ -519,13 +519,26 @@ fn intern_round<'a, F: ResolveFile<'a>>(
             file.symbol_names()
         }
     };
+    // A lazy file whose names are the very same as an earlier one's (the
+    // members of an archive named twice on the command line share the
+    // index's bytes) gets that file's IDs instead of interning them again:
+    // at a later position, its names are never a first occurrence. clang
+    // names 22 archives twice, 84,500 of its 298,000 lazy names.
+    let repeats = repeated_lazy_files(files, lazy);
+    let interned: Vec<usize> = lazy
+        .iter()
+        .zip(&repeats)
+        .filter(|(_, repeat)| repeat.is_none())
+        .map(|(&index, _)| index)
+        .collect();
     let mut outputs: Vec<(usize, bool, &mut Vec<SymbolId>)> = load
         .iter()
         .zip(select_mut(symbol_ids, load))
         .map(|(&index, ids)| (index, false, ids))
         .chain(
-            lazy.iter()
-                .zip(select_mut(lazy_ids, lazy))
+            interned
+                .iter()
+                .zip(select_mut(lazy_ids, &interned))
                 .map(|(&index, ids)| (index, true, ids)),
         )
         .collect();
@@ -553,7 +566,50 @@ fn intern_round<'a, F: ResolveFile<'a>>(
             ids: ids.as_mut_slice(),
         })
         .collect();
-    table.try_intern_batch(&mut jobs)
+    table.try_intern_batch(&mut jobs)?;
+    drop(jobs);
+    for (&index, repeat) in lazy.iter().zip(&repeats) {
+        if let &Some(original) = repeat {
+            lazy_ids[index] = lazy_ids[original].clone();
+        }
+    }
+    Ok(())
+}
+
+/// For each of the `lazy` files (in index order), the earlier one whose
+/// lazy names are the very same (the same bytes in memory, not merely
+/// equal), if any.
+fn repeated_lazy_files<'a, F: ResolveFile<'a>>(files: &[F], lazy: &[usize]) -> Vec<Option<usize>> {
+    let same = |a: &SymbolName<'_>, b: &SymbolName<'_>| {
+        std::ptr::eq(a.bytes(), b.bytes())
+            && a.version().map(<[u8]>::as_ptr) == b.version().map(<[u8]>::as_ptr)
+            && a.version().map(<[u8]>::len) == b.version().map(<[u8]>::len)
+    };
+    let mut first: hashbrown::HashMap<(usize, usize), usize> = hashbrown::HashMap::new();
+    lazy.iter()
+        .map(|&index| {
+            let names = files[index].lazy_names();
+            let head = names.first()?;
+            let key = (names.len(), head.bytes().as_ptr() as usize);
+            match first.get(&key) {
+                Some(&original)
+                    if files[original].position() < files[index].position()
+                        && files[original]
+                            .lazy_names()
+                            .iter()
+                            .zip(names)
+                            .all(|(a, b)| same(a, b)) =>
+                {
+                    Some(original)
+                }
+                Some(_) => None,
+                None => {
+                    first.insert(key, index);
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Inserts this round's lazy and live definitions and sets the reference
@@ -843,6 +899,63 @@ mod tests {
 
     fn live(resolution: &Resolution<'_>) -> Vec<usize> {
         resolution.live_files().map(FileId::index).collect()
+    }
+
+    #[test]
+    fn repeated_archive_gets_the_ids_of_the_first_copy() {
+        // An archive named twice: the second copy's members either share
+        // the first's names (as members of one mapped archive do, which
+        // skips interning them) or have copies of them. IDs and the
+        // resolution must not differ.
+        let specs: [&[&'static str]; 3] = [&["D:f", "U:h"], &["D:g", "D:h"], &["D:x", "U:y"]];
+        let build = |shared: bool| {
+            let mut files = vec![object(0, &["U:f", "U:g", "D:main"])];
+            let first: Vec<Mock> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| member(1, i as u32, s))
+                .collect();
+            let mut second: Vec<Mock> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| member(3, i as u32, s))
+                .collect();
+            for (copy, original) in second.iter_mut().zip(&first) {
+                if shared {
+                    copy.lazy = original.lazy.clone();
+                    copy.names = original.names.clone();
+                } else {
+                    let fresh = |name: &SymbolName<'static>| {
+                        SymbolName::new(Box::leak(name.bytes().to_vec().into_boxed_slice()))
+                    };
+                    copy.lazy = original.lazy.iter().map(fresh).collect();
+                    copy.names = original.names.iter().map(fresh).collect();
+                }
+            }
+            files.extend(first);
+            files.push(object(2, &["U:x", "D:z"]));
+            files.extend(second);
+            files
+        };
+        let mut shared = build(true);
+        let mut copied = build(false);
+        let repeats = repeated_lazy_files(&shared, &[1, 2, 3, 5, 6, 7]);
+        assert_eq!(repeats, [None, None, None, Some(1), Some(2), Some(3)]);
+        let (table_a, resolution_a) = run(&mut shared);
+        let (table_b, resolution_b) = run(&mut copied);
+        let names = |table: &SymbolTable<'_>| {
+            table
+                .names()
+                .iter()
+                .map(|name| name.bytes().to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&table_a), names(&table_b));
+        assert_eq!(live(&resolution_a), live(&resolution_b));
+        for file in 0..shared.len() {
+            let file = FileId::new(file);
+            assert_eq!(resolution_a.symbol_ids(file), resolution_b.symbol_ids(file));
+        }
     }
 
     #[test]

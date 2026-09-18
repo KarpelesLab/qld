@@ -16,11 +16,12 @@ deleted and the file system synced, outside the timing.
 
 Each run records wall time, the load average (1 minute) just before it,
 and, through wait4(), user+system CPU time and peak RSS of the linker
-process. mold and wild fork by default and return as soon as the output is
-written, leaving the child to clean up; the child's CPU time and RSS are
-not visible to wait4(), so for those two linkers CPU and RSS come from a
-separate `--no-fork` run (--rusage-runs, default 1) while wall time is
-taken in their default mode.
+process. mold, wild and qld fork by default and return as soon as the
+output is written, leaving the child to clean up; the child's CPU time and
+RSS are not visible to wait4(), so for those linkers CPU and RSS come from
+a separate `--no-fork` run (--rusage-runs, default 1) while wall time is
+taken in their default mode. A linker name that starts with one of theirs
+(`qld-base`, given with --linker and --only) counts as forking too.
 
 After the timed runs, the output of every configuration is checked with
 the spec's smoke command (`{out}` is replaced by the output path); a
@@ -56,7 +57,7 @@ DEFAULT_LINKERS = {
     "wild": f"{HOME}/.cache/qld-bench/tools/wild/bin/wild",
     "qld": os.path.join(os.path.dirname(HERE), "target/release/qld"),
 }
-FORKING = ("mold", "wild")
+FORKING = ("mold", "wild", "qld")
 # Options a replayed argv may carry that only change diagnostics or checks
 # (not the output), and that some linkers reject.
 STRIP = {"--color-diagnostics"}
@@ -205,7 +206,7 @@ def main():
         def out_of(c):
             return os.path.join(o.outdir, f"{spec['name']}.{c[0]}.{c[1]}")
 
-        extra = {c: (shlex.split(o.qld_args) if c[0] == "qld" else []) for c in configs}
+        extra = {c: (shlex.split(o.qld_args) if c[0].startswith("qld") else []) for c in configs}
         for i in range(o.runs):
             for c in configs:
                 cell = cells[c]
@@ -227,7 +228,7 @@ def main():
             cell["size"] = os.path.getsize(out)
             if not smoke(spec, out, env):
                 cell["broken"] = "smoke check failed"
-            if c[0] in FORKING:
+            if c[0].startswith(FORKING):
                 for _ in range(o.rusage_runs):
                     remove(out)
                     os.sync()
@@ -247,7 +248,7 @@ def main():
                 print(f"| {c[0]} | {c[1]} | BROKEN: {cell['broken'][:80]} | | | | | |")
             else:
                 walls = [r["wall"] for r in cell["runs"]]
-                usage = cell["rusage"] if c[0] in FORKING else cell["runs"]
+                usage = cell["rusage"] if c[0].startswith(FORKING) else cell["runs"]
                 cpu = statistics.median(r["cpu"] for r in usage) if usage else float("nan")
                 rss = max(r["rss_kib"] for r in usage) if usage else 0
                 loads = [r["load"] for r in cell["runs"]]

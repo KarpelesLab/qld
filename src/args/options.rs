@@ -448,6 +448,58 @@ impl Default for PeArgs {
     }
 }
 
+/// A callback for the moment a successful link's output is complete, set in
+/// [`LinkOptions::on_output_complete`].
+///
+/// When it runs, the output file (and a link map, if one was asked for) is
+/// written, closed and in place under its final name; everything the link
+/// prints on stdout has been printed; every diagnostic has been emitted; and
+/// LTO plugins have been cleaned up. The link then returns `Ok` without
+/// emitting anything else: what remains is freeing memory and unmapping the
+/// inputs, which takes a while for large links (150 ms for a 1.2 GiB output
+/// with debug information).
+///
+/// It runs at most once per link, and never for a link that fails. Clones
+/// share the "already called" state, so the copies a driver makes of the
+/// options do not call it twice. It may run on any thread, including a
+/// worker of the link's thread pool.
+///
+/// The `qld` binary uses it for `--fork`: the child process that runs the
+/// link tells its parent to exit with success, then cleans up on its own.
+#[derive(Clone)]
+pub struct OutputCompleteHook {
+    callback: std::sync::Arc<dyn Fn() + Send + Sync>,
+    called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OutputCompleteHook {
+    /// Wraps `callback`.
+    pub fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            callback: std::sync::Arc::new(callback),
+            called: std::sync::Arc::default(),
+        }
+    }
+
+    /// Runs the callback, unless this hook or a clone of it already did.
+    pub fn call(&self) {
+        if !self.called.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            (self.callback)();
+        }
+    }
+}
+
+impl std::fmt::Debug for OutputCompleteHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputCompleteHook")
+            .field(
+                "called",
+                &self.called.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 /// Everything a link is configured by.
 ///
 /// Construct one with [`LinkOptions::new`] and the builder methods, or parse
@@ -719,6 +771,15 @@ pub struct LinkOptions {
     /// does. The `qld` binary sets this; library callers get an error
     /// instead, and accept that a plugin may not expect to be called again.
     pub exit_on_plugin_fatal: bool,
+    /// `--fork` (the default) / `--no-fork`: whether the `qld` binary runs
+    /// the link in a child process and returns as soon as the output is
+    /// complete, leaving the child to free memory and unmap the inputs.
+    /// Only the binary reads it (on Unix); the library never forks.
+    pub fork: bool,
+    /// Called once when a successful link's output is complete; see
+    /// [`OutputCompleteHook`]. `None` by default. The `qld` binary sets it
+    /// in the child process of `--fork` to let its parent exit early.
+    pub on_output_complete: Option<OutputCompleteHook>,
     /// Options that were recognized but have no effect yet, kept so that
     /// `--verbose` and tests can report them.
     pub ignored: Vec<OsString>,
@@ -742,7 +803,20 @@ impl LinkOptions {
             section_header: true,
             relax: true,
             dependent_libraries: true,
+            fork: true,
             ..Self::default()
+        }
+    }
+
+    /// Runs the [`on_output_complete`](Self::on_output_complete) hook, if
+    /// there is one and it has not run yet.
+    ///
+    /// Link drivers call this once the output of a successful link is
+    /// complete, and [`crate::link`] calls it before returning `Ok` for
+    /// drivers that did not.
+    pub fn output_complete(&self) {
+        if let Some(hook) = &self.on_output_complete {
+            hook.call();
         }
     }
 

@@ -44,12 +44,20 @@ impl<'a> StringTable<'a> {
 /// Finds the first NUL byte, a word at a time.
 #[inline]
 pub(crate) fn find_nul(bytes: &[u8]) -> Option<usize> {
+    find_byte(bytes, 0)
+}
+
+/// Finds the first `needle` byte, a word at a time.
+#[inline]
+pub(crate) fn find_byte(bytes: &[u8], needle: u8) -> Option<usize> {
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
+    // XOR turns the needle into zero bytes (a no-op for NUL).
+    let spread = LO.wrapping_mul(u64::from(needle));
     let (words, _) = bytes.as_chunks::<8>();
     let mut base = 0usize;
     for word in words {
-        let w = u64::from_le_bytes(*word);
+        let w = u64::from_le_bytes(*word) ^ spread;
         let zero = w.wrapping_sub(LO) & !w & HI;
         if zero != 0 {
             // The lowest set bit marks the first zero byte (bytes after it
@@ -61,7 +69,7 @@ pub(crate) fn find_nul(bytes: &[u8]) -> Option<usize> {
     }
     let rest = bytes.get(base..)?;
     rest.iter()
-        .position(|&b| b == 0)
+        .position(|&b| b == needle)
         .map(|i| base.wrapping_add(i))
 }
 
@@ -85,6 +93,29 @@ mod tests {
         }
         // Bytes with the high bit set next to a zero must not confuse it.
         assert_eq!(find_nul(&[0x81, 0x80, 0x01, 0x00, 0xff, 0, 0, 0]), Some(3));
+    }
+
+    #[test]
+    fn finds_any_byte_everywhere() {
+        for needle in [b'@', 0x80, 0xff, 0x01] {
+            for len in 0..40 {
+                for pos in 0..len {
+                    let mut v = vec![needle ^ 0x7e; len];
+                    v[pos] = needle;
+                    if pos + 1 < len {
+                        v[len - 1] = needle;
+                    }
+                    assert_eq!(
+                        find_byte(&v, needle),
+                        Some(pos),
+                        "{needle} len {len} pos {pos}"
+                    );
+                }
+                assert_eq!(find_byte(&vec![needle ^ 1; len], needle), None);
+            }
+        }
+        assert_eq!(find_byte(b"_ZN4llvm3foo@@VERS_1", b'@'), Some(12));
+        assert_eq!(find_byte(&[0x3f, 0xc0, 0x41, 0x40, 0x40], b'@'), Some(3));
     }
 
     #[test]

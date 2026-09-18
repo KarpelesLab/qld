@@ -693,7 +693,7 @@ fn definition(weak: bool, comdat: bool) -> SymbolUse {
 /// without a version), `foo@VERSION` a distinct, versioned symbol.
 #[must_use]
 pub fn split_version(name: &[u8]) -> (&[u8], Option<&[u8]>) {
-    let Some(at) = name.iter().position(|&b| b == b'@') else {
+    let Some(at) = crate::elf::read::strtab::find_byte(name, b'@') else {
         return (name, None);
     };
     let base = name.get(..at).unwrap_or(name);

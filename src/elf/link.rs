@@ -5,7 +5,9 @@
 //! turns problems into diagnostics:
 //!
 //! 1. [`inputs`]: search paths, archives, input scripts; then the thread
-//!    pool is sized from the input size unless `--threads` was given;
+//!    pool is sized from the input size unless `--threads` was given (in a
+//!    pool of more than 16 threads, every stage but the relocation scan and
+//!    section merging runs in a pool of 16: see `Narrow`);
 //! 2. [`resolve_symbols_with`] with [`ElfRules`], claiming COMDAT groups as
 //!    rounds load files ([`resolve::ComdatHook`]), then dropping the
 //!    discarded copies' sections;
@@ -107,18 +109,88 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     // core): mapping the inputs gains nothing from more than a few threads,
     // and 849 objects took 50 ms on 64 threads against 10 ms on 16.
     let own_pools = options.threads.is_none() && rayon::current_thread_index().is_none();
+    // In a larger pool (`--threads` above MAX_DEFAULT_THREADS, or a
+    // caller's pool), the stages that get slower with more threads run in a
+    // pool of MAX_DEFAULT_THREADS; see `Narrow`.
+    let mut narrow = Narrow {
+        pool: (!own_pools && rayon::current_num_threads() > MAX_DEFAULT_THREADS)
+            .then(|| thread_pool(MAX_DEFAULT_THREADS))
+            .transpose()?,
+        widen: None,
+    };
     let mut inputs = if own_pools {
         let threads = available_threads().min(INPUT_THREADS);
         thread_pool(threads)?.install(|| inputs::collect(options, &table, &internal, config))?
     } else {
-        inputs::collect(options, &table, &internal, config)?
+        narrow.run(|| inputs::collect(options, &table, &internal, config))?
     };
     lap("inputs");
 
-    match input_sized_threads(options, &table, own_pools) {
-        Some(threads) => thread_pool(threads)?
-            .install(|| link_inputs(options, diagnostics, &mut inputs, &internal, script, &lap)),
-        None => link_inputs(options, diagnostics, &mut inputs, &internal, script, &lap),
+    let threads = input_sized_threads(options, &table, own_pools);
+    if own_pools
+        && threads == Some(MAX_DEFAULT_THREADS)
+        && available_threads() > MAX_DEFAULT_THREADS
+    {
+        narrow.widen = Some(available_threads());
+    }
+    match threads {
+        Some(threads) => thread_pool(threads)?.install(|| {
+            link_inputs(
+                options,
+                diagnostics,
+                &mut inputs,
+                &internal,
+                script,
+                &lap,
+                &narrow,
+            )
+        }),
+        None => link_inputs(
+            options,
+            diagnostics,
+            &mut inputs,
+            &internal,
+            script,
+            &lap,
+            &narrow,
+        ),
+    }
+}
+
+/// A pool of [`MAX_DEFAULT_THREADS`] threads for the stages that do not
+/// scale past it, when the link runs in a larger pool (an explicit
+/// `--threads`, or a caller's pool); `None` otherwise.
+///
+/// Past 16 threads, most stages get slower on the 32-core development
+/// machine, not faster: idle rayon workers spin looking for work between
+/// the many short parallel steps, share cores with the busy ones, and page
+/// faults and `mmap` contend in the kernel. Measured at 16 and 64 threads
+/// (clang, `libclang-cpp`, clang with debug information): mapping the
+/// inputs took 5 ms against 28-53 ms (1,014 objects), resolution 50
+/// against 62 ms, the dynamic symbol plan 15 against 24 ms, layout 9
+/// against 15 ms, and the write of a 1.2 GiB output 353 against 451 ms.
+/// The relocation scan and section merging still gain from the larger pool
+/// (merging clang's 18 million debug strings: 182 ms on 16 threads, 153 on
+/// 64), so they keep it. With this, `--threads=64` links as fast as 16
+/// threads or faster: clang 155 ms against 203 before, clang with debug
+/// information 670 against 771, `libclang-cpp` 121 against 189.
+///
+/// The other way round, a large link in qld's own pool of 16 threads merges
+/// sections in a pool of one thread per core when there are many pieces
+/// (`widen`, see [`merge::merge`]).
+struct Narrow {
+    pool: Option<rayon::ThreadPool>,
+    /// Threads for section merging, when they are more than the link's.
+    widen: Option<usize>,
+}
+
+impl Narrow {
+    /// Runs `op` in the narrow pool, if there is one.
+    fn run<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        match &self.pool {
+            Some(pool) => pool.install(op),
+            None => op(),
+        }
     }
 }
 
@@ -250,17 +322,19 @@ fn link_inputs<'a>(
     internal: &InternalNames,
     script: Option<&'a super::script_layout::LayoutScript>,
     lap: &(dyn Fn(&str) + Sync),
+    narrow: &Narrow,
 ) -> Result<()> {
     let rules = ElfRules {
         allow_multiple_definition: options.allow_multiple_definition,
     };
     // Resolution, and LTO when a plugin claims IR inputs (`lto` module).
-    let (mut symbols, resolution, lto) = super::lto::resolve(options, diagnostics, &rules, inputs)?;
+    let (mut symbols, resolution, lto) =
+        narrow.run(|| super::lto::resolve(options, diagnostics, &rules, inputs))?;
     let files = &inputs.files;
-    dso::bind_unextracted(files, &symbols, &resolution);
+    narrow.run(|| dso::bind_unextracted(files, &symbols, &resolution));
     lap("resolution");
 
-    let mut sections = Sections::new(files, &resolution)?;
+    let mut sections = narrow.run(|| Sections::new(files, &resolution))?;
     let relocatable = options.kind == OutputKind::Relocatable;
     if relocatable {
         relocatable::revive_sections(files, &mut sections, options);
@@ -277,13 +351,21 @@ fn link_inputs<'a>(
         // property notes rather than merging them.
         relocatable::revive_named(files, &mut sections, b".note.gnu.property");
     }
-    resolve::deduplicate_comdat(files, &mut sections);
-    let mut errors =
-        resolve::report_duplicates(files, &resolution, &sections, options.demangle, diagnostics);
-    report_gnu_warnings(files, &symbols, diagnostics);
-    xref::trace_symbols(files, &resolution, options, diagnostics);
-    xref::warn_common(files, &resolution, options, diagnostics);
-    let cref = xref::cross_reference(files, &symbols, &resolution, options);
+    let (mut errors, cref) = narrow.run(|| {
+        resolve::deduplicate_comdat(files, &mut sections);
+        let errors = resolve::report_duplicates(
+            files,
+            &resolution,
+            &sections,
+            options.demangle,
+            diagnostics,
+        );
+        report_gnu_warnings(files, &symbols, diagnostics);
+        xref::trace_symbols(files, &resolution, options, diagnostics);
+        xref::warn_common(files, &resolution, options, diagnostics);
+        let cref = xref::cross_reference(files, &symbols, &resolution, options);
+        (errors, cref)
+    });
 
     if relocatable {
         if errors > 0 && !options.noinhibit_exec {
@@ -300,13 +382,15 @@ fn link_inputs<'a>(
             lap,
         )?;
         map::write_cref(options, cref.as_deref())?;
-        return lto.finish(diagnostics);
+        lto.finish(diagnostics)?;
+        options.output_complete();
+        return Ok(());
     }
 
-    let needed = dso::plan_needed(files, &symbols, &rules, &resolution);
+    let needed = narrow.run(|| dso::plan_needed(files, &symbols, &rules, &resolution));
     let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
     if mode.dynamic && !mode.shared {
-        dso::mark_dependency_symbols(files, &symbols, &needed, options);
+        narrow.run(|| dso::mark_dependency_symbols(files, &symbols, &needed, options));
     }
     let always: &[&str] = if mode.dynamic && mode.executable() && options.export_dynamic {
         for name in defined::ALWAYS_DEFINED {
@@ -318,33 +402,36 @@ fn link_inputs<'a>(
     };
 
     let rule_set = RuleSet::for_link(script, diagnostics);
-    let mut placement = place::place(&rule_set, files, &sections, options);
+    let mut placement = narrow.run(|| place::place(&rule_set, files, &sections, options));
     for id in &placement.discarded {
         if let Some(slot) = sections.live.get_mut(id.index()) {
             *slot = false;
         }
     }
-    let linker = defined::register(&symbols, files, &placement, options, mode.dynamic, always);
+    let linker = narrow
+        .run(|| defined::register(&symbols, files, &placement, options, mode.dynamic, always));
     let (mut version_script, dynamic_patterns) = export::read_scripts(options)?;
     if version_script.is_none()
         && let Some(nodes) = script.map(|s| &s.version).filter(|v| !v.is_empty())
     {
         version_script = Some(export::VersionScript::new(nodes)?);
     }
-    let exports = export::plan(
-        files,
-        &symbols,
-        &resolution,
-        &needed,
-        options,
-        mode,
-        version_script,
-        &dynamic_patterns,
-        &linker,
-    )?;
+    let exports = narrow.run(|| {
+        export::plan(
+            files,
+            &symbols,
+            &resolution,
+            &needed,
+            options,
+            mode,
+            version_script,
+            &dynamic_patterns,
+            &linker,
+        )
+    })?;
     lap("placement");
 
-    let mut eh_frames = ehframe::split(files, &sections)?;
+    let mut eh_frames = narrow.run(|| ehframe::split(files, &sections))?;
     if options.gc_sections {
         let refs = Refs {
             files,
@@ -353,8 +440,8 @@ fn link_inputs<'a>(
             sections: &sections,
         };
         let why_live = !options.why_live.is_empty();
-        let (removed, graph) =
-            gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live)?;
+        let (removed, graph) = narrow
+            .run(|| gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live))?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
@@ -369,7 +456,7 @@ fn link_inputs<'a>(
         eh_frames
             .sections
             .retain(|s| sections.live.get(s.id.index()).copied().unwrap_or(false));
-        placement.compute_flags(files, &sections);
+        narrow.run(|| placement.compute_flags(files, &sections));
         lap("gc");
     }
 
@@ -385,7 +472,22 @@ fn link_inputs<'a>(
         copy_relocs: options.copy_relocs,
         arch: super::arch::Arch::of(options, files),
     };
-    let scan = scan::scan(&refs, &context);
+    // Section merging needs neither the scan's results nor anything it
+    // changes (symbol flags), and neither stage keeps every thread busy on
+    // its own: they run side by side. A merge error counts only if the scan
+    // reports none, as when the merge ran after it.
+    let (scan, merged) = rayon::join(
+        || scan::scan(&refs, &context),
+        || {
+            merge::merge(
+                files,
+                &sections,
+                &placement,
+                options.optimize >= 2,
+                narrow.widen,
+            )
+        },
+    );
     for file in &scan.files {
         for error in &file.errors {
             diagnostics.emit(error.clone());
@@ -426,8 +528,8 @@ fn link_inputs<'a>(
     }
     lap("scan");
 
-    let commons = common::allocate(&refs);
-    let merged = merge::merge(files, &sections, &placement, options.optimize >= 2)?;
+    let commons = narrow.run(|| common::allocate(&refs));
+    let merged = merged?;
     lap("merge");
     let icf_mode = match options.icf.as_deref() {
         Some("all") => Some(IcfMode::All),
@@ -452,13 +554,13 @@ fn link_inputs<'a>(
         resolution: &resolution,
         sections: &sections,
     };
-    eh_frames.finalize(&refs);
+    narrow.run(|| eh_frames.finalize(&refs));
 
     let mut synth = Synth {
         arch: context.arch,
         ..Synth::default()
     };
-    synth.plan_entries(&refs, &scan, mode);
+    narrow.run(|| synth.plan_entries(&refs, &scan, mode));
     // DT_RELR is for position-independent output; GNU ld ignores the
     // option otherwise.
     synth.relr = options.pack_relative_relocs && mode.pic;
@@ -476,7 +578,7 @@ fn link_inputs<'a>(
     synth.eh_frame_end = eh_frames.sections.iter().any(|s| s.size > 0);
     synth.common = (commons.size, commons.align);
 
-    let nonempty_outputs = nonempty_outputs(files, &sections, &placement);
+    let nonempty_outputs = narrow.run(|| nonempty_outputs(files, &sections, &placement));
     let has_output = |name: &[u8]| {
         placement
             .outputs
@@ -494,23 +596,25 @@ fn link_inputs<'a>(
                 .file_name()
                 .map(|n| n.as_encoded_bytes().to_vec())
         });
-    let dynamic = dynsym::plan(&dynsym::PlanInput {
-        refs: &refs,
-        needed: &needed,
-        mode,
-        options,
-        synth: &synth,
-        exports: &exports,
-        scan: &scan,
-        has_output: &has_output,
-        soname,
+    let dynamic = narrow.run(|| {
+        dynsym::plan(&dynsym::PlanInput {
+            refs: &refs,
+            needed: &needed,
+            mode,
+            options,
+            synth: &synth,
+            exports: &exports,
+            scan: &scan,
+            has_output: &has_output,
+            soname,
+        })
     })?;
     synth.dynamic_sizes = dynamic.sizes();
     synth.verneed_count = dynamic.verneed_count;
     synth.verdef_count = dynamic.verdef_count;
     lap("dynamic");
 
-    let plan = symtab::plan(&refs, &linker, options);
+    let plan = narrow.run(|| symtab::plan(&refs, &linker, options));
     let trailers = TrailerSizes {
         symtab: plan.symtab_size(),
         strtab: if plan.is_empty() {
@@ -524,20 +628,22 @@ fn link_inputs<'a>(
         .iter()
         .filter_map(|f| f.object.as_ref())
         .any(|o| o.exec_stack);
-    let mut layout = layout::layout(&LayoutInput {
-        options,
-        refs,
-        rules: &rule_set,
-        files,
-        sections: &sections,
-        placement: &placement,
-        merged: &merged,
-        eh_frames: &eh_frames,
-        synth: &synth,
-        trailers,
-        exec_stack,
-        mode,
-        compressed: &[],
+    let mut layout = narrow.run(|| {
+        layout::layout(&LayoutInput {
+            options,
+            refs,
+            rules: &rule_set,
+            files,
+            sections: &sections,
+            placement: &placement,
+            merged: &merged,
+            eh_frames: &eh_frames,
+            synth: &synth,
+            trailers,
+            exec_stack,
+            mode,
+            compressed: &[],
+        })
     })?;
     // `.relr.dyn`'s size depends on the addresses it encodes: lay out with an
     // estimate, and again with the real size while it does not fit (growth
@@ -666,27 +772,34 @@ fn link_inputs<'a>(
         lap("compress");
     }
 
-    let addresses = Addresses::new(
-        refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
-    );
+    let addresses = narrow.run(|| {
+        Addresses::new(
+            refs, &layout, &merged, &eh_frames, &synth, &commons, &placement, &linker, options,
+        )
+    });
     let entry = entry_address(&addresses, options, mode, diagnostics);
-    write::write(&WriteInput {
-        options,
-        addresses: &addresses,
-        symtab: &plan,
-        linker: &linker,
-        dynamic: &dynamic,
-        scan: &scan,
-        context,
-        tombstones: &tombstones,
-        relr: &relr,
-        entry,
-        prerendered: &prerendered,
-        diagnostics,
+    narrow.run(|| {
+        write::write(&WriteInput {
+            options,
+            addresses: &addresses,
+            symtab: &plan,
+            linker: &linker,
+            dynamic: &dynamic,
+            scan: &scan,
+            context,
+            tombstones: &tombstones,
+            relr: &relr,
+            entry,
+            prerendered: &prerendered,
+            diagnostics,
+        })
     })?;
-    map::write(options, &addresses, &plan, cref.as_deref())?;
+    narrow.run(|| map::write(options, &addresses, &plan, cref.as_deref()))?;
     lap("write");
-    lto.finish(diagnostics)
+    lto.finish(diagnostics)?;
+    // Freeing the link's data and unmapping the inputs come after this.
+    options.output_complete();
+    Ok(())
 }
 
 /// The rest of a relocatable (`-r`) link: `--gc-sections` when asked (GNU

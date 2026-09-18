@@ -647,20 +647,20 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
         }
     }
 
-    // Versions needed: (file, version name) in file order, then name.
-    let mut needs_versions: Vec<(usize, &[u8], SymbolId)> = plan
+    // The version each entry imports, looked up once and in parallel: the
+    // needed versions and `.gnu.version` both walk every entry (150,000 for
+    // clang, which exports its symbols).
+    let imported: Vec<Option<(usize, &[u8])>> = plan
         .entries
-        .iter()
-        .filter_map(|entry| match entry {
-            Entry::Symbol(id) => import_version(refs, *id).map(|(file, name)| (file, name, *id)),
+        .par_iter()
+        .map(|&entry| match entry {
+            Entry::Symbol(id) => import_version(refs, id),
             Entry::Version(_) => None,
         })
         .collect();
-    needs_versions.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
-    let mut need_list: Vec<(usize, &[u8])> = needs_versions
-        .iter()
-        .map(|&(file, name, _)| (file, name))
-        .collect();
+    // Versions needed: (file, version name) in file order, then name.
+    let mut need_list: Vec<(usize, &[u8])> = imported.iter().flatten().copied().collect();
+    need_list.sort_unstable();
     // glibc refuses DT_RELR without this version need, which its libc.so
     // defines for that purpose.
     if input.synth.relr_count() > 0
@@ -737,30 +737,33 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
     if versioned {
         plan.versym = Vec::with_capacity(plan.entries.len().saturating_add(1));
         plan.versym.push(0);
-        for &entry in &plan.entries {
-            let value = match entry {
-                Entry::Version(version) => version,
-                Entry::Symbol(id) => {
-                    let def_kind = symbols.definition_kind(id);
-                    if let Some((file, name)) = import_version(refs, id) {
-                        need_index(file, name)
-                    } else if matches!(def_kind, DefinitionKind::Shared)
-                        || !matches!(
-                            def_kind,
-                            DefinitionKind::Regular | DefinitionKind::Weak | DefinitionKind::Common
-                        )
-                    {
-                        0
-                    } else {
-                        match input.exports.version(id) {
-                            0 => VER_NDX_GLOBAL,
-                            v => v,
+        let exports = input.exports;
+        plan.versym
+            .par_extend(plan.entries.par_iter().zip(&imported).map(
+                |(&entry, &imported)| match entry {
+                    Entry::Version(version) => version,
+                    Entry::Symbol(id) => {
+                        let def_kind = symbols.definition_kind(id);
+                        if let Some((file, name)) = imported {
+                            need_index(file, name)
+                        } else if matches!(def_kind, DefinitionKind::Shared)
+                            || !matches!(
+                                def_kind,
+                                DefinitionKind::Regular
+                                    | DefinitionKind::Weak
+                                    | DefinitionKind::Common
+                            )
+                        {
+                            0
+                        } else {
+                            match exports.version(id) {
+                                0 => VER_NDX_GLOBAL,
+                                v => v,
+                            }
                         }
                     }
-                }
-            };
-            plan.versym.push(value);
-        }
+                },
+            ));
     }
 
     // `.gnu.version_r`.

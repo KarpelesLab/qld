@@ -184,6 +184,7 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
 /// # Errors
 ///
 /// [`ClassifyError`] for unsupported relocations and unrecognized TLS code.
+#[inline(always)]
 pub fn decide(
     context: &Context,
     rel: &Relocation,

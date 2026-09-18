@@ -81,6 +81,11 @@ pub fn version_line() -> String {
 /// own, call `link` (or a format driver such as [`elf::link`](fn@elf::link))
 /// inside your pool's `install`.
 ///
+/// A successful link runs [`LinkOptions::on_output_complete`] once the
+/// output is complete: the ELF driver runs it before freeing its data and
+/// unmapping the inputs, and `link` runs it before returning `Ok` if the
+/// driver did not.
+///
 /// # Errors
 ///
 /// Returns any fatal error from the link, including
@@ -102,4 +107,5 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
             .install(run),
         None => run(),
     }
+    .inspect(|()| options.output_complete())
 }

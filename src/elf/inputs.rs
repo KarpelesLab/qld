@@ -30,7 +30,9 @@ use crate::error::{Error, Result};
 use crate::ids::FileId;
 use crate::input::archive::Member;
 use crate::input::identify::FileFormat;
-use crate::input::{FileTable, InputFile, LibraryNaming, RealFileSystem, SearchContext, Source};
+use crate::input::{
+    FileTable, InputFile, LibraryNaming, MemberEntry, RealFileSystem, SearchContext, Source,
+};
 use crate::script::{self, CommandKind, InputName};
 use crate::symbols::{DefinitionKind, InputPosition, ResolveFile, SymbolName, SymbolUse};
 use crate::target::{Architecture, Target};
@@ -556,6 +558,16 @@ pub fn collect<'a>(
     }
     let sources: Vec<Source> = pending.iter().map(|p| p.source.clone()).collect();
     let loaded = table.load_all(&sources);
+    // The members of the archives on the command line are found and
+    // described in parallel (reading every member header is most of the
+    // walk); the walk below adds them in order.
+    let mut prepared: Vec<Option<Result<Vec<PreparedMember<'a>>>>> = loaded
+        .par_iter()
+        .map(|id| {
+            let file = table.get(*id.as_ref().ok()?)?;
+            (file.format() == FileFormat::Archive).then(|| prepare_members(table, file, id))
+        })
+        .collect();
 
     let mut files = Vec::new();
     let mut internal_symbols = InternalSymbols::default();
@@ -595,10 +607,18 @@ pub fn collect<'a>(
         lto: LtoMode::for_options(options),
         deferred: Vec::new(),
     };
-    for (entry, id) in pending.iter().zip(loaded) {
+    for ((entry, id), members) in pending.iter().zip(loaded).zip(prepared.iter_mut()) {
         // An archive index read later still reports its error before this
         // input's.
-        let added = id.and_then(|id| walker.add(id, entry.attrs, &entry.what, &entry.found_as));
+        let added = id.and_then(|id| {
+            walker.add(
+                id,
+                entry.attrs,
+                &entry.what,
+                &entry.found_as,
+                members.take(),
+            )
+        });
         if let Err(error) = added {
             walker.finish()?;
             return Err(error);
@@ -634,6 +654,34 @@ struct Walker<'a, 's> {
     lto: LtoMode,
     /// Archives whose symbol index is read by [`Walker::finish`].
     deferred: Vec<DeferredIndex<'a>>,
+}
+
+/// An archive member found before the walk: the member and its file table
+/// entry, not added yet.
+struct PreparedMember<'a> {
+    member: Member<'a>,
+    entry: MemberEntry,
+}
+
+/// Finds the members of the (regular) archive `file`, whose ID is `id`, and
+/// describes each as a file table entry, as [`Walker`] would one by one.
+fn prepare_members<'a>(
+    table: &FileTable,
+    file: &'a InputFile,
+    id: &Result<FileId>,
+) -> Result<Vec<PreparedMember<'a>>> {
+    let id = *id
+        .as_ref()
+        .map_err(|_| Error::Internal("archive not loaded".into()))?;
+    let archive = file.archive()?;
+    archive
+        .members()
+        .map(|member| {
+            let member = member?;
+            let entry = table.member_entry(id, &member)?;
+            Ok(PreparedMember { member, entry })
+        })
+        .collect()
 }
 
 /// An indexed archive whose symbol index is read after the walk, in
@@ -723,7 +771,16 @@ impl<'a> Walker<'a, '_> {
         }
     }
 
-    fn add(&mut self, id: FileId, attrs: InputAttrs, what: &str, found_as: &[u8]) -> Result<()> {
+    /// Adds input `id`. `prepared` holds its members if it is an archive
+    /// whose members were found before the walk ([`prepare_members`]).
+    fn add(
+        &mut self,
+        id: FileId,
+        attrs: InputAttrs,
+        what: &str,
+        found_as: &[u8],
+        prepared: Option<Result<Vec<PreparedMember<'a>>>>,
+    ) -> Result<()> {
         let Some(file) = self.table.get(id) else {
             return Err(Error::Internal("loaded file missing from table".into()));
         };
@@ -755,7 +812,9 @@ impl<'a> Walker<'a, '_> {
                 16,
                 "ELF file type (expected a relocatable object)",
             )),
-            FileFormat::Archive | FileFormat::ThinArchive => self.add_archive(id, file, attrs),
+            FileFormat::Archive | FileFormat::ThinArchive => {
+                self.add_archive(id, file, attrs, prepared)
+            }
             FileFormat::Text(_) => self.add_script(file, attrs, what),
             FileFormat::Empty => Ok(()),
             format if format.is_ir() => {
@@ -820,34 +879,61 @@ impl<'a> Walker<'a, '_> {
         Ok(())
     }
 
-    fn add_archive(&mut self, id: FileId, file: &'a InputFile, attrs: InputAttrs) -> Result<()> {
+    fn add_archive(
+        &mut self,
+        id: FileId,
+        file: &'a InputFile,
+        attrs: InputAttrs,
+        prepared: Option<Result<Vec<PreparedMember<'a>>>>,
+    ) -> Result<()> {
         let archive = file.archive()?;
         let input_number = self.next_position()?;
         let first = self.files.len();
         // Header offset -> index into `files`, for the symbol index.
         let mut by_offset: Vec<(u64, usize)> = Vec::new();
-        for (ordinal, member) in archive.members().enumerate() {
-            let member = member?;
+        let mut add = |walker: &mut Self, ordinal: usize, member: Member<'a>, entry| {
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| Error::Limit("too many archive members".into()))?;
             let mut input =
-                self.input(InputPosition::new(input_number, ordinal), InputRole::Member);
-            if archive.is_thin() {
-                input.thin = Some(ThinMember {
-                    archive: id,
-                    member,
-                });
-            } else {
-                let member_id = self.table.add_member(id, &member)?;
-                let member_file = self.table.get(member_id);
-                if let Some(member_file) = member_file {
-                    self.infer_target(member_file);
+                walker.input(InputPosition::new(input_number, ordinal), InputRole::Member);
+            match entry {
+                None => {
+                    input.thin = Some(ThinMember {
+                        archive: id,
+                        member,
+                    });
                 }
-                input.file = member_file;
+                Some(entry) => {
+                    let member_id = walker.table.push_member(entry)?;
+                    let member_file = walker.table.get(member_id);
+                    if let Some(member_file) = member_file {
+                        walker.infer_target(member_file);
+                    }
+                    input.file = member_file;
+                }
             }
             input.live_at_start = attrs.whole_archive;
-            by_offset.push((member.header_offset, self.files.len()));
-            self.files.push(input);
+            by_offset.push((member.header_offset, walker.files.len()));
+            walker.files.push(input);
+            Ok::<(), Error>(())
+        };
+        match prepared {
+            Some(members) => {
+                for (ordinal, prepared) in members?.into_iter().enumerate() {
+                    add(self, ordinal, prepared.member, Some(prepared.entry))?;
+                }
+            }
+            None => {
+                for (ordinal, member) in archive.members().enumerate() {
+                    let member = member?;
+                    let entry = if archive.is_thin() {
+                        None
+                    } else {
+                        Some(self.table.member_entry(id, &member)?)
+                    };
+                    add(self, ordinal, member, entry)?;
+                }
+            }
         }
         if attrs.whole_archive {
             return Ok(());
@@ -936,7 +1022,7 @@ impl<'a> Walker<'a, '_> {
         }
         for (source, entry_attrs, found_as) in entries {
             let id = self.table.load(&source)?;
-            self.add(id, entry_attrs, "", &found_as)?;
+            self.add(id, entry_attrs, "", &found_as, None)?;
         }
         self.depth = self.depth.saturating_sub(1);
         Ok(())
@@ -1091,7 +1177,7 @@ pub fn add_after_lto<'a>(
     let result = (|| -> Result<()> {
         for &id in objects {
             let found_as = table.get(id).map(|f| base_name_of(f.path()));
-            walker.add(id, attrs, "", &found_as.unwrap_or_default())?;
+            walker.add(id, attrs, "", &found_as.unwrap_or_default(), None)?;
         }
         if options.kind == crate::args::OutputKind::Relocatable {
             // Undefined symbols stay undefined in relocatable output.
@@ -1113,7 +1199,7 @@ pub fn add_after_lto<'a>(
                 continue;
             }
             let id = table.load_path(&path)?;
-            walker.add(id, attrs, "", &base_name_of(&path))?;
+            walker.add(id, attrs, "", &base_name_of(&path), None)?;
         }
         Ok(())
     })();
