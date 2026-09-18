@@ -1,15 +1,22 @@
-//! Integration tests for the Mach-O linker (`qld::macho`, workstream W25).
+//! Integration tests for the Mach-O linker (`qld::macho`, workstreams W25
+//! and W27).
 //!
 //! Fixtures in `tests/data/macho_link/` are compiled with
 //! `clang --target=<arch>-apple-macos13` (no SDK needed: the sources declare
 //! what they use, and `tests/data/macho_link/sdk` provides `.tbd` stubs for
-//! libSystem and libc++). The outputs are checked structurally with qld's
-//! own Mach-O reader and, when installed, `llvm-objdump`; the code signature
-//! hashes are recomputed; and when `ld64.lld` is available the same inputs
-//! are linked with it and the two outputs compared.
+//! libSystem, including what Rust's std imports, and libc++). The outputs
+//! are checked structurally with qld's own Mach-O reader and, when
+//! installed, `llvm-objdump`; the code signature hashes are recomputed; and
+//! when `ld64.lld` is available the same inputs are linked with it and the
+//! two outputs compared. `ld64.lld` has no `-r`: relocatable outputs are
+//! checked by linking them (with qld and `ld64.lld`) and comparing with
+//! links of the original objects.
 //!
 //! On macOS the fixtures link against the real SDK (`xcrun --show-sdk-path`)
-//! and are run.
+//! and are run; `-r` outputs are also compared with Apple's `ld -r` and
+//! linked by Apple's linker. The Rust test needs `rustc` with the standard
+//! library of `aarch64-apple-darwin` (and runs `x86_64-apple-darwin` too
+//! when that is installed).
 //!
 //! Missing tools make tests skip with a message. With
 //! `QLD_REQUIRE_MACHO_TOOLS=1` (set on the macOS CI runner) a missing tool is
