@@ -302,8 +302,8 @@ pub fn merged_visibility(flags: SymbolFlags) -> u8 {
 /// Returns an error when a symbol names a version the script does not
 /// define.
 #[allow(clippy::too_many_arguments)]
-pub fn plan(
-    files: &[ElfInput<'_>],
+pub fn plan<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     resolution: &Resolution<'_>,
     needed: &Needed,
@@ -355,7 +355,7 @@ pub fn plan(
         });
 
     let exclude_all = options.exclude_libs.iter().any(|l| l == "ALL");
-    let excluded = |file: &ElfInput<'_>| -> bool {
+    let excluded = |file: &ElfInput<'_, F>| -> bool {
         if options.exclude_libs.is_empty() || file.role != InputRole::Member {
             return false;
         }

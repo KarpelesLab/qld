@@ -38,7 +38,7 @@ impl Commons {
 
 /// Lays out the common symbols that won resolution.
 #[must_use]
-pub fn allocate(refs: &Refs<'_, '_>) -> Commons {
+pub fn allocate<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>) -> Commons {
     let symbols = refs.symbols;
     let mut winners: Vec<(u64, u32, SymbolId, u64, u64)> = symbols
         .ids()

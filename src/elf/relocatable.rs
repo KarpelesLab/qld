@@ -113,7 +113,11 @@ fn kept_when_ignored(section: &InputSection<'_>, strip_debug: bool) -> bool {
 /// Marks live the sections only relocatable output copies: `SHF_EXCLUDE`
 /// sections, `.note.GNU-stack` and `.gnu.warning*`. Call it before COMDAT
 /// deduplication, which may kill some of them again.
-pub fn revive_sections(files: &[ElfInput<'_>], sections: &mut Sections, options: &LinkOptions) {
+pub fn revive_sections<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    sections: &mut Sections,
+    options: &LinkOptions,
+) {
     let strip_debug = options.strip >= StripMode::Debug;
     for (file_index, file) in files.iter().enumerate() {
         let Some(object) = &file.object else {
@@ -137,7 +141,11 @@ pub fn revive_sections(files: &[ElfInput<'_>], sections: &mut Sections, options:
 
 /// Marks live the ignored sections named `name` (for `--emit-relocs`,
 /// which keeps `.note.GNU-stack` as GNU ld does).
-pub fn revive_named(files: &[ElfInput<'_>], sections: &mut Sections, name: &[u8]) {
+pub fn revive_named<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    sections: &mut Sections,
+    name: &[u8],
+) {
     for (file_index, file) in files.iter().enumerate() {
         let Some(object) = &file.object else {
             continue;
@@ -159,11 +167,11 @@ pub fn revive_named(files: &[ElfInput<'_>], sections: &mut Sections, name: &[u8]
 }
 
 /// What a relocatable link writes.
-pub struct RelocatableInput<'r, 'a> {
+pub struct RelocatableInput<'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Options.
     pub options: &'r LinkOptions,
     /// Inputs, symbols and section liveness.
-    pub refs: Refs<'r, 'a>,
+    pub refs: Refs<'r, 'a, F>,
     /// The common block, when `-d` allocates common symbols.
     pub commons: Option<&'r Commons>,
     /// The layout of a linker script's output sections (`-r -T`).
@@ -494,13 +502,15 @@ fn slot<T: Copy + Default>(table: &[T], index: usize) -> T {
 /// Returns I/O errors, [`Error::Malformed`] for broken relocations,
 /// [`Error::Unimplemented`] for `SHT_REL` inputs, and [`Error::Limit`] when
 /// the output does not fit the ELF format.
-pub fn write(input: &RelocatableInput<'_, '_>) -> Result<()> {
+pub fn write<F: crate::elf::read::ElfFormat>(input: &RelocatableInput<'_, '_, F>) -> Result<()> {
     let plan = plan(input)?;
     write_file(input, &plan)
 }
 
 #[allow(clippy::too_many_lines)]
-fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
+fn plan<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
+) -> Result<Plan<'a>> {
     let refs = &input.refs;
     let files = refs.files;
     let sections = refs.sections;
@@ -1177,8 +1187,8 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
 /// `compare_link_order` does in relocatable links: by the address of the
 /// sections they link to (their output section's address while GNU ld runs
 /// the script, 0 for others, plus their offset), then in input order.
-fn sort_link_order(
-    files: &[ElfInput<'_>],
+fn sort_link_order<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     sections: &Sections,
     offsets: &[u64],
     addresses: &[u64],
@@ -1201,8 +1211,8 @@ fn sort_link_order(
 }
 
 /// What relocation rewriting needs.
-struct Context<'c, 'r, 'a> {
-    refs: &'c Refs<'r, 'a>,
+struct Context<'c, 'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
+    refs: &'c Refs<'r, 'a, F>,
     assign: &'c [u32],
     offsets: &'c [u64],
     kept: &'c KeptGroups<'a>,
@@ -1210,7 +1220,7 @@ struct Context<'c, 'r, 'a> {
     script_outs: &'c [u32],
 }
 
-impl Context<'_, '_, '_> {
+impl<F: crate::elf::read::ElfFormat> Context<'_, '_, '_, F> {
     /// The output section list index and member offset of an input section.
     fn placed(&self, file: usize, section: u32) -> Option<(u32, u64)> {
         let id = self.refs.sections.id(file, section)?;
@@ -1238,10 +1248,10 @@ impl Context<'_, '_, '_> {
 }
 
 /// Rewrites one relocation of a copied section of `file`.
-fn rewrite(
-    context: &Context<'_, '_, '_>,
+fn rewrite<F: crate::elf::read::ElfFormat>(
+    context: &Context<'_, '_, '_, F>,
     file: usize,
-    object: &ObjectInput<'_>,
+    object: &ObjectInput<'_, F>,
     rel: &Relocation,
     relocated: &InputSection<'_>,
 ) -> Result<Rewritten> {
@@ -1315,10 +1325,10 @@ fn rewrite(
 }
 
 /// The relocations of a copied section.
-fn relocations_of<'a>(
-    object: &ObjectInput<'a>,
+fn relocations_of<'a, F: crate::elf::read::ElfFormat>(
+    object: &ObjectInput<'a, F>,
     section: &InputSection<'a>,
-) -> Result<Option<crate::elf::read::RelaSlice<'a, crate::elf::read::Elf64Le>>> {
+) -> Result<Option<crate::elf::read::RelaSlice<'a, F>>> {
     if section.relocs == 0 {
         return Ok(None);
     }
@@ -1341,10 +1351,10 @@ type ScanOutput = (Vec<u32>, Vec<(u32, u64)>);
 
 /// Counts the relocations each copied section of `file` keeps, and lists
 /// the local symbols relocations and groups refer to.
-fn scan_file(
-    context: &Context<'_, '_, '_>,
+fn scan_file<F: crate::elf::read::ElfFormat>(
+    context: &Context<'_, '_, '_, F>,
     file_index: usize,
-    file: &ElfInput<'_>,
+    file: &ElfInput<'_, F>,
     plans: &[FilePlan],
 ) -> Result<ScanOutput> {
     let mut referenced = Vec::new();
@@ -1392,11 +1402,11 @@ fn scan_file(
 
 /// Where a local symbol of `file` goes, or `None` if its section is not in
 /// the output: `(section list index or special, value)`.
-fn local_place(
-    context: &Context<'_, '_, '_>,
+fn local_place<F: crate::elf::read::ElfFormat>(
+    context: &Context<'_, '_, '_, F>,
     plan: &FilePlan,
     file_index: usize,
-    object: &ObjectInput<'_>,
+    object: &ObjectInput<'_, F>,
     index: usize,
     raw: &RawSymbol,
 ) -> Option<(Place, u64)> {
@@ -1419,10 +1429,10 @@ fn local_place(
 
 /// Picks the local symbols of `file` to write. Returns them with the size
 /// of their names.
-fn keep_locals(
-    context: &Context<'_, '_, '_>,
+fn keep_locals<F: crate::elf::read::ElfFormat>(
+    context: &Context<'_, '_, '_, F>,
     file_index: usize,
-    file: &ElfInput<'_>,
+    file: &ElfInput<'_, F>,
     plan: &FilePlan,
     discard: DiscardMode,
 ) -> Result<(Vec<u32>, u64)> {
@@ -1471,9 +1481,9 @@ const fn visibility_rank(visibility: u8) -> u8 {
 
 /// Plans the global symbols, by symbol ID.
 #[allow(clippy::too_many_lines)]
-fn plan_globals(
-    input: &RelocatableInput<'_, '_>,
-    context: &Context<'_, '_, '_>,
+fn plan_globals<F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, '_, F>,
+    context: &Context<'_, '_, '_, F>,
     commons: Option<(u32, u64)>,
 ) -> Result<Vec<Global>> {
     let refs = context.refs;
@@ -1647,8 +1657,8 @@ fn plan_globals(
 }
 
 /// The global symbol a linker script defines.
-fn script_global(
-    context: &Context<'_, '_, '_>,
+fn script_global<F: crate::elf::read::ElfFormat>(
+    context: &Context<'_, '_, '_, F>,
     script: Option<&RelocatableScript<'_>>,
     definition: &ScriptDefinition,
     visibility: u8,
@@ -1699,7 +1709,10 @@ fn script_global(
 
 /// The place, value and type of a `--defsym` symbol: absolute for a
 /// number, next to its target (and of its type) for `symbol+offset`.
-fn defsym_value(context: &Context<'_, '_, '_>, expr: &DefsymExpr) -> (Place, u64, u8) {
+fn defsym_value<F: crate::elf::read::ElfFormat>(
+    context: &Context<'_, '_, '_, F>,
+    expr: &DefsymExpr,
+) -> (Place, u64, u8) {
     let refs = context.refs;
     match expr {
         DefsymExpr::Absolute(value) => (Place::Absolute, *value, STT_NOTYPE),
@@ -1729,7 +1742,7 @@ fn defsym_value(context: &Context<'_, '_, '_>, expr: &DefsymExpr) -> (Place, u64
     }
 }
 
-fn global_name_len(refs: &Refs<'_, '_>, global: &Global) -> u64 {
+fn global_name_len<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, global: &Global) -> u64 {
     let name = refs.symbols.name(global.id);
     let mut len = name.bytes().len();
     if let Some(version) = name.version() {
@@ -1742,7 +1755,10 @@ fn global_name_len(refs: &Refs<'_, '_>, global: &Global) -> u64 {
     (len as u64).saturating_add(1)
 }
 
-fn default_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<&'a [u8]> {
+fn default_version<'a, F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, 'a, F>,
+    id: SymbolId,
+) -> Option<&'a [u8]> {
     let def = refs.symbols.definition(id);
     refs.files
         .get(def.file.index())?
@@ -1774,7 +1790,10 @@ enum Chunk {
     SectionHeaders,
 }
 
-fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<()> {
+fn write_file<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
+    plan: &Plan<'a>,
+) -> Result<()> {
     let mut chunks: Vec<(ChunkRange, Chunk)> = vec![(ChunkRange::new(0, EHDR_SIZE), Chunk::Header)];
     for (out_index, out) in plan.outs.iter().enumerate() {
         let out_u32 = index_u32(out_index)?;
@@ -1917,8 +1936,8 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
     Ok(())
 }
 
-fn write_chunk<'a>(
-    input: &RelocatableInput<'_, 'a>,
+fn write_chunk<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
     plan: &Plan<'a>,
     chunk: Chunk,
     out: &mut [u8],
@@ -2088,8 +2107,8 @@ fn put_shdr(
 }
 
 /// The output symbol index of a group's signature.
-fn group_signature_index<'a>(
-    input: &RelocatableInput<'_, 'a>,
+fn group_signature_index<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
     plan: &Plan<'a>,
     file: u32,
     symbol: u32,
@@ -2139,7 +2158,11 @@ fn local_index(plan: &Plan<'_>, file: usize, symbol: u32) -> u32 {
     }
 }
 
-fn write_section_headers<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut [u8]) {
+fn write_section_headers<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
+    plan: &Plan<'a>,
+    out: &mut [u8],
+) {
     out.fill(0);
     let mut entries = out.as_chunks_mut::<64>().0.iter_mut();
     if let Some(first) = entries.next()
@@ -2264,8 +2287,8 @@ fn write_section_headers<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, 
     }
 }
 
-fn write_rela<'a>(
-    input: &RelocatableInput<'_, 'a>,
+fn write_rela<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
     plan: &Plan<'a>,
     out_index: u32,
     member_index: u32,
@@ -2391,8 +2414,8 @@ fn split_symbols<'o>(
     (first, files, rest)
 }
 
-fn write_symtab<'a>(
-    input: &RelocatableInput<'_, 'a>,
+fn write_symtab<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
     plan: &Plan<'a>,
     out: &mut [u8],
 ) -> Result<()> {
@@ -2481,7 +2504,11 @@ fn write_symtab<'a>(
     Ok(())
 }
 
-fn write_shndx<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut [u8]) {
+fn write_shndx<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
+    plan: &Plan<'a>,
+    out: &mut [u8],
+) {
     out.fill(0);
     let context = Context {
         refs: &input.refs,
@@ -2548,7 +2575,11 @@ fn put_bytes(out: &mut [u8], at: usize, bytes: &[u8]) -> usize {
     end
 }
 
-fn write_strtab<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>, out: &mut [u8]) {
+fn write_strtab<'a, F: crate::elf::read::ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
+    plan: &Plan<'a>,
+    out: &mut [u8],
+) {
     out.fill(0);
     let refs = &input.refs;
     // Per-file slices of the local names, then the globals.

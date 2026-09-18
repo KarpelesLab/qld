@@ -230,7 +230,12 @@ impl Synth {
     }
 
     /// Plans GOT, PLT and copy relocation entries from the scan.
-    pub fn plan_entries(&mut self, refs: &Refs<'_, '_>, scan: &ScanResult, mode: Mode) {
+    pub fn plan_entries<F: crate::elf::read::ElfFormat>(
+        &mut self,
+        refs: &Refs<'_, '_, F>,
+        scan: &ScanResult,
+        mode: Mode,
+    ) {
         let symbols = refs.symbols;
         self.arch = Arch::of_files(refs.files).unwrap_or(self.arch);
         self.mode = Some(mode);
@@ -330,7 +335,11 @@ impl Synth {
     /// one copy: every alias the library defines becomes an alias of the
     /// copy and is exported, so the library binds all of them to it, as lld
     /// does.
-    fn plan_copies(&mut self, refs: &Refs<'_, '_>, symbols: Vec<SymbolId>) {
+    fn plan_copies<F: crate::elf::read::ElfFormat>(
+        &mut self,
+        refs: &Refs<'_, '_, F>,
+        symbols: Vec<SymbolId>,
+    ) {
         // (file, shndx, value) of each symbol's definition.
         let key = |id: SymbolId| -> Option<(usize, u16, u64)> {
             let def = refs.symbols.definition(id);
@@ -425,7 +434,10 @@ impl Synth {
 
     /// Counts the `.rela.dyn` relocations of GOT entries and copies:
     /// `(relative, other)`.
-    fn count_got_relocs(&self, refs: &Refs<'_, '_>) -> (u64, u64) {
+    fn count_got_relocs<F: crate::elf::read::ElfFormat>(
+        &self,
+        refs: &Refs<'_, '_, F>,
+    ) -> (u64, u64) {
         let Some(mode) = self.mode.filter(|m| m.dynamic) else {
             return (0, 0);
         };
@@ -685,7 +697,10 @@ impl Synth {
 
 /// Size, alignment and read-only-ness of the space a copy relocation of
 /// `id` needs, from the shared library's definition.
-fn copy_shape(refs: &Refs<'_, '_>, id: SymbolId) -> (u64, u64, bool) {
+fn copy_shape<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    id: SymbolId,
+) -> (u64, u64, bool) {
     use crate::elf::read::consts::SHF_WRITE;
     let def = refs.symbols.definition(id);
     let Some(shared) = refs
@@ -738,8 +753,8 @@ pub enum SlotReloc {
 /// The dynamic relocations of the (one or two) GOT words of `owner`'s
 /// entry of `kind`.
 #[must_use]
-pub fn got_slot_relocs(
-    refs: &Refs<'_, '_>,
+pub fn got_slot_relocs<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     mode: Mode,
     owner: Owner,
     kind: GotKind,
@@ -823,7 +838,7 @@ pub fn plan_build_id(options: &LinkOptions) -> Option<u64> {
 /// objects): x86 `FEATURE_1_AND` or AArch64 `FEATURE_1_AND`, whichever the
 /// link targets.
 #[must_use]
-pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
+pub fn input_features<F: crate::elf::read::ElfFormat>(files: &[ElfInput<'_, F>]) -> u32 {
     let aarch64 = Arch::of_files(files) == Some(Arch::AArch64);
     let mut feature_and: Option<u32> = None;
     for file in files {
@@ -845,7 +860,10 @@ pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
 /// `-z ibt`, or every object marked) or AArch64 BTI (every object marked,
 /// or `-z force-bti`).
 #[must_use]
-pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+pub fn plan_ibt<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> bool {
     if Arch::of_files(files) == Some(Arch::AArch64) {
         return options.aarch64.force_bti
             || input_features(files) & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
@@ -858,14 +876,20 @@ pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
 /// Whether PLT entries authenticate the addresses they load: AArch64
 /// `-z pac-plt`.
 #[must_use]
-pub fn plan_pac_plt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+pub fn plan_pac_plt<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> bool {
     options.aarch64.pac_plt && Arch::of_files(files) == Some(Arch::AArch64)
 }
 
 /// The warnings `-z force-bti` gives, as GNU ld does: one for each input
 /// object without the BTI property.
 #[must_use]
-pub fn force_bti_warnings(files: &[ElfInput<'_>], options: &LinkOptions) -> Vec<Diagnostic> {
+pub fn force_bti_warnings<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> Vec<Diagnostic> {
     if !options.aarch64.force_bti || Arch::of_files(files) != Some(Arch::AArch64) {
         return Vec::new();
     }
@@ -903,7 +927,10 @@ pub fn force_bti_warnings(files: &[ElfInput<'_>], options: &LinkOptions) -> Vec<
 /// Properties are written in type order; zero values are left out. Shared
 /// libraries do not take part.
 #[must_use]
-pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Option<Vec<u8>> {
+pub fn plan_property_note<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> Option<Vec<u8>> {
     let aarch64 = Arch::of_files(files) == Some(Arch::AArch64);
     let mut needed_1 = 0u32;
     let mut isa_needed = 0u32;

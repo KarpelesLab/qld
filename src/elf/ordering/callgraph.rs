@@ -72,7 +72,11 @@ impl Profile {
 
 /// The section a symbol of `file` orders, as lld's `Defined::section`: the
 /// section it is defined in (the one ICF folded it into), live or not.
-fn defined_section(refs: &Refs<'_, '_>, file: usize, symbol: usize) -> Option<SectionId> {
+fn defined_section<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    symbol: usize,
+) -> Option<SectionId> {
     let target = refs.target(file, symbol)?;
     let Def::Section { file, section, .. } = target.def else {
         return None;
@@ -88,7 +92,10 @@ fn defined_section(refs: &Refs<'_, '_>, file: usize, symbol: usize) -> Option<Se
 ///
 /// Returns [`Error::Malformed`] for unreadable sections, and when the
 /// relocations do not match the weights.
-pub fn from_objects(refs: &Refs<'_, '_>, diagnostics: &dyn DiagnosticSink) -> Result<Profile> {
+pub fn from_objects<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    diagnostics: &dyn DiagnosticSink,
+) -> Result<Profile> {
     type Edges = Vec<(SectionId, SectionId, u64)>;
     let per_file: Vec<Result<(Edges, bool)>> = refs
         .files
@@ -166,8 +173,8 @@ pub fn from_objects(refs: &Refs<'_, '_>, diagnostics: &dyn DiagnosticSink) -> Re
 ///
 /// Returns I/O errors, and [`Error::Option`] for a line that is not
 /// `caller callee count`.
-pub fn from_file(
-    refs: &Refs<'_, '_>,
+pub fn from_file<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     path: &Path,
     warn: bool,
     ignore_undefined: bool,
@@ -242,7 +249,7 @@ pub fn from_file(
 }
 
 /// The size lld's `getSize` gives an input section.
-fn section_size(refs: &Refs<'_, '_>, id: SectionId) -> u64 {
+fn section_size<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SectionId) -> u64 {
     refs.sections
         .locate(id)
         .and_then(|(file, index)| {
@@ -265,8 +272,8 @@ fn output_of(placement: &Placement<'_>, id: SectionId) -> u32 {
 /// The sections of the graph in the order `algorithm` gives, and the
 /// priority of the first one.
 #[must_use]
-pub fn order(
-    refs: &Refs<'_, '_>,
+pub fn order<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     placement: &Placement<'_>,
     profile: &Profile,
     algorithm: CallGraphSort,
@@ -322,8 +329,8 @@ impl Cluster {
     }
 }
 
-fn hfsort(
-    refs: &Refs<'_, '_>,
+fn hfsort<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     placement: &Placement<'_>,
     profile: &Profile,
 ) -> (Vec<SectionId>, i64) {
@@ -463,8 +470,8 @@ fn merge_clusters(clusters: &mut [Cluster], into: usize, from: usize) {
     }
 }
 
-fn cache_directed(
-    refs: &Refs<'_, '_>,
+fn cache_directed<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     placement: &Placement<'_>,
     profile: &Profile,
 ) -> (Vec<SectionId>, i64) {
@@ -516,7 +523,11 @@ fn cache_directed(
 /// # Errors
 ///
 /// Returns I/O errors.
-pub fn print_symbol_order(refs: &Refs<'_, '_>, order: &[SectionId], path: &Path) -> Result<()> {
+pub fn print_symbol_order<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    order: &[SectionId],
+    path: &Path,
+) -> Result<()> {
     let mut out = Vec::new();
     for &id in order {
         let Some((file, _)) = refs.sections.locate(id) else {

@@ -196,8 +196,8 @@ impl DebugNames {
     /// Returns [`Error::Malformed`] for indexes that cannot be read (DWARF
     /// 64 and versions other than 5 included), and [`Error::Limit`] for
     /// indexes past 4 GiB.
-    pub fn build<'a>(
-        objects: &[(usize, &ObjectInput<'a>)],
+    pub fn build<'a, F: crate::elf::read::ElfFormat>(
+        objects: &[(usize, &ObjectInput<'a, F>)],
         live: &(dyn Fn(usize, u32) -> bool + Sync),
     ) -> Result<Self> {
         // Parse every object's last `.debug_names`, as lld picks it.
@@ -637,7 +637,11 @@ fn rewrite(
 }
 
 /// The file offset of a problem in `section`, for diagnostics.
-fn section_offset(object: &ObjectInput<'_>, section: &Section<'_>, e: Malformed) -> u64 {
+fn section_offset<F: crate::elf::read::ElfFormat>(
+    object: &ObjectInput<'_, F>,
+    section: &Section<'_, F>,
+    e: Malformed,
+) -> u64 {
     object
         .section(section.index)
         .map_or(0, |s| s.header.sh_offset)
@@ -645,10 +649,10 @@ fn section_offset(object: &ObjectInput<'_>, section: &Section<'_>, e: Malformed)
 }
 
 /// Parses every name index of `section`.
-fn parse_section<'a>(
-    obj: &DebugObject<'_, 'a>,
+fn parse_section<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
     file: usize,
-    section: &Section<'a>,
+    section: &Section<'a, F>,
 ) -> core::result::Result<Vec<InputIndex<'a>>, Malformed> {
     let mut indexes = Vec::new();
     let mut offset = 0usize;
@@ -661,10 +665,10 @@ fn parse_section<'a>(
 }
 
 /// Parses the name index at `start`; returns it and the offset after it.
-fn parse_index<'a>(
-    obj: &DebugObject<'_, 'a>,
+fn parse_index<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
     file: usize,
-    section: &Section<'a>,
+    section: &Section<'a, F>,
     start: usize,
 ) -> core::result::Result<(InputIndex<'a>, usize), Malformed> {
     let data = section.data;

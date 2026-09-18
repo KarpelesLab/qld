@@ -66,8 +66,8 @@ enum Value {
     Skip,
 }
 
-struct Writer<'s, 'w, 'x, 'a> {
-    input: &'s WriteInput<'w, 'x, 'a>,
+struct Writer<'s, 'w, 'x, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
+    input: &'s WriteInput<'w, 'x, 'a, F>,
     section: SectionWrite<'s>,
     alloc: bool,
     relax: Option<&'s SectionRelax>,
@@ -80,8 +80,8 @@ struct Writer<'s, 'w, 'x, 'a> {
 ///
 /// Relocation section parse errors; relocation problems are reported to the
 /// diagnostic sink instead.
-pub fn write_section(
-    input: &WriteInput<'_, '_, '_>,
+pub fn write_section<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
     section: SectionWrite<'_>,
     out: &mut [u8],
 ) -> Result<()> {
@@ -152,8 +152,8 @@ pub fn write_section(
     Ok(())
 }
 
-impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
-    fn addresses(&self) -> &'w Addresses<'x, 'a> {
+impl<'w, 'x, 'a, F: crate::elf::read::ElfFormat> Writer<'_, 'w, 'x, 'a, F> {
+    fn addresses(&self) -> &'w Addresses<'x, 'a, F> {
         self.input.addresses
     }
 
@@ -295,7 +295,7 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
         {
             return (class, Value::Write(truncated(value)));
         }
-        let owner = Addresses::owner(&target, self.section.file, rel.symbol);
+        let owner = Addresses::<F>::owner(&target, self.section.file, rel.symbol);
         let Some((mut s, a)) = symbol_address(addresses, &target, rel.addend) else {
             if self.alloc {
                 if report {
@@ -461,7 +461,7 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
                     let Some(decision) = self.decide(rel, &target, flags) else {
                         continue;
                     };
-                    let owner = Addresses::owner(&target, self.section.file, rel.symbol);
+                    let owner = Addresses::<F>::owner(&target, self.section.file, rel.symbol);
                     desc_relaxed = edit.is_some();
                     match decision.class.kind {
                         Kind::DescToLe => {
@@ -633,8 +633,8 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
 
 /// `S` and the addend still to add for a relocation target, with section
 /// symbol offsets into relaxed code moved as labels are.
-fn symbol_address(
-    addresses: &Addresses<'_, '_>,
+fn symbol_address<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
     target: &Target,
     addend: i64,
 ) -> Option<(u64, i64)> {

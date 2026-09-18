@@ -23,15 +23,15 @@ use super::rules::Synthetic;
 use super::synth::{GotKind, Owner, Synth};
 
 /// Everything needed to compute addresses.
-pub struct Addresses<'x, 'a> {
+pub struct Addresses<'x, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Relocation target resolution.
-    pub refs: Refs<'x, 'a>,
+    pub refs: Refs<'x, 'a, F>,
     /// The layout.
     pub layout: &'x Layout<'a>,
     /// Merged sections.
     pub merged: &'x Merged<'x, 'a>,
     /// `.eh_frame` sections.
-    pub eh_frames: &'x EhFrames<'a>,
+    pub eh_frames: &'x EhFrames<'a, F>,
     /// Synthetic sections.
     pub synth: &'x Synth,
     /// Common symbols.
@@ -40,15 +40,15 @@ pub struct Addresses<'x, 'a> {
     pub globals: Vec<u64>,
 }
 
-impl<'x, 'a> Addresses<'x, 'a> {
+impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
     /// Computes global symbol addresses.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
-        refs: Refs<'x, 'a>,
+        refs: Refs<'x, 'a, F>,
         layout: &'x Layout<'a>,
         merged: &'x Merged<'x, 'a>,
-        eh_frames: &'x EhFrames<'a>,
+        eh_frames: &'x EhFrames<'a, F>,
         synth: &'x Synth,
         commons: &'x Commons,
         placement: &Placement<'_>,

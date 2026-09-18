@@ -13,23 +13,23 @@ use std::cell::Cell;
 
 use crate::elf::object::ObjectInput;
 use crate::elf::read::consts::SHF_GROUP;
-use crate::elf::read::{Elf64Le, Relocation, Relocations, SectionIndex};
+use crate::elf::read::{Relocation, Relocations, SectionIndex};
 use crate::error::Result;
 
 /// A debug section with its relocations.
 #[derive(Clone, Debug)]
-pub struct Section<'a> {
+pub struct Section<'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Section index in the object.
     pub index: u32,
     /// Contents (decompressed).
     pub data: &'a [u8],
-    relocs: Relocs<'a>,
+    relocs: Relocs<'a, F>,
     /// Where the last lookup ended: readers mostly go forward, so the next
     /// relocation is usually at or just after it.
     hint: Cell<usize>,
 }
 
-impl Section<'_> {
+impl<F: crate::elf::read::ElfFormat> Section<'_, F> {
     /// Index of the first relocation at or after `offset`: a few steps
     /// forward from the last lookup, else a binary search.
     fn find(&self, offset: u64) -> usize {
@@ -57,15 +57,15 @@ impl Section<'_> {
 
 /// The relocations of a section, searchable by offset.
 #[derive(Clone, Debug)]
-enum Relocs<'a> {
+enum Relocs<'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     None,
     /// Already sorted by offset in the file (the usual case).
-    Sorted(Relocations<'a, Elf64Le>),
+    Sorted(Relocations<'a, F>),
     /// Sorted copies.
     Copied(Vec<Relocation>, bool),
 }
 
-impl Relocs<'_> {
+impl<F: crate::elf::read::ElfFormat> Relocs<'_, F> {
     fn len(&self) -> usize {
         match self {
             Self::None => 0,
@@ -105,42 +105,42 @@ impl Relocs<'_> {
 }
 
 /// The debug sections of an object that the index builders read.
-pub struct DebugObject<'o, 'a> {
+pub struct DebugObject<'o, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// The object.
-    pub object: &'o ObjectInput<'a>,
+    pub object: &'o ObjectInput<'a, F>,
     /// The `.debug_info` section outside section groups (the last one, as
     /// lld picks it); groups hold DWARF 5 type units.
-    pub info: Option<Section<'a>>,
+    pub info: Option<Section<'a, F>>,
     /// `.debug_abbrev`.
-    pub abbrev: Option<Section<'a>>,
+    pub abbrev: Option<Section<'a, F>>,
     /// `.debug_str`.
-    pub str: Option<Section<'a>>,
+    pub str: Option<Section<'a, F>>,
     /// `.debug_line_str`.
-    pub line_str: Option<Section<'a>>,
+    pub line_str: Option<Section<'a, F>>,
     /// `.debug_str_offsets`.
-    pub str_offsets: Option<Section<'a>>,
+    pub str_offsets: Option<Section<'a, F>>,
     /// `.debug_addr`.
-    pub addr: Option<Section<'a>>,
+    pub addr: Option<Section<'a, F>>,
     /// `.debug_ranges`.
-    pub ranges: Option<Section<'a>>,
+    pub ranges: Option<Section<'a, F>>,
     /// `.debug_rnglists`.
-    pub rnglists: Option<Section<'a>>,
+    pub rnglists: Option<Section<'a, F>>,
     /// `.debug_gnu_pubnames`.
-    pub gnu_pubnames: Option<Section<'a>>,
+    pub gnu_pubnames: Option<Section<'a, F>>,
     /// `.debug_gnu_pubtypes`.
-    pub gnu_pubtypes: Option<Section<'a>>,
+    pub gnu_pubtypes: Option<Section<'a, F>>,
     /// `.debug_names` sections (live ones), in section order.
-    pub names: Vec<Section<'a>>,
+    pub names: Vec<Section<'a, F>>,
     /// Sections that hold type units: live `.debug_info` sections in
     /// groups (DWARF 5) and live `.debug_types` sections (DWARF 4), with
     /// whether they are `.debug_types`.
-    pub type_units: Vec<(Section<'a>, bool)>,
+    pub type_units: Vec<(Section<'a, F>, bool)>,
     /// Whether the object has any live `.debug_info` section (in a group
     /// or not).
     pub has_info: bool,
 }
 
-impl<'o, 'a> DebugObject<'o, 'a> {
+impl<'o, 'a, F: crate::elf::read::ElfFormat> DebugObject<'o, 'a, F> {
     /// Collects the debug sections of `object`; `live` tells whether a
     /// section (by index) is in the output.
     ///
@@ -148,7 +148,7 @@ impl<'o, 'a> DebugObject<'o, 'a> {
     ///
     /// Returns [`crate::Error::Malformed`] if a relocation section cannot be
     /// read.
-    pub fn new(object: &'o ObjectInput<'a>, live: &dyn Fn(u32) -> bool) -> Result<Self> {
+    pub fn new(object: &'o ObjectInput<'a, F>, live: &dyn Fn(u32) -> bool) -> Result<Self> {
         let mut this = Self {
             object,
             info: None,
@@ -228,12 +228,12 @@ impl<'o, 'a> DebugObject<'o, 'a> {
         Ok(this)
     }
 
-    fn load(&self, index: u32) -> Result<Section<'a>> {
+    fn load(&self, index: u32) -> Result<Section<'a, F>> {
         Self::load_from(self.object, index)
     }
 
     /// Loads section `index` of `object` with its relocations.
-    fn load_from(object: &ObjectInput<'a>, index: u32) -> Result<Section<'a>> {
+    fn load_from(object: &ObjectInput<'a, F>, index: u32) -> Result<Section<'a, F>> {
         let Some(section) = object.section(index) else {
             return Ok(Section {
                 index,
@@ -290,7 +290,12 @@ impl<'o, 'a> DebugObject<'o, 'a> {
     /// section the symbol is defined in, or `raw` and `None` without a
     /// relocation.
     #[must_use]
-    pub fn relocate(&self, section: &Section<'_>, offset: usize, raw: u64) -> (u64, Option<u32>) {
+    pub fn relocate(
+        &self,
+        section: &Section<'_, F>,
+        offset: usize,
+        raw: u64,
+    ) -> (u64, Option<u32>) {
         let Ok(offset) = u64::try_from(offset) else {
             return (raw, None);
         };

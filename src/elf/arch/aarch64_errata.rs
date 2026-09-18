@@ -60,7 +60,9 @@ fn mapping_symbol(name: &[u8]) -> Option<bool> {
 }
 
 /// The mapping symbols of `object`, as `(section, value, code)`, sorted.
-fn mapping_symbols(object: &ObjectInput<'_>) -> Vec<(u32, u64, bool)> {
+fn mapping_symbols<F: crate::elf::read::ElfFormat>(
+    object: &ObjectInput<'_, F>,
+) -> Vec<(u32, u64, bool)> {
     let symbols = object.elf.symbols();
     let mut out: Vec<(u32, u64, bool)> = symbols
         .iter_raw()
@@ -105,7 +107,11 @@ fn code_ranges(symbols: &[(u32, u64, bool)], size: u64) -> Vec<(u64, u64)> {
 /// Every instruction the enabled workarounds patch, sorted by output
 /// section and address.
 #[must_use]
-pub fn scan(refs: &Refs<'_, '_>, layout: &Layout<'_>, options: &LinkOptions) -> Vec<Site> {
+pub fn scan<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    layout: &Layout<'_>,
+    options: &LinkOptions,
+) -> Vec<Site> {
     let fix_843419 = options.fix_cortex_a53_843419;
     let fix_835769 = options.aarch64.fix_cortex_a53_835769;
     if !fix_843419 && !fix_835769 {

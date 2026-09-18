@@ -105,8 +105,8 @@ impl<'a> GdbIndex<'a> {
     ///
     /// Returns [`Error::Malformed`] for unreadable relocation sections, and
     /// [`Error::Limit`] when the constant pool passes 4 GiB.
-    pub fn build(
-        objects: &[(usize, &ObjectInput<'a>)],
+    pub fn build<F: crate::elf::read::ElfFormat>(
+        objects: &[(usize, &ObjectInput<'a, F>)],
         live: &(dyn Fn(usize, u32) -> bool + Sync),
     ) -> Result<Self> {
         let read: Vec<Result<ObjectRead<'a>>> = objects
@@ -266,9 +266,9 @@ type ObjectRead<'a> = (Option<Chunk>, Vec<NameEntry<'a>>, Vec<(u32, Malformed)>)
 
 /// Reads one object: its chunk (if it has a live `.debug_info`), its
 /// names, and the problems found.
-fn read_object<'a>(
+fn read_object<'a, F: crate::elf::read::ElfFormat>(
     file: usize,
-    object: &ObjectInput<'a>,
+    object: &ObjectInput<'a, F>,
     live: &(dyn Fn(usize, u32) -> bool + Sync),
 ) -> Result<ObjectRead<'a>> {
     let obj = DebugObject::new(object, &|section| live(file, section))?;

@@ -216,11 +216,11 @@ impl LtoLink {
 /// Errors of [`resolve_symbols_with`], plugin errors, IR inputs that cannot
 /// be linked, and [`Error::Reported`] when a plugin reported errors while
 /// generating code.
-pub fn resolve<'a>(
+pub fn resolve<'a, F: crate::elf::read::ElfFormat>(
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
     rules: &ElfRules,
-    inputs: &mut Inputs<'a>,
+    inputs: &mut Inputs<'a, F>,
 ) -> Result<(SymbolTable<'a>, Resolution<'a>, LtoLink)> {
     #[cfg(feature = "plugin")]
     if !options.plugins.is_empty() {
@@ -414,9 +414,9 @@ mod plugin_link {
         }
 
         /// Offers `file` (input `handle`) to the plugins.
-        fn claim<'a>(
+        fn claim<'a, F: crate::elf::read::ElfFormat>(
             &mut self,
-            file: &ElfInput<'a>,
+            file: &ElfInput<'a, F>,
             handle: usize,
             known_used: bool,
         ) -> Result<Option<IrSymbols<'a>>> {
@@ -441,7 +441,10 @@ mod plugin_link {
     /// How `file` is described to a plugin: an archive member by the
     /// archive's path and the member's offset, as GNU ld does; a thin
     /// archive member by its own path.
-    fn input_file(file: &ElfInput<'_>, handle: usize) -> Result<InputFile> {
+    fn input_file<F: crate::elf::read::ElfFormat>(
+        file: &ElfInput<'_, F>,
+        handle: usize,
+    ) -> Result<InputFile> {
         let Some(data) = file.file else {
             return Err(Error::Internal(format!(
                 "{}: LTO input not loaded",
@@ -473,8 +476,8 @@ mod plugin_link {
 
     /// Turns a claimed file's symbols into resolution input, with names
     /// owned by the file table.
-    fn ir_symbols<'a>(
-        file: &ElfInput<'a>,
+    fn ir_symbols<'a, F: crate::elf::read::ElfFormat>(
+        file: &ElfInput<'a, F>,
         claimed: &ClaimedFile,
         claim: usize,
     ) -> Result<IrSymbols<'a>> {
@@ -575,17 +578,17 @@ mod plugin_link {
         comdat: ComdatHook<'a>,
     }
 
-    impl<'a> RoundHook<ElfInput<'a>> for ClaimHook<'_, '_, 'a> {
+    impl<'a, F: crate::elf::read::ElfFormat> RoundHook<ElfInput<'a, F>> for ClaimHook<'_, '_, 'a> {
         // Regular objects offer their groups as they load; IR files, which
         // are claimed below, in `after_load`.
-        fn load_hook(&self) -> Option<&dyn LoadHook<ElfInput<'a>>> {
+        fn load_hook(&self) -> Option<&dyn LoadHook<ElfInput<'a, F>>> {
             self.comdat.load_hook()
         }
 
         fn after_load(
             &mut self,
             round: usize,
-            files: &mut [RoundFile<'_, ElfInput<'a>>],
+            files: &mut [RoundFile<'_, ElfInput<'a, F>>],
         ) -> Result<()> {
             // `files` is in input-position order.
             for round_file in files.iter_mut() {
@@ -617,7 +620,10 @@ mod plugin_link {
     }
 
     impl Context {
-        fn new(options: &LinkOptions, files: &[ElfInput<'_>]) -> Result<Self> {
+        fn new<F: crate::elf::read::ElfFormat>(
+            options: &LinkOptions,
+            files: &[ElfInput<'_, F>],
+        ) -> Result<Self> {
             let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
             let export_all = mode.shared
                 || (options.export_dynamic
@@ -653,8 +659,8 @@ mod plugin_link {
     /// versioned default definition (`name@@VERSION`) does not have, so IR
     /// references alone never keep a library for a versioned symbol (the
     /// library comes back for the generated code).
-    fn needed_by_ir(
-        files: &[ElfInput<'_>],
+    fn needed_by_ir<F: crate::elf::read::ElfFormat>(
+        files: &[ElfInput<'_, F>],
         symbols: &SymbolTable<'_>,
         resolution: &Resolution<'_>,
     ) -> Vec<bool> {
@@ -691,7 +697,11 @@ mod plugin_link {
 
     /// Records, in the first resolution's table, which symbols regular
     /// objects, shared libraries and the linker name.
-    fn mark_usage(files: &[ElfInput<'_>], symbols: &SymbolTable<'_>, resolution: &Resolution<'_>) {
+    fn mark_usage<F: crate::elf::read::ElfFormat>(
+        files: &[ElfInput<'_, F>],
+        symbols: &SymbolTable<'_>,
+        resolution: &Resolution<'_>,
+    ) {
         files.par_iter().enumerate().for_each(|(index, file)| {
             let id = FileId::new(index);
             if !resolution.is_live(id) || file.ir.is_some() {
@@ -736,9 +746,9 @@ mod plugin_link {
     }
 
     /// The resolution of every symbol of the claimed file `handle`.
-    fn file_resolution(
+    fn file_resolution<F: crate::elf::read::ElfFormat>(
         context: &Context,
-        files: &[ElfInput<'_>],
+        files: &[ElfInput<'_, F>],
         symbols: &SymbolTable<'_>,
         resolution: &Resolution<'_>,
         handle: usize,
@@ -808,11 +818,11 @@ mod plugin_link {
     }
 
     /// [`super::resolve`] for links with plugins.
-    pub(super) fn resolve<'a>(
+    pub(super) fn resolve<'a, F: crate::elf::read::ElfFormat>(
         options: &LinkOptions,
         diagnostics: &dyn DiagnosticSink,
         rules: &ElfRules,
-        inputs: &mut Inputs<'a>,
+        inputs: &mut Inputs<'a, F>,
     ) -> Result<(SymbolTable<'a>, Resolution<'a>, LtoLink)> {
         let mut driver = Driver {
             options,
@@ -936,7 +946,7 @@ mod plugin_link {
         drop(symbols);
 
         let old = std::mem::take(&mut inputs.files);
-        let mut files: Vec<ElfInput<'a>> = Vec::with_capacity(old.len());
+        let mut files: Vec<ElfInput<'a, F>> = Vec::with_capacity(old.len());
         let mut others = Vec::new();
         let mut placed = false;
         for (index, mut file) in old.into_iter().enumerate() {

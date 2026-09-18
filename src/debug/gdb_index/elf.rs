@@ -17,7 +17,6 @@ use crate::symbols::Resolution;
 use super::GdbIndex;
 use crate::debug::debug_names::DebugNames;
 use crate::debug::section::{OutputCompression, compress_section};
-use crate::elf::read::Elf64Le;
 
 /// The debug indexes of a link, planned before layout.
 #[derive(Debug, Default)]
@@ -37,8 +36,8 @@ impl<'a> DebugIndexes<'a> {
     /// # Errors
     ///
     /// Returns errors for unreadable inputs and oversized indexes.
-    pub fn build(
-        files: &[ElfInput<'a>],
+    pub fn build<F: crate::elf::read::ElfFormat>(
+        files: &[ElfInput<'a, F>],
         resolution: &Resolution<'_>,
         sections: &Sections,
         options: &LinkOptions,
@@ -60,9 +59,9 @@ impl<'a> DebugIndexes<'a> {
 
     /// Reports the problems found in the inputs, and drops the input
     /// sections the indexes consume from `sections`.
-    pub fn apply(
+    pub fn apply<F: crate::elf::read::ElfFormat>(
         &mut self,
-        files: &[ElfInput<'a>],
+        files: &[ElfInput<'a, F>],
         resolution: &Resolution<'_>,
         sections: &mut Sections,
         diagnostics: &dyn DiagnosticSink,
@@ -137,9 +136,9 @@ impl<'a> DebugIndexes<'a> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Limit`] for oversized sections.
-    pub fn compress(
+    pub fn compress<F: crate::elf::read::ElfFormat>(
         &mut self,
-        addresses: &Addresses<'_, '_>,
+        addresses: &Addresses<'_, '_, F>,
         compression: OutputCompression,
     ) -> Result<Option<bool>> {
         let Some(names) = &self.debug_names else {
@@ -149,7 +148,7 @@ impl<'a> DebugIndexes<'a> {
             addresses.section_offset_address(file, section, value)
         };
         let bytes = names.render(&offset)?;
-        let compressed = compress_section::<Elf64Le>(&bytes, compression, 4);
+        let compressed = compress_section::<F>(&bytes, compression, 4);
         if compressed.len() >= bytes.len() {
             return Ok(None);
         }
@@ -168,9 +167,9 @@ impl<'a> DebugIndexes<'a> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Internal`] if layout did not reserve them.
-    pub fn render(
+    pub fn render<F: crate::elf::read::ElfFormat>(
         &self,
-        addresses: &Addresses<'_, '_>,
+        addresses: &Addresses<'_, '_, F>,
         prerendered: &mut Vec<Prerendered>,
     ) -> Result<()> {
         if let Some(names) = &self.debug_names {
@@ -204,10 +203,10 @@ impl<'a> DebugIndexes<'a> {
 }
 
 /// The live objects of the link, as (file index, object).
-fn live_objects<'x, 'a>(
-    files: &'x [ElfInput<'a>],
+fn live_objects<'x, 'a, F: crate::elf::read::ElfFormat>(
+    files: &'x [ElfInput<'a, F>],
     resolution: &Resolution<'_>,
-) -> Vec<(usize, &'x ObjectInput<'a>)> {
+) -> Vec<(usize, &'x ObjectInput<'a, F>)> {
     files
         .iter()
         .enumerate()
@@ -217,7 +216,10 @@ fn live_objects<'x, 'a>(
 }
 
 /// The position in the layout of the generated section `name`.
-fn generated_position(addresses: &Addresses<'_, '_>, name: &[u8]) -> Result<u32> {
+fn generated_position<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    name: &[u8],
+) -> Result<u32> {
     addresses
         .layout
         .sections

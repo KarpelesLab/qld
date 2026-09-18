@@ -39,7 +39,7 @@ use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::consts::{
     DT_RPATH, DT_RUNPATH, SHN_UNDEF, STB_LOCAL, STB_WEAK, VER_NDX_GLOBAL, VER_NDX_LOCAL,
 };
-use crate::elf::read::{Elf64Le, SharedObject, Source as ElfSource, VersionKind};
+use crate::elf::read::{Elf64Le, ElfFormat, SharedObject, Source as ElfSource, VersionKind};
 use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
 use crate::input::FileTable;
@@ -60,9 +60,9 @@ pub const REF_REGULAR_STRONG: SymbolFlags = SymbolFlags::backend(5);
 
 /// A shared object in the link.
 #[derive(Debug)]
-pub struct SharedInput<'a> {
+pub struct SharedInput<'a, F: ElfFormat = Elf64Le> {
     /// The parsed shared object.
-    pub elf: SharedObject<'a, Elf64Le>,
+    pub elf: SharedObject<'a, F>,
     /// The `DT_NEEDED` string for this library: its `DT_SONAME`, or the
     /// name it was found by.
     pub needed_name: Vec<u8>,
@@ -76,7 +76,7 @@ pub struct SharedInput<'a> {
     pub symbols: Vec<u32>,
 }
 
-impl<'a> SharedInput<'a> {
+impl<'a, F: ElfFormat> SharedInput<'a, F> {
     /// Parses the headers of a shared object; symbols are read by
     /// [`load_symbols`](Self::load_symbols).
     ///
@@ -92,7 +92,7 @@ impl<'a> SharedInput<'a> {
         found_as: &[u8],
         as_needed: bool,
     ) -> Result<Self> {
-        let elf = SharedObject::<Elf64Le>::parse(data, source)?;
+        let elf = SharedObject::<F>::parse(data, source)?;
         if crate::elf::arch::Arch::from_machine(elf.elf().header().e_machine).is_none() {
             return Err(source.malformed(18, "ELF machine (not an architecture qld links)"));
         }
@@ -218,8 +218,8 @@ fn shared_owner(symbols: &SymbolTable<'_>, id: SymbolId) -> Option<usize> {
 /// rebinds symbols defined only by unneeded ones, and sets
 /// [`REF_REGULAR`] and [`REF_DYNAMIC`].
 #[must_use]
-pub fn plan_needed(
-    files: &[ElfInput<'_>],
+pub fn plan_needed<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     rules: &ElfRules,
     resolution: &Resolution<'_>,
@@ -231,8 +231,8 @@ pub fn plan_needed(
 /// index) needed from the start. The LTO driver uses it for libraries that
 /// IR references keep, before code generation.
 #[must_use]
-pub fn plan_needed_with(
-    files: &[ElfInput<'_>],
+pub fn plan_needed_with<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     rules: &ElfRules,
     resolution: &Resolution<'_>,
@@ -371,8 +371,8 @@ pub fn plan_needed_with(
 /// symbol with only weak references (or none) keeps the lazy definition,
 /// which would leave it undefined; GNU ld binds it to the shared library,
 /// and so does this. Returns the number of rebound symbols.
-pub fn bind_unextracted(
-    files: &[ElfInput<'_>],
+pub fn bind_unextracted<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     resolution: &Resolution<'_>,
 ) -> usize {
@@ -416,8 +416,8 @@ pub fn bind_unextracted(
 
 /// Binds symbols whose definition is in an unneeded shared object to the
 /// best definition in a needed one, or leaves them undefined.
-fn rebind_unneeded(
-    files: &[ElfInput<'_>],
+fn rebind_unneeded<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     rules: &ElfRules,
     resolution: &Resolution<'_>,
@@ -547,8 +547,8 @@ struct Dependency {
 /// Loads the transitive dependencies of the needed libraries that are not
 /// in the link. Returns them, and the libraries whose dependencies could
 /// not all be found.
-fn load_dependencies(
-    files: &[ElfInput<'_>],
+fn load_dependencies<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     needed: &Needed,
     options: &LinkOptions,
     table: &FileTable,
@@ -610,10 +610,11 @@ fn load_dependencies(
                     return None;
                 }
                 let id = table.load_path(&path).ok()?;
-                let ok = SharedObject::<Elf64Le>::parse(table.data(id), ElfSource::new(&path))
-                    .is_ok_and(|so| {
+                let ok = SharedObject::<F>::parse(table.data(id), ElfSource::new(&path)).is_ok_and(
+                    |so| {
                         crate::elf::arch::Arch::from_machine(so.elf().header().e_machine).is_some()
-                    });
+                    },
+                );
                 ok.then_some((id, path))
             })
         };
@@ -627,7 +628,7 @@ fn load_dependencies(
             }
             continue;
         };
-        if let Ok(so) = SharedObject::<Elf64Le>::parse(table.data(id), ElfSource::new(&path)) {
+        if let Ok(so) = SharedObject::<F>::parse(table.data(id), ElfSource::new(&path)) {
             let run_path = SharedInputView(&so).search_path().map(<[u8]>::to_vec);
             for dependency in so.needed().filter_map(|n| n.ok()) {
                 queue.push((dependency.to_vec(), path.clone(), run_path.clone(), owner));
@@ -648,8 +649,8 @@ fn load_dependencies(
 /// needed libraries that is not itself in the link and defines it, with the
 /// library that needs it: GNU ld's "DSO missing from command line" case.
 #[must_use]
-pub fn defined_in_dependencies(
-    files: &[ElfInput<'_>],
+pub fn defined_in_dependencies<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     needed: &Needed,
     options: &LinkOptions,
     names: &[&[u8]],
@@ -670,10 +671,9 @@ pub fn defined_in_dependencies(
         .collect();
     wanted.sort_unstable();
     for dependency in &dependencies {
-        let Ok(so) = SharedObject::<Elf64Le>::parse(
-            table.data(dependency.id),
-            ElfSource::new(&dependency.path),
-        ) else {
+        let Ok(so) =
+            SharedObject::<F>::parse(table.data(dependency.id), ElfSource::new(&dependency.path))
+        else {
             continue;
         };
         for symbol in so.symbols().iter().flatten() {
@@ -708,8 +708,8 @@ pub fn defined_in_dependencies(
 /// instance or inline variable defined in both got two addresses, and a
 /// callback a dependency looks up in the executable was not found. Returns
 /// the number of dependencies loaded.
-pub fn mark_dependency_symbols(
-    files: &[ElfInput<'_>],
+pub fn mark_dependency_symbols<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     needed: &Needed,
     options: &LinkOptions,
@@ -730,10 +730,9 @@ pub fn mark_dependency_symbols(
     let table = FileTable::new();
     let (dependencies, _) = load_dependencies(files, needed, options, &table, &silent);
     dependencies.par_iter().for_each(|dependency| {
-        let Ok(so) = SharedObject::<Elf64Le>::parse(
-            table.data(dependency.id),
-            ElfSource::new(&dependency.path),
-        ) else {
+        let Ok(so) =
+            SharedObject::<F>::parse(table.data(dependency.id), ElfSource::new(&dependency.path))
+        else {
             return;
         };
         let table = so.symbols();
@@ -770,9 +769,9 @@ pub fn mark_dependency_symbols(
 }
 
 /// Run path lookup on a bare [`SharedObject`].
-struct SharedInputView<'s, 'a>(&'s SharedObject<'a, Elf64Le>);
+struct SharedInputView<'s, 'a, F: ElfFormat>(&'s SharedObject<'a, F>);
 
-impl<'a> SharedInputView<'_, 'a> {
+impl<'a, F: ElfFormat> SharedInputView<'_, 'a, F> {
     fn search_path(&self) -> Option<&'a [u8]> {
         let mut rpath = None;
         for entry in self.0.dynamic_entries() {
@@ -789,8 +788,8 @@ impl<'a> SharedInputView<'_, 'a> {
 /// Reports undefined symbols of needed shared libraries that nothing in the
 /// link, nor the libraries' own dependencies, defines. Returns the number
 /// of errors.
-pub fn check_shlib_undefined(
-    files: &[ElfInput<'_>],
+pub fn check_shlib_undefined<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     resolution: &Resolution<'_>,
     needed: &Needed,
@@ -843,11 +842,9 @@ pub fn check_shlib_undefined(
     // dependencies loaded for the check.
     let mut defined: HashSet<&[u8], foldhash::fast::FixedState> =
         HashSet::with_hasher(foldhash::fast::FixedState::with_seed(0x756e_6466));
-    let parsed: Vec<SharedObject<'_, Elf64Le>> = dependencies
+    let parsed: Vec<SharedObject<'_, F>> = dependencies
         .iter()
-        .filter_map(|d| {
-            SharedObject::<Elf64Le>::parse(table.data(d.id), ElfSource::new(&d.path)).ok()
-        })
+        .filter_map(|d| SharedObject::<F>::parse(table.data(d.id), ElfSource::new(&d.path)).ok())
         .collect();
     let in_link = files
         .iter()

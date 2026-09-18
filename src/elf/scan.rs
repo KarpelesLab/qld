@@ -163,7 +163,10 @@ impl ScanResult {
 
 /// Scans every live allocated section.
 #[must_use]
-pub fn scan(refs: &Refs<'_, '_>, context: &Context) -> ScanResult {
+pub fn scan<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    context: &Context,
+) -> ScanResult {
     let files = refs
         .files
         .par_iter()
@@ -175,7 +178,12 @@ pub fn scan(refs: &Refs<'_, '_>, context: &Context) -> ScanResult {
 
 /// A diagnostic location for offset `offset` of section `section` of `file`.
 #[must_use]
-pub fn location(refs: &Refs<'_, '_>, file: usize, section: u32, offset: u64) -> Location {
+pub fn location<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    section: u32,
+    offset: u64,
+) -> Location {
     let input = refs.files.get(file);
     let name = input
         .and_then(|f| f.object.as_ref())
@@ -194,7 +202,11 @@ fn type_name(arch: Arch, r_type: u32) -> String {
     arch.reloc_label(r_type)
 }
 
-fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileScan {
+fn scan_file<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file_index: usize,
+    context: &Context,
+) -> FileScan {
     let mut result = FileScan::default();
     let Some(file) = refs.files.get(file_index) else {
         return result;

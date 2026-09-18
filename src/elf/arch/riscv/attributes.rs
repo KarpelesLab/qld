@@ -412,7 +412,7 @@ pub struct Output {
 /// Merges the live `SHT_RISCV_ATTRIBUTES` sections of every object, in
 /// input order; `None` when there are none.
 #[must_use]
-pub fn collect(refs: &Refs<'_, '_>) -> Option<Output> {
+pub fn collect<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>) -> Option<Output> {
     let mut first = None;
     let mut sections: Vec<(String, &[u8])> = Vec::new();
     for (file_index, file) in refs.files.iter().enumerate() {

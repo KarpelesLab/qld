@@ -50,7 +50,10 @@ impl Sections {
     /// # Errors
     ///
     /// Returns [`Error::Limit`] if there are more than `u32::MAX` sections.
-    pub fn new(files: &[ElfInput<'_>], resolution: &Resolution<'_>) -> Result<Self> {
+    pub fn new<F: crate::elf::read::ElfFormat>(
+        files: &[ElfInput<'_, F>],
+        resolution: &Resolution<'_>,
+    ) -> Result<Self> {
         let mut base = Vec::with_capacity(files.len());
         let mut count = Vec::with_capacity(files.len());
         let mut total = 0u32;

@@ -148,10 +148,10 @@ const AARCH64_EXTRA: &[(&str, Value)] = &[
 /// `_DYNAMIC` whenever it creates dynamic sections. They are in `.symtab`
 /// (`_DYNAMIC` as a local), and in `.dynsym` only when exported.
 #[must_use]
-pub fn always_defined(
+pub fn always_defined<F: crate::elf::read::ElfFormat>(
     mode: super::export::Mode,
     script: bool,
-    files: &[ElfInput<'_>],
+    files: &[ElfInput<'_, F>],
 ) -> Vec<&'static str> {
     let mut names = Vec::new();
     if mode.executable() && !script {
@@ -210,9 +210,9 @@ fn wanted(symbols: &SymbolTable<'_>, id: SymbolId) -> bool {
 /// `__rela_iplt_end` then stay undefined, as in GNU ld's dynamic scripts,
 /// since the dynamic relocation code applies `IRELATIVE` relocations.
 /// Names in `always` are defined even when nothing refers to them.
-pub fn register(
+pub fn register<F: crate::elf::read::ElfFormat>(
     symbols: &SymbolTable<'_>,
-    files: &[ElfInput<'_>],
+    files: &[ElfInput<'_, F>],
     placement: &Placement<'_>,
     options: &LinkOptions,
     dynamic: bool,
@@ -344,9 +344,9 @@ pub fn register(
 
 /// Defines the symbols linker scripts assign and records where the symbols
 /// they read are defined.
-fn register_script(
+fn register_script<F: crate::elf::read::ElfFormat>(
     symbols: &SymbolTable<'_>,
-    files: &[ElfInput<'_>],
+    files: &[ElfInput<'_, F>],
     script: &ScriptPlacement,
     result: &mut LinkerSymbols,
     define: &dyn Fn(SymbolId, Value, &mut LinkerSymbols),
@@ -409,7 +409,11 @@ fn register_script(
 }
 
 /// Where symbol `id` is defined, for script expressions.
-fn symbol_def(symbols: &SymbolTable<'_>, files: &[ElfInput<'_>], id: SymbolId) -> SymbolDef {
+fn symbol_def<F: crate::elf::read::ElfFormat>(
+    symbols: &SymbolTable<'_>,
+    files: &[ElfInput<'_, F>],
+    id: SymbolId,
+) -> SymbolDef {
     use crate::elf::read::SectionIndex;
     let def = symbols.definition(id);
     match def.kind {
@@ -448,8 +452,8 @@ fn symbol_def(symbols: &SymbolTable<'_>, files: &[ElfInput<'_>], id: SymbolId) -
 /// output section, or `__start_SEC`/`__stop_SEC`, belongs to that section
 /// even at its end, where the next section may start.
 #[must_use]
-pub fn linker_shndx(
-    addresses: &super::values::Addresses<'_, '_>,
+pub fn linker_shndx<F: crate::elf::read::ElfFormat>(
+    addresses: &super::values::Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
     id: SymbolId,
 ) -> Option<u16> {
@@ -517,7 +521,11 @@ pub fn defsym_references(name: &str, expr: &str) -> Vec<Vec<u8>> {
 /// one symbol, as GNU ld's `bfd_copy_link_hash_symbol_type`), or
 /// `STT_NOTYPE`.
 #[must_use]
-pub fn linker_type(refs: &super::refs::Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) -> u8 {
+pub fn linker_type<F: crate::elf::read::ElfFormat>(
+    refs: &super::refs::Refs<'_, '_, F>,
+    linker: &LinkerSymbols,
+    id: SymbolId,
+) -> u8 {
     use crate::elf::read::consts::{STT_NOTYPE, STT_OBJECT};
     // GNU ld's ELF backend defines these as objects.
     if linker
@@ -555,8 +563,8 @@ enum DefsymSection {
 }
 
 /// What `--defsym` expressions read after layout.
-struct DefsymContext<'c, 'x, 'a> {
-    refs: &'c super::refs::Refs<'x, 'a>,
+struct DefsymContext<'c, 'x, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
+    refs: &'c super::refs::Refs<'x, 'a, F>,
     layout: &'c super::layout::Layout<'a>,
     options: &'c LinkOptions,
     globals: &'c [u64],
@@ -564,14 +572,14 @@ struct DefsymContext<'c, 'x, 'a> {
     values: &'c [(SymbolId, ExprValue<DefsymSection>)],
 }
 
-impl DefsymContext<'_, '_, '_> {
+impl<F: crate::elf::read::ElfFormat> DefsymContext<'_, '_, '_, F> {
     fn position_named(&self, name: &[u8]) -> Option<u32> {
         let position = self.layout.sections.iter().position(|s| s.name == name)?;
         u32::try_from(position).ok()
     }
 }
 
-impl EvalContext for DefsymContext<'_, '_, '_> {
+impl<F: crate::elf::read::ElfFormat> EvalContext for DefsymContext<'_, '_, '_, F> {
     type Section = DefsymSection;
 
     fn section_vma(&self, section: DefsymSection) -> u64 {
@@ -690,9 +698,9 @@ impl EvalContext for DefsymContext<'_, '_, '_> {
 /// 0, repeated so that forward references to later `--defsym`s settle.
 /// Symbols whose value is absolute (every expression but a lone symbol,
 /// `.` or `ADDR`) get [`ABSOLUTE`].
-pub fn evaluate_defsyms<'a>(
+pub fn evaluate_defsyms<'a, F: crate::elf::read::ElfFormat>(
     globals: &mut [u64],
-    refs: &super::refs::Refs<'_, 'a>,
+    refs: &super::refs::Refs<'_, 'a, F>,
     layout: &super::layout::Layout<'a>,
     options: &LinkOptions,
     defsyms: &[(SymbolId, usize)],
@@ -771,17 +779,17 @@ pub fn evaluate_defsyms<'a>(
 /// layout (the relocation scan needs it) from how its symbols are defined:
 /// GNU ld's rules make every expression but a lone symbol, `.`, `ADDR` and
 /// the like absolute outside output sections.
-fn defsym_is_absolute(
+fn defsym_is_absolute<F: crate::elf::read::ElfFormat>(
     symbols: &SymbolTable<'_>,
-    files: &[ElfInput<'_>],
+    files: &[ElfInput<'_, F>],
     assignment: &Assignment,
 ) -> bool {
     /// Values are irrelevant here, only the sections results end up in.
-    struct Classify<'c, 's, 'f> {
+    struct Classify<'c, 's, 'f, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
         symbols: &'c SymbolTable<'s>,
-        files: &'c [ElfInput<'f>],
+        files: &'c [ElfInput<'f, F>],
     }
-    impl EvalContext for Classify<'_, '_, '_> {
+    impl<F: crate::elf::read::ElfFormat> EvalContext for Classify<'_, '_, '_, F> {
         type Section = ();
         fn section_vma(&self, _section: ()) -> u64 {
             0

@@ -50,7 +50,10 @@ pub const GLOBAL_POINTER: &[u8] = b"__global_pointer$";
 /// The value of `__global_pointer$` in `layout`, when something defines it
 /// (lld relaxes against it only then).
 #[must_use]
-pub fn global_pointer(input: &LayoutInput<'_, '_>, layout: &Layout<'_>) -> Option<u64> {
+pub fn global_pointer<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    layout: &Layout<'_>,
+) -> Option<u64> {
     let refs = &input.refs;
     let id = refs.symbols.lookup(&SymbolName::new(GLOBAL_POINTER))?;
     match refs.global_target(id, true).def {
@@ -100,7 +103,10 @@ pub fn global_pointer(input: &LayoutInput<'_, '_>, layout: &Layout<'_>) -> Optio
 /// [`crate::error::Error::Malformed`] for `R_RISCV_ALIGN` padding too small
 /// for its alignment.
 #[allow(clippy::too_many_lines)]
-pub fn decide(pass: &Pass<'_, '_, '_>, section: &SectionInput<'_, '_>) -> Result<Edits> {
+pub fn decide<F: crate::elf::read::ElfFormat>(
+    pass: &Pass<'_, '_, '_, F>,
+    section: &SectionInput<'_, '_, F>,
+) -> Result<Edits> {
     let mut edits = Edits::default();
     let rvc = section.object.elf.elf().header().e_flags & EF_RISCV_RVC != 0;
     let relocs = &section.relocs;

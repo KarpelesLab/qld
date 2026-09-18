@@ -380,9 +380,9 @@ pub fn sysv_hash(name: &[u8]) -> u32 {
 }
 
 /// What the planner needs from the rest of the link.
-pub struct PlanInput<'p, 'r, 'a> {
+pub struct PlanInput<'p, 'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Relocation targets and the symbol table.
-    pub refs: &'p Refs<'r, 'a>,
+    pub refs: &'p Refs<'r, 'a, F>,
     /// Needed shared objects.
     pub needed: &'p Needed,
     /// The output mode.
@@ -405,7 +405,10 @@ pub struct PlanInput<'p, 'r, 'a> {
 /// For a symbol a shared library defines under a non-base version, the
 /// library's file index and the version name.
 #[must_use]
-pub fn import_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<(usize, &'a [u8])> {
+pub fn import_version<'a, F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, 'a, F>,
+    id: SymbolId,
+) -> Option<(usize, &'a [u8])> {
     let def = refs.symbols.definition(id);
     if def.kind != DefinitionKind::Shared {
         return None;
@@ -423,7 +426,10 @@ pub fn import_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<(usize, &
 pub const GLIBC_ABI_DT_RELR: &[u8] = b"GLIBC_ABI_DT_RELR";
 
 /// The needed shared library that defines the `GLIBC_ABI_DT_RELR` version.
-fn relr_version_provider(refs: &Refs<'_, '_>, needed: &Needed) -> Option<usize> {
+fn relr_version_provider<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    needed: &Needed,
+) -> Option<usize> {
     refs.files.iter().enumerate().find_map(|(index, file)| {
         let shared = file.shared.as_ref()?;
         (needed.is_needed(index)
@@ -438,7 +444,7 @@ fn relr_version_provider(refs: &Refs<'_, '_>, needed: &Needed) -> Option<usize> 
 }
 
 /// Whether a defined symbol's section made it into the output.
-fn present(refs: &Refs<'_, '_>, id: SymbolId) -> bool {
+fn present<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SymbolId) -> bool {
     match refs.global_target(id, true).def {
         Def::Section { file, section, .. } => refs.sections.is_present_in(file, section),
         Def::Undefined { .. } => false,
@@ -451,8 +457,8 @@ fn present(refs: &Refs<'_, '_>, id: SymbolId) -> bool {
 /// `__timezone` for `timezone`), as GNU ld does: it records a weak
 /// definition's "real" alias as dynamic whenever the weak one is. `chosen`
 /// is in symbol ID order and stays so.
-fn with_strong_aliases(
-    refs: &Refs<'_, '_>,
+fn with_strong_aliases<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     synth: &Synth,
     mut chosen: Vec<(SymbolId, bool)>,
 ) -> Vec<(SymbolId, bool)> {
@@ -541,7 +547,9 @@ fn with_strong_aliases(
 ///
 /// Returns [`Error::Limit`] when tables exceed their formats.
 #[allow(clippy::too_many_lines)]
-pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
+pub fn plan<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
+) -> Result<DynamicPlan> {
     let refs = input.refs;
     let symbols = refs.symbols;
     let mode = input.mode;
@@ -1048,7 +1056,10 @@ fn build_sysv_hash(names: &[&[u8]], kind: ElfKind) -> Result<Vec<u8>> {
 
 /// The symbol `name` if a regular object defines it and it is in the
 /// output.
-fn defined_symbol(refs: &Refs<'_, '_>, name: &[u8]) -> Option<SymbolId> {
+fn defined_symbol<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    name: &[u8],
+) -> Option<SymbolId> {
     let id = refs
         .symbols
         .lookup(&crate::symbols::SymbolName::new(name))?;
@@ -1060,8 +1071,8 @@ fn defined_symbol(refs: &Refs<'_, '_>, name: &[u8]) -> Option<SymbolId> {
     .filter(|&id| present(refs, id))
 }
 
-fn dynamic_entries(
-    input: &PlanInput<'_, '_, '_>,
+fn dynamic_entries<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
     plan: &DynamicPlan,
     strings: &DynamicStrings,
 ) -> Vec<(i64, DynValue)> {
@@ -1250,7 +1261,10 @@ fn put_sym<F: ElfFormat>(
 }
 
 /// The output section header index holding `address`, or `SHN_ABS`.
-pub fn shndx_of_address(addresses: &Addresses<'_, '_>, address: u64) -> u16 {
+pub fn shndx_of_address<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    address: u64,
+) -> u16 {
     let sections = &addresses.layout.sections;
     sections
         .iter()
@@ -1268,7 +1282,7 @@ pub fn shndx_of_address(addresses: &Addresses<'_, '_>, address: u64) -> u16 {
 /// Writes `.dynsym`.
 pub fn write_dynsym<F: ElfFormat>(
     plan: &DynamicPlan,
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     out: &mut [u8],
 ) {
     let refs = &addresses.refs;
@@ -1404,7 +1418,7 @@ pub fn write_dynsym<F: ElfFormat>(
 /// Writes `.dynamic`.
 pub fn write_dynamic<F: ElfFormat>(
     plan: &DynamicPlan,
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     out: &mut [u8],
 ) {
     let layout = addresses.layout;

@@ -21,7 +21,6 @@ use crate::args::LinkOptions;
 use crate::debug::tombstone::{DeadTarget, SectionTombstone, Tombstones};
 use crate::diag::{Collect, Diagnostic, DiagnosticSink, Severity};
 use crate::elf::read::consts::{ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR};
-use crate::elf::read::format::with_format;
 use crate::elf::read::{
     ElfFormat, ElfKind, Endian, FileHeader, ProgramHeader, RawRecord, Relocations, SectionHeader,
 };
@@ -133,11 +132,11 @@ fn push_code_padding(
 }
 
 /// Inputs to the writer.
-pub struct WriteInput<'w, 'x, 'a> {
+pub struct WriteInput<'w, 'x, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Options.
     pub options: &'w LinkOptions,
     /// Addresses (and through it, layout, merge, eh_frame, synthetic).
-    pub addresses: &'w Addresses<'x, 'a>,
+    pub addresses: &'w Addresses<'x, 'a, F>,
     /// The symbol table plan.
     pub symtab: &'w SymtabPlan,
     /// Linker-defined symbols.
@@ -179,7 +178,7 @@ pub struct Prerendered {
 ///
 /// Returns I/O errors, [`Error::Reported`] when relocations failed, and
 /// [`Error::Internal`] for layout bugs.
-pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
+pub fn write<F: crate::elf::read::ElfFormat>(input: &WriteInput<'_, '_, '_, F>) -> Result<()> {
     let layout = input.addresses.layout;
     if !input.options.no_warnings {
         for warning in &layout.warnings {
@@ -368,7 +367,10 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
 
 /// Emits the problems chunks reported, in input order; fails the link on
 /// errors (unless `--noinhibit-exec`).
-fn emit_collected(collected: Collect, input: &WriteInput<'_, '_, '_>) -> Result<()> {
+fn emit_collected<F: crate::elf::read::ElfFormat>(
+    collected: Collect,
+    input: &WriteInput<'_, '_, '_, F>,
+) -> Result<()> {
     let mut problems = collected.take_sorted();
     problems.sort_by(|a, b| {
         let key = |d: &Diagnostic| {
@@ -403,8 +405,8 @@ fn emit_collected(collected: Collect, input: &WriteInput<'_, '_, '_>) -> Result<
 ///
 /// Returns [`Error::Reported`] when relocations in the sections failed, and
 /// [`Error::Internal`] for layout bugs.
-pub fn prerender_debug_sections(
-    input: &WriteInput<'_, '_, '_>,
+pub fn prerender_debug_sections<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
     compression: crate::debug::section::OutputCompression,
 ) -> Result<Vec<Prerendered>> {
     let layout = input.addresses.layout;
@@ -448,11 +450,8 @@ pub fn prerender_debug_sections(
             .map(|(slice, &(_, chunk))| write_chunk(&local, chunk, slice))
             .collect();
         results.into_iter().collect::<Result<()>>()?;
-        let compressed = crate::debug::section::compress_section::<crate::elf::read::Elf64Le>(
-            &bytes,
-            compression,
-            section.align,
-        );
+        let compressed =
+            crate::debug::section::compress_section::<F>(&bytes, compression, section.align);
         let position =
             u32::try_from(position).map_err(|_| Error::Limit("too many output sections".into()))?;
         if compressed.len() < bytes.len() {
@@ -473,12 +472,16 @@ pub fn prerender_debug_sections(
     Ok(out)
 }
 
-fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> Result<()> {
+fn write_chunk<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    chunk: Chunk,
+    out: &mut [u8],
+) -> Result<()> {
     let addresses = input.addresses;
     let layout = addresses.layout;
     match chunk {
         Chunk::Headers => write_headers(input, out),
-        Chunk::SectionHeaders => write_section_headers(layout, out),
+        Chunk::SectionHeaders => write_section_headers_as::<F>(layout, out),
         Chunk::Shstrtab => {
             if let Some(dest) = out.get_mut(..layout.shstrtab.len()) {
                 dest.copy_from_slice(&layout.shstrtab);
@@ -546,13 +549,14 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
     }
 }
 
-fn write_headers(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
-    with_format!(input.addresses.layout.kind, |F| {
-        write_headers_as::<F>(input, out)
-    })
+fn write_headers<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    out: &mut [u8],
+) -> Result<()> {
+    write_headers_as::<F>(input, out)
 }
 
-fn write_headers_as<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+fn write_headers_as<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) -> Result<()> {
     let layout = input.addresses.layout;
     let too_small = || Error::Internal("header chunk too small".into());
     let ehdr_size = usize::try_from(layout.kind.ehdr_size()).unwrap_or(64);
@@ -619,12 +623,6 @@ fn write_headers_as<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]
     Ok(())
 }
 
-fn write_section_headers(layout: &Layout<'_>, out: &mut [u8]) -> Result<()> {
-    with_format!(layout.kind, |F| {
-        write_section_headers_as::<F>(layout, out)
-    })
-}
-
 fn write_section_headers_as<F: ElfFormat>(layout: &Layout<'_>, out: &mut [u8]) -> Result<()> {
     out.fill(0);
     let size = <F::Shdr as RawRecord>::SIZE;
@@ -669,14 +667,16 @@ fn copy_into(out: &mut [u8], bytes: &[u8]) {
     }
 }
 
-fn write_synthetic(input: &WriteInput<'_, '_, '_>, kind: Synthetic, out: &mut [u8]) -> Result<()> {
-    with_format!(input.addresses.layout.kind, |F| {
-        write_synthetic_as::<F>(input, kind, out)
-    })
+fn write_synthetic<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    kind: Synthetic,
+    out: &mut [u8],
+) -> Result<()> {
+    write_synthetic_as::<F>(input, kind, out)
 }
 
 fn write_synthetic_as<F: ElfFormat>(
-    input: &WriteInput<'_, '_, '_>,
+    input: &WriteInput<'_, '_, '_, F>,
     kind: Synthetic,
     out: &mut [u8],
 ) -> Result<()> {
@@ -787,7 +787,10 @@ fn write_synthetic_as<F: ElfFormat>(
 }
 
 /// The value a GOT entry holds for `owner`, before dynamic relocation.
-fn owner_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
+fn owner_value<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    owner: Owner,
+) -> u64 {
     if let Some(stub) = addresses.iplt_address(owner) {
         return stub;
     }
@@ -795,7 +798,10 @@ fn owner_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
 }
 
 /// The address of `owner`'s symbol.
-fn symbol_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
+fn symbol_value<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    owner: Owner,
+) -> u64 {
     match owner {
         Owner::Global(id) => addresses.globals.get(id.index()).copied().unwrap_or(0),
         Owner::Local { file, symbol } => addresses
@@ -806,7 +812,7 @@ fn symbol_value(addresses: &Addresses<'_, '_>, owner: Owner) -> u64 {
     }
 }
 
-fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let Some((base, ..)) = addresses.layout.synthetic(Synthetic::Got) else {
@@ -881,7 +887,7 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     }
 }
 
-fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let size = <F::Word as RawRecord>::SIZE.max(1);
@@ -928,7 +934,10 @@ fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     }
 }
 
-fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+fn write_plt<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    out: &mut [u8],
+) -> Result<()> {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let arch = synth.arch;
@@ -988,7 +997,7 @@ fn put_rela<F: ElfFormat>(out: &mut [u8], offset: u64, symbol: u32, r_type: u32,
     entry.copy_from_slice(F::encode_rela(&rel).as_bytes());
 }
 
-fn write_rela_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
+fn write_rela_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
     let irelative = synth.arch.dyn_reloc(DynKind::Irelative);
@@ -1063,8 +1072,8 @@ fn dyn_reloc(arch: Arch, offset: u64, symbol: u32, kind: DynKind, addend: i64) -
 
 /// Every dynamic relocation of the output except `.rela.plt`'s, unsorted:
 /// GOT entries, copy relocations, and input sections (in parallel).
-fn collect_dyn_relocs(
-    addresses: &Addresses<'_, '_>,
+fn collect_dyn_relocs<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
     context: &Context,
     plan: &DynamicPlan,
     scan: &ScanResult,
@@ -1171,7 +1180,7 @@ fn collect_dyn_relocs(
     relocs
 }
 
-fn write_rela_dyn<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
+fn write_rela_dyn<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) -> Result<()> {
     let synth = input.addresses.synth;
     let mut relocs = collect_dyn_relocs(input.addresses, &input.context, input.dynamic, input.scan);
     if synth.relr {
@@ -1200,8 +1209,8 @@ fn write_rela_dyn<F: ElfFormat>(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) 
 
 /// The addresses of the relative relocations `.relr.dyn` holds, sorted.
 #[must_use]
-pub fn relr_addresses(
-    addresses: &Addresses<'_, '_>,
+pub fn relr_addresses<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
     context: &Context,
     plan: &DynamicPlan,
     scan: &ScanResult,
@@ -1252,8 +1261,8 @@ pub fn encode_relr(places: &[u64], kind: ElfKind) -> Vec<u64> {
 
 /// The dynamic relocations of section `section` of `file`, by re-running
 /// the scan's decisions.
-fn section_dyn_relocs(
-    addresses: &Addresses<'_, '_>,
+fn section_dyn_relocs<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
     context: &Context,
     plan: &DynamicPlan,
     file_index: usize,
@@ -1320,7 +1329,7 @@ fn section_dyn_relocs(
         match decision.dynamic {
             Dynamic::None => {}
             Dynamic::Relative => {
-                let owner = Addresses::owner(&target, file_index, rel.symbol);
+                let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
                 let (s, a) = target_value(addresses, &target, owner, rel.addend);
                 let mut reloc = dyn_reloc(
                     context.arch,
@@ -1343,8 +1352,8 @@ fn section_dyn_relocs(
 
 /// `(S, A)` for a relocation: IFUNCs resolve to their PLT stub, calls to
 /// preemptible symbols to their PLT entry.
-fn target_value(
-    addresses: &Addresses<'_, '_>,
+fn target_value<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
     target: &super::refs::Target,
     owner: Owner,
     addend: i64,
@@ -1360,7 +1369,7 @@ fn target_value(
     (s, a)
 }
 
-fn write_eh_frame_hdr<F: ElfFormat>(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
+fn write_eh_frame_hdr<F: ElfFormat>(addresses: &Addresses<'_, '_, F>, out: &mut [u8]) {
     let layout = addresses.layout;
     let Some((hdr, ..)) = layout.synthetic(Synthetic::EhFrameHdr) else {
         return;
@@ -1411,7 +1420,10 @@ fn write_eh_frame_hdr<F: ElfFormat>(addresses: &Addresses<'_, '_>, out: &mut [u8
 }
 
 /// Why a relocation's target section is not in the output, if it is not.
-pub(crate) fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
+pub(crate) fn dead_target<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    target: &super::refs::Target,
+) -> Option<DeadTarget> {
     let id = refs.target_section(target)?;
     if refs.sections.is_live(id) {
         return None;
@@ -1425,8 +1437,8 @@ pub(crate) fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> 
 
 /// The Cortex-A53 erratum patches of input section `id`, which starts at
 /// `base` and is `len` bytes long, as `(offset of the site, patch address)`.
-fn erratum_patches(
-    input: &WriteInput<'_, '_, '_>,
+fn erratum_patches<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
     id: SectionId,
     base: u64,
     len: usize,
@@ -1453,7 +1465,11 @@ fn erratum_patches(
 
 /// Writes input section `id`: its relocated contents, then the branches to
 /// its Cortex-A53 erratum patches.
-fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) -> Result<()> {
+fn write_input<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    id: SectionId,
+    out: &mut [u8],
+) -> Result<()> {
     relocate_input(input, id, out)?;
     let base = input.addresses.section_address(id).unwrap_or(0);
     for (offset, patch) in erratum_patches(input, id, base, out.len()) {
@@ -1475,8 +1491,8 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
 /// Writes the Cortex-A53 erratum patches of the output section at
 /// `position`, whose block is its data entry `index`: each one is the
 /// relocated instruction it replaces, and a branch back after it.
-fn write_patches(
-    input: &WriteInput<'_, '_, '_>,
+fn write_patches<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
     position: u32,
     index: u32,
     out: &mut [u8],
@@ -1543,7 +1559,11 @@ fn write_patches(
 }
 
 #[allow(clippy::too_many_lines)]
-fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) -> Result<()> {
+fn relocate_input<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    id: SectionId,
+    out: &mut [u8],
+) -> Result<()> {
     let addresses = input.addresses;
     let refs = &addresses.refs;
     let (file_index, section_index) = refs
@@ -1656,7 +1676,7 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
             continue;
         }
         let place = base.wrapping_add(rel.offset);
-        let owner = Addresses::owner(&target, file_index, rel.symbol);
+        let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
         if !alloc
             && matches!(class.kind, Kind::Abs | Kind::DtpOff)
             && let Some(dead) = dead_target(refs, &target)
@@ -1974,9 +1994,9 @@ struct PpcBranch {
 /// through a stub. Out of line, so the other architectures' relocation loop
 /// does not carry it.
 #[inline(never)]
-fn ppc64_branch(
+fn ppc64_branch<F: crate::elf::read::ElfFormat>(
     out: &mut [u8],
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     id: SectionId,
     rel: &crate::elf::read::Relocation,
     call: PpcBranch,
@@ -2017,12 +2037,12 @@ fn ppc64_branch(
 /// address of, found on first use.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn ppc64_toc_access(
+fn ppc64_toc_access<F: crate::elf::read::ElfFormat>(
     out: &mut [u8],
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     file_index: usize,
     rel: &crate::elf::read::Relocation,
-    relas: crate::elf::read::RelaSlice<'_, crate::elf::read::Elf64Le>,
+    relas: crate::elf::read::RelaSlice<'_, F>,
     pinned: &std::cell::OnceCell<Vec<(u32, u64)>>,
     pic: bool,
     sa: u64,
@@ -2052,8 +2072,8 @@ fn ppc64_toc_access(
 /// `target` when a `NOCROSSREFS` list prohibits it, as GNU ld checks: both
 /// output sections are in one list and differ, and for `NOCROSSREFS_TO`
 /// the target is in the list's first section.
-pub(crate) fn prohibited_cross_reference(
-    input: &WriteInput<'_, '_, '_>,
+pub(crate) fn prohibited_cross_reference<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
     from: SectionId,
     target: &super::refs::Target,
 ) -> Option<(String, String)> {
@@ -2103,8 +2123,8 @@ pub(crate) fn prohibited_cross_reference(
 
 /// The name a cross-reference error uses for a symbol: GNU ld names a
 /// section symbol after its input section, which has no symbol name.
-pub(crate) fn cross_reference_name(
-    refs: &Refs<'_, '_>,
+pub(crate) fn cross_reference_name<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     file: usize,
     symbol: u32,
     target: &super::refs::Target,
@@ -2123,14 +2143,18 @@ pub(crate) fn cross_reference_name(
     symbol_name(refs, file, symbol)
 }
 
-pub(crate) fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {
+pub(crate) fn symbol_name<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    symbol: u32,
+) -> String {
     refs.symbol_name(file, symbol)
         .unwrap_or_else(|| format!("symbol {symbol}"))
 }
 
-fn write_eh_frame(
-    input: &WriteInput<'_, '_, '_>,
-    eh: &EhSection<'_>,
+fn write_eh_frame<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    eh: &EhSection<'_, F>,
     base: u64,
     out: &mut [u8],
 ) -> Result<()> {

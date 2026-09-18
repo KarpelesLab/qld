@@ -30,18 +30,18 @@ use crate::symbols::{DefinitionKind, Resolution, ResolveFile, SymbolTable, Symbo
 use super::inputs::{ElfInput, InputRole};
 
 /// The live files that take part in symbol reports, with their index.
-fn live_inputs<'f, 'a>(
-    files: &'f [ElfInput<'a>],
+fn live_inputs<'f, 'a, F: crate::elf::read::ElfFormat>(
+    files: &'f [ElfInput<'a, F>],
     resolution: &Resolution<'_>,
-) -> impl Iterator<Item = (usize, &'f ElfInput<'a>)> {
+) -> impl Iterator<Item = (usize, &'f ElfInput<'a, F>)> {
     files.iter().enumerate().filter(|(index, file)| {
         file.role != InputRole::Internal && resolution.is_live(FileId::new(*index))
     })
 }
 
 /// Emits the `-y`/`--trace-symbol` notes.
-pub fn trace_symbols(
-    files: &[ElfInput<'_>],
+pub fn trace_symbols<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     resolution: &Resolution<'_>,
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
@@ -84,8 +84,8 @@ enum Held {
 }
 
 /// Emits the `--warn-common` warnings.
-pub fn warn_common(
-    files: &[ElfInput<'_>],
+pub fn warn_common<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     resolution: &Resolution<'_>,
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
@@ -216,8 +216,8 @@ const CREF_COLUMN: usize = 50;
 
 /// Renders the `--cref` table, or `None` without `--cref`.
 #[must_use]
-pub fn cross_reference(
-    files: &[ElfInput<'_>],
+pub fn cross_reference<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     resolution: &Resolution<'_>,
     options: &LinkOptions,

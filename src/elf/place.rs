@@ -84,9 +84,9 @@ enum Assigned<'a> {
 
 /// Assigns output sections to every live input section.
 #[must_use]
-pub fn place<'a>(
+pub fn place<'a, F: crate::elf::read::ElfFormat>(
     rules: &RuleSet<'a>,
-    files: &[ElfInput<'a>],
+    files: &[ElfInput<'a, F>],
     sections: &Sections,
     options: &crate::args::LinkOptions,
 ) -> Placement<'a> {
@@ -297,7 +297,11 @@ impl Placement<'_> {
     /// sections. Placement does this once; the driver repeats it after
     /// garbage collection, since GNU ld decides flags from the sections that
     /// survive it.
-    pub fn compute_flags(&mut self, files: &[ElfInput<'_>], sections: &Sections) {
+    pub fn compute_flags<F: crate::elf::read::ElfFormat>(
+        &mut self,
+        files: &[ElfInput<'_, F>],
+        sections: &Sections,
+    ) {
         // Output types and flags from the inputs, as a fold over the live
         // input sections in section order. The fold is associative, so each
         // file folds its own sections in parallel and the files' results are

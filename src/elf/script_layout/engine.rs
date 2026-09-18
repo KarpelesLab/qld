@@ -167,8 +167,8 @@ struct Snapshot {
     symbols: Vec<Option<(u64, bool)>>,
 }
 
-struct Engine<'e, 'l, 'a> {
-    input: &'e LayoutInput<'l, 'a>,
+struct Engine<'e, 'l, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
+    input: &'e LayoutInput<'l, 'a, F>,
     script: &'e LayoutScript,
     placed: &'e ScriptPlacement,
     entries: Vec<Vec<Entry>>,
@@ -237,7 +237,7 @@ fn is_trivial_dot_expr(expr: &Expr) -> bool {
     }
 }
 
-impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
+impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
     fn stmt(&self, index: u32) -> Option<&'e OutputStmt> {
         self.placed.stmt(self.script, index)
     }
@@ -1029,7 +1029,7 @@ impl<'e, 'l, 'a> Engine<'e, 'l, 'a> {
     }
 }
 
-impl EvalContext for Engine<'_, '_, '_> {
+impl<F: crate::elf::read::ElfFormat> EvalContext for Engine<'_, '_, '_, F> {
     type Section = u32;
 
     fn section_vma(&self, section: u32) -> u64 {
@@ -1334,8 +1334,8 @@ fn for_each_expr(script: &LayoutScript, placed: &ScriptPlacement, f: &mut dyn Fn
 /// symbol defined in output `removed`, which is not output (empty and not
 /// kept), moves to: the kept neighbour that would share its segment,
 /// looking in the same memory region first.
-fn nearby_section(
-    engine: &Engine<'_, '_, '_>,
+fn nearby_section<F: crate::elf::read::ElfFormat>(
+    engine: &Engine<'_, '_, '_, F>,
     output_places: &[(u64, u64, u32)],
     sections: &[OutSection<'_>],
     removed: u32,
@@ -1510,8 +1510,8 @@ pub(super) fn compare_sections(
 
 /// The members of every output section, in order.
 #[allow(clippy::too_many_lines)]
-fn build_entries(
-    input: &LayoutInput<'_, '_>,
+fn build_entries<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
     script: &LayoutScript,
     placed: &ScriptPlacement,
 ) -> Result<Vec<Vec<Entry>>> {
@@ -1754,7 +1754,11 @@ fn build_programs<'s>(
 }
 
 /// Emits `errors` and returns the error that fails the link.
-fn fail(input: &LayoutInput<'_, '_>, script: &LayoutScript, errors: &[(Span, String)]) -> Error {
+fn fail<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    script: &LayoutScript,
+    errors: &[(Span, String)],
+) -> Error {
     let render = |span: &Span, message: &str| {
         if span.line == 0 {
             message.to_string()
@@ -1793,8 +1797,8 @@ fn fail(input: &LayoutInput<'_, '_>, script: &LayoutScript, errors: &[(Span, Str
 /// non-convergence are reported to the diagnostic sink and returned as
 /// [`Error::Reported`].
 #[allow(clippy::too_many_lines)]
-pub fn layout<'a>(
-    input: &LayoutInput<'_, 'a>,
+pub fn layout<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
     script: &LayoutScript,
     placed: &ScriptPlacement,
 ) -> Result<Layout<'a>> {
@@ -1816,8 +1820,8 @@ pub fn layout<'a>(
     Ok(layout)
 }
 
-fn layout_with<'a>(
-    input: &LayoutInput<'_, 'a>,
+fn layout_with<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
     script: &LayoutScript,
     placed: &ScriptPlacement,
     headers_override: Option<u64>,
@@ -2197,8 +2201,8 @@ fn layout_with<'a>(
 /// GNU's `lang_find_relro_sections`: whether a non-empty allocated input
 /// section lies between the `DATA_SEGMENT_ALIGN` assignment and the
 /// `DATA_SEGMENT_RELRO_END` one.
-fn has_relro_section(
-    input: &LayoutInput<'_, '_>,
+fn has_relro_section<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
     script: &LayoutScript,
     placed: &ScriptPlacement,
     entries: &[Vec<Entry>],
@@ -2293,7 +2297,7 @@ fn propagate_lma_regions(
 
 /// GNU's `lang_size_relro_segment_1`: moves the start of the RELRO region
 /// up so that it ends on a page boundary. Returns the expected end.
-fn relro_adjust(engine: &mut Engine<'_, '_, '_>) -> u64 {
+fn relro_adjust<F: crate::elf::read::ElfFormat>(engine: &mut Engine<'_, '_, '_, F>) -> u64 {
     let seg = engine.dataseg;
     let page = seg.max_page.max(1);
     let relro_end = align_up(seg.relro_end, page);
@@ -2354,7 +2358,10 @@ fn size_segment(seg: &mut DataSeg) -> bool {
 
 /// Turns the final assignment into a [`Layout`].
 #[allow(clippy::too_many_lines)]
-fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result<Layout<'a>> {
+fn assemble<'a, F: crate::elf::read::ElfFormat>(
+    engine: Engine<'_, '_, 'a, F>,
+    relro: Option<(u64, u64)>,
+) -> Result<Layout<'a>> {
     let input = engine.input;
     let placement = input.placement;
     let script = engine.script;

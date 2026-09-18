@@ -25,7 +25,7 @@ use rayon::prelude::*;
 
 use crate::args::{InputAttrs, InputKind, LinkOptions};
 use crate::elf::read::consts::{ET_DYN, ET_REL};
-use crate::elf::read::{Elf64Le, ObjectFile, SectionIndex, Source as ElfSource};
+use crate::elf::read::{Elf64Le, ElfFormat, ObjectFile, SectionIndex, Source as ElfSource};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
 use crate::input::archive::Member;
@@ -109,7 +109,7 @@ struct ThinMember<'a> {
 
 /// One input as symbol resolution sees it.
 #[derive(Debug)]
-pub struct ElfInput<'a> {
+pub struct ElfInput<'a, F: ElfFormat = Elf64Le> {
     /// Where the input sits on the command line.
     pub position: InputPosition,
     /// What kind of input this is.
@@ -121,11 +121,11 @@ pub struct ElfInput<'a> {
     /// Names a lazy member would define.
     pub lazy_names: Vec<SymbolName<'a>>,
     /// The parsed object, once loaded.
-    pub object: Option<ObjectInput<'a>>,
+    pub object: Option<ObjectInput<'a, F>>,
     /// For the internal file, its symbols.
     pub internal: InternalSymbols<'a>,
     /// For shared objects, the parsed library.
-    pub shared: Option<SharedInput<'a>>,
+    pub shared: Option<SharedInput<'a, F>>,
     /// For IR inputs an LTO plugin claimed, the symbols it reported.
     pub ir: Option<Box<IrSymbols<'a>>>,
     thin: Option<ThinMember<'a>>,
@@ -137,7 +137,7 @@ pub struct ElfInput<'a> {
     needs_claim: bool,
 }
 
-impl<'a> ElfInput<'a> {
+impl<'a, F: ElfFormat> ElfInput<'a, F> {
     /// A display name for diagnostics: `path` or `path(member)`.
     #[must_use]
     pub fn display(&self) -> String {
@@ -237,7 +237,7 @@ impl<'a> ElfInput<'a> {
         if let Some(file) = self.file
             && matches!(file.format(), FileFormat::Elf(ident) if ident.is_relocatable())
         {
-            self.lazy_names = defined_names(file)?.0;
+            self.lazy_names = defined_names::<F>(file)?.0;
         }
         Ok(())
     }
@@ -277,7 +277,7 @@ impl<'a> ElfInput<'a> {
     }
 }
 
-impl<'a> ResolveFile<'a> for ElfInput<'a> {
+impl<'a, F: ElfFormat> ResolveFile<'a> for ElfInput<'a, F> {
     fn position(&self) -> InputPosition {
         self.position
     }
@@ -377,9 +377,9 @@ impl<'a> ResolveFile<'a> for ElfInput<'a> {
 
 /// Everything collected from the command line.
 #[derive(Debug)]
-pub struct Inputs<'a> {
+pub struct Inputs<'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// All inputs, file 0 being the internal file.
-    pub files: Vec<ElfInput<'a>>,
+    pub files: Vec<ElfInput<'a, F>>,
     /// The target: from `-m`, or inferred from the first object.
     pub target: Target,
 }
@@ -511,12 +511,12 @@ fn base_name_of(path: &Path) -> Vec<u8> {
 /// Returns [`Error::NotFound`] for missing libraries, [`Error::Io`] for files
 /// that cannot be read, [`Error::Unimplemented`] for inputs that need a later
 /// milestone, and parse errors for malformed archives and scripts.
-pub fn collect<'a>(
+pub fn collect<'a, F: crate::elf::read::ElfFormat>(
     options: &LinkOptions,
     table: &'a FileTable,
     internal: &'a InternalNames,
     config: ParseConfig<'a>,
-) -> Result<Inputs<'a>> {
+) -> Result<Inputs<'a, F>> {
     // The file table looks in `options.input_provider` first.
     let fs = table;
     let search = SearchContext {
@@ -645,11 +645,11 @@ pub fn collect<'a>(
     })
 }
 
-struct Walker<'a, 's> {
+struct Walker<'a, 's, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     table: &'a FileTable,
     search: SearchContext<'s>,
     config: ParseConfig<'a>,
-    files: Vec<ElfInput<'a>>,
+    files: Vec<ElfInput<'a, F>>,
     ordinal: u32,
     target: Option<Target>,
     depth: u32,
@@ -701,7 +701,7 @@ struct DeferredIndex<'a> {
     by_offset: Vec<(u64, usize)>,
 }
 
-impl<'a> Walker<'a, '_> {
+impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
     /// Reads the symbol indexes of the archives added so far, in parallel:
     /// each gives its members their lazy names (and, with a plugin, marks
     /// the IR members the index does not describe). On failure, returns the
@@ -711,8 +711,8 @@ impl<'a> Walker<'a, '_> {
         if deferred.is_empty() {
             return Ok(());
         }
-        let mut slices: Vec<&mut [ElfInput<'a>]> = Vec::with_capacity(deferred.len());
-        let mut rest: &mut [ElfInput<'a>] = &mut self.files;
+        let mut slices: Vec<&mut [ElfInput<'a, F>]> = Vec::with_capacity(deferred.len());
+        let mut rest: &mut [ElfInput<'a, F>] = &mut self.files;
         let mut consumed = 0usize;
         let layout = || Error::Internal("archive members out of order".into());
         for archive in &deferred {
@@ -744,7 +744,7 @@ impl<'a> Walker<'a, '_> {
         Ok(self.ordinal)
     }
 
-    fn input(&self, position: InputPosition, role: InputRole) -> ElfInput<'a> {
+    fn input(&self, position: InputPosition, role: InputRole) -> ElfInput<'a, F> {
         ElfInput {
             position,
             role,
@@ -798,7 +798,7 @@ impl<'a> Walker<'a, '_> {
                 let mut input = self.input(InputPosition::new(input_number, 0), InputRole::Object);
                 input.file = Some(file);
                 if attrs.lazy {
-                    let (names, gcc_lto) = defined_names(file)?;
+                    let (names, gcc_lto) = defined_names::<F>(file)?;
                     if gcc_lto && self.lto == LtoMode::Claim {
                         // IR names come from the plugin: link it eagerly.
                         input.live_at_start = true;
@@ -966,7 +966,7 @@ impl<'a> Walker<'a, '_> {
                     };
                     match member_file.format() {
                         FileFormat::Elf(i) if i.is_relocatable() => {
-                            let (names, gcc_lto) = defined_names(member_file)?;
+                            let (names, gcc_lto) = defined_names::<F>(member_file)?;
                             if gcc_lto && claim {
                                 input.needs_claim = true;
                             } else {
@@ -1093,12 +1093,12 @@ impl<'a> Walker<'a, '_> {
 /// The global symbols an object defines, for lazy objects and archives
 /// without an index, and whether the object carries GCC LTO IR (only
 /// checked when it defines GCC's slim-object marker or nothing).
-fn defined_names(file: &InputFile) -> Result<(Vec<SymbolName<'_>>, bool)> {
+fn defined_names<F: ElfFormat>(file: &InputFile) -> Result<(Vec<SymbolName<'_>>, bool)> {
     let source = match file.member() {
         Some(member) => ElfSource::member(file.path(), member),
         None => ElfSource::new(file.path()),
     };
-    let object = ObjectFile::<Elf64Le>::parse(file.data(), source)?;
+    let object = ObjectFile::<F>::parse(file.data(), source)?;
     let symbols = object.symbols();
     let mut names = Vec::new();
     for symbol in symbols.globals() {
@@ -1126,8 +1126,8 @@ fn defined_names(file: &InputFile) -> Result<(Vec<SymbolName<'_>>, bool)> {
 /// # Errors
 ///
 /// Errors loading the new inputs.
-pub fn add_after_lto<'a>(
-    files: &mut Vec<ElfInput<'a>>,
+pub fn add_after_lto<'a, F: crate::elf::read::ElfFormat>(
+    files: &mut Vec<ElfInput<'a, F>>,
     options: &LinkOptions,
     objects: &[FileId],
     libraries: &[std::ffi::OsString],
@@ -1218,9 +1218,9 @@ pub fn add_after_lto<'a>(
 
 /// Reads one deferred archive symbol index into its `members` (the
 /// archive's entries of `files`, in member order); see [`Walker::finish`].
-fn read_symbol_index<'a>(
+fn read_symbol_index<'a, F: crate::elf::read::ElfFormat>(
     archive: &DeferredIndex<'a>,
-    members: &mut [ElfInput<'a>],
+    members: &mut [ElfInput<'a, F>],
     lto: LtoMode,
 ) -> Result<()> {
     let file = archive.file;
@@ -1264,7 +1264,7 @@ fn read_symbol_index<'a>(
             }
             let ir = match member_file.format() {
                 FileFormat::Elf(i) if i.is_relocatable() => {
-                    defined_names(member_file).is_ok_and(|(_, gcc_lto)| gcc_lto)
+                    defined_names::<F>(member_file).is_ok_and(|(_, gcc_lto)| gcc_lto)
                 }
                 format => format.is_ir(),
             };

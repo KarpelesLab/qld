@@ -22,7 +22,6 @@ use crate::elf::read::consts::{
     SHN_ABS, SHN_UNDEF, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_NOTYPE, STT_OBJECT,
     STT_SECTION, STT_TLS, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL,
 };
-use crate::elf::read::format::with_format;
 use crate::elf::read::{ElfFormat, ElfKind, RawRecord, RawSymbol, SectionIndex};
 use crate::ids::SymbolId;
 use crate::symbols::{DefinitionKind, SymbolFlags};
@@ -85,7 +84,11 @@ fn keep_local(name: &[u8], raw: &RawSymbol, discard: DiscardMode) -> bool {
     }
 }
 
-fn global_visibility(refs: &Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) -> u8 {
+fn global_visibility<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    linker: &LinkerSymbols,
+    id: SymbolId,
+) -> u8 {
     let target = refs.global_target(id, true);
     if let Def::Linker(_) = target.def {
         return match linker.entries.iter().find(|(i, _)| *i == id) {
@@ -97,7 +100,9 @@ fn global_visibility(refs: &Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) 
 }
 
 /// Whether an input has a `STT_FILE` symbol.
-pub(crate) fn has_file_symbol(object: &super::object::ObjectInput<'_>) -> bool {
+pub(crate) fn has_file_symbol<F: crate::elf::read::ElfFormat>(
+    object: &super::object::ObjectInput<'_, F>,
+) -> bool {
     let symbols = object.elf.symbols();
     (1..object.first_global).any(|index| {
         symbols
@@ -109,7 +114,9 @@ pub(crate) fn has_file_symbol(object: &super::object::ObjectInput<'_>) -> bool {
 /// The name GNU ld gives the `STT_FILE` symbol it adds for an input without
 /// one: the file name without directories (for an archive member, the
 /// member's).
-pub(crate) fn file_symbol_name(file: &super::inputs::ElfInput<'_>) -> Option<Vec<u8>> {
+pub(crate) fn file_symbol_name<F: crate::elf::read::ElfFormat>(
+    file: &super::inputs::ElfInput<'_, F>,
+) -> Option<Vec<u8>> {
     let input = file.file?;
     let name: &[u8] = match input.member() {
         Some(member) => member.as_bytes(),
@@ -121,10 +128,10 @@ pub(crate) fn file_symbol_name(file: &super::inputs::ElfInput<'_>) -> Option<Vec
 
 /// Which local symbols of `file` the relocations of its live sections
 /// name, by symbol index.
-fn referenced_locals(
-    refs: &Refs<'_, '_>,
+fn referenced_locals<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     file_index: usize,
-    object: &super::object::ObjectInput<'_>,
+    object: &super::object::ObjectInput<'_, F>,
 ) -> Vec<bool> {
     let mut referenced = vec![false; object.first_global];
     for (index, section) in object.sections.iter().enumerate() {
@@ -165,8 +172,8 @@ fn live_import(flags: SymbolFlags) -> bool {
 
 /// Plans the symbol table. Returns an empty plan for `-s`.
 #[must_use]
-pub fn plan(
-    refs: &Refs<'_, '_>,
+pub fn plan<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     linker: &LinkerSymbols,
     options: &LinkOptions,
     kind: ElfKind,
@@ -399,7 +406,10 @@ impl SymtabPlan {
 /// versioned symbols.
 /// The version a symbol imported from a shared library is written with
 /// (`name@VERSION`, as GNU ld does), unless its name already has one.
-fn import_suffix<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<&'a [u8]> {
+fn import_suffix<'a, F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, 'a, F>,
+    id: SymbolId,
+) -> Option<&'a [u8]> {
     if refs.symbols.definition_kind(id) != DefinitionKind::Shared
         || refs.symbols.name(id).version().is_some()
     {
@@ -409,7 +419,7 @@ fn import_suffix<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<&'a [u8]> {
 }
 
 /// The length of a global symbol's name in `.strtab`.
-fn global_name_len(refs: &Refs<'_, '_>, id: SymbolId) -> usize {
+fn global_name_len<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SymbolId) -> usize {
     let len = name_len(refs.symbols.name(id));
     match import_suffix(refs, id) {
         Some(version) => len.saturating_add(1).saturating_add(version.len()),
@@ -430,7 +440,12 @@ fn name_len(name: crate::symbols::SymbolName<'_>) -> usize {
 
 /// In executables and shared objects, a TLS symbol's value is its offset in
 /// the TLS template.
-fn tls_relative(addresses: &Addresses<'_, '_>, kind: u8, value: u64, shndx: u16) -> u64 {
+fn tls_relative<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    kind: u8,
+    value: u64,
+    shndx: u16,
+) -> u64 {
     if kind != STT_TLS || shndx == SHN_ABS || shndx == SHN_UNDEF {
         return value;
     }
@@ -463,7 +478,11 @@ fn put_sym<F: ElfFormat>(
 /// The output section header index of input section `section` of `file`
 /// (after ICF folding): `SHN_ABS` when its output section was dropped as
 /// empty, `SHN_UNDEF` when it is not in the output.
-pub(crate) fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32) -> u16 {
+pub(crate) fn shndx_for<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    file: usize,
+    section: u32,
+) -> u16 {
     let Some(id) = addresses
         .refs
         .sections
@@ -485,20 +504,19 @@ pub(crate) fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32
 }
 
 /// Writes `.symtab` into `out`.
-pub fn write_symtab(
+pub fn write_symtab<F: crate::elf::read::ElfFormat>(
     plan: &SymtabPlan,
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
     out: &mut [u8],
 ) {
-    with_format!(plan.kind, |F| {
-        write_symtab_as::<F>(plan, addresses, linker, out);
-    });
+    // The link's input format is its output format.
+    write_symtab_as::<F>(plan, addresses, linker, out);
 }
 
 fn write_symtab_as<F: ElfFormat>(
     plan: &SymtabPlan,
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
     out: &mut [u8],
 ) {
@@ -723,7 +741,11 @@ fn write_symtab_as<F: ElfFormat>(
 
 /// Writes `.strtab` into `out`: each file's local names, then the hidden
 /// and global names, from the offsets the plan computed, in parallel.
-pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
+pub fn write_strtab<F: crate::elf::read::ElfFormat>(
+    plan: &SymtabPlan,
+    refs: &Refs<'_, '_, F>,
+    out: &mut [u8],
+) {
     /// Globals whose names one task writes.
     const NAMES_PER_TASK: usize = 4096;
     enum Task<'p> {
@@ -815,7 +837,7 @@ pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
 
 /// The binding of an undefined or imported symbol: weak when every
 /// reference from a regular object is weak.
-fn import_binding(refs: &Refs<'_, '_>, id: SymbolId) -> u8 {
+fn import_binding<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SymbolId) -> u8 {
     if refs.symbols.flags(id).contains(REF_REGULAR_STRONG) {
         STB_GLOBAL
     } else {

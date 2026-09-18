@@ -347,15 +347,15 @@ impl Layout<'_> {
 }
 
 /// Everything layout reads.
-pub struct LayoutInput<'l, 'a> {
+pub struct LayoutInput<'l, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Options.
     pub options: &'l LinkOptions,
     /// Relocation target resolution, for range-extension thunks.
-    pub refs: Refs<'l, 'a>,
+    pub refs: Refs<'l, 'a, F>,
     /// Rules.
     pub rules: &'l RuleSet<'l>,
     /// Inputs.
-    pub files: &'l [ElfInput<'a>],
+    pub files: &'l [ElfInput<'a, F>],
     /// Input sections.
     pub sections: &'l Sections,
     /// Placement.
@@ -363,7 +363,7 @@ pub struct LayoutInput<'l, 'a> {
     /// Merge groups.
     pub merged: &'l Merged<'l, 'a>,
     /// `.eh_frame` sections.
-    pub eh_frames: &'l EhFrames<'a>,
+    pub eh_frames: &'l EhFrames<'a, F>,
     /// Synthetic sections.
     pub synth: &'l Synth,
     /// Trailing table sizes.
@@ -382,7 +382,7 @@ pub struct LayoutInput<'l, 'a> {
     pub relax: Option<&'l Relaxation>,
 }
 
-impl LayoutInput<'_, '_> {
+impl<F: crate::elf::read::ElfFormat> LayoutInput<'_, '_, F> {
     /// The ELF class and byte order of the output.
     #[must_use]
     pub fn kind(&self) -> ElfKind {
@@ -444,7 +444,9 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 /// # Errors
 ///
 /// Returns [`Error::Limit`] when the image does not fit the address space.
-pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
+pub fn layout<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
+) -> Result<Layout<'a>> {
     input.synth.arch.check_options(input.options)?;
     if input.relax.is_none() && input.synth.arch.relaxes() {
         return super::arch::shrink::layout(input, &|input| layout(input));
@@ -473,7 +475,10 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
 }
 
 /// One round of layout, reserving space for `thunks`.
-fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layout<'a>> {
+fn layout_once<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
+    thunks: &Thunks,
+) -> Result<Layout<'a>> {
     let kind = input.kind();
     let placement = input.placement;
     let sections = input.sections;
@@ -1406,8 +1411,8 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
 /// `.symtab`, `.strtab`, `.shstrtab`) to `out_sections`, names every
 /// section, and links the trailers. Returns the number of section symbols
 /// and the `.shstrtab` contents.
-pub(crate) fn add_trailers(
-    input: &LayoutInput<'_, '_>,
+pub(crate) fn add_trailers<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
     out_sections: &mut Vec<OutSection<'_>>,
 ) -> Result<(u32, Vec<u8>)> {
     let kind = input.kind();
@@ -1746,7 +1751,10 @@ pub(crate) fn synthetic_flags(kind: Synthetic) -> (u64, u32) {
     }
 }
 
-pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result<(u64, u64)> {
+pub(crate) fn member_size<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    member: Member,
+) -> Result<(u64, u64)> {
     Ok(match member {
         Member::Input(id) => {
             let (file, index) = input
@@ -1795,8 +1803,8 @@ pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result
 /// section (the others are empty).
 #[cold]
 #[inline(never)]
-fn riscv_member_size(
-    input: &LayoutInput<'_, '_>,
+fn riscv_member_size<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
     id: SectionId,
     section: &super::object::InputSection<'_>,
 ) -> (u64, u64) {
@@ -1817,7 +1825,11 @@ fn riscv_member_size(
     )
 }
 
-pub(crate) fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[Placed]) -> u64 {
+pub(crate) fn entsize_of<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    _output: usize,
+    placed: &[Placed],
+) -> u64 {
     let mut entsize: Option<u64> = None;
     for p in placed {
         let size = match p.member {

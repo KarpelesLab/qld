@@ -137,14 +137,14 @@ pub(crate) struct TypeUnits<'a> {
 impl<'a> TypeUnits<'a> {
     /// Reads the type units of `obj`. Malformed units are left out, with
     /// the problem reported.
-    pub(crate) fn read(
-        obj: &DebugObject<'_, 'a>,
+    pub(crate) fn read<F: crate::elf::read::ElfFormat>(
+        obj: &DebugObject<'_, 'a, F>,
         abbrevs: &mut Abbrevs,
         problems: &mut Vec<(u32, Malformed)>,
     ) -> Self {
         let mut this = Self::default();
         // (unit header, section, its DIEs, unit DIE) of every type unit.
-        let mut read: Vec<(UnitHeader, &Section<'a>, Dies<'a>, UnitInfo)> = Vec::new();
+        let mut read: Vec<(UnitHeader, &Section<'a, F>, Dies<'a>, UnitInfo)> = Vec::new();
         for (section, types) in &obj.type_units {
             let (headers, error) = unit::unit_headers(obj, section, *types);
             if let Some(error) = error {
@@ -260,9 +260,9 @@ impl<'a> TypeUnits<'a> {
 
 /// Adds the names of unit `unit` (index `index` in its object) to `out`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn names<'a>(
-    obj: &DebugObject<'_, 'a>,
-    info: &Section<'a>,
+pub(crate) fn names<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
+    info: &Section<'a, F>,
     unit: &UnitHeader,
     abbrevs: &AbbrevTable,
     die: &UnitInfo,
@@ -434,9 +434,9 @@ fn plan(abbrev: &unit::Abbrev, unit: &UnitHeader) -> Plan {
 }
 
 /// Reads the DIEs of a unit after the unit DIE.
-fn read_dies<'a>(
-    obj: &DebugObject<'_, 'a>,
-    info: &Section<'a>,
+fn read_dies<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
+    info: &Section<'a, F>,
     unit: &UnitHeader,
     abbrevs: &AbbrevTable,
     start: usize,
@@ -554,8 +554,8 @@ fn read_dies<'a>(
     })
 }
 
-struct Scan<'s, 'o, 'a> {
-    obj: &'s DebugObject<'o, 'a>,
+struct Scan<'s, 'o, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
+    obj: &'s DebugObject<'o, 'a, F>,
     unit: &'s UnitHeader,
     bases: unit::Bases,
     dies: &'s [Die<'a>],
@@ -563,7 +563,7 @@ struct Scan<'s, 'o, 'a> {
     type_units: &'s TypeUnits<'a>,
 }
 
-impl<'a> Scan<'_, '_, 'a> {
+impl<'a, F: crate::elf::read::ElfFormat> Scan<'_, '_, 'a, F> {
     fn die(&self, index: u32) -> Option<&Die<'a>> {
         self.dies.get(usize::try_from(index).ok()?)
     }

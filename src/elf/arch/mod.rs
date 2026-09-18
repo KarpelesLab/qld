@@ -434,7 +434,10 @@ impl Arch {
     /// The architecture of a link: the emulation (`-m`) when one was given,
     /// otherwise the first relocatable object's machine.
     #[must_use]
-    pub fn of(options: &LinkOptions, files: &[super::inputs::ElfInput<'_>]) -> Self {
+    pub fn of<F: crate::elf::read::ElfFormat>(
+        options: &LinkOptions,
+        files: &[super::inputs::ElfInput<'_, F>],
+    ) -> Self {
         options
             .target
             .and_then(Self::from_target)
@@ -444,7 +447,9 @@ impl Arch {
 
     /// The architecture of the first relocatable object among `files`.
     #[must_use]
-    pub fn of_files(files: &[super::inputs::ElfInput<'_>]) -> Option<Self> {
+    pub fn of_files<F: crate::elf::read::ElfFormat>(
+        files: &[super::inputs::ElfInput<'_, F>],
+    ) -> Option<Self> {
         files.iter().find_map(|file| {
             let object = file.object.as_ref()?;
             Self::from_machine(object.elf.elf().header().e_machine)
@@ -454,15 +459,15 @@ impl Arch {
     /// Why object `file` cannot be linked with the others, if it cannot
     /// (RISC-V: a floating-point ABI other than the first object's).
     #[must_use]
-    pub fn incompatible(
+    pub fn incompatible<F: crate::elf::read::ElfFormat>(
         self,
-        files: &[super::inputs::ElfInput<'_>],
+        files: &[super::inputs::ElfInput<'_, F>],
         file: usize,
     ) -> Option<String> {
         if self != Self::RiscV64 {
             return None;
         }
-        let flags = |f: &super::inputs::ElfInput<'_>| {
+        let flags = |f: &super::inputs::ElfInput<'_, F>| {
             f.object.as_ref().map(|o| o.elf.elf().header().e_flags)
         };
         let (first_index, first) = files
@@ -580,7 +585,10 @@ impl Arch {
     /// ABI and object ABI version, or the PowerPC64 ABI version (2); zero
     /// elsewhere.
     #[must_use]
-    pub fn output_flags(self, files: &[super::inputs::ElfInput<'_>]) -> u32 {
+    pub fn output_flags<F: crate::elf::read::ElfFormat>(
+        self,
+        files: &[super::inputs::ElfInput<'_, F>],
+    ) -> u32 {
         if self == Self::Ppc64 {
             return ppc64::ABI_VERSION;
         }

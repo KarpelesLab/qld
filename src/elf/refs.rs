@@ -82,9 +82,9 @@ impl Target {
 
 /// Read-only access to everything needed to resolve relocation targets.
 #[derive(Clone, Copy)]
-pub struct Refs<'r, 'a> {
+pub struct Refs<'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// All inputs.
-    pub files: &'r [ElfInput<'a>],
+    pub files: &'r [ElfInput<'a, F>],
     /// The global symbol table.
     pub symbols: &'r SymbolTable<'a>,
     /// The resolution result.
@@ -93,7 +93,7 @@ pub struct Refs<'r, 'a> {
     pub sections: &'r Sections,
 }
 
-impl<'a> Refs<'_, 'a> {
+impl<'a, F: crate::elf::read::ElfFormat> Refs<'_, 'a, F> {
     /// The global symbol ID of symbol `index` of `file`, if it is global.
     #[inline]
     #[must_use]
@@ -212,11 +212,11 @@ impl<'a> Refs<'_, 'a> {
 }
 
 #[inline(always)]
-fn local_def(
+fn local_def<F: crate::elf::read::ElfFormat>(
     file: usize,
     index: usize,
     raw: &RawSymbol,
-    symbols: &crate::elf::read::SymbolTable<'_, crate::elf::read::Elf64Le>,
+    symbols: &crate::elf::read::SymbolTable<'_, F>,
 ) -> Option<Def> {
     Some(match symbols.section_of(index, raw)? {
         SectionIndex::Section(section) => Def::Section {

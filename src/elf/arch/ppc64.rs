@@ -652,10 +652,10 @@ pub fn write_call_stub(out: &mut [u8], slot: u64, toc: u64) -> Result<(), ApplyE
 /// not relaxed ([`toc_indirection`]). Each is `(.toc section index, offset
 /// in it)`, sorted.
 #[must_use]
-pub fn pinned_toc_entries(
-    refs: &crate::elf::refs::Refs<'_, '_>,
+pub fn pinned_toc_entries<F: crate::elf::read::ElfFormat>(
+    refs: &crate::elf::refs::Refs<'_, '_, F>,
     file: usize,
-    relocations: Relocations<'_, crate::elf::read::Elf64Le>,
+    relocations: Relocations<'_, F>,
 ) -> Vec<(u32, u64)> {
     let Relocations::Rela(relas) = relocations else {
         return Vec::new();
@@ -672,8 +672,8 @@ pub fn pinned_toc_entries(
 
 /// The `.toc` entry a relocation against a `.toc` section symbol names:
 /// `(section index, offset)`.
-fn toc_entry(
-    refs: &crate::elf::refs::Refs<'_, '_>,
+fn toc_entry<F: crate::elf::read::ElfFormat>(
+    refs: &crate::elf::refs::Refs<'_, '_, F>,
     file: usize,
     rel: &Relocation,
 ) -> Option<(u32, u64)> {
@@ -702,8 +702,8 @@ fn toc_entry(
 /// address and the field that packs it (the `ld` becomes an `addi`).
 /// `pinned` comes from [`pinned_toc_entries`].
 #[must_use]
-pub fn toc_indirection(
-    addresses: &crate::elf::values::Addresses<'_, '_>,
+pub fn toc_indirection<F: crate::elf::read::ElfFormat>(
+    addresses: &crate::elf::values::Addresses<'_, '_, F>,
     file: usize,
     rel: &Relocation,
     pinned: &[(u32, u64)],

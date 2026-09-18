@@ -28,7 +28,7 @@ use crate::elf::read::consts::x86_64::{
     R_X86_64_32, R_X86_64_32S, R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_NONE, R_X86_64_PC32,
     R_X86_64_REX_GOTPCRELX,
 };
-use crate::elf::read::{Elf64Le, RelaSlice, Relocation, Relocations};
+use crate::elf::read::{RelaSlice, Relocation, Relocations};
 use crate::error::{Error, Result};
 
 use super::arch::x86_64::Kind;
@@ -46,7 +46,10 @@ use crate::symbols::SymbolFlags;
 /// Size of an `Elf64_Rela`.
 const RELA_SIZE: usize = 24;
 
-fn relocations<'a>(object: &ObjectInput<'a>, index: u32) -> Option<RelaSlice<'a, Elf64Le>> {
+fn relocations<'a, F: crate::elf::read::ElfFormat>(
+    object: &ObjectInput<'a, F>,
+    index: u32,
+) -> Option<RelaSlice<'a, F>> {
     let section = object.section(index)?;
     if section.relocs == 0 {
         return None;
@@ -64,10 +67,10 @@ fn relocations<'a>(object: &ObjectInput<'a>, index: u32) -> Option<RelaSlice<'a,
 }
 
 /// The number of relocations one output section member contributes.
-fn member_count(
-    files: &[ElfInput<'_>],
+fn member_count<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     sections: &Sections,
-    eh_frames: &EhFrames<'_>,
+    eh_frames: &EhFrames<'_, F>,
     member: Member,
 ) -> u64 {
     let Member::Input(id) = member else {
@@ -103,10 +106,10 @@ fn member_count(
 ///
 /// Returns [`Error::Unimplemented`] when a member has `SHT_REL`
 /// relocations.
-pub fn count(
-    files: &[ElfInput<'_>],
+pub fn count<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     sections: &Sections,
-    eh_frames: &EhFrames<'_>,
+    eh_frames: &EhFrames<'_, F>,
     members: &[Placed],
 ) -> Result<u64> {
     for placed in members {
@@ -143,8 +146,8 @@ fn put(out: &mut [u8], offset: u64, symbol: usize, r_type: u32, addend: i64) {
 }
 
 /// The output symbol and addend of relocation `rel` of `file`.
-fn output_symbol(
-    addresses: &Addresses<'_, '_>,
+fn output_symbol<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
     plan: &SymtabPlan,
     section_symbols: u32,
     file: usize,
@@ -182,8 +185,8 @@ fn output_symbol(
 
 /// The type GNU ld writes for a relocation: its `GOTPCRELX` conversions
 /// show, other relaxations do not.
-fn output_type(
-    input: &WriteInput<'_, '_, '_>,
+fn output_type<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
     file: usize,
     section: &InputSection<'_>,
     data: &[u8],
@@ -237,7 +240,11 @@ fn output_type(
 /// # Errors
 ///
 /// Returns [`Error::Internal`] if the relocations do not fill the section.
-pub fn write(input: &WriteInput<'_, '_, '_>, position: u32, out: &mut [u8]) -> Result<()> {
+pub fn write<F: crate::elf::read::ElfFormat>(
+    input: &WriteInput<'_, '_, '_, F>,
+    position: u32,
+    out: &mut [u8],
+) -> Result<()> {
     let addresses = input.addresses;
     let plan = input.symtab;
     let refs = &addresses.refs;

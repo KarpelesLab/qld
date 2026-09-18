@@ -31,6 +31,7 @@ use rayon::prelude::*;
 use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
+use crate::elf::read::{Elf32Le, Elf64Le, ElfKind};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
 use crate::passes::IcfMode;
@@ -81,8 +82,74 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     // `-plugin` needs no check here: compiler drivers always pass it, and
     // an IR input is reported as Unimplemented (M6) when it is loaded.
     let prepared = super::script_layout::prepare(options)?;
+    check_supported(&prepared.options)?;
+    // The class and byte order are chosen once, here: everything below is
+    // generic over them, so the pipeline is monomorphized and never checks
+    // either at run time. Only the combinations some architecture uses are
+    // instantiated.
+    match input_kind(&prepared.options) {
+        ElfKind::Elf64Le => link_as::<Elf64Le>(&prepared, diagnostics),
+        ElfKind::Elf32Le => link_as::<Elf32Le>(&prepared, diagnostics),
+        kind @ (ElfKind::Elf64Be | ElfKind::Elf32Be) => Err(Error::Unimplemented(format!(
+            "big-endian ELF output ({kind:?}) needs a big-endian architecture (M4)"
+        ))),
+    }
+}
+
+/// The ELF class and byte order of the link: the emulation's (`-m`) when one
+/// was given, else the first ELF input's named on the command line (an
+/// object, or the first object member of an archive), else 64-bit
+/// little-endian.
+fn input_kind(options: &LinkOptions) -> ElfKind {
+    if let Some(arch) = options.target.and_then(super::arch::Arch::from_target) {
+        return arch.kind();
+    }
+    options
+        .inputs
+        .iter()
+        .find_map(|input| match &input.kind {
+            crate::args::InputKind::File(path) => sniff_file(path),
+            crate::args::InputKind::Bytes { data, .. } => sniff_bytes(data),
+            _ => None,
+        })
+        .unwrap_or(ElfKind::Elf64Le)
+}
+
+/// The ELF kind of `data`: an ELF file's, or its first ELF member's if it is
+/// an archive.
+fn sniff_bytes(data: &[u8]) -> Option<ElfKind> {
+    if let Some(kind) = ElfKind::identify(data) {
+        return Some(kind);
+    }
+    let archive = crate::input::archive::Archive::parse(std::path::Path::new(""), data).ok()?;
+    archive
+        .members()
+        .filter_map(core::result::Result::ok)
+        .find_map(|member| member.bytes().and_then(ElfKind::identify))
+}
+
+/// [`sniff_bytes`] for a file on disk, reading as little of it as it can.
+fn sniff_file(path: &std::path::Path) -> Option<ElfKind> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 8];
+    file.read_exact(&mut head).ok()?;
+    if let Some(kind) = ElfKind::identify(&head) {
+        return Some(kind);
+    }
+    if &head != b"!<arch>\n" {
+        return None;
+    }
+    // An archive: map it through the input layer's reader.
+    let data = std::fs::read(path).ok()?;
+    sniff_bytes(&data)
+}
+
+fn link_as<F: crate::elf::read::ElfFormat>(
+    prepared: &super::script_layout::Prepared,
+    diagnostics: &dyn DiagnosticSink,
+) -> Result<()> {
     let options = &prepared.options;
-    check_supported(options)?;
     let timing = options.timing.as_ref();
     let start = Instant::now();
     let lap = |what: &str| {
@@ -126,9 +193,10 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     };
     let mut inputs = if own_pools {
         let threads = available_threads().min(INPUT_THREADS);
-        thread_pool(threads)?.install(|| inputs::collect(options, &table, &internal, config))?
+        thread_pool(threads)?
+            .install(|| inputs::collect::<F>(options, &table, &internal, config))?
     } else {
-        narrow.run(|| inputs::collect(options, &table, &internal, config))?
+        narrow.run(|| inputs::collect::<F>(options, &table, &internal, config))?
     };
     lap("inputs");
     // x86-64 relocatable output follows GNU ld's built-in `-r` layout.
@@ -139,7 +207,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     }
     options.check_cancelled()?;
 
-    let threads = input_sized_threads(options, &table, own_pools);
+    let threads = input_sized_threads::<F>(options, &table, own_pools);
     if own_pools
         && threads == Some(MAX_DEFAULT_THREADS)
         && available_threads() > MAX_DEFAULT_THREADS
@@ -296,7 +364,11 @@ const MAX_DEFAULT_THREADS: usize = 16;
 /// Small links are dominated by the fixed cost of spreading tiny tasks over
 /// many threads (a static "hello world" takes 10 ms on one thread and 28 ms
 /// on 64). The output does not depend on the thread count.
-fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool) -> Option<usize> {
+fn input_sized_threads<F: crate::elf::read::ElfFormat>(
+    options: &LinkOptions,
+    table: &FileTable,
+    own_pools: bool,
+) -> Option<usize> {
     if options.threads.is_some() {
         return None;
     }
@@ -312,7 +384,7 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
     let most = BYTES_PER_THREAD.saturating_mul(MAX_DEFAULT_THREADS as u64);
     if bytes < most {
         for (_, file) in top_level() {
-            bytes = bytes.saturating_add(compressed_growth(file));
+            bytes = bytes.saturating_add(compressed_growth::<F>(file));
             if bytes >= most {
                 break;
             }
@@ -327,13 +399,13 @@ fn input_sized_threads(options: &LinkOptions, table: &FileTable, own_pools: bool
 /// How many bytes the compressed sections of a relocatable ELF input grow
 /// by when inflated (0 for anything else, and for malformed files, which
 /// parsing reports later).
-fn compressed_growth(file: &crate::input::InputFile) -> u64 {
-    use crate::elf::read::{Elf64Le, ObjectFile, Source};
+fn compressed_growth<F: crate::elf::read::ElfFormat>(file: &crate::input::InputFile) -> u64 {
+    use crate::elf::read::{ObjectFile, Source};
     use crate::input::FileFormat;
     if !matches!(file.format(), FileFormat::Elf(ident) if ident.is_relocatable()) {
         return 0;
     }
-    let Ok(object) = ObjectFile::<Elf64Le>::parse(file.data(), Source::new(file.path())) else {
+    let Ok(object) = ObjectFile::<F>::parse(file.data(), Source::new(file.path())) else {
         return 0;
     };
     object
@@ -350,10 +422,10 @@ fn compressed_growth(file: &crate::input::InputFile) -> u64 {
 
 /// Everything after input collection, run in the link's thread pool.
 #[allow(clippy::too_many_lines)]
-fn link_inputs<'a>(
+fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     options: &LinkOptions,
     diagnostics: &'a dyn DiagnosticSink,
-    inputs: &mut inputs::Inputs<'a>,
+    inputs: &mut inputs::Inputs<'a, F>,
     internal: &InternalNames,
     script: Option<&'a super::script_layout::LayoutScript>,
     lap: &(dyn Fn(&str) + Sync),
@@ -990,10 +1062,10 @@ fn link_inputs<'a>(
 /// The rest of a relocatable (`-r`) link: `--gc-sections` when asked (GNU
 /// ld requires `-e` or `-u` roots for it), then [`relocatable::write`].
 #[allow(clippy::too_many_arguments)]
-fn link_relocatable<'a>(
+fn link_relocatable<'a, F: crate::elf::read::ElfFormat>(
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
-    files: &[inputs::ElfInput<'a>],
+    files: &[inputs::ElfInput<'a, F>],
     symbols: &SymbolTable<'a>,
     resolution: &crate::symbols::Resolution<'a>,
     mut sections: Sections,
@@ -1082,8 +1154,8 @@ fn link_relocatable<'a>(
 }
 
 /// Whether each placement output receives a non-empty live input section.
-fn nonempty_outputs(
-    files: &[super::inputs::ElfInput<'_>],
+fn nonempty_outputs<F: crate::elf::read::ElfFormat>(
+    files: &[super::inputs::ElfInput<'_, F>],
     sections: &Sections,
     placement: &place::Placement<'_>,
 ) -> Vec<bool> {
@@ -1136,8 +1208,8 @@ fn symbol_display(name: SymbolName<'_>, demangle: bool) -> String {
 
 /// Library and near-miss hints ([`crate::hints`]) for each group of
 /// undefined references. Runs only when a link has undefined symbols.
-fn undefined_hints(
-    refs: &Refs<'_, '_>,
+fn undefined_hints<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     groups: &[&[UndefinedRef]],
     options: &LinkOptions,
     needed: &dso::Needed,
@@ -1187,8 +1259,8 @@ fn undefined_hints(
 }
 
 /// Reports undefined symbols, lld-style. Returns the number of errors.
-fn report_undefined(
-    refs: &Refs<'_, '_>,
+fn report_undefined<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     scan: &scan::ScanResult,
     options: &LinkOptions,
     mode: Mode,
@@ -1313,8 +1385,8 @@ fn report_undefined(
 
 /// Emits the messages of `.gnu.warning.SYM` sections whose symbol is
 /// referenced (and of plain `.gnu.warning` sections), as GNU ld does.
-fn report_gnu_warnings(
-    files: &[super::inputs::ElfInput<'_>],
+fn report_gnu_warnings<F: crate::elf::read::ElfFormat>(
+    files: &[super::inputs::ElfInput<'_, F>],
     symbols: &SymbolTable<'_>,
     diagnostics: &dyn DiagnosticSink,
 ) {
@@ -1348,8 +1420,8 @@ fn report_gnu_warnings(
     }
 }
 
-fn entry_address(
-    addresses: &Addresses<'_, '_>,
+fn entry_address<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
     options: &LinkOptions,
     mode: Mode,
     diagnostics: &dyn DiagnosticSink,

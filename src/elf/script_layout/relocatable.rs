@@ -149,9 +149,9 @@ impl RelocatableScript<'_> {
 /// places them; only their position matters here (they start at address 0
 /// and move the next section's start), as the relocatable writer groups
 /// and orders them itself.
-pub fn place<'a>(
+pub fn place<'a, F: crate::elf::read::ElfFormat>(
     script: &'a LayoutScript,
-    files: &[ElfInput<'a>],
+    files: &[ElfInput<'a, F>],
     sections: &mut Sections,
     options: &LinkOptions,
 ) -> Placement<'a> {
@@ -172,9 +172,9 @@ enum Handle {
 }
 
 /// Expression state for one pass.
-struct Context<'c, 'a> {
+struct Context<'c, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     script: &'c LayoutScript,
-    files: &'c [ElfInput<'a>],
+    files: &'c [ElfInput<'a, F>],
     sections: &'c Sections,
     symbols: &'c SymbolTable<'a>,
     options: &'c LinkOptions,
@@ -197,7 +197,7 @@ struct Context<'c, 'a> {
     errors: Vec<String>,
 }
 
-impl Context<'_, '_> {
+impl<F: crate::elf::read::ElfFormat> Context<'_, '_, F> {
     fn output_named(&self, name: &[u8]) -> Option<u32> {
         self.script.statements.iter().find_map(|s| match s {
             Statement::Output(i) => {
@@ -238,7 +238,7 @@ impl Context<'_, '_> {
     }
 }
 
-impl EvalContext for Context<'_, '_> {
+impl<F: crate::elf::read::ElfFormat> EvalContext for Context<'_, '_, F> {
     type Section = Handle;
 
     fn section_vma(&self, section: Handle) -> u64 {
@@ -370,10 +370,10 @@ fn applied_symbols(
 /// Undefined symbols in expressions, failed `ASSERT`s, and values that do
 /// not settle.
 #[allow(clippy::too_many_lines)]
-pub fn layout<'a>(
+pub fn layout<'a, F: crate::elf::read::ElfFormat>(
     script: &'a LayoutScript,
     placement: &Placement<'a>,
-    files: &[ElfInput<'a>],
+    files: &[ElfInput<'a, F>],
     sections: &Sections,
     symbols: &SymbolTable<'a>,
     options: &LinkOptions,
@@ -857,8 +857,8 @@ fn copied_type(script: &LayoutScript, name: &[u8], symbols: &SymbolTable<'_>) ->
 }
 
 /// Evaluates a symbol or `.` assignment.
-fn assign(
-    ctx: &mut Context<'_, '_>,
+fn assign<F: crate::elf::read::ElfFormat>(
+    ctx: &mut Context<'_, '_, F>,
     assignment: &crate::script::Assignment,
     wanted: &dyn Fn(&[u8]) -> bool,
 ) {
@@ -895,23 +895,23 @@ struct Laid {
 
 /// Lays out the items of output statement `output` (script output `out`),
 /// whose members by description are `list`.
-fn lay_out_output(
-    ctx: &mut Context<'_, '_>,
+fn lay_out_output<F: crate::elf::read::ElfFormat>(
+    ctx: &mut Context<'_, '_, F>,
     output: &OutputStmt,
     (out, vma, attr_align, subalign): (u32, u64, u64, Option<u64>),
     list: &[(u16, SectionId)],
-    files: &[ElfInput<'_>],
+    files: &[ElfInput<'_, F>],
     sections: &Sections,
     wanted: &dyn Fn(&[u8]) -> bool,
 ) -> Laid {
-    let abs = |ctx: &mut Context<'_, '_>, expr: &crate::script::Expr| match eval(expr, ctx) {
+    let abs = |ctx: &mut Context<'_, '_, F>, expr: &crate::script::Expr| match eval(expr, ctx) {
         Ok(value) => Some(value.resolve(ctx)),
         Err(error) => {
             ctx.errors.push(error.to_string());
             None
         }
     };
-    let fill_of = |ctx: &mut Context<'_, '_>, fill: &Fill| match fill_pattern(fill, ctx) {
+    let fill_of = |ctx: &mut Context<'_, '_, F>, fill: &Fill| match fill_pattern(fill, ctx) {
         Ok(pattern) => Some(pattern),
         Err(error) => {
             ctx.errors.push(error.to_string());

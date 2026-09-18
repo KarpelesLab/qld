@@ -225,8 +225,8 @@ pub fn read_symbol_ordering_file(
 /// Returns [`Error::Option`] when both ordering files are given or the
 /// call graph file does not parse, I/O errors for unreadable files, and
 /// [`Error::Malformed`] for broken call graph profile sections.
-pub fn for_link(
-    refs: &Refs<'_, '_>,
+pub fn for_link<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     placement: &Placement<'_>,
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
@@ -329,7 +329,11 @@ enum Located {
 }
 
 /// Where global symbol `id` leads.
-fn locate_global(refs: &Refs<'_, '_>, id: SymbolId, ignore_undefined: bool) -> Located {
+fn locate_global<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    id: SymbolId,
+    ignore_undefined: bool,
+) -> Located {
     let definition = refs.symbols.definition(id);
     let file = || {
         refs.files
@@ -374,7 +378,11 @@ fn locate_global(refs: &Refs<'_, '_>, id: SymbolId, ignore_undefined: bool) -> L
 }
 
 /// Where local symbol `index` of `file` leads.
-fn locate_local(refs: &Refs<'_, '_>, file: usize, index: usize) -> Located {
+fn locate_local<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    index: usize,
+) -> Located {
     let Some(object) = refs.files.get(file).and_then(|f| f.object.as_ref()) else {
         return Located::Nothing;
     };
@@ -410,8 +418,8 @@ fn locate_local(refs: &Refs<'_, '_>, file: usize, index: usize) -> Located {
 
 /// Why symbol `index` of `file` cannot be ordered, as `(file to name,
 /// what)`, or `None` if it can.
-fn unorderable(
-    refs: &Refs<'_, '_>,
+fn unorderable<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     file: usize,
     index: usize,
     ignore_undefined: bool,
@@ -433,8 +441,8 @@ fn unorderable(
 /// be ordered.
 ///
 /// Call it once sections are final (after `--gc-sections` and ICF).
-pub fn symbol_order(
-    refs: &Refs<'_, '_>,
+pub fn symbol_order<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     names: &[Vec<u8>],
     before: usize,
     order: &mut SectionOrder,
@@ -546,7 +554,10 @@ pub fn symbol_order(
 
 /// The first live file (in input order) whose global symbols include an
 /// undefined `name`, for diagnostics.
-fn first_reference(refs: &Refs<'_, '_>, name: &[u8]) -> Option<String> {
+fn first_reference<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    name: &[u8],
+) -> Option<String> {
     refs.files.iter().enumerate().find_map(|(file, input)| {
         let object = input.object.as_ref()?;
         if !refs.resolution.is_live(crate::ids::FileId::new(file)) {
