@@ -446,7 +446,8 @@ impl Arch {
     }
 
     /// The architecture of a link: the emulation (`-m`) when one was given,
-    /// otherwise the first relocatable object's machine.
+    /// otherwise the first relocatable object's machine, otherwise the
+    /// default target's ([`crate::elf::target::default_target`]).
     #[must_use]
     pub fn of<F: crate::elf::read::ElfFormat>(
         options: &LinkOptions,
@@ -456,6 +457,7 @@ impl Arch {
             .target
             .and_then(Self::from_target)
             .or_else(|| Self::of_files(files))
+            .or_else(|| Self::from_target(crate::elf::target::default_target()))
             .unwrap_or_default()
     }
 

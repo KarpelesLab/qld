@@ -13,6 +13,7 @@
 //! | [`read`] | Zero-copy parsing of objects and shared objects (W7) |
 //! | [`link`](mod@link) | The driver: sequences the stages below |
 //! | [`inputs`] | 2–3: `-l` search, archives with lazy members, shared objects, input scripts, target inference |
+//! | [`target`](mod@target) | The target without `-m`: from the first ELF, GCC LTO or bitcode input, else the host |
 //! | [`object`] | 4: per-object symbols for resolution, section classes, merge splitting, COMDAT groups, notes |
 //! | [`dso`] | 4–5: shared object symbols, `DT_NEEDED` and `--as-needed`, undefined symbols of shared libraries |
 //! | [`resolve`] | 5: ELF precedence rules, COMDAT group claims during resolution rounds, duplicate symbol diagnostics |
@@ -100,6 +101,7 @@ pub mod sections;
 pub mod separate_debug;
 pub mod symtab;
 pub mod synth;
+pub mod target;
 pub mod values;
 pub mod write;
 pub mod xref;

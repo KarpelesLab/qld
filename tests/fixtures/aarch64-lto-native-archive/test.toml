@@ -1,0 +1,19 @@
+# M6/M4 regression: the first input is GCC LTO IR, and the objects the
+# plugin generates are linked with native archives (libnative.a, and the
+# libgcc.a GCC's plugin passes through), all AArch64. qld once checked the
+# libraries added after LTO against a hard-coded x86-64 target, and every
+# GCC LTO link for another architecture failed.
+description = "gcc -flto first, then a native archive, for AArch64"
+compile = [
+  "cc -O2 -flto -c main.c",
+  "cc -O2 -c native.c",
+  "ar rcs libnative.a native.o",
+]
+driver = "cc"
+link = "-O2 -flto -o out main.o -L. -lnative"
+run = "./out"
+expect.stdout = "scaled=42\n"
+expect.readelf = ["AArch64", "!__gnu_lto_slim"]
+targets = ["aarch64-linux-gnu"]
+determinism = true
+timeout = 120
