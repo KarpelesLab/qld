@@ -257,7 +257,9 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             packable: 0,
         };
         let mut skip = false;
-        for rel in relas.iter() {
+        let mut relas = relas.iter().peekable();
+        while let Some(rel) = relas.next() {
+            let rel = context.arch.annotate(rel, relas.peek());
             if skip {
                 // The call a TLS relaxation removed still counts as a use
                 // (GNU ld keeps `__tls_get_addr` in the dynamic symbols).
