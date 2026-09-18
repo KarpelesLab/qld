@@ -65,7 +65,7 @@ can work at the same time without colliding.
 | W25 | Mach-O linking (M8) | `src/macho/**`, the ld64 front end in `src/args/`, `tests/macho_link*` | W15 | merged |
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | merged |
 | W26 | Performance round 2 (M5) | `src/main.rs` (fork on exit, agreed), `--fork`/`--no-fork` in `src/args/`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**` (except `hash/sha256.rs`), `src/input/**`, `src/debug/**`, `benches/**`, `tests/projects/bench*` | W24 | in progress |
-| W27 | Mach-O follow-ups (M8) | `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs` (moved from `src/macho/`), `tests/macho_link*` | W25 | in progress |
+| W27 | Mach-O follow-ups (M8) | `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs` (moved from `src/macho/`), `tests/macho_link*` | W25 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
