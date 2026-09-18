@@ -148,7 +148,8 @@ impl DynamicPlan {
             ),
             (Synthetic::DynStr, len(&self.dynstr), 1),
             (Synthetic::GnuHash, len(&self.gnu_hash), 8),
-            (Synthetic::Hash, len(&self.sysv_hash), 4),
+            // GNU ld aligns the ELF64 `.hash` to 8.
+            (Synthetic::Hash, len(&self.sysv_hash), 8),
             (
                 Synthetic::VerSym,
                 u64::try_from(self.versym.len())
@@ -609,8 +610,7 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
     let sysv = options.hash_style != HashStyle::Gnu;
     let hashed_count = exports.len();
     let nbuckets = if gnu {
-        u32::try_from((hashed_count / 4).max(1))
-            .map_err(|_| Error::Limit("too many dynamic symbols".into()))?
+        bucket_count(hashed_count, true)
     } else {
         1
     };
@@ -954,10 +954,28 @@ fn build_gnu_hash(hashed: &[(u32, &[u8])], nbuckets: u32, symoffset: usize) -> R
     Ok(data)
 }
 
+/// GNU ld's bucket count for `.hash` and `.gnu.hash` (`compute_bucket_count`
+/// without `-O`): the largest size of a fixed prime table below which the
+/// symbol count stays, at least 2 for `.gnu.hash`.
+fn bucket_count(symbols: usize, gnu: bool) -> u32 {
+    const SIZES: [u32; 16] = [
+        1, 3, 17, 37, 67, 97, 131, 197, 263, 521, 1031, 2053, 4099, 8209, 16411, 32771,
+    ];
+    let mut best = 1;
+    for (index, &size) in SIZES.iter().enumerate() {
+        best = size;
+        match SIZES.get(index.saturating_add(1)) {
+            Some(&next) if (next as usize) <= symbols => {}
+            _ => break,
+        }
+    }
+    if gnu { best.max(2) } else { best }
+}
+
 fn build_sysv_hash(names: &[&[u8]]) -> Result<Vec<u8>> {
     let too_big = || Error::Limit("hash table too large".into());
     let nchain = u32::try_from(names.len().saturating_add(1)).map_err(|_| too_big())?;
-    let nbucket = nchain.max(1);
+    let nbucket = bucket_count(names.len(), false);
     let mut buckets = vec![0u32; nbucket as usize];
     let mut chains = vec![0u32; nchain as usize];
     for (position, name) in names.iter().enumerate() {

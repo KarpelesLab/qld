@@ -174,6 +174,8 @@ enum OutKind {
     Group { file: u32, group: u32, symbol: u32 },
     /// The merged `.note.gnu.property`.
     Property,
+    /// `.note.gnu.build-id` (`--build-id`).
+    BuildId,
 }
 
 /// How input sections map to output sections.
@@ -639,10 +641,29 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         }
     }
 
+    // `--build-id`: GNU ld creates the note in the first input object, so
+    // under a script it follows that object's orphans; its default `-r`
+    // script puts it first.
+    let build_id = crate::elf::synth::plan_build_id(input.options);
+    let make_build_id = |size: u64| {
+        let mut note = OutSection::new(b".note.gnu.build-id", OutKind::BuildId, SHT_NOTE);
+        note.flags = SHF_ALLOC;
+        note.align = 4;
+        note.size = size.saturating_add(16);
+        note
+    };
+    let mut build_id_pending = build_id;
+    if input.script.is_none()
+        && let Some(size) = build_id_pending.take()
+    {
+        outs.push(make_build_id(size));
+    }
+
     // Content sections, in order of first appearance.
     let mut keys: HashMap<Key<'a>, u32, foldhash::fast::FixedState> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x0072_656c_6f63));
     let mut property_out = None;
+    let mut first_object = true;
     for (file_index, file) in files.iter().enumerate() {
         let Some(object) = &file.object else {
             continue;
@@ -650,6 +671,10 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         if slot(&sections.base, file_index) == NONE {
             continue;
         }
+        if !first_object && let Some(size) = build_id_pending.take() {
+            outs.push(make_build_id(size));
+        }
+        first_object = false;
         let file_u32 = index_u32(file_index)?;
         for (index, section) in object.sections.iter().enumerate() {
             let index = index_u32(index)?;
@@ -726,6 +751,9 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             }
         }
     }
+    if let Some(size) = build_id_pending.take() {
+        outs.push(make_build_id(size));
+    }
     let mut property = property;
     if property.is_some() && property_out.is_none() {
         let mut note = OutSection::new(b".note.gnu.property", OutKind::Property, SHT_NOTE);
@@ -778,6 +806,28 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
                     .is_some_and(|s| s.header.sh_flags & SHF_LINK_ORDER != 0)
             })
     };
+    // The addresses GNU ld gives script outputs while it runs the script;
+    // link-order sections sort by them.
+    let addresses: Vec<u64> = {
+        let mut addresses = vec![0u64; sections.len()];
+        for out in &outs {
+            let Some(vma) = out
+                .script
+                .and_then(|i| input.script?.outputs.get(i as usize))
+                .map(|o| o.vma)
+            else {
+                continue;
+            };
+            for member in &out.members {
+                if let Some(id) = sections.id(member.file as usize, member.section)
+                    && let Some(slot) = addresses.get_mut(id.index())
+                {
+                    *slot = vma;
+                }
+            }
+        }
+        addresses
+    };
     let order: Vec<usize> = (0..outs.len())
         .filter(|&i| outs.get(i).is_some_and(|o| !link_order(o)))
         .chain((0..outs.len()).filter(|&i| outs.get(i).is_some_and(link_order)))
@@ -791,7 +841,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         }
         let keep_offsets = out.script.is_some() && !link_order(out);
         if link_order(out) {
-            sort_link_order(files, sections, &offsets, &mut out.members);
+            sort_link_order(files, sections, &offsets, &addresses, &mut out.members);
         }
         let (merge_flags, merge_entsize, mixed) = out.merge;
         if !mixed {
@@ -1083,13 +1133,14 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
 }
 
 /// Orders the members of a link-order output section as GNU ld's
-/// `compare_link_order` does: by the output offset of the sections they
-/// link to (every output section of a relocatable link is at address 0),
-/// then by that section's size and input order.
+/// `compare_link_order` does in relocatable links: by the address of the
+/// sections they link to (their output section's address while GNU ld runs
+/// the script, 0 for others, plus their offset), then in input order.
 fn sort_link_order(
     files: &[ElfInput<'_>],
     sections: &Sections,
     offsets: &[u64],
+    addresses: &[u64],
     members: &mut [Member],
 ) {
     members.sort_by_cached_key(|member| {
@@ -1099,13 +1150,12 @@ fn sort_link_order(
             .and_then(|o| {
                 let link = o.section(member.section)?.header.sh_link;
                 let id = sections.id(member.file as usize, link)?;
-                Some((
-                    slot(offsets, id.index()),
-                    o.section(link)?.header.sh_size,
-                    id.as_u32(),
-                ))
+                Some(slot(addresses, id.index()).wrapping_add(slot(offsets, id.index())))
             });
-        linked.unwrap_or((u64::MAX, u64::MAX, u32::MAX))
+        let id = sections
+            .id(member.file as usize, member.section)
+            .map_or(u32::MAX, |id| id.as_u32());
+        (linked.unwrap_or(u64::MAX), id)
     });
 }
 
@@ -1670,6 +1720,8 @@ enum Chunk {
     /// Padding between the members of an executable section: NOPs, as
     /// GNU ld pads code (disassemblers such as objtool decode through it).
     Nops,
+    /// The `.note.gnu.build-id` header; the hash is written last.
+    BuildId,
     /// Bytes a linker script's data commands put into an output section:
     /// the output section list index and the index of the data.
     ScriptData(u32, u32),
@@ -1691,6 +1743,9 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
             }
             OutKind::Property => {
                 chunks.push((ChunkRange::new(out.offset, out.size), Chunk::Property));
+            }
+            OutKind::BuildId => {
+                chunks.push((ChunkRange::new(out.offset, out.size), Chunk::BuildId));
             }
             OutKind::Content => {
                 let script = out
@@ -1799,12 +1854,23 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
         ..OutputOptions::for_link(input.options)
     };
     let mut file = OutputFile::create(&path, plan.file_size, &options)?;
+    let build_id = plan
+        .outs
+        .iter()
+        .find(|o| o.kind == OutKind::BuildId)
+        .map(|o| o.offset.saturating_add(16));
+    if let Some(offset) = build_id {
+        file.reserve_build_id(&input.options.build_id, offset);
+    }
     file.write_chunks(&ranges, |index, out| {
         let Some(&(_, chunk)) = chunks.get(index) else {
             return Err(Error::Internal("chunk index out of range".into()));
         };
         write_chunk(input, plan, chunk, out)
     })?;
+    if let Some(offset) = build_id {
+        file.apply_build_id(&input.options.build_id, offset)?;
+    }
     file.finish()?;
     Ok(())
 }
@@ -1865,6 +1931,13 @@ fn write_chunk<'a>(
         }
         Chunk::Nops => {
             plan.arch.write_nops(out);
+            Ok(())
+        }
+        Chunk::BuildId => {
+            crate::elf::synth::write_build_id_header(
+                out,
+                u64::try_from(out.len()).unwrap_or(0).saturating_sub(16),
+            );
             Ok(())
         }
         Chunk::ScriptData(out_index, data) => {
@@ -2171,8 +2244,10 @@ fn write_rela<'a>(
         kept: &plan.kept,
         script_outs: &plan.script_outs,
     };
-    let mut entries = out.as_chunks_mut::<24>().0.iter_mut();
-    let mut written = 0u64;
+    // GNU ld sorts each output relocation section by offset, keeping the
+    // order of equal offsets (`elf_link_adjust_relocs`); members do not
+    // overlap, so sorting each member's relocations is enough.
+    let mut sorted: Vec<(u64, u64, i64)> = Vec::with_capacity(relas.len());
     for rel in relas.iter() {
         let Rewritten::Keep {
             symbol,
@@ -2192,22 +2267,21 @@ fn write_rela<'a>(
             Some(index) => (index, r_type, addend),
             None => (0, R_X86_64_NONE, 0),
         };
-        let Some(entry) = entries.next() else {
-            return Err(Error::Internal(
-                "relocatable output: more relocations than planned".into(),
-            ));
-        };
         let offset = rel.offset.wrapping_add(member.offset);
         let info = (u64::from(index) << 32) | u64::from(r_type);
-        entry[0..8].copy_from_slice(&offset.to_le_bytes());
-        entry[8..16].copy_from_slice(&info.to_le_bytes());
-        entry[16..24].copy_from_slice(&addend.to_le_bytes());
-        written = written.saturating_add(1);
+        sorted.push((offset, info, addend));
     }
-    if written != member.relocs {
+    sorted.sort_by_key(|&(offset, ..)| offset);
+    let entries = out.as_chunks_mut::<24>().0;
+    if sorted.len() as u64 != member.relocs || entries.len() < sorted.len() {
         return Err(Error::Internal(
             "relocatable output: relocation count changed after planning".into(),
         ));
+    }
+    for (entry, (offset, info, addend)) in entries.iter_mut().zip(sorted) {
+        entry[0..8].copy_from_slice(&offset.to_le_bytes());
+        entry[8..16].copy_from_slice(&info.to_le_bytes());
+        entry[16..24].copy_from_slice(&addend.to_le_bytes());
     }
     Ok(())
 }

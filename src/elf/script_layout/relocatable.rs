@@ -102,6 +102,9 @@ pub struct ScriptOutput<'a> {
     pub size: u64,
     /// Its alignment: the largest of its members' and its `ALIGN`.
     pub align: u64,
+    /// The address GNU ld gives it while running the script (relocatable
+    /// output keeps none; link-order sections sort by it).
+    pub vma: u64,
     /// The flags it has without input sections: `SHF_ALLOC` for data
     /// commands, `SHF_WRITE` for a section created by assignments alone
     /// (GNU ld's `init_os` with no flags).
@@ -769,6 +772,7 @@ pub fn layout<'a>(
                 output.data = data.get_mut(index).map(std::mem::take).unwrap_or_default();
                 output.fill = fills.get_mut(index).and_then(Option::take);
                 output.size = sizes.get(index).copied().unwrap_or(0);
+                output.vma = vmas.get(index).copied().unwrap_or(0);
                 output.align = aligns.get(index).copied().unwrap_or(1);
             }
             break;

@@ -270,10 +270,13 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
             // hidden symbol of a shared object output. (In a PIE it also
             // localizes the hidden functions that PLT32 relocations call,
             // which qld does not track: they stay global and hidden.)
-            let hidden = matches!(visibility, STV_HIDDEN | STV_INTERNAL)
-                && kind != DefinitionKind::Undefined
-                && kind != DefinitionKind::Lazy
-                && (shared || matches!(refs.global_target(id, true).def, Def::Linker(_)));
+            // Symbols a version script's `local:` or `--exclude-libs` hides
+            // are local too.
+            let defined = kind != DefinitionKind::Undefined && kind != DefinitionKind::Lazy;
+            let hidden = defined
+                && ((matches!(visibility, STV_HIDDEN | STV_INTERNAL)
+                    && (shared || matches!(refs.global_target(id, true).def, Def::Linker(_))))
+                    || symbols.flags(id).contains(super::export::FORCED_LOCAL));
             if hidden && discard == DiscardMode::All {
                 return None;
             }

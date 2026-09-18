@@ -1330,6 +1330,78 @@ fn for_each_expr(script: &LayoutScript, placed: &ScriptPlacement, f: &mut dyn Fn
     }
 }
 
+/// GNU ld's `ldlang_nearby_section`: the output section (by position) a
+/// symbol defined in output `removed`, which is not output (empty and not
+/// kept), moves to: the kept neighbour that would share its segment,
+/// looking in the same memory region first.
+fn nearby_section(
+    engine: &Engine<'_, '_, '_>,
+    output_places: &[(u64, u64, u32)],
+    sections: &[OutSection<'_>],
+    removed: u32,
+    address: u64,
+) -> Option<u32> {
+    let statements = &engine.placed.statements;
+    let at = statements
+        .iter()
+        .position(|s| matches!(s, Statement::Output(i) if *i == removed))?;
+    let region_of = |output: u32| engine.outs.get(output as usize).and_then(|o| o.region);
+    let region = region_of(removed);
+    let kept = |statement: &Statement, same_region: bool| match statement {
+        Statement::Output(i) => {
+            let position = output_places.get(*i as usize).map(|p| p.2)?;
+            (position != NONE && (!same_region || region_of(*i) == region)).then_some(position)
+        }
+        _ => None,
+    };
+    // GNU section flags of an emitted section, and of the removed one
+    // (which never got SEC_LOAD).
+    let flags = |position: u32| {
+        sections
+            .get(position as usize)
+            .map_or(0, |s| gnu_flags(s.flags, s.sh_type, s.name))
+    };
+    let removed_flags = engine
+        .outs
+        .get(removed as usize)
+        .map_or(0, |o| o.input_flags & !sec::LOAD);
+    for same_region in [true, false] {
+        let prev = statements
+            .get(..at)?
+            .iter()
+            .rev()
+            .find_map(|s| kept(s, same_region));
+        let next = statements
+            .get(at.saturating_add(1)..)?
+            .iter()
+            .find_map(|s| kept(s, same_region));
+        let best = match (prev, next) {
+            (None, next) => next,
+            (Some(prev), None) => Some(prev),
+            (Some(prev), Some(next)) => {
+                let (pf, nf) = (flags(prev), flags(next));
+                let use_prev = if (pf ^ nf) & (sec::ALLOC | sec::THREAD_LOCAL | sec::LOAD) != 0 {
+                    (nf ^ removed_flags) & (sec::ALLOC | sec::THREAD_LOCAL) != 0
+                        || (pf & sec::LOAD != 0 && nf & sec::LOAD == 0)
+                } else if (pf ^ nf) & sec::READONLY != 0 {
+                    (nf ^ removed_flags) & sec::READONLY != 0
+                } else if (pf ^ nf) & sec::CODE != 0 {
+                    (nf ^ removed_flags) & sec::CODE != 0
+                } else {
+                    sections
+                        .get(next as usize)
+                        .is_some_and(|s| address < s.addr)
+                };
+                Some(if use_prev { prev } else { next })
+            }
+        };
+        if best.is_some() {
+            return best;
+        }
+    }
+    None
+}
+
 /// How the members matched by one description are ordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SortRule {
@@ -2640,7 +2712,16 @@ fn assemble<'a>(engine: Engine<'_, '_, 'a>, relro: Option<(u64, u64)>) -> Result
                     ValueSection::Relative(output) => output_places
                         .get(output as usize)
                         .map(|p| p.2)
-                        .filter(|&p| p != NONE),
+                        .filter(|&p| p != NONE)
+                        .or_else(|| {
+                            nearby_section(
+                                &engine,
+                                &output_places,
+                                &out_sections,
+                                output,
+                                value.resolve(&engine),
+                            )
+                        }),
                     _ => None,
                 },
             },
