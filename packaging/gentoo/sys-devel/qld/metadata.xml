@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<!-- maintainer-needed: fill in for an overlay or ::gentoo submission -->
+	<use>
+		<flag name="plugin">Support LTO through the GCC/LLVM linker plugin API (loads the compiler's plugin with dlopen)</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">KarpelesLab/qld</remote-id>
+	</upstream>
+</pkgmetadata>
