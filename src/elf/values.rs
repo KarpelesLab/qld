@@ -230,7 +230,11 @@ impl<'x, 'a> Addresses<'x, 'a> {
         if !refs.sections.is_live(id) {
             // Folded by ICF: the kept section has the same contents.
             let kept = refs.sections.resolve(id)?;
-            let offset = self.layout.relax.map(kept, offset);
+            let offset = if self.layout.relax.is_empty() {
+                offset
+            } else {
+                self.relaxed_offset(kept, offset)
+            };
             return Some(self.section_address(kept)?.wrapping_add(offset));
         }
         let kind = *refs.sections.kind.get(id.index())?;
@@ -274,17 +278,51 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 Some(start)
             }
             // Linker relaxation (RISC-V) moves offsets in code sections.
-            _ => Some(
+            _ if !self.layout.relax.is_empty() => Some(
                 self.section_address(id)?
-                    .wrapping_add(self.layout.relax.map(id, offset)),
+                    .wrapping_add(self.relaxed_offset(id, offset)),
             ),
+            _ => Some(self.section_address(id)?.wrapping_add(offset)),
         }
+    }
+
+    /// Offset `offset` of section `id` after linker relaxation: out of line,
+    /// so that links without relaxation pay only the emptiness check.
+    #[cold]
+    #[inline(never)]
+    fn relaxed_offset(&self, id: SectionId, offset: u64) -> u64 {
+        self.layout.relax.map(id, offset)
+    }
+
+    /// `S` of a section symbol plus `addend` pointing into code that linker
+    /// relaxation shrank (RISC-V): the offset moves with the code, as it
+    /// does for a label. `None` when that is not the case, and
+    /// [`Self::symbol_address`] applies. (lld leaves such offsets alone;
+    /// assemblers reference local labels instead.)
+    #[must_use]
+    pub fn relaxed_section_symbol(&self, target: &Target, addend: i64) -> Option<(u64, i64)> {
+        let Def::Section {
+            file,
+            section,
+            value,
+        } = target.def
+        else {
+            return None;
+        };
+        if self.layout.relax.is_empty() || !target.is_section_symbol() {
+            return None;
+        }
+        let id = self.refs.sections.id(file, section)?;
+        let relax = self.layout.relax.section(id)?;
+        let offset = value.checked_add_signed(addend)?;
+        Some((self.section_address(id)?.wrapping_add(relax.map(offset)), 0))
     }
 
     /// The size of a symbol at `value` with size `size` in section
     /// `section` of `file`: smaller than `size` when linker relaxation
     /// deleted bytes inside it.
     #[must_use]
+    #[inline]
     pub fn symbol_size(&self, file: usize, section: u32, value: u64, size: u64) -> u64 {
         if self.layout.relax.is_empty() {
             return size;
@@ -327,17 +365,6 @@ impl<'x, 'a> Addresses<'x, 'a> {
                 if merge && target.is_section_symbol() {
                     let offset = value.checked_add_signed(addend)?;
                     return Some((self.section_offset_address(file, section, offset)?, 0));
-                }
-                // A section symbol plus an offset into code that linker
-                // relaxation shrank (RISC-V): the offset moves too.
-                if target.is_section_symbol()
-                    && !self.layout.relax.is_empty()
-                    && let Some(id) = self.refs.sections.id(file, section)
-                    && let Some(relax) = self.layout.relax.section(id)
-                    && let Some(offset) = value.checked_add_signed(addend)
-                {
-                    let base = self.section_address(id)?;
-                    return Some((base.wrapping_add(relax.map(offset)), 0));
                 }
                 if let Some(global) = target.global {
                     if !self.refs.sections.is_present_in(file, section) {

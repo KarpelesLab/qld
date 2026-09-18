@@ -318,6 +318,7 @@ impl Field {
     /// target is misaligned), [`FieldError::OutOfBounds`] when `data` is
     /// too short.
     #[allow(clippy::too_many_lines)]
+    #[inline(never)]
     pub fn apply(self, data: &mut [u8], value: u64) -> Result<(), FieldError> {
         let signed = value as i64;
         let check = |bits: u32| {

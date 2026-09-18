@@ -1351,14 +1351,7 @@ pub fn write_value(
             let v = i8::try_from(signed).map_err(|_| ApplyError::Overflow)?;
             *slot::<1>(out, offset)? = [v as u8];
         }
-        Width::RiscV(field) => {
-            let start = usize::try_from(offset).map_err(|_| ApplyError::OutOfBounds)?;
-            let data = out.get_mut(start..).ok_or(ApplyError::OutOfBounds)?;
-            field.apply(data, value).map_err(|error| match error {
-                crate::arch::riscv::FieldError::Overflow => ApplyError::Overflow,
-                crate::arch::riscv::FieldError::OutOfBounds => ApplyError::OutOfBounds,
-            })?;
-        }
+        Width::RiscV(field) => riscv::write_field(out, offset, field, value)?,
         Width::Field(field) => {
             if field.bytes() == 2 {
                 let word = slot::<2>(out, offset)?;
