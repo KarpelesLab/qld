@@ -808,7 +808,7 @@ impl<'t> Walker<'_, 't> {
                             position: InputPosition::new(position, 0),
                             live: true,
                             hidden: false,
-                            mtime: file_mtime(file.path()),
+                            mtime: file_mtime(file.path(), self.options.zero_ar_date),
                         }));
                         Ok(())
                     }
@@ -954,7 +954,7 @@ impl<'t> Walker<'_, 't> {
                 position: InputPosition::new(position, ordinal),
                 live,
                 hidden,
-                mtime: if zero_mtime() { 0 } else { date },
+                mtime: if self.options.zero_ar_date { 0 } else { date },
             }));
         }
         Ok(())
@@ -1268,15 +1268,11 @@ pub fn is_implicitly_linked(install_name: &[u8]) -> bool {
     false
 }
 
-/// `ZERO_AR_DATE`: record zero modification times in the debug map, for
-/// reproducible outputs (ld64 and lld read it too).
-fn zero_mtime() -> bool {
-    std::env::var_os("ZERO_AR_DATE").is_some_and(|v| !v.is_empty() && v != "0")
-}
-
-/// The modification time of `path` in seconds, for the debug map.
-fn file_mtime(path: &Path) -> u64 {
-    if zero_mtime() {
+/// The modification time of `path` in seconds, for the debug map; 0 with
+/// [`LinkOptions::zero_ar_date`], which `ZERO_AR_DATE` in the environment
+/// sets for the `qld` binary (ld64 and lld read it too).
+fn file_mtime(path: &Path, zero: bool) -> u64 {
+    if zero {
         return 0;
     }
     std::fs::metadata(path)

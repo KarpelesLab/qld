@@ -367,6 +367,63 @@ fn a_large_caller_pool_is_used_as_it_is() {
     assert_eq!(provider.threads.load(Ordering::Relaxed), THREADS);
 }
 
+/// Nothing a link produces reaches the process's standard output on its
+/// own: `-M` goes where [`LinkOptions::map_output`] says, and a
+/// `LinkOptions` that never went through `use_process_defaults` names no
+/// destination at all.
+#[test]
+fn the_link_map_goes_to_a_caller_supplied_writer() {
+    use qld::args::TextOutput;
+
+    let mut options = in_memory_options(4);
+    options.print_map = true;
+    options.cref = true;
+    assert!(options.map_output.is_none(), "silent by default");
+    let map = Arc::new(std::sync::Mutex::new(String::new()));
+    let collected = Arc::clone(&map);
+    options.map_output = Some(TextOutput::new(move |text| {
+        collected.lock().unwrap().push_str(text);
+    }));
+    link_to_memory(&mut options).unwrap();
+    let text = map.lock().unwrap();
+    assert!(text.contains("VMA     Size Align Out"), "{text}");
+    assert!(text.contains("Cross Reference Table"), "{text}");
+    assert!(text.contains("main.o"), "{text}");
+}
+
+/// `use_process_defaults` is the only door to the environment and to the
+/// process's streams, and options that did not go through it have neither.
+#[test]
+fn process_defaults_are_opt_in() {
+    let hermetic = LinkOptions::new();
+    assert!(hermetic.map_output.is_none());
+    assert!(hermetic.timing.is_none());
+    assert!(hermetic.env_run_path.is_empty());
+    assert!(hermetic.env_library_path.is_empty());
+    assert!(!hermetic.zero_ar_date);
+    assert!(hermetic.output_backing.is_none());
+
+    let mut binary_like = LinkOptions::new();
+    binary_like.use_process_defaults();
+    assert!(binary_like.map_output.is_some());
+
+    // The GNU front end describes the link the `qld` binary runs, the
+    // hermetic one does not.
+    let argv = ["ld", "-o", "out", "a.o"];
+    let parsed = |outcome| match outcome {
+        Ok(qld::ParseOutcome::Link(options)) => options,
+        other => panic!("{other:?}"),
+    };
+    let hermetic = parsed(qld::parse_gnu_with(&argv, &|path: &Path| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("unexpected read of {}", path.display()),
+        ))
+    }));
+    assert!(hermetic.map_output.is_none());
+    assert!(parsed(qld::parse_gnu(&argv)).map_output.is_some());
+}
+
 #[test]
 fn output_buffers_and_tokens_compare_by_identity() {
     let buffer = OutputBuffer::new();

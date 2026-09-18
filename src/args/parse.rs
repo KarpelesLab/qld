@@ -42,6 +42,12 @@ pub enum ParseOutcome {
 /// such as `ld64.qld` (see [`select_flavor`]). Response files are read with
 /// [`std::fs::read`]; use [`parse_gnu_with`] to supply them another way.
 ///
+/// The options describe a link run the way the `qld` binary runs one:
+/// [`LinkOptions::use_process_defaults`] is applied, so the link map goes to
+/// standard output and `LD_LIBRARY_PATH` and the other variables GNU ld
+/// reads are taken from the environment. [`parse_gnu_with`] parses the same
+/// command line into a hermetic, silent link.
+///
 /// Warnings found while parsing, such as unknown `-z` keywords, are returned
 /// in [`LinkOptions::warnings`] for the caller to report.
 ///
@@ -51,7 +57,20 @@ pub enum ParseOutcome {
 /// [`Error::Io`] for an unreadable response file, and
 /// [`Error::Unimplemented`] for a flavor qld does not parse yet.
 pub fn parse_gnu<S: AsRef<OsStr>>(args: &[S]) -> Result<ParseOutcome> {
-    parse_gnu_with(args, &FsReader)
+    process_defaults(parse_gnu_with(args, &FsReader)?)
+}
+
+/// Applies [`LinkOptions::use_process_defaults`] to a parsed link, which is
+/// what makes [`parse_gnu`] and [`parse_darwin`] describe the binary's link
+/// rather than a hermetic one.
+fn process_defaults(outcome: ParseOutcome) -> Result<ParseOutcome> {
+    Ok(match outcome {
+        ParseOutcome::Link(mut options) => {
+            options.use_process_defaults();
+            ParseOutcome::Link(options)
+        }
+        other => other,
+    })
 }
 
 /// Like [`parse_gnu`], but reads `@response` files through `reader`.
@@ -86,14 +105,15 @@ pub fn parse_gnu_with<S: AsRef<OsStr>>(
 ///
 /// `args` includes `argv[0]` (and may start with `-flavor darwin`).
 /// Response files and `-filelist` files are read with [`std::fs::read`];
-/// see [`crate::args::darwin`] for the option table.
+/// see [`crate::args::darwin`] for the option table. As in [`parse_gnu`],
+/// the options carry [`LinkOptions::use_process_defaults`].
 ///
 /// # Errors
 ///
 /// Returns [`Error::Option`] for unknown, unsupported or malformed options
 /// and [`Error::Io`] for unreadable response files.
 pub fn parse_darwin<S: AsRef<OsStr>>(args: &[S]) -> Result<ParseOutcome> {
-    parse_darwin_with(args, &FsReader)
+    process_defaults(parse_darwin_with(args, &FsReader)?)
 }
 
 /// Like [`parse_darwin`], but reads `@response` and `-filelist` files through

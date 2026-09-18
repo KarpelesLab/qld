@@ -28,9 +28,9 @@ pub use darwin::DarwinArgs;
 pub use options::{
     BuildId, CancelToken, ColorChoice, DebugCompression, DiscardMode, DynamicFlags, ExecStack,
     Flavor, HashStyle, IcfMode, InputAttrs, InputFormat, InputKind, InputSpec, LinkOptions,
-    MagicMode, OrphanHandling, OutputBuffer, OutputCompleteHook, OutputFormat, OutputKind, PeArgs,
-    ReportLevel, SeparateCode, SortSection, StripMode, SymbolicMode, UnresolvedSymbols, Visibility,
-    X86Features,
+    MagicMode, OrphanHandling, OutputBacking, OutputBuffer, OutputCompleteHook, OutputFormat,
+    OutputKind, PeArgs, ReportLevel, SeparateCode, SortSection, StripMode, SymbolicMode,
+    TextOutput, UnresolvedSymbols, Visibility, X86Features,
 };
 pub use parse::{
     ParseOutcome, parse_darwin, parse_darwin_with, parse_gnu, parse_gnu_with, select_flavor, usage,

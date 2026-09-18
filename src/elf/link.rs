@@ -83,14 +83,14 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     let prepared = super::script_layout::prepare(options)?;
     let options = &prepared.options;
     check_supported(options)?;
-    let timing = std::env::var_os("QLD_TIMING").is_some();
+    let timing = options.timing.as_ref();
     let start = Instant::now();
     let lap = |what: &str| {
-        if timing {
-            eprintln!(
+        if let Some(timing) = timing {
+            timing.write_line(&format!(
                 "qld: {what}: {:.1} ms",
                 start.elapsed().as_secs_f64() * 1000.0
-            );
+            ));
         }
     };
 

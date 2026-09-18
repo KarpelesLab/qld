@@ -927,6 +927,121 @@ impl CancelToken {
     }
 }
 
+/// Receives text a link would otherwise print, set in
+/// [`LinkOptions::map_output`] and [`LinkOptions::timing`].
+///
+/// A link never writes to the process's standard output or standard error
+/// on its own: the two options above are the only text it produces outside
+/// its [`DiagnosticSink`](crate::DiagnosticSink), and both are `None` by
+/// default, which drops the text. [`LinkOptions::use_process_defaults`]
+/// sets them the way the `qld` binary does.
+///
+/// The callback may run on any thread, including a worker of the link's
+/// thread pool, and is called with whole lines or larger pieces.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+/// use qld::args::{LinkOptions, TextOutput};
+///
+/// let map = Arc::new(Mutex::new(String::new()));
+/// let collected = Arc::clone(&map);
+/// let mut options = LinkOptions::new();
+/// options.print_map = true;
+/// options.map_output = Some(TextOutput::new(move |text| {
+///     collected.lock().unwrap().push_str(text);
+/// }));
+/// ```
+#[derive(Clone)]
+pub struct TextOutput {
+    write: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    what: &'static str,
+}
+
+impl TextOutput {
+    /// Sends the text to `write`.
+    #[must_use]
+    pub fn new(write: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            write: std::sync::Arc::new(write),
+            what: "callback",
+        }
+    }
+
+    /// Sends the text to the process's standard output, as GNU ld does.
+    #[must_use]
+    pub fn stdout() -> Self {
+        Self {
+            write: std::sync::Arc::new(|text: &str| {
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(text.as_bytes());
+            }),
+            what: "stdout",
+        }
+    }
+
+    /// Sends the text to the process's standard error.
+    #[must_use]
+    pub fn stderr() -> Self {
+        Self {
+            write: std::sync::Arc::new(|text: &str| {
+                use std::io::Write as _;
+                let mut out = std::io::stderr().lock();
+                let _ = out.write_all(text.as_bytes());
+            }),
+            what: "stderr",
+        }
+    }
+
+    /// Writes `text`.
+    pub fn write(&self, text: &str) {
+        (self.write)(text);
+    }
+
+    /// Writes `text` followed by a newline.
+    pub fn write_line(&self, text: &str) {
+        (self.write)(&format!("{text}\n"));
+    }
+}
+
+impl std::fmt::Debug for TextOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TextOutput").field(&self.what).finish()
+    }
+}
+
+/// How the output image is held while the link writes it
+/// (`QLD_OUTPUT_BACKING`).
+///
+/// A benchmarking knob: every backing writes the same bytes. `None` in
+/// [`LinkOptions::output_backing`] lets the writer choose.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputBacking {
+    /// `mmap`: map the output file writable.
+    Mapped,
+    /// `write`: write the chunks with positional writes.
+    Written,
+    /// `memory`: build the image in a heap buffer and write it on commit.
+    Buffered,
+}
+
+impl OutputBacking {
+    /// Parses a `QLD_OUTPUT_BACKING` value. `auto` and unknown values give
+    /// `None`, which leaves the choice to the writer.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "mmap" | "mapped" => Some(Self::Mapped),
+            "write" | "written" | "pwrite" => Some(Self::Written),
+            "memory" | "buffer" | "buffered" => Some(Self::Buffered),
+            _ => None,
+        }
+    }
+}
+
 /// Everything a link is configured by.
 ///
 /// Construct one with [`LinkOptions::new`] and the builder methods, or parse
@@ -1270,6 +1385,33 @@ pub struct LinkOptions {
     /// Stop the link with an error once this token is cancelled; see
     /// [`CancelToken`]. `None` by default.
     pub cancel: Option<CancelToken>,
+    /// Receives the link map of `-M` / `--print-map`, and the `--cref`
+    /// table when no `-Map` file was named. `None` by default, which drops
+    /// that text: a library link writes nothing to the process's standard
+    /// output. See [`LinkOptions::use_process_defaults`].
+    pub map_output: Option<TextOutput>,
+    /// Receives one line per pipeline stage with the time it took, the way
+    /// `QLD_TIMING` asks the `qld` binary for. `None` by default, which
+    /// measures nothing. See [`LinkOptions::use_process_defaults`].
+    pub timing: Option<TextOutput>,
+    /// `LD_RUN_PATH`, split into directories: searched for the dependencies
+    /// of shared libraries when no `-rpath` was given, as GNU ld does.
+    /// Empty by default; a library link reads no environment of its own.
+    /// See [`LinkOptions::use_process_defaults`].
+    pub env_run_path: Vec<PathBuf>,
+    /// `LD_LIBRARY_PATH`, split into directories: searched for the
+    /// dependencies of shared libraries, as GNU ld does. Empty by default.
+    /// See [`LinkOptions::use_process_defaults`].
+    pub env_library_path: Vec<PathBuf>,
+    /// Record zero modification times in a Mach-O debug map, for
+    /// reproducible output; `ZERO_AR_DATE` in the environment asks ld64,
+    /// lld and the `qld` binary for it. Off by default. See
+    /// [`LinkOptions::use_process_defaults`].
+    pub zero_ar_date: bool,
+    /// How the output image is held while it is written. `None`, the
+    /// default, leaves the choice to the writer; `QLD_OUTPUT_BACKING` sets
+    /// it for the `qld` binary. See [`LinkOptions::use_process_defaults`].
+    pub output_backing: Option<OutputBacking>,
     /// Options that were recognized but have no effect yet, kept so that
     /// `--verbose` and tests can report them.
     pub ignored: Vec<OsString>,
@@ -1453,8 +1595,68 @@ impl LinkOptions {
             input_provider: Default::default(),
             output_buffer: Default::default(),
             cancel: Default::default(),
+            map_output: Default::default(),
+            timing: Default::default(),
+            env_run_path: Default::default(),
+            env_library_path: Default::default(),
+            zero_ar_date: Default::default(),
+            output_backing: Default::default(),
             ignored: Default::default(),
             warnings: Default::default(),
+        }
+    }
+
+    /// Makes these options describe a link run the way the `qld` binary
+    /// runs one, by taking from the process what a library link must be
+    /// told explicitly.
+    ///
+    /// Nothing else in qld reads the environment or writes to standard
+    /// output or standard error, so a `LinkOptions` that never went through
+    /// this method describes a hermetic, silent link. [`parse_gnu`] and
+    /// [`parse_darwin`] call it, because they parse a command line the way
+    /// the binary does; [`parse_gnu_with`], [`parse_darwin_with`] and
+    /// [`LinkOptions::new`] do not.
+    ///
+    /// It sets:
+    ///
+    /// - [`map_output`](Self::map_output) to standard output, where GNU ld
+    ///   writes the map of `-M` and a `--cref` table with no `-Map` file;
+    /// - [`timing`](Self::timing) to standard error when `QLD_TIMING` is
+    ///   set in the environment;
+    /// - [`env_run_path`](Self::env_run_path) from `LD_RUN_PATH` and
+    ///   [`env_library_path`](Self::env_library_path) from
+    ///   `LD_LIBRARY_PATH`, which GNU ld also searches;
+    /// - [`zero_ar_date`](Self::zero_ar_date) from `ZERO_AR_DATE`, which
+    ///   ld64 and lld also read;
+    /// - [`output_backing`](Self::output_backing) from
+    ///   `QLD_OUTPUT_BACKING`, a benchmarking knob.
+    ///
+    /// [`parse_gnu`]: crate::args::parse_gnu
+    /// [`parse_darwin`]: crate::args::parse_darwin
+    /// [`parse_gnu_with`]: crate::args::parse_gnu_with
+    /// [`parse_darwin_with`]: crate::args::parse_darwin_with
+    pub fn use_process_defaults(&mut self) {
+        self.map_output = Some(TextOutput::stdout());
+        if std::env::var_os("QLD_TIMING").is_some() {
+            self.timing = Some(TextOutput::stderr());
+        }
+        if let Some(run_path) = std::env::var_os("LD_RUN_PATH") {
+            self.env_run_path = std::env::split_paths(&run_path).collect();
+        }
+        if let Some(library_path) = std::env::var_os("LD_LIBRARY_PATH") {
+            self.env_library_path = std::env::split_paths(&library_path).collect();
+        }
+        self.zero_ar_date =
+            std::env::var_os("ZERO_AR_DATE").is_some_and(|v| !v.is_empty() && v != "0");
+        self.output_backing = std::env::var("QLD_OUTPUT_BACKING")
+            .ok()
+            .and_then(|value| OutputBacking::from_name(value.trim()));
+    }
+
+    /// Writes `text` to [`map_output`](Self::map_output), if there is one.
+    pub(crate) fn print_text(&self, text: &str) {
+        if let Some(output) = &self.map_output {
+            output.write(text);
         }
     }
 

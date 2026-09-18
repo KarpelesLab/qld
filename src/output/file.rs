@@ -78,11 +78,22 @@ pub enum BackingPolicy {
 }
 
 impl BackingPolicy {
-    /// The environment variable read by [`BackingPolicy::Auto`].
+    /// The environment variable [`LinkOptions::use_process_defaults`] reads
+    /// into [`LinkOptions::output_backing`].
     pub const ENV: &'static str = "QLD_OUTPUT_BACKING";
 
-    /// What [`BackingPolicy::Auto`] means without the environment variable.
+    /// What [`BackingPolicy::Auto`] means.
     pub const DEFAULT: Self = Self::Written;
+
+    /// The policy an [`OutputBacking`](crate::args::OutputBacking) names.
+    #[must_use]
+    pub fn from_option(backing: crate::args::OutputBacking) -> Self {
+        match backing {
+            crate::args::OutputBacking::Mapped => Self::Mapped,
+            crate::args::OutputBacking::Written => Self::Written,
+            crate::args::OutputBacking::Buffered => Self::Buffered,
+        }
+    }
 
     /// Parses a `QLD_OUTPUT_BACKING` value: `mmap`, `write` or `memory`
     /// (also `mapped`, `written`, `pwrite`, `buffered`, `buffer`, `auto`).
@@ -97,16 +108,13 @@ impl BackingPolicy {
         }
     }
 
-    /// Resolves [`BackingPolicy::Auto`] from the environment and the default;
-    /// other values are returned as they are.
+    /// Resolves [`BackingPolicy::Auto`] to [`BackingPolicy::DEFAULT`];
+    /// other values are returned as they are. Nothing here reads the
+    /// environment: [`LinkOptions::output_backing`] carries the choice.
     #[must_use]
     pub fn resolve(self) -> Self {
         match self {
-            Self::Auto => std::env::var(Self::ENV)
-                .ok()
-                .and_then(|value| Self::from_name(value.trim()))
-                .filter(|policy| *policy != Self::Auto)
-                .unwrap_or(Self::DEFAULT),
+            Self::Auto => Self::DEFAULT,
             other => other,
         }
     }
@@ -151,6 +159,9 @@ impl OutputOptions {
         Self {
             capture: options.output_buffer.clone(),
             cancel: options.cancel.clone(),
+            backing: options
+                .output_backing
+                .map_or(BackingPolicy::Auto, BackingPolicy::from_option),
             ..Self::default()
         }
     }
