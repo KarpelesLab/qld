@@ -72,6 +72,8 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_RISCV_TOOLS: "1"
+      # tests/riscv64.rs reads QLD_LLD, not QLD_TEST_LLD
+      QLD_LLD: ld.lld-22
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
