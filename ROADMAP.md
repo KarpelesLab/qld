@@ -362,12 +362,14 @@ arm64e.
 - [~] Public API review ([library-api.md](docs/library-api.md)); semver guarantees.
       Review done ([api-review.md](tests/projects/api-review.md)): the 1.0 surface is
       the crate root, `args`, `diag`, `error` and `target`; other modules are
-      `#[doc(hidden)]`. Open 1.0 blockers are listed in the review
-      (`Default` vs `new()`, string-typed options, `darwin.inputs`, printing
-      and environment reads in the library).
+      `#[doc(hidden)]`. W41 settled the blockers: `default()` is `new()`,
+      options are enums, one input list for every format, no printing or
+      environment reads in the library, and a caller's thread pool is used as
+      it is. The smaller items left are listed at the end of
+      [api-review.md](tests/projects/api-review.md).
 - [~] In-memory inputs and outputs (`InputKind::bytes`, `MemoryFiles`,
       `link_to_memory`), caller-provided thread pool, cancellation
-      (`CancelToken`, `Error::Cancelled`): done for ELF; PE and Mach-O pending
+      (`CancelToken`, `Error::Cancelled`): done for ELF, PE and Mach-O
 - [~] Complete rustdoc with examples (crate-level and `link` examples, five
       programs in `examples/`); published on crates.io
 - [~] Packaging: prebuilt binaries, distribution packages, `ld.qld` and `ld64.qld` symlinks.

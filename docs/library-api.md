@@ -5,11 +5,26 @@ JIT/AOT pipelines, test harnesses and packagers. The API will be unstable
 until 1.0 (M9). This document records the intended shape so that internal
 design choices don't close it off.
 
-**Status (W36):**
+**Status (W41):**
 - **Documented surface:** the crate root, `args`, `diag`, `error` and
   `target`. Every other module is `#[doc(hidden)]`: it is public for qld's own
   tests and tools, and is not covered by semantic versioning.
-- **In-memory I/O and cancellation (ELF links only so far):**
+- **One way to build options:** `LinkOptions::default()` is
+  `LinkOptions::new()`. `LinkOptions`, `InputSpec` and `InputAttrs` are
+  `#[non_exhaustive]`.
+- **Typed options:** ICF mode, orphan handling, section sorting, debug
+  compression, start-stop visibility and `--oformat` are enums, not strings.
+- **Hermetic by default:** a `LinkOptions::new()` link prints nothing and
+  reads no environment variable. Map and `--cref` text goes to
+  `LinkOptions::map_output`, stage timings to `LinkOptions::timing`, and
+  `env_run_path`, `env_library_path`, `zero_ar_date` and `output_backing`
+  carry what the `qld` binary reads from the environment.
+  `LinkOptions::use_process_defaults()` is the documented opt-in, applied by
+  `parse_gnu` and `parse_darwin` (not by `parse_gnu_with` /
+  `parse_darwin_with`).
+- **Threading:** a rayon pool you install is used as it is, whatever its
+  size; the driver creates none of its own.
+- **In-memory I/O and cancellation (ELF, PE and Mach-O):**
   - `InputKind::bytes(name, data)` passes an input as bytes.
   - `MemoryFiles` / `InputProvider` (`LinkOptions::input_provider`) serve
     files by path, ahead of the disk. This covers `-l` search, scripts and
@@ -18,8 +33,10 @@ design choices don't close it off.
     the output image.
   - A `CancelToken` (`LinkOptions::cancel`) makes the link return
     `Error::Cancelled`, leaving no output behind.
+  - One input list serves every format: the ld64 front end fills
+    `LinkOptions::inputs` too, so `InputKind::Bytes` links on Mach-O.
 - **Examples:** `examples/` has `link_argv`, `in_memory`, `custom_sink`,
-  `rayon_pool` and `cancel`.
+  `rayon_pool`, `cancel` and `link_map`.
 - **Review:** [tests/projects/api-review.md](../tests/projects/api-review.md)
   lists every public item, the 1.0 blockers and the semver policy.
 
