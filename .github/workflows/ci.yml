@@ -74,6 +74,7 @@ jobs:
       # x86_64 slices of the fixtures run under Rosetta on the arm64 runner.
       - run: softwareupdate --install-rosetta --agree-to-license || true
       - run: cargo test --all-features --test macho_link -- --nocapture
+      - run: cargo test --all-features --test macho_lto -- --nocapture
       - name: Real projects with -fuse-ld=qld (zlib, Lua, SQLite, {fmt})
         if: success() || failure()
         run: |
