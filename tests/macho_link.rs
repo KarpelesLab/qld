@@ -2261,6 +2261,7 @@ fn rustc_link(
     target: &str,
     linker: RustLinker<'_>,
     deployment: Option<&str>,
+    link_args: &[&str],
     output: &Path,
 ) -> Result<(), String> {
     let mut command = Command::new("rustc");
@@ -2270,6 +2271,9 @@ fn rustc_link(
         .arg("-o")
         .arg(output)
         .current_dir(output.parent().unwrap());
+    for arg in link_args {
+        command.arg("-C").arg(format!("link-arg={arg}"));
+    }
     match linker {
         RustLinker::Clang(path) => {
             command
@@ -2346,7 +2350,7 @@ fn rust_binary() {
             } else {
                 RustLinker::Direct(&linker)
             };
-            rustc_link(target, how, deployment, &exe)
+            rustc_link(target, how, deployment, &[], &exe)
                 .unwrap_or_else(|e| panic!("{variant}: rustc with qld failed:\n{e}"));
             let bytes = std::fs::read(&exe).unwrap();
 
@@ -2384,8 +2388,14 @@ fn rust_binary() {
 
             if let Some(lld) = ld64_lld() {
                 let reference = out_dir.join("rust_std-lld");
-                rustc_link(target, RustLinker::Direct(&lld), deployment, &reference)
-                    .unwrap_or_else(|e| panic!("{variant}: rustc with ld64.lld failed:\n{e}"));
+                rustc_link(
+                    target,
+                    RustLinker::Direct(&lld),
+                    deployment,
+                    &[],
+                    &reference,
+                )
+                .unwrap_or_else(|e| panic!("{variant}: rustc with ld64.lld failed:\n{e}"));
                 if let (Some(ours), Some(theirs)) = (summarize(&exe), summarize(&reference)) {
                     assert_eq!(ours, theirs, "{variant}: qld vs ld64.lld");
                 }
@@ -2393,7 +2403,58 @@ fn rust_binary() {
             if host_can_run(arch) {
                 assert_eq!(run(&exe).unwrap(), RUST_STD_OUTPUT, "{variant}");
             }
+            if chained {
+                rust_prelinked(target, arch, &linker, &out_dir);
+            }
         }
+    }
+}
+
+/// `-r` on a whole Rust program: rustc hands qld the program's objects
+/// and the standard library's rlibs with `-r`, and the merged object then
+/// links into the program (with qld, and with `ld64.lld` for comparison;
+/// on macOS also with Apple's linker), which runs.
+fn rust_prelinked(target: &str, arch: &str, linker: &Path, dir: &Path) {
+    let merged = dir.join("rust_std.o");
+    rustc_link(
+        target,
+        RustLinker::Direct(linker),
+        Some("13.0"),
+        &["-r"],
+        &merged,
+    )
+    .unwrap_or_else(|e| panic!("{arch}: rustc with qld -r failed:\n{e}"));
+    let bytes = std::fs::read(&merged).unwrap();
+    check_object(&bytes, true);
+    let mut args = base_args(arch);
+    args.extend(strings(&[
+        merged.to_str().unwrap(),
+        "-lSystem",
+        "-lc",
+        "-lm",
+        "-dead_strip",
+    ]));
+    let exe = dir.join("rust_std-prelinked");
+    link_and_compare(&args, &exe);
+    if host_can_run(arch) {
+        assert_eq!(run(&exe).unwrap(), RUST_STD_OUTPUT, "{arch}: prelinked");
+        let apple = dir.join("rust_std-prelinked-apple");
+        let status = Command::new("clang")
+            .args(["-arch", arch])
+            .arg(&merged)
+            .arg("-o")
+            .arg(&apple)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "{arch}: Apple's linker rejects the object"
+        );
+        assert_eq!(
+            run(&apple).unwrap(),
+            RUST_STD_OUTPUT,
+            "{arch}: by Apple's ld"
+        );
     }
 }
 

@@ -51,7 +51,7 @@ use crate::macho::read::consts::{
     N_ABS, N_EXT, N_INDR, N_PEXT, N_SECT, N_TYPE, N_UNDF, N_WEAK_DEF, N_WEAK_REF, S_ATTR_DEBUG,
     X86_64_RELOC_UNSIGNED,
 };
-use crate::macho::read::{AtomRelocation, Relocation, Section};
+use crate::macho::read::{AtomKind, AtomRelocation, Relocation, Section};
 use crate::symbols::SymbolUse;
 
 use super::addr::Addresses;
@@ -694,6 +694,7 @@ impl Symbols {
         };
 
         let mut locals: Vec<(Entry, Option<(usize, u32)>)> = Vec::new();
+        let mut labels = 0usize;
         for file in 0..link.files.len() {
             let Some(object) = link.object(file) else {
                 continue;
@@ -720,6 +721,42 @@ impl Symbols {
                         n_value,
                     },
                     Some((file, symbol.index)),
+                ));
+            }
+            // An atom that no symbol starts (the bytes before a section's
+            // first symbol) gets a temporary label, so that it stays an
+            // atom of its own once concatenated after another object's.
+            for (atom, info) in object.atoms.atoms().iter().enumerate() {
+                if info.kind != AtomKind::Regular
+                    || info.size == 0
+                    || !object.atoms.atom_symbols(atom).is_empty()
+                {
+                    continue;
+                }
+                let id = link.atom_id(file, atom);
+                let (Some(&section), Some(address)) =
+                    (layout.atom_section.get(id), layout.atom_address(id))
+                else {
+                    continue;
+                };
+                let Some(ordinal) = section
+                    .checked_add(1)
+                    .and_then(|o| u8::try_from(o).ok())
+                    .filter(|_| section != NONE)
+                else {
+                    continue;
+                };
+                let name = format!("ltmp_r{labels}").into_bytes();
+                labels = labels.saturating_add(1);
+                locals.push((
+                    Entry {
+                        name,
+                        n_type: N_SECT,
+                        n_sect: ordinal,
+                        n_desc: 0,
+                        n_value: address,
+                    },
+                    None,
                 ));
             }
         }
