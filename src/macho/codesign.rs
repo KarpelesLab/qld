@@ -15,8 +15,8 @@
 
 use rayon::prelude::*;
 
-use super::sha256::Sha256;
 use crate::error::{Error, Result};
+use crate::output::hash::Sha256;
 
 /// `CSMAGIC_EMBEDDED_SIGNATURE`.
 pub const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;

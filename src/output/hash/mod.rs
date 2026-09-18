@@ -13,10 +13,12 @@
 
 mod md5;
 mod sha1;
+mod sha256;
 mod xxh64;
 
 pub use md5::Md5;
 pub use sha1::Sha1;
+pub use sha256::Sha256;
 pub use xxh64::{Xxh64, xxh64};
 
 /// Size of the blocks MD5 and SHA-1 compress.

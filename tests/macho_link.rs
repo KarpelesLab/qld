@@ -27,7 +27,7 @@ use qld::macho::read::consts::{
     LC_SYMTAB, LC_UUID, MH_EXECUTE,
 };
 use qld::macho::read::{ChainedFixups, MachOFile, Source};
-use qld::macho::sha256::Sha256;
+use qld::output::hash::Sha256;
 
 // ---------------------------------------------------------------------------
 // Helpers

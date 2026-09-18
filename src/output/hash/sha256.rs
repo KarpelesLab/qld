@@ -1,8 +1,5 @@
-//! SHA-256 (FIPS 180-4), for code signature page hashes.
-//!
-//! In-crate like the MD5 and SHA-1 of [`crate::output::hash`], which is
-//! where it belongs once that module can take it (it is outside this
-//! workstream's files).
+//! SHA-256 (FIPS 180-4), for the page hashes of Mach-O ad-hoc code
+//! signatures (`crate::macho::codesign`).
 
 /// An incremental SHA-256 hasher.
 #[derive(Clone, Debug)]

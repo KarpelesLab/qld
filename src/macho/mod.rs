@@ -29,7 +29,7 @@
 //! | [`trie`] | The export trie |
 //! | [`symtab`], [`stabs`] | Symbol tables and the STABS debug map |
 //! | [`write`](mod@write) | Header, load commands, `__LINKEDIT` |
-//! | [`codesign`], [`sha256`] | Ad-hoc code signature |
+//! | [`codesign`] | Ad-hoc code signature (SHA-256 from [`crate::output::hash`]) |
 //! | [`fat`] | Universal binaries |
 //! | [`buf`] | Byte helpers |
 
@@ -50,7 +50,6 @@ pub mod reloc;
 pub mod resolve;
 pub mod scan;
 pub mod sections;
-pub mod sha256;
 pub mod stabs;
 pub mod state;
 pub mod symtab;
