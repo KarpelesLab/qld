@@ -9,7 +9,8 @@
 //! 2. [`resolve_symbols`] with [`MachRules`];
 //! 3. [`Link::new`]: what every symbol resolved to, undefined symbol
 //!    reports, `-undefined` handling; relocations are loaded in parallel;
-//! 4. [`Link::mark_live`]: weak definition coalescing and `-dead_strip`;
+//! 4. [`Link::mark_live`]: weak definition coalescing and `-dead_strip`
+//!    (after which undefined symbols only dead code refers to are dropped);
 //! 5. [`scan::scan`]: stubs, `__got`, `__thread_ptrs`, imports and dylib
 //!    ordinals;
 //! 6. [`layout::plan`] and [`Layout::assign_addresses`], with
@@ -285,6 +286,7 @@ fn link_arch_once(
         diagnostics,
     )?;
     link.mark_live(options)?;
+    link.report_live_undefined(options, diagnostics)?;
     if config.is_relocatable() {
         return super::relocatable::write(&link, options, diagnostics).map(Attempt::Done);
     }

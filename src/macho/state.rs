@@ -101,6 +101,9 @@ pub struct Link<'a> {
     pub atom_count: usize,
     /// Live atoms (global numbering).
     pub live: Vec<bool>,
+    /// With `-dead_strip`, undefined symbols whose report waits for dead
+    /// stripping: only those live code reaches are errors, as in ld64.
+    pub pending_undefined: Vec<SymbolId>,
 }
 
 impl std::fmt::Debug for Link<'_> {
@@ -187,6 +190,7 @@ impl<'a> Link<'a> {
             atom_base,
             atom_count: usize::try_from(count).unwrap_or(usize::MAX),
             live: Vec::new(),
+            pending_undefined: Vec::new(),
         };
         link.classify(options, diagnostics)?;
         Ok(link)
@@ -340,6 +344,7 @@ impl<'a> Link<'a> {
         // the final link, boundary symbols included.
         let darwin = &options.darwin;
         let mut errors = 0usize;
+        let mut pending = Vec::new();
         for (index, def) in defs.iter_mut().enumerate() {
             if *def != SymbolDef::Undefined
                 || !referenced.get(index).copied().unwrap_or(false)
@@ -362,7 +367,11 @@ impl<'a> Link<'a> {
             } else {
                 self.config.undefined
             };
+            let internal = self.referenced_internally(id);
             match treatment {
+                UndefinedTreatment::Error if self.config.dead_strip && !internal => {
+                    pending.push(id);
+                }
                 UndefinedTreatment::Error => {
                     let shown = display_name(name, options.demangle);
                     let mut diagnostic = Diagnostic::error(format!("undefined symbol: {shown}"));
@@ -384,6 +393,7 @@ impl<'a> Link<'a> {
         }
         self.defs = defs;
         self.strong_ref = strong_ref;
+        self.pending_undefined = pending;
         self.auto_hidden = self.auto_hidden_definitions();
         if errors > 0 && !options.noinhibit_exec {
             return Err(Error::Reported { errors });
@@ -439,6 +449,125 @@ impl<'a> Link<'a> {
         entry.is_private_external()
             || self.files.get(file).is_some_and(|f| f.hidden)
             || self.auto_hidden.get(id.index()).copied().unwrap_or(false)
+    }
+
+    /// Whether the linker's internal file refers to `id` (the entry point,
+    /// `-u`, an `-alias` target): such references are never dead.
+    fn referenced_internally(&self, id: SymbolId) -> bool {
+        let Some(file) = self.files.first() else {
+            return false;
+        };
+        let ids = self.resolution.symbol_ids(FileId::new(0));
+        file.uses
+            .iter()
+            .zip(ids)
+            .any(|(u, i)| *i == id && matches!(u, SymbolUse::Reference { .. }))
+    }
+
+    /// Reports the undefined symbols [`Link::mark_live`] left pending that
+    /// live code refers to, with the files that refer to them. The others
+    /// stay undefined and unused.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Reported`] when any was reported (unless
+    /// `-noinhibit-exec`), and malformed relocations.
+    pub fn report_live_undefined(
+        &self,
+        options: &crate::args::LinkOptions,
+        diagnostics: &dyn DiagnosticSink,
+    ) -> Result<()> {
+        if self.pending_undefined.is_empty() {
+            return Ok(());
+        }
+        let mut pending = vec![false; self.symbols.len()];
+        for id in &self.pending_undefined {
+            if let Some(slot) = pending.get_mut(id.index()) {
+                *slot = true;
+            }
+        }
+        // (symbol, file) pairs of live references, per file.
+        let per_file: Vec<Result<Vec<(SymbolId, usize)>>> = (0..self.files.len())
+            .into_par_iter()
+            .map(|file| {
+                let mut out = Vec::new();
+                let Some(object) = self.object(file) else {
+                    return Ok(out);
+                };
+                for (section_index, relocations) in object.relocations.iter().enumerate() {
+                    let Some(section) = object.file.sections().get(section_index) else {
+                        continue;
+                    };
+                    // `__eh_frame` records are not atoms of their own: a
+                    // personality there counts whatever uses it.
+                    let eh_frame = section.is(b"__TEXT", b"__eh_frame");
+                    if !eh_frame
+                        && super::layout::is_consumed(
+                            section.segname,
+                            section.sectname,
+                            section.flags,
+                        )
+                        && !section.is(b"__LD", b"__compact_unwind")
+                    {
+                        continue;
+                    }
+                    let data = object.file.section_data(section_index)?;
+                    for relocation in relocations {
+                        if !eh_frame && !self.is_live(file, relocation.atom) {
+                            continue;
+                        }
+                        let decoded = super::reloc::decode(
+                            self,
+                            file,
+                            object,
+                            section_index,
+                            data,
+                            &relocation.relocation,
+                        )?;
+                        for referent in [Some(decoded.referent), decoded.subtrahend]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let super::reloc::Referent::Global(id) = referent
+                                && pending.get(id.index()).copied().unwrap_or(false)
+                            {
+                                out.push((id, file));
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .collect();
+        let mut referrers: Vec<Vec<usize>> = vec![Vec::new(); self.symbols.len()];
+        for result in per_file {
+            for (id, file) in result? {
+                if let Some(list) = referrers.get_mut(id.index())
+                    && list.last() != Some(&file)
+                {
+                    list.push(file);
+                }
+            }
+        }
+        let mut errors = 0usize;
+        for &id in &self.pending_undefined {
+            let Some(files) = referrers.get(id.index()).filter(|f| !f.is_empty()) else {
+                continue;
+            };
+            let shown = display_name(self.symbols.name(id).bytes(), options.demangle);
+            let mut diagnostic = Diagnostic::error(format!("undefined symbol: {shown}"));
+            for &file in files.iter().take(3) {
+                if let Some(input) = self.files.get(file) {
+                    diagnostic = diagnostic.detail(format!("referenced by {}", input.display()));
+                }
+            }
+            diagnostics.emit(diagnostic);
+            errors = errors.saturating_add(1);
+        }
+        if errors > 0 && !options.noinhibit_exec {
+            return Err(Error::Reported { errors });
+        }
+        Ok(())
     }
 
     fn referencing_files(&self, id: SymbolId) -> Vec<String> {
