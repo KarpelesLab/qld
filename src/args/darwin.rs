@@ -220,8 +220,11 @@ pub struct DarwinArgs {
     /// externs instead of becoming local symbols.
     pub keep_private_externs: bool,
     /// `-flat_namespace` (`true`) / `-twolevel_namespace` (`false`, the
-    /// default).
+    /// default). `-force_flat_namespace` sets it too.
     pub flat_namespace: bool,
+    /// `-force_flat_namespace`: an executable that makes dyld bind every
+    /// image it loads with flat lookup (`MH_FORCE_FLAT`).
+    pub force_flat_namespace: bool,
 }
 
 impl Default for DarwinArgs {
@@ -268,6 +271,7 @@ impl Default for DarwinArgs {
             print_version: false,
             keep_private_externs: false,
             flat_namespace: false,
+            force_flat_namespace: false,
         }
     }
 }
@@ -354,6 +358,8 @@ enum Act {
     StackSize,
     Sectcreate,
     Alias,
+    AliasList,
+    ForceFlat,
     Init,
     DeadStrippableDylib,
     OsoPrefix,
@@ -839,7 +845,12 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
         Act::Namespace(true),
         "Flat namespace: imports are looked up by name in every image",
     ),
-    unsupported("force_flat_namespace", Flag, "flat namespace output"),
+    opt(
+        "force_flat_namespace",
+        Flag,
+        Act::ForceFlat,
+        "Flat namespace for this executable and every image it loads",
+    ),
     ignored("multiply_defined", V1),
     ignored("multiply_defined_unused", V1),
     ignored("weak_reference_mismatches", V1),
@@ -851,7 +862,12 @@ pub const DARWIN_OPTIONS: &[DarwinOption] = &[
         Act::KeepPrivateExterns,
         "With -r, keep private externs instead of making them local",
     ),
-    unsupported("alias_list", V1, "-alias_list"),
+    opt(
+        "alias_list",
+        V1,
+        Act::AliasList,
+        "Define aliases listed in a file (symbol alias, one per line)",
+    ),
     unsupported("interposable", Flag, "interposable symbols"),
     unsupported("interposable_list", V1, "interposable symbols"),
     unsupported("reexported_symbols_list", V1, "-reexported_symbols_list"),
@@ -1376,7 +1392,15 @@ impl Parser<'_> {
                 .push((first.to_owned(), values.get(1).cloned().unwrap_or_default())),
             Act::Init => self.options.init = Some(first.to_owned()),
             Act::KeepPrivateExterns => darwin.keep_private_externs = true,
-            Act::Namespace(flat) => darwin.flat_namespace = flat,
+            Act::Namespace(flat) => {
+                darwin.flat_namespace = flat;
+                darwin.force_flat_namespace = false;
+            }
+            Act::ForceFlat => {
+                darwin.flat_namespace = true;
+                darwin.force_flat_namespace = true;
+            }
+            Act::AliasList => self.alias_list(first)?,
             Act::DeadStrippableDylib => darwin.mark_dead_strippable_dylib = true,
             Act::OsoPrefix => darwin.oso_prefix = Some(PathBuf::from(first)),
             Act::FunctionStarts(on) => darwin.function_starts = on,
@@ -1385,6 +1409,38 @@ impl Parser<'_> {
             Act::FatalWarnings => self.options.fatal_warnings = true,
             Act::BundleLoader => darwin.bundle_loader = Some(PathBuf::from(first)),
             Act::Trace => self.options.trace = true,
+        }
+        Ok(())
+    }
+
+    /// `-alias_list file`: one `symbol alias` pair per line, separated by
+    /// white space; `#` starts a comment.
+    fn alias_list(&mut self, file: &str) -> Result<()> {
+        let contents = self
+            .reader
+            .read_file(std::path::Path::new(file))
+            .map_err(|error| Error::io(file, error))?;
+        for (number, line) in contents.split(|&b| b == b'\n').enumerate() {
+            let line = match line.iter().position(|&b| b == b'#') {
+                Some(hash) => line.get(..hash).unwrap_or(&[]),
+                None => line,
+            };
+            let mut words = line
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|w| !w.is_empty());
+            let Some(symbol) = words.next() else {
+                continue;
+            };
+            let (Some(alias), None) = (words.next(), words.next()) else {
+                return Err(Error::Option(format!(
+                    "-alias_list {file}:{}: expected `symbol alias`",
+                    number.saturating_add(1)
+                )));
+            };
+            self.options.darwin.aliases.push((
+                String::from_utf8_lossy(symbol).into_owned(),
+                String::from_utf8_lossy(alias).into_owned(),
+            ));
         }
         Ok(())
     }
@@ -1431,6 +1487,13 @@ impl Parser<'_> {
                         .into(),
                 ));
             }
+        }
+        if options.darwin.force_flat_namespace
+            && options.darwin.output_type != MachOutputType::Execute
+        {
+            return Err(Error::Option(
+                "-force_flat_namespace can only be used with main executables".into(),
+            ));
         }
         if options.darwin.bundle_loader.is_some()
             && options.darwin.output_type != MachOutputType::Bundle
@@ -1500,7 +1563,10 @@ mod tests {
     #[test]
     fn every_table_entry_parses_or_is_rejected_by_name() {
         for option in DARWIN_OPTIONS {
-            if matches!(option.action, Act::Help | Act::Version | Act::Filelist) {
+            if matches!(
+                option.action,
+                Act::Help | Act::Version | Act::Filelist | Act::AliasList
+            ) {
                 continue;
             }
             let value = match option.action {
@@ -1698,6 +1764,45 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(darwin_usage().contains("-platform_version"));
+    }
+
+    #[test]
+    fn alias_list_and_force_flat_namespace() {
+        struct List;
+        impl FileReader for List {
+            fn read_file(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                Ok(b"# aliases\n_foo _bar\n\n  _baz\t_qux # trailing\n".to_vec())
+            }
+        }
+        let args: Vec<&OsStr> = ["-alias_list", "aliases.txt", "a.o"]
+            .iter()
+            .map(OsStr::new)
+            .collect();
+        let Ok(ParseOutcome::Link(options)) = parse(&args, &List) else {
+            panic!("-alias_list did not parse");
+        };
+        assert_eq!(
+            options.darwin.aliases,
+            [
+                ("_foo".to_owned(), "_bar".to_owned()),
+                ("_baz".to_owned(), "_qux".to_owned())
+            ]
+        );
+
+        struct Bad;
+        impl FileReader for Bad {
+            fn read_file(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                Ok(b"_foo _bar\n_one\n".to_vec())
+            }
+        }
+        let error = parse(&args, &Bad).unwrap_err().to_string();
+        assert!(error.contains("aliases.txt:2"), "{error}");
+
+        let options = parse_ok(&["-force_flat_namespace", "a.o"]);
+        assert!(options.darwin.flat_namespace && options.darwin.force_flat_namespace);
+        let options = parse_ok(&["-force_flat_namespace", "-twolevel_namespace", "a.o"]);
+        assert!(!options.darwin.flat_namespace && !options.darwin.force_flat_namespace);
+        assert!(parse_err(&["-force_flat_namespace", "-dylib", "a.o"]).contains("executables"));
     }
 
     #[test]

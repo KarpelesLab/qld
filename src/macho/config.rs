@@ -62,6 +62,8 @@ pub struct Config {
     pub oso_prefix: Option<PathBuf>,
     /// `-flat_namespace`: imports are bound by name in any image.
     pub flat_namespace: bool,
+    /// `-force_flat_namespace`: `MH_FORCE_FLAT`.
+    pub force_flat_namespace: bool,
 }
 
 /// The first deployment target of each platform where ld64 defaults to
@@ -211,6 +213,7 @@ impl Config {
             debug_map: options.strip == crate::args::StripMode::None,
             oso_prefix: darwin.oso_prefix.clone(),
             flat_namespace: darwin.flat_namespace,
+            force_flat_namespace: darwin.force_flat_namespace,
         })
     }
 

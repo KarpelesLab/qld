@@ -39,10 +39,14 @@ use qld::macho::read::consts::{
 use qld::macho::read::{ChainedFixups, MachOFile, Source};
 use qld::output::hash::Sha256;
 
+#[path = "macho_link/namespace.rs"]
+mod namespace;
 #[path = "macho_link/search_paths.rs"]
 mod search_paths;
 #[path = "macho_link/suite.rs"]
 mod suite;
+#[path = "macho_link/undefined.rs"]
+mod undefined;
 #[path = "macho_link/weak_binding.rs"]
 mod weak_binding;
 
