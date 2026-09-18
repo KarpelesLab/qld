@@ -1,5 +1,9 @@
 # Library API review for 1.0 (W36, milestone M9)
 
+**Update (W41):** the five 1.0 blockers this review listed are settled; see
+[What W41 changed](#what-w41-changed) at the end. The rows below are marked
+**Done (W41)** where they were.
+
 This review covers the public surface of the `qld` crate at `65d6536` plus
 the W36 additions. It sorts every public item into one of three groups,
 recommends what to do with each, and lists the concrete changes by owner.
@@ -105,18 +109,18 @@ the end does exactly this.
 
 | Item | Class | Recommendation |
 | --- | --- | --- |
-| `LinkOptions` (129 pub fields, 8 methods) | stable | **Add `#[non_exhaustive]`** so that fields can be added in minor releases. Field assignment still works on a non-exhaustive struct; only struct literals and `..Default::default()` stop working outside the crate. **Blocker:** `tests/coff_link.rs` builds `LinkOptions { .. }` literals at lines 406, 950, 958, 965 and 972. They must switch to `LinkOptions::new()` plus assignments before the attribute can land. A full builder is not needed: `new()` plus public fields, `push_input` and a few helpers is simpler and just as future-proof once the struct is non-exhaustive. |
-| `LinkOptions::default()` vs `LinkOptions::new()` | accidental | **Footgun:** the derived `Default` turns `demangle`, `relro`, `gnu_stack`, `copy_relocs`, `combine_relocs`, `extern_protected_data`, `section_header`, `relax`, `dependent_libraries` and `fork` off, while `new()` turns them on. Make `Default` return `new()` by writing out `new()`'s field list, or change those fields to `Option<bool>`, with `None` meaning the default. This needs agreement: every workstream that adds a field relies on `..Self::default()` in `new()`, and `tests/coff_link.rs` uses `..LinkOptions::default()`. |
-| `LinkOptions` string-typed fields: `icf`, `orphan_handling`, `sort_section`, `compress_debug_sections`, `start_stop_visibility`, `output_format` | stable, needs change | Change them to enums before 1.0 (`IcfMode`, `OrphanHandling`, `SortSection`, `DebugCompression`, `Visibility`, `OutputFormat`). A string cannot be validated when the options are built, and the drivers match on literals. |
+| `LinkOptions` (129 pub fields, 8 methods) | stable | **Done (W41): `#[non_exhaustive]`**, and the test literals are gone. Original note: **Add `#[non_exhaustive]`** so that fields can be added in minor releases. Field assignment still works on a non-exhaustive struct; only struct literals and `..Default::default()` stop working outside the crate. **Blocker:** `tests/coff_link.rs` builds `LinkOptions { .. }` literals at lines 406, 950, 958, 965 and 972. They must switch to `LinkOptions::new()` plus assignments before the attribute can land. A full builder is not needed: `new()` plus public fields, `push_input` and a few helpers is simpler and just as future-proof once the struct is non-exhaustive. |
+| `LinkOptions::default()` vs `LinkOptions::new()` | accidental | **Done (W41):** `Default` is `new()`. The derived `Default` is gone; `new()` builds on a private `LinkOptions::blank()` that lists every field, so a new field names its default there. Original note: **Footgun:** the derived `Default` turns `demangle`, `relro`, `gnu_stack`, `copy_relocs`, `combine_relocs`, `extern_protected_data`, `section_header`, `relax`, `dependent_libraries` and `fork` off, while `new()` turns them on. Make `Default` return `new()` by writing out `new()`'s field list, or change those fields to `Option<bool>`, with `None` meaning the default. This needs agreement: every workstream that adds a field relies on `..Self::default()` in `new()`, and `tests/coff_link.rs` uses `..LinkOptions::default()`. |
+| `LinkOptions` string-typed fields: `icf`, `orphan_handling`, `sort_section`, `compress_debug_sections`, `start_stop_visibility`, `output_format` | stable, needs change | **Done (W41):** `IcfMode`, `OrphanHandling`, `SortSection`, `DebugCompression`, `Visibility` and `OutputFormat`. `--oformat` names a BFD target, so `OutputFormat` keeps `binary`/`ihex`/`srec` as variants and every other name as `OutputFormat::Bfd(String)`, which the format driver checks. Original note: Change them to enums before 1.0 (`IcfMode`, `OrphanHandling`, `SortSection`, `DebugCompression`, `Visibility`, `OutputFormat`). A string cannot be validated when the options are built, and the drivers match on literals. |
 | `LinkOptions::{fork, exit_on_plugin_fatal, on_output_complete}` | internal | Only the binary uses these. Make them `#[doc(hidden)]` and keep them out of semver. They could move into a `ProcessOptions` that `main.rs` owns. |
 | `LinkOptions::{warnings, ignored}` | stable, should move | These are outputs of parsing, not options. Before 1.0, move them to a `Parsed { options, warnings, ignored }` in `ParseOutcome::Link`. Until then, `examples/link_argv.rs` shows the caller emitting them, as `main.rs` does. |
 | `LinkOptions::{input_provider, output_buffer, cancel}` *(new, W36)* | stable | Added. |
-| `LinkOptions::darwin.inputs` vs `LinkOptions::inputs` | stable, needs change | Mach-O links read a separate input list (`DarwinArgs::inputs`, `DarwinInputKind`), so `InputKind::Bytes` and `push_input` have no effect on a Mach-O link. Before 1.0, merge them into one list: add `Framework`/`WeakLibrary`/… as `InputKind` variants or as attributes. |
-| `LinkOptions::threads` | stable | The doc says `None` means one thread per core; in fact the ELF driver sizes the pool from the input size. Fix the doc (in `options.rs`, W1). |
+| `LinkOptions::darwin.inputs` vs `LinkOptions::inputs` | stable, needs change | **Done (W41):** one list. `DarwinArgs::inputs`, `DarwinInput` and `DarwinInputKind` are gone; the ld64 front end fills `LinkOptions::inputs`, with `InputKind::Framework`, `InputAttrs::load` (`LoadMode`) and `InputAttrs::whole_archive` (`-force_load`). `InputKind::Bytes` works for Mach-O. Original note: Mach-O links read a separate input list (`DarwinArgs::inputs`, `DarwinInputKind`), so `InputKind::Bytes` and `push_input` have no effect on a Mach-O link. Before 1.0, merge them into one list: add `Framework`/`WeakLibrary`/… as `InputKind` variants or as attributes. |
+| `LinkOptions::threads` | stable | **Done (W41):** the doc says what the driver does, including that a caller's pool is used as it is. |
 | `LinkOptions::{output_complete, output_path, is_pic, is_dynamic, push_input, resolve_sysroot, check_cancelled}` | stable | Keep. `output_complete` is internal to the drivers: make it `#[doc(hidden)]`. |
 | `InputKind` (non_exhaustive, 6 variants) | stable | Keep. `InputKind::bytes()` added. `Bytes::name` is a `String` while `Source::Bytes::name` is a `PathBuf`: pick one (`PathBuf`, as diagnostics treat it as a path) before 1.0. |
-| `InputSpec` | stable | Add `#[non_exhaustive]` once `tests/input.rs:561` and `tests/coff_link.rs:411,511,1059,1219` stop building literals. `position` is assigned by `push_input`, so it should become read-only, through an accessor. |
-| `InputAttrs` | stable | `#[non_exhaustive]` once `tests/input.rs:563` stops using a struct literal. `lazy`, `copy_dt_needed` and `format` will keep growing. |
+| `InputSpec` | stable | **Done (W41): `#[non_exhaustive]`**, with `InputSpec::new` for a spec outside a list; `position` is still a field, documented as assigned by `push_input`. Original note: Add `#[non_exhaustive]` once `tests/input.rs:561` and `tests/coff_link.rs:411,511,1059,1219` stop building literals. `position` is assigned by `push_input`, so it should become read-only, through an accessor. |
+| `InputAttrs` | stable | **Done (W41): `#[non_exhaustive]`**, and it grew `load` for the Mach-O load modes. |
 | `PeArgs`, `DynamicFlags`, `X86Features` | stable | **Done (W36): `#[non_exhaustive]`.** No external code builds them with literals. |
 | `StripMode`, `DiscardMode`, `HashStyle`, `SymbolicMode`, `UnresolvedSymbols`, `ColorChoice`, `MagicMode`, `SeparateCode`, `ExecStack`, `ReportLevel`, `InputFormat` | stable | **Done (W36): `#[non_exhaustive]`.** Nothing outside the crate matches them exhaustively. `InputFormat` will get more `-b` formats. |
 | `Flavor`, `OutputKind`, `BuildId` | stable | Already `#[non_exhaustive]`. |
@@ -214,11 +218,11 @@ they stay `pub` (hidden) rather than `pub(crate)`.
 
 | Requirement | Where it breaks | Recommendation (owner) |
 | --- | --- | --- |
-| No printing | `src/elf/map.rs:140,159` prints `-M`/`--cref` to stdout; `src/elf/link.rs:90` and `src/elf/lto.rs:823,860` print `QLD_TIMING` laps to stderr; `src/plugin/host.rs:1484` prints plugin messages | Route `-M` through a caller-supplied writer (a `LinkOptions::map_writer`, or a map in the `LinkReport`); send timing to a `LinkReport` or behind an option; send plugin messages to the sink. |
+| No printing | **Done (W41)** for `-M`/`--cref` (`LinkOptions::map_output`) and the `QLD_TIMING` laps of `src/elf/{link,lto}.rs` (`LinkOptions::timing`), both `TextOutput` sinks that are `None` by default. `--print-gc-sections` and `--print-icf-sections` already went to the diagnostic sink. **Remaining:** `src/symbols/resolve.rs:378,405` still reads `QLD_TIMING` and prints its own laps — `resolve_symbols` takes no options, so the flag needs a provided `RoundHook::timing()` (W28's file). `src/plugin/host.rs:1484` prints a plugin message that arrives after the session is gone, when there is no sink to send it to. |
 | No `process::exit` | `src/elf/lto.rs:364`, gated by `exit_on_plugin_fatal`, which only the binary sets | Fine as is; keep the flag `#[doc(hidden)]`. |
-| No environment dependence | `QLD_TIMING`, `QLD_OUTPUT_BACKING`, `LD_RUN_PATH`/`LD_LIBRARY_PATH` (`src/elf/dso.rs:510-514`), `ZERO_AR_DATE` (`src/macho/inputs.rs:1240`) | GNU ld reads `LD_*` too, so keep that behavior, but have `main.rs` read the environment and pass it in through `LinkOptions` (for example `env_library_path: Vec<PathBuf>`), so that library links are hermetic by default. |
-| Caller-controlled threading | Outside any pool, the ELF driver creates its own pools. Inside a caller's pool of more than 16 threads it also creates a 16-thread "narrow" pool (`src/elf/link.rs`, `Narrow`) | Document it in the rustdoc of `link`, or add `LinkOptions::thread_policy = { CallerPool, Own(n) }` so that a caller can forbid extra pools. |
-| In-memory inputs and outputs | Only the ELF driver: PE and Mach-O ignore `output_buffer`, `input_provider` and `cancel` | See the change list below; `link` rejects `output_buffer` for them in the lib.rs diff. |
+| No environment dependence | **Done (W41):** the drivers read no variable. `LinkOptions::{env_run_path, env_library_path, zero_ar_date, output_backing, timing}` carry what used to come from `LD_RUN_PATH`, `LD_LIBRARY_PATH`, `ZERO_AR_DATE`, `QLD_OUTPUT_BACKING` and `QLD_TIMING`, and `LinkOptions::use_process_defaults()` is the documented opt-in that fills them. `parse_gnu` and `parse_darwin` call it, because they describe the link the `qld` binary runs; `parse_gnu_with`, `parse_darwin_with` and `LinkOptions::new` leave a link hermetic. (`src/symbols/resolve.rs` still reads `QLD_TIMING`; see the row above.) |
+| Caller-controlled threading | **Done (W41):** a pool the caller installed is used as it is, whatever its size, and the driver builds none of its own in it. The driver tells the two cases apart by `LinkOptions::threads`: `Some(n)` means the surrounding pool is the one `qld::link` built for this link, which qld may narrow; `None` inside a pool means the caller's. A caller who wants qld's tuned pools sets `threads` instead. No new option was needed. |
+| In-memory inputs and outputs | PE (W33) and Mach-O (W34/W35) now honour `output_buffer`. W41 made `InputKind::Bytes` and `LinkOptions::inputs` work for Mach-O as well. |
 | Cancellation | Resolution (`src/elf/lto.rs`, `src/symbols/resolve.rs`) and the relocation scan do not check the token internally | Measured with `examples/cancel.rs` on the `clang` link (180–190 ms): a token cancelled at t = 30 ms made the link return at 110 ms, and one cancelled later made it return 25–55 ms after cancellation, including freeing the link's data. Resolution is the longest unchecked stage. W28 can add a check between resolution rounds. |
 
 ## What W36 changed
@@ -272,13 +276,89 @@ installed, so there are no instruction counts.
 | 6 | W28 | `src/elf/lto.rs`, `src/symbols/resolve.rs` | `options.check_cancelled()?` after each resolution round and after the laps in `lto.rs` (`first resolution`, `code generation`, `second resolution`). |
 | 7 | W38 | `src/elf/script_layout/load.rs:116,121,227,453`, `src/script/parser.rs:80` (`FsReader`) | Read `-T` scripts and `INCLUDE`d files through `options.input_provider` first (`provider.read(path)` before `std::fs::read`). |
 | 8 | any `src/elf` owner | `src/elf/export.rs:248,265,273` | Version scripts, dynamic lists and export lists: the same provider-first read. |
-| 9 | W9 | `tests/coff_link.rs`, `tests/input.rs` | Replace the `LinkOptions { .. }`, `InputSpec { .. }` and `InputAttrs { .. }` literals with `new()`/`default()` plus assignments, to unblock `#[non_exhaustive]` on those structs. |
+| 9 | ~~W9~~ W41 | `tests/coff_link.rs`, `tests/coff_link_arm64.rs`, `tests/input.rs` | **Done (W41).** |
 | 10 | W9 | `tests/passes.rs:19`, `tests/symbols.rs:24` | Import `FileId`/`SectionId`/`SymbolId` from `qld::ids`, so that the root re-exports can go. |
-| 11 | W1 | `src/args/options.rs` | `Default` = `new()`; enums for the six string-typed options; move `warnings`/`ignored` into `ParseOutcome`; document `threads` correctly. |
+| 11 | ~~W1~~ W41 | `src/args/options.rs` | **Done (W41)** except moving `warnings`/`ignored` into `ParseOutcome`, which waits for the `#[non_exhaustive] ParseOutcome` of row 12. |
 | 12 | W1, integrator | `src/args/parse.rs`, `src/main.rs` | `#[non_exhaustive]` on `ParseOutcome`, with a wildcard arm in `main.rs`. |
 | 13 | integrator | `src/diag.rs` | `#[non_exhaustive]` plus constructors for `Diagnostic`, `Location` and `SourceLocation`; a default body for `DiagnosticSink::error_count`; no panic in `Collect::take_sorted`. |
 | 14 | integrator | `src/target.rs` | `#[non_exhaustive]` on `Target`. |
-| 15 | W5 successor | `src/output/file.rs`, `src/elf/{link,lto}.rs`, `src/elf/map.rs` | Stop reading `QLD_OUTPUT_BACKING` and `QLD_TIMING` in the library; route `-M` output through a writer. |
+| 15 | ~~W5 successor~~ W41 | `src/output/file.rs`, `src/elf/{link,lto}.rs`, `src/elf/map.rs` | **Done (W41).** `BackingPolicy::resolve` no longer reads the environment and `OutputOptions::for_link` takes the backing from `LinkOptions::output_backing`. |
+
+## What W41 changed
+
+The five 1.0 blockers, in `src/args/options.rs` unless another file is
+named.
+
+1. **`Default` is `new()`.** The derived `Default` left ten options off
+   that `new()` turns on (`-z relro`, `--demangle`, `--relax`,
+   `-z copyreloc`, `-z combreloc`, `-z extern-protected-data`,
+   `-z sectionheader`, `-z gnustack`, `--dependent-libraries`, `--fork`),
+   so two constructors described two different links. `Default` now
+   delegates to `new()`, which builds on a private `LinkOptions::blank()`
+   listing every field. Adding a field is a compile error in `blank()`
+   until its default is named there — which is where a field's default
+   belongs. A unit test compares `Default::default()` with `new()`.
+
+2. **Six string options became enums**: `IcfMode`, `OrphanHandling`,
+   `SortSection`, `DebugCompression`, `Visibility` and `OutputFormat`.
+   `--oformat` names a BFD target, so `OutputFormat` has variants for the
+   three raw formats and `Bfd(String)` for the rest, with `from_name`,
+   `name` and `is_raw`. The parser takes the same spellings and produces
+   the same errors; `tests/args.rs` has a test that pins every spelling and
+   every rejected value.
+
+3. **One input list for every format.** `DarwinArgs::inputs`,
+   `DarwinInput` and `DarwinInputKind` are gone. The ld64 front end fills
+   `LinkOptions::inputs`, with `InputKind::Framework { name, suffix }`,
+   `InputAttrs::load` (`LoadMode`, re-exported from `args`) and
+   `InputAttrs::whole_archive` for `-force_load`. `src/macho/inputs.rs`
+   resolves each input to a `Source`, so `InputKind::Bytes` links on
+   Mach-O too, and `-arch`/`-platform_version` inference reads in-memory
+   inputs. `src/macho/lto/driver.rs`'s `Spec::Gnu`/`Spec::Darwin` index
+   pair collapsed to one index. `tests/macho_link.rs` links the same
+   program from a file and from bytes and requires the same image.
+
+4. **No printing, no environment reads.** `LinkOptions::map_output` and
+   `LinkOptions::timing` are `TextOutput` sinks (`None` by default) for the
+   `-M`/`--cref` text and the stage laps; `env_run_path`,
+   `env_library_path`, `zero_ar_date` and `output_backing` carry what the
+   drivers used to read from the environment.
+   `LinkOptions::use_process_defaults()` fills all of them from the
+   process, and `parse_gnu`/`parse_darwin` call it, so the CLI is
+   unchanged while `LinkOptions::new()` describes a hermetic, silent link.
+
+5. **Nested thread pools.** In a pool the caller installed, the ELF driver
+   no longer builds a 16-thread "narrow" pool or an input-sized pool: it
+   uses the caller's pool as it is. `--threads` still means the pool
+   belongs to the link, so CLI behavior is unchanged.
+   `tests/api.rs` pins it with an input provider that records
+   `rayon::current_num_threads()`.
+
+6. **`#[non_exhaustive]`** on `LinkOptions`, `InputSpec` and `InputAttrs`,
+   with `InputSpec::new`; the struct literals in `tests/coff_link.rs`,
+   `tests/coff_link_arm64.rs` and `tests/input.rs` are gone.
+
+New public items in `qld::args`: `TextOutput`, `OutputBacking`, `IcfMode`,
+`OrphanHandling`, `SortSection`, `DebugCompression`, `Visibility`,
+`OutputFormat`, `LoadMode` (re-exported from `args::darwin`),
+`InputSpec::new`, `LinkOptions::use_process_defaults`.
+
+Cost: the `clang` link measured with
+`valgrind --tool=callgrind` on `~/.cache/qld-bench/specs/clang/link.json`
+(`--no-fork --threads=1`) went from 4,998,368,098 to 4,998,963,517
+instructions, +0.012%, with the same output hash (`ffad1ac52df901c0`).
+
+Still open for 1.0, in rough order of value:
+
+- `ParseOutcome` is not `#[non_exhaustive]`, and `warnings`/`ignored` are
+  still options rather than parse results (rows 11 and 12).
+- `#[non_exhaustive]` and constructors for `Diagnostic`, `Location`,
+  `SourceLocation` and `Target` (rows 13 and 14).
+- `InputKind::Bytes::name` is a `String` while `Source::Bytes::name` is a
+  `PathBuf`.
+- `src/symbols/resolve.rs` still reads `QLD_TIMING` on its own.
+- `DarwinArgs` and the `args::darwin` enums still need
+  `#[non_exhaustive]`.
 
 ## Semver policy to adopt at 1.0
 
