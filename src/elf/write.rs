@@ -94,31 +94,37 @@ fn push_code_padding(
         )
         .collect();
     covered.sort_unstable();
-    let end_of = |(range, _): &(ChunkRange, Chunk)| range.offset.saturating_add(range.size);
+    let end_of = |range: &ChunkRange| range.offset.saturating_add(range.size);
+    // The member chunks, in offset order; gaps come in offset order too, so
+    // the member that ends where a gap starts is found by walking forward.
+    let member_end = chunks.len();
+    let mut next = members;
+    let mut nops = Vec::new();
     let mut cursor = 0u64;
     for (offset, size) in covered.into_iter().chain([(section.size, 0)]) {
         if offset > cursor && cursor < section.size {
             let end = offset.min(section.size);
             let start = section.offset.saturating_add(cursor);
             let gap = end.saturating_sub(cursor);
-            // The member chunks are in offset order: find the one that ends
-            // where the gap starts.
-            let tail = chunks.get_mut(members..).unwrap_or_default();
-            let at = tail.partition_point(|chunk| end_of(chunk) < start);
-            match (tail.get_mut(at), u32::try_from(gap)) {
-                (Some((range, chunk @ Chunk::Input(_))), Ok(pad))
-                    if end_of(&(*range, *chunk)) == start =>
-                {
-                    if let Chunk::Input(id) = *chunk {
-                        *chunk = Chunk::PaddedInput(id, pad);
-                        range.size = range.size.saturating_add(gap);
+            while next < member_end && chunks.get(next).is_some_and(|(r, _)| end_of(r) < start) {
+                next = next.saturating_add(1);
+            }
+            match (chunks.get_mut(next), u32::try_from(gap)) {
+                (Some((range, chunk)), Ok(pad)) if next < member_end && end_of(range) == start => {
+                    match *chunk {
+                        Chunk::Input(id) => {
+                            *chunk = Chunk::PaddedInput(id, pad);
+                            range.size = range.size.saturating_add(gap);
+                        }
+                        _ => nops.push((ChunkRange::new(start, gap), Chunk::Nop)),
                     }
                 }
-                _ => chunks.push((ChunkRange::new(start, gap), Chunk::Nop)),
+                _ => nops.push((ChunkRange::new(start, gap), Chunk::Nop)),
             }
         }
         cursor = cursor.max(offset.saturating_add(size));
     }
+    chunks.extend(nops);
 }
 
 /// Inputs to the writer.
