@@ -253,14 +253,15 @@ pub fn decide(
             }
         }
         Kind::Pc | Kind::Page => {
-            let plt = context.arch.is_branch(rel.r_type);
+            // Whether the relocation is a call is asked only for the
+            // symbols it matters for: most branch to a local definition.
             if p.preemptible {
-                if plt {
+                if context.arch.is_branch(rel.r_type) {
                     decision.flags |= SymbolFlags::NEEDS_PLT;
                 } else {
                     direct_reference(&mut decision, context, p);
                 }
-            } else if plt && p.undefined_weak && mode.dynamic {
+            } else if p.undefined_weak && mode.dynamic && context.arch.is_branch(rel.r_type) {
                 // Resolved to zero here, but GNU ld still gives a call
                 // that is also checked through the GOT a `.plt.got` entry.
                 decision.flags |= SymbolFlags::NEEDS_PLT;
@@ -283,7 +284,7 @@ pub fn decide(
                 return Ok(decision);
             }
             let writable = section_flags & SHF_WRITE != 0;
-            if class.width == Width::W64 {
+            if matches!(class.width, Width::W64) {
                 if !p.preemptible {
                     if mode.pic && (p.defined || !p.global) && !p.absolute {
                         decision.dynamic = Dynamic::Relative;

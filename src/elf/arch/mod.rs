@@ -1002,14 +1002,16 @@ impl Arch {
     /// PLT when its symbol is preemptible, and does not take the symbol's
     /// address (so `--icf=safe` may fold its target).
     #[must_use]
+    #[inline(always)]
     pub fn is_branch(self, r_type: u32) -> bool {
         use crate::elf::read::consts::{aarch64 as a64, ppc64 as p64, x86_64 as x64};
+        // x86-64 first, so that it pays for no other architecture.
+        if self == Self::X86_64 {
+            return matches!(r_type, x64::R_X86_64_PLT32 | x64::R_X86_64_PLT32_BND);
+        }
         match self {
-            Self::X86_64 => matches!(r_type, x64::R_X86_64_PLT32 | x64::R_X86_64_PLT32_BND),
-            Self::Ppc64 => matches!(
-                ppc64::base_type(r_type),
-                p64::R_PPC64_REL24 | p64::R_PPC64_REL24_NOTOC
-            ),
+            Self::X86_64 => false, // answered above
+            Self::Ppc64 => matches!(r_type, p64::R_PPC64_REL24 | p64::R_PPC64_REL24_NOTOC),
             Self::AArch64 => matches!(
                 r_type,
                 a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26 | a64::R_AARCH64_PLT32
@@ -1024,6 +1026,8 @@ impl Arch {
     /// # Errors
     ///
     /// [`ClassifyError`] for unsupported types and unrecognized TLS code.
+    // Only a dispatch: each architecture's classifier stays out of line.
+    #[inline(always)]
     pub fn classify(
         self,
         r_type: u32,
@@ -1381,7 +1385,9 @@ pub fn write_value(
     Ok(())
 }
 
-/// Writes PowerPC64 field `field` at `offset`.
+/// Writes PowerPC64 field `field` at `offset`. Out of line, so that
+/// [`write_value`] stays small for the other architectures.
+#[inline(never)]
 fn write_ppc64(
     out: &mut [u8],
     offset: u64,
