@@ -472,7 +472,22 @@ fn link_inputs<'a>(
         copy_relocs: options.copy_relocs,
         arch: super::arch::Arch::of(options, files),
     };
-    let scan = scan::scan(&refs, &context);
+    // Section merging needs neither the scan's results nor anything it
+    // changes (symbol flags), and neither stage keeps every thread busy on
+    // its own: they run side by side. A merge error counts only if the scan
+    // reports none, as when the merge ran after it.
+    let (scan, merged) = rayon::join(
+        || scan::scan(&refs, &context),
+        || {
+            merge::merge(
+                files,
+                &sections,
+                &placement,
+                options.optimize >= 2,
+                narrow.widen,
+            )
+        },
+    );
     for file in &scan.files {
         for error in &file.errors {
             diagnostics.emit(error.clone());
@@ -514,13 +529,7 @@ fn link_inputs<'a>(
     lap("scan");
 
     let commons = narrow.run(|| common::allocate(&refs));
-    let merged = merge::merge(
-        files,
-        &sections,
-        &placement,
-        options.optimize >= 2,
-        narrow.widen,
-    )?;
+    let merged = merged?;
     lap("merge");
     let icf_mode = match options.icf.as_deref() {
         Some("all") => Some(IcfMode::All),
