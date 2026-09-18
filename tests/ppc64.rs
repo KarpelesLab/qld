@@ -145,9 +145,15 @@ fn discover() -> Result<Tools, String> {
     })
 }
 
+/// The tools, discovered once per test binary.
+fn tools() -> Result<&'static Tools, &'static str> {
+    static TOOLS: std::sync::OnceLock<Result<Tools, String>> = std::sync::OnceLock::new();
+    TOOLS.get_or_init(discover).as_ref().map_err(String::as_str)
+}
+
 macro_rules! require {
     () => {
-        match discover() {
+        match tools() {
             Ok(tools) => tools,
             Err(reason) => {
                 let required = std::env::var_os("QLD_REQUIRE_TOOLS")
@@ -426,6 +432,75 @@ mod canon {
         ((v << 30) as i64) >> 30
     }
 
+    /// What is known about each register: the address it holds.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Known {
+        /// The address each register holds, if known.
+        regs: [Option<u64>; 32],
+        /// Known values spilled to the stack frame: `(offset from r1,
+        /// value)`, as compilers spill a hoisted `addis`.
+        stack: [Option<(i64, u64)>; 16],
+    }
+
+    impl Known {
+        const NONE: Self = Self {
+            regs: [None; 32],
+            stack: [None; 16],
+        };
+
+        fn spilled(&self, offset: i64) -> Option<u64> {
+            self.stack
+                .iter()
+                .flatten()
+                .find(|(o, _)| *o == offset)
+                .map(|&(_, v)| v)
+        }
+
+        fn spill(&mut self, offset: i64, value: Option<u64>) {
+            for slot in &mut self.stack {
+                if slot.is_some_and(|(o, _)| o == offset) {
+                    *slot = None;
+                }
+            }
+            if let Some(value) = value
+                && let Some(slot) = self.stack.iter_mut().find(|s| s.is_none())
+            {
+                *slot = Some((offset, value));
+            }
+        }
+
+        /// What both states agree on.
+        fn meet(mut self, other: &Self) -> Self {
+            for (m, a) in self.regs.iter_mut().zip(other.regs) {
+                if *m != a {
+                    *m = None;
+                }
+            }
+            for slot in &mut self.stack {
+                if let Some((offset, value)) = *slot
+                    && other.spilled(offset) != Some(value)
+                {
+                    *slot = None;
+                }
+            }
+            self
+        }
+    }
+
+    /// One decoded instruction.
+    struct Step {
+        /// Its canonical form (`None` for what the comparison drops).
+        text: Option<String>,
+        /// The register values after it.
+        after: Known,
+        /// Its size.
+        len: u64,
+        /// Where it branches, other than a call.
+        target: Option<u64>,
+        /// Whether execution can continue with the next instruction.
+        falls_through: bool,
+    }
+
     /// A GOT, `.toc` or `.branch_lt` word: what it holds.
     enum Entry {
         /// The address of something.
@@ -476,9 +551,33 @@ mod canon {
                     format!("{}+{:#x}", symbol.name, address - symbol.value)
                 };
             }
-            match self.elf.section_at(address) {
-                Some(section) => format!("{}+{:#x}", section.name, address - section.addr),
-                None => format!("{address:#x}"),
+            // Unnamed data: name it by the first relocation that fills it
+            // (a table of pointers, say).
+            let next = self
+                .elf
+                .relocs
+                .iter()
+                .filter(|r| r.offset >= address && r.offset < address + 64)
+                .map(|r| r.offset)
+                .min();
+            match (self.elf.section_at(address), next) {
+                (Some(_), Some(next)) => match self.entry(next) {
+                    Entry::Address(name) | Entry::Other(name) => {
+                        format!("data[{name}]-{:#x}", next - address)
+                    }
+                },
+                // Merged constants land at different offsets in each
+                // linker's output: name them by their bytes.
+                (Some(section), None) if section.flags & 4 == 0 && section.sh_type != 8 => {
+                    let bytes = self.elf.bytes_at(address, 4).unwrap_or_default();
+                    format!("const{bytes:02x?}")
+                }
+                (Some(section), None) => {
+                    format!("{}+{:#x}", section.name, address - section.addr)
+                }
+                // Not an address in the output: a value the analysis
+                // mistook for one.
+                (None, _) => format!("?{address:#x}"),
             }
         }
 
@@ -527,12 +626,77 @@ mod canon {
         /// Follows a branch through PLT call stubs and range-extension
         /// thunks to where it ends up.
         fn destination(&self, target: u64, depth: u32) -> String {
-            let words: Vec<u32> = (0..8)
+            let words: Vec<u32> = (0..9)
                 .map_while(|i| self.elf.word(target + i * 4))
                 .collect();
             let mut i = 0;
             if words.first() == Some(&0xf841_0018) {
                 i = 1; // std r2, 24(r1)
+            }
+            let at = target + 4 * i as u64;
+            if depth >= 4 {
+                return self.describe(target);
+            }
+            // b dest (after saving r2)
+            if i == 1
+                && let Some(&b) = words.get(1)
+                && b & 0xfc00_0003 == 0x4800_0000
+            {
+                return self.destination(at.wrapping_add_signed(sext_branch(b)), depth + 1);
+            }
+            // pld r12, slot@pcrel / paddi r12, 0, dest@pcrel, 1; mtctr r12; bctr
+            if let [prefix, suffix, 0x7d89_03a6, 0x4e80_0420, ..] = words[i..]
+                && prefix & 0xfc10_0000 == 0x0410_0000
+            {
+                let prefixed = (u64::from(prefix) << 32) | u64::from(suffix);
+                let d = sext34(((prefixed >> 16) & 0x3_ffff_0000) | (prefixed & 0xffff));
+                let ea = at.wrapping_add_signed(d);
+                match suffix & 0xffff_0000 {
+                    0xe580_0000 => return self.through_slot(ea, depth),
+                    0x3980_0000 => return self.destination(ea, depth + 1),
+                    _ => {}
+                }
+            }
+            // addis r12, r2, ha; addi r12, r12, lo; mtctr r12; bctr
+            if let [addis, addi, 0x7d89_03a6, 0x4e80_0420, ..] = words[i..]
+                && addis >> 16 == 0x3d82
+                && addi >> 16 == 0x398c
+            {
+                let dest = self
+                    .toc
+                    .wrapping_add_signed(sext16(addis) << 16)
+                    .wrapping_add_signed(sext16(addi));
+                return self.destination(dest, depth + 1);
+            }
+            // mflr r12; bcl 20,31,.+4; mflr r11; mtlr r12;
+            // addis r12, r11, ha; addi r12, r12, lo (or ld r12, lo(r12));
+            // mtctr r12; bctr
+            if let [
+                0x7d88_02a6,
+                0x429f_0005,
+                0x7d68_02a6,
+                0x7d88_03a6,
+                addis,
+                low,
+                0x7d89_03a6,
+                0x4e80_0420,
+                ..,
+            ] = words[i..]
+                && addis >> 16 == 0x3d8b
+            {
+                let ea = (at + 8)
+                    .wrapping_add_signed(sext16(addis) << 16)
+                    .wrapping_add_signed(sext16(low & !3));
+                match low >> 16 {
+                    0x398c => {
+                        let dest = (at + 8)
+                            .wrapping_add_signed(sext16(addis) << 16)
+                            .wrapping_add_signed(sext16(low));
+                        return self.destination(dest, depth + 1);
+                    }
+                    0xe98c => return self.through_slot(ea, depth),
+                    _ => {}
+                }
             }
             // addis rX, r2, ha; ld r12, lo(rX); mtctr r12; bctr
             if let [addis, ld, 0x7d89_03a6, 0x4e80_0420, ..] = words[i..] {
@@ -557,27 +721,6 @@ mod canon {
                 let slot = self.toc.wrapping_add_signed(sext16(ld & !3));
                 return self.through_slot(slot, depth);
             }
-            // mflr r12; bcl 20,31,.+4; mflr r11; mtlr r12;
-            // addis r12, r11, ha; addi r12, r12, lo; mtctr r12; bctr
-            if let [
-                0x7d88_02a6,
-                0x429f_0005,
-                0x7d68_02a6,
-                0x7d88_03a6,
-                addis,
-                addi,
-                0x7d89_03a6,
-                0x4e80_0420,
-            ] = words[..]
-                && addis >> 16 == 0x3d8b
-                && addi >> 16 == 0x398c
-                && depth < 4
-            {
-                let dest = (target + 8)
-                    .wrapping_add_signed(sext16(addis) << 16)
-                    .wrapping_add_signed(sext16(addi));
-                return self.destination(dest, depth + 1);
-            }
             self.describe(target)
         }
 
@@ -599,98 +742,218 @@ mod canon {
             }
         }
 
-        /// The canonical instructions of the `size` bytes at `start`.
-        fn body(&self, start: u64, size: u64) -> Vec<String> {
-            let mut out = Vec::new();
-            let mut known: [Option<u64>; 32] = [None; 32];
-            known[12] = Some(start);
-            let mut pc = start;
-            let end = start + size;
-            while pc < end {
-                let Some(insn) = self.elf.word(pc) else { break };
-                let op = insn >> 26;
-                let rt = ((insn >> 21) & 31) as usize;
-                let ra = ((insn >> 16) & 31) as usize;
-                let base =
-                    |r: usize| -> Option<u64> { known[r].or_else(|| (r == 2).then_some(self.toc)) };
-                let at = pc;
-                pc += 4;
-                match op {
-                    _ if insn == 0x6000_0000 => {}
-                    1 => {
-                        let Some(suffix) = self.elf.word(pc) else {
-                            break;
-                        };
-                        pc += 4;
-                        let prefixed = (u64::from(insn) << 32) | u64::from(suffix);
-                        let pcrel = insn & 0x0010_0000 != 0;
-                        let d = sext34(((prefixed >> 16) & 0x3_ffff_0000) | (prefixed & 0xffff));
-                        let srt = ((suffix >> 21) & 31) as usize;
-                        known[srt] = None;
-                        if !pcrel {
-                            out.push(format!("{prefixed:016x}"));
-                            continue;
-                        }
-                        let ea = at.wrapping_add_signed(d);
+        /// Decodes the instruction at `at` with the register values
+        /// `known` holds before it.
+        fn step(&self, at: u64, known: &Known) -> Option<Step> {
+            let insn = self.elf.word(at)?;
+            let op = insn >> 26;
+            let rt = ((insn >> 21) & 31) as usize;
+            let ra = ((insn >> 16) & 31) as usize;
+            let base = |r: usize| -> Option<u64> {
+                if r == 0 {
+                    return None;
+                }
+                known.regs[r].or_else(|| (r == 2).then_some(self.toc))
+            };
+            let mut after = *known;
+            let mut step = Step {
+                text: None,
+                after: *known,
+                len: 4,
+                target: None,
+                falls_through: true,
+            };
+            match op {
+                _ if insn == 0x6000_0000 => {}
+                // std rS, d(r1): a spill.
+                62 if ra == 1 && insn & 3 == 0 => {
+                    step.text = Some(format!("{insn:08x}"));
+                    after.spill(sext16(insn & !3), known.regs[rt]);
+                }
+                // ld rT, d(r1): a reload.
+                58 if ra == 1 && insn & 3 == 0 => {
+                    step.text = Some(format!("{insn:08x}"));
+                    after.regs[rt] = known.spilled(sext16(insn & !3));
+                }
+                // blr, bctr
+                _ if insn == 0x4e80_0020 || insn == 0x4e80_0420 => {
+                    step.text = Some(format!("{insn:08x}"));
+                    step.falls_through = false;
+                }
+                1 => {
+                    let suffix = self.elf.word(at + 4)?;
+                    step.len = 8;
+                    let prefixed = (u64::from(insn) << 32) | u64::from(suffix);
+                    let d = sext34(((prefixed >> 16) & 0x3_ffff_0000) | (prefixed & 0xffff));
+                    let srt = ((suffix >> 21) & 31) as usize;
+                    after.regs[srt] = None;
+                    let ea = at.wrapping_add_signed(d);
+                    step.text = Some(if insn & 0x0010_0000 == 0 {
+                        format!("{prefixed:016x}")
+                    } else {
                         match suffix >> 26 {
-                            14 => out.push(format!("addr r{srt}, {}", self.describe(ea))),
+                            14 => format!("addr r{srt}, {}", self.describe(ea)),
                             57 if self.is_table(ea) => match self.entry(ea) {
-                                Entry::Address(name) => out.push(format!("addr r{srt}, {name}")),
-                                Entry::Other(name) => out.push(format!("pld r{srt}, [{name}]")),
+                                Entry::Address(name) => format!("addr r{srt}, {name}"),
+                                Entry::Other(name) => format!("pld r{srt}, [{name}]"),
                             },
-                            other => out.push(format!("p{other} r{srt}, [{}]", self.describe(ea))),
+                            other => format!("p{other} r{srt}, [{}]", self.describe(ea)),
                         }
+                    });
+                }
+                15 if base(ra).is_some() => {
+                    after.regs[rt] = base(ra).map(|b| b.wrapping_add_signed(sext16(insn) << 16));
+                }
+                14 if base(ra).is_some() => {
+                    let ea = base(ra)?.wrapping_add_signed(sext16(insn));
+                    step.text = Some(format!("addr r{rt}, {}", self.describe(ea)));
+                    after.regs[rt] = Some(ea);
+                }
+                32..=58 | 61 | 62 if base(ra).is_some() => {
+                    let mask = form_mask(op, insn);
+                    let d = sext16(insn & !mask);
+                    let ea = base(ra)?.wrapping_add_signed(d);
+                    let form = insn & mask;
+                    step.text = Some(if op == 58 && form == 0 && self.is_table(ea) {
+                        match self.entry(ea) {
+                            Entry::Address(name) => format!("addr r{rt}, {name}"),
+                            Entry::Other(name) => format!("ld r{rt}, [{name}]"),
+                        }
+                    } else {
+                        format!("op{op}.{form} r{rt}, [{}]", self.describe(ea))
+                    });
+                    if !matches!(op, 36..=39 | 44..=55 | 62) {
+                        after.regs[rt] = None;
                     }
-                    15 if base(ra).is_some() && ra != 0 => {
-                        known[rt] = base(ra).map(|b| b.wrapping_add_signed(sext16(insn) << 16));
-                    }
-                    14 if base(ra).is_some() && ra != 0 => {
-                        let ea = base(ra).unwrap().wrapping_add_signed(sext16(insn));
-                        out.push(format!("addr r{rt}, {}", self.describe(ea)));
-                        known[rt] = None;
-                    }
-                    32..=55 | 58 | 62 if base(ra).is_some() && ra != 0 => {
-                        let ds = matches!(op, 58 | 62);
-                        let d = if ds { sext16(insn & !3) } else { sext16(insn) };
-                        let ea = base(ra).unwrap().wrapping_add_signed(d);
-                        let form = if ds { insn & 3 } else { 0 };
-                        if op == 58 && form == 0 && self.is_table(ea) {
-                            match self.entry(ea) {
-                                Entry::Address(name) => out.push(format!("addr r{rt}, {name}")),
-                                Entry::Other(name) => out.push(format!("ld r{rt}, [{name}]")),
+                    // A link-time address loaded from a table entry.
+                    if op == 58 && form == 0 && self.is_table(ea) {
+                        after.regs[rt] = match self.reloc_at(ea) {
+                            Some(reloc) if reloc.r_type == R_PPC64_RELATIVE => {
+                                Some(reloc.addend as u64)
                             }
-                        } else {
-                            out.push(format!("op{op}.{form} r{rt}, [{}]", self.describe(ea)));
-                        }
-                        if !matches!(op, 36..=39 | 44 | 45 | 52..=55 | 62) {
-                            known[rt] = None;
-                        }
-                    }
-                    18 => {
-                        let target = if insn & 2 != 0 {
-                            sext_branch(insn) as u64
-                        } else {
-                            at.wrapping_add_signed(sext_branch(insn))
+                            Some(_) => None,
+                            None => self
+                                .elf
+                                .dword(ea)
+                                .filter(|&v| self.elf.section_at(v).is_some()),
                         };
-                        let link = if insn & 1 != 0 { "bl" } else { "b" };
-                        out.push(format!("{link} {}", self.destination(target, 0)));
-                        if insn & 1 != 0 {
-                            known = [None; 32];
-                        }
-                    }
-                    16 => {
-                        let target = at.wrapping_add_signed(sext16(insn & 0xfffc));
-                        out.push(format!(
-                            "bc {:#x} {}",
-                            insn & 0x03ff_0003,
-                            self.describe(target)
-                        ));
-                    }
-                    _ => {
-                        out.push(format!("{insn:08x}"));
-                        known[rt] = None;
                     }
                 }
+                18 => {
+                    let target = if insn & 2 != 0 {
+                        sext_branch(insn) as u64
+                    } else {
+                        at.wrapping_add_signed(sext_branch(insn))
+                    };
+                    let link = insn & 1 != 0;
+                    step.text = Some(format!(
+                        "{} {}",
+                        if link { "bl" } else { "b" },
+                        self.destination(target, 0)
+                    ));
+                    if link {
+                        // A call clobbers the volatile registers.
+                        for register in [0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+                            after.regs[register] = None;
+                        }
+                    } else {
+                        step.target = Some(target);
+                        step.falls_through = false;
+                    }
+                }
+                16 => {
+                    let target = at.wrapping_add_signed(sext16(insn & 0xfffc));
+                    step.text = Some(format!(
+                        "bc {:#x} {}",
+                        insn & 0x03ff_0003,
+                        self.describe(target)
+                    ));
+                    step.target = Some(target);
+                }
+                _ => {
+                    step.text = Some(format!("{insn:08x}"));
+                    // A load or store from a base the analysis cannot
+                    // follow (a register the other linker's code may have
+                    // made TOC-relative).
+                    if matches!(op, 14 | 15 | 32..=58 | 61 | 62) && ra != 0 && ra != 1 {
+                        let mask = form_mask(op, insn);
+                        let form = insn & mask;
+                        let d = sext16(insn & !mask);
+                        step.text = Some(format!("op{op}.{form} r{rt}, [?r{ra}{d:+}]"));
+                    }
+                    // Stores and compares write no register there.
+                    // Stores, compares, and vector and floating-point
+                    // instructions write no general register there.
+                    if !matches!(op, 4 | 10 | 11 | 17 | 19 | 36..=39 | 44 | 45 | 48..=55 | 57 | 59..=63)
+                    {
+                        after.regs[rt] = None;
+                    }
+                    // Logical and rotate instructions write rA.
+                    if matches!(op, 20..=31) {
+                        after.regs[ra] = None;
+                    }
+                    // bctrl, blrl: an indirect call.
+                    if op == 19 && insn & 1 != 0 {
+                        for register in [0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+                            after.regs[register] = None;
+                        }
+                    }
+                }
+            }
+            if after.regs[1] != known.regs[1]
+                || (op == 62 && ra == 1 && insn & 3 == 1)
+                || (op == 14 && rt == 1)
+            {
+                // The stack pointer moved.
+                after.stack = [None; 16];
+            }
+            step.after = after;
+            Some(step)
+        }
+
+        /// The canonical instructions of the `size` bytes at `start`. The
+        /// register values the TOC-relative addressing builds are tracked
+        /// along the function's branches (a value is known at a join only
+        /// if every path agrees on it), since compilers hoist an `addis`
+        /// out of a loop.
+        fn body(&self, start: u64, size: u64) -> Vec<String> {
+            let end = start + size;
+            let mut entry = Known::NONE;
+            entry.regs[12] = Some(start);
+            let mut states: BTreeMap<u64, Known> = BTreeMap::new();
+            states.insert(start, entry);
+            let mut work = vec![start];
+            while let Some(pc) = work.pop() {
+                let Some(state) = states.get(&pc).copied() else {
+                    continue;
+                };
+                let Some(step) = self.step(pc, &state) else {
+                    continue;
+                };
+                let next = step.falls_through.then_some(pc + step.len);
+                for successor in [next, step.target].into_iter().flatten() {
+                    if successor < start || successor >= end {
+                        continue;
+                    }
+                    let merged = match states.get(&successor) {
+                        None => step.after,
+                        Some(old) => old.meet(&step.after),
+                    };
+                    if states.get(&successor) != Some(&merged) {
+                        states.insert(successor, merged);
+                        work.push(successor);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            let mut pc = start;
+            while pc < end {
+                let state = states.get(&pc).copied().unwrap_or(Known::NONE);
+                let Some(step) = self.step(pc, &state) else {
+                    break;
+                };
+                out.extend(step.text);
+                pc += step.len;
             }
             out
         }
@@ -714,11 +977,28 @@ mod canon {
                         }
                         (_, None) => format!("{:#x}", reloc.addend),
                     };
+                    // Unnamed read-only data is compared by kind only (see
+                    // `equivalent`).
+                    let target = match target.split_once("const[") {
+                        Some((head, _)) => format!("{head}const"),
+                        None => target,
+                    };
                     format!("{} {target} @ {place}", reloc.r_type)
                 })
                 .collect();
             out.sort();
             out
+        }
+    }
+
+    /// The low displacement bits a DS- or DQ-form instruction uses for
+    /// its opcode extension.
+    fn form_mask(op: u32, insn: u32) -> u32 {
+        match op {
+            56 => 0xf,
+            61 if insn & 3 == 1 => 0xf,
+            57 | 58 | 61 | 62 => 3,
+            _ => 0,
         }
     }
 
@@ -756,6 +1036,36 @@ mod canon {
             out.insert(symbol.name.clone(), (symbol.value, size, symbol.other));
         }
         out
+    }
+
+    /// Whether two canonical instructions agree: equal, or one is an
+    /// access through a base register the analysis could not resolve and
+    /// the other the same access resolved to a symbol.
+    fn equivalent(x: &str, y: &str) -> bool {
+        if x == y {
+            return true;
+        }
+        let unresolved = |a: &str, b: &str| {
+            a.split_once(", [?").is_some_and(|(head, _)| {
+                b.split_once(", [").is_some_and(|(other, _)| head == other)
+                    // An `addi` from an unresolved base, and the address
+                    // the other linker's code computes there.
+                    || head
+                        .strip_prefix("op14.0 ")
+                        .is_some_and(|register| b.starts_with(&format!("addr {register}, ")))
+            })
+        };
+        let stray = |a: &str| a.split_once("?0x").map(|(head, _)| head.to_string());
+        if let (Some(a), Some(b)) = (stray(x), stray(y)) {
+            return a == b;
+        }
+        // Unnamed read-only data (merged constants, jump tables whose
+        // entries are link-time offsets) cannot be told apart reliably.
+        let unnamed = |a: &str| a.split_once("const[").map(|(head, _)| head.to_string());
+        if let (Some(a), Some(b)) = (unnamed(x), unnamed(y)) {
+            return a == b;
+        }
+        unresolved(x, y) || unresolved(y, x)
     }
 
     /// Checks `.glink`: `DT_PPC64_GLINK + 32` is the first lazy entry, each
@@ -821,10 +1131,23 @@ mod canon {
             assert_eq!(other, their_other, "{name}: st_other differs from {label}");
             let size = size.min(their_size);
             let (ours_body, theirs_body) = (b.body(start, size), a.body(their_start, size));
-            assert_eq!(
-                theirs_body, ours_body,
-                "{name} was relocated differently from {label}\n{label}: {theirs_body:#?}\nqld: {ours_body:#?}"
-            );
+            if let Some(at) = (0..ours_body.len().max(theirs_body.len())).find(|&i| {
+                match (ours_body.get(i), theirs_body.get(i)) {
+                    (Some(x), Some(y)) => !equivalent(x, y),
+                    _ => true,
+                }
+            }) {
+                let window = |body: &[String]| {
+                    body.get(at.saturating_sub(3)..(at + 4).min(body.len()))
+                        .unwrap_or_default()
+                        .to_vec()
+                };
+                panic!(
+                    "{name} was relocated differently from {label} at canonical instruction {at}\n{label}: {:#?}\nqld: {:#?}",
+                    window(&theirs_body),
+                    window(&ours_body)
+                );
+            }
             compared += 1;
         }
         assert!(compared > 0, "no function compared with {label}");
@@ -894,14 +1217,14 @@ fn toc_accesses_and_calls_match() {
     let dir = scratch("toc");
     for (name, flags) in [("pic", "-fPIC"), ("nopic", "-fno-PIC")] {
         compile(
-            &tools,
+            tools,
             &dir,
             &format!("main-{name}.c"),
             TOC_MAIN,
             &["-O2", flags],
         );
         compile(
-            &tools,
+            tools,
             &dir,
             &format!("other-{name}.c"),
             TOC_OTHER,
@@ -909,13 +1232,13 @@ fn toc_accesses_and_calls_match() {
         );
     }
     link_and_compare(
-        &tools,
+        tools,
         &dir,
         "static",
         &["-static", "-e", "_start", "main-nopic.o", "other-nopic.o"],
     );
     let pie = link_and_compare(
-        &tools,
+        tools,
         &dir,
         "pie",
         &["-pie", "-e", "_start", "main-pic.o", "other-pic.o"],
@@ -951,10 +1274,10 @@ int main(void) { return use_library(1); }
 fn dynamic_linking_matches() {
     let tools = require!();
     let dir = scratch("dynamic");
-    compile(&tools, &dir, "lib.c", LIBRARY, &["-O2", "-fPIC"]);
-    compile(&tools, &dir, "main.c", DYNAMIC_MAIN, &["-O2", "-fPIC"]);
+    compile(tools, &dir, "lib.c", LIBRARY, &["-O2", "-fPIC"]);
+    compile(tools, &dir, "main.c", DYNAMIC_MAIN, &["-O2", "-fPIC"]);
     link_and_compare(
-        &tools,
+        tools,
         &dir,
         "libdemo.so",
         &["-shared", "-soname", "libdemo.so", "lib.o"],
@@ -969,9 +1292,9 @@ fn dynamic_linking_matches() {
             "main.o",
             "libdemo.so",
         ]);
-        link_and_compare(&tools, &dir, name, &args);
+        link_and_compare(tools, &dir, name, &args);
         args.extend(["-z", "now"]);
-        link_and_compare(&tools, &dir, &format!("{name}-now"), &args);
+        link_and_compare(tools, &dir, &format!("{name}-now"), &args);
     }
 }
 
@@ -1001,7 +1324,7 @@ __attribute__((noinline)) int from_other(void) { return tls_gd + shared_tls; }
 
 const TLS_SHARED: &str = r#"
 __thread int shared_tls = 8;
-int *shared_address(void) { return &shared_tls; }
+int shared_function(int x) { return x + 1; }
 "#;
 
 /// The TLS models: relaxed to local-exec in an executable, to
@@ -1017,28 +1340,22 @@ fn tls_models_match() {
         ("shared", TLS_SHARED),
         ("le", TLS_LOCAL_EXEC),
     ] {
-        compile(
-            &tools,
-            &dir,
-            &format!("{name}.c"),
-            source,
-            &["-O2", "-fPIC"],
-        );
+        compile(tools, &dir, &format!("{name}.c"), source, &["-O2", "-fPIC"]);
     }
     link_and_compare(
-        &tools,
+        tools,
         &dir,
         "libshared.so",
         &["-shared", "-soname", "libshared.so", "shared.o"],
     );
     link_and_compare(
-        &tools,
+        tools,
         &dir,
         "libtls.so",
         &["-shared", "defs.o", "user.o", "libshared.so"],
     );
     link_and_compare(
-        &tools,
+        tools,
         &dir,
         "exe",
         &[
@@ -1074,22 +1391,55 @@ __thread int tls_ie = 9;
 int ext_func(int x) { return x + ext_var; }
 "#;
 
+const TOC_CALLER: &str = r#"
+extern int pcrel_caller(int);
+extern int ext_var;
+__attribute__((noinline)) int toc_caller(int x) { return pcrel_caller(x) + ext_var; }
+"#;
+
+const PCREL_LIBRARY: &str = r#"
+extern int outside_function(int);
+extern int lib_data;
+__attribute__((noinline)) int calls_outside(int x) { return outside_function(x) + lib_data; }
+int lib_data = 5;
+"#;
+
 /// Power10 PC-relative code: `R_PPC64_GOT_PCREL34` relaxed to
-/// `R_PPC64_PCREL34`, `R_PPC64_REL24_NOTOC` calls, and the PC-relative TLS
+/// `R_PPC64_PCREL34` (with `R_PPC64_PCREL_OPT`), `R_PPC64_REL24_NOTOC`
+/// calls into TOC-based code (through a thunk that sets up `r12`) and
+/// through the PLT (a stub that loads the PLT word PC-relatively), calls
+/// from TOC-based code into PC-relative code, and the PC-relative TLS
 /// sequences.
 #[test]
 fn power10_pcrel_matches() {
     let tools = require!();
     let dir = scratch("pcrel");
     let power10 = ["-O2", "-fPIC", "-mcpu=power10"];
-    compile(&tools, &dir, "pcrel.c", PCREL, &power10);
-    compile(&tools, &dir, "other.c", PCREL_OTHER, &power10);
+    compile(tools, &dir, "pcrel.c", PCREL, &power10);
+    compile(tools, &dir, "library.c", PCREL_LIBRARY, &power10);
+    // ext_func is TOC-based code, called from PC-relative code.
+    compile(
+        tools,
+        &dir,
+        "other.c",
+        PCREL_OTHER,
+        &["-O2", "-fPIC", "-mcpu=power8"],
+    );
+    compile(
+        tools,
+        &dir,
+        "toc.c",
+        TOC_CALLER,
+        &["-O2", "-fPIC", "-mcpu=power8"],
+    );
     link_and_compare(
-        &tools,
+        tools,
         &dir,
         "exe",
-        &["-pie", "-e", "pcrel_caller", "pcrel.o", "other.o"],
+        &["-pie", "-e", "pcrel_caller", "pcrel.o", "other.o", "toc.o"],
     );
+    // Preemptible calls in a shared library go through the PLT.
+    link_and_compare(tools, &dir, "libpcrel.so", &["-shared", "library.o"]);
 }
 
 const FAR_CALLS: &str = r#"
@@ -1134,9 +1484,9 @@ far_function:
 fn far_calls_get_thunks() {
     let tools = require!();
     let dir = scratch("thunks");
-    compile(&tools, &dir, "far.s", FAR_CALLS, &[]);
+    compile(tools, &dir, "far.s", FAR_CALLS, &[]);
     let ours = link_and_compare(
-        &tools,
+        tools,
         &dir,
         "exe",
         &["-static", "-e", "near_caller", "far.o"],
@@ -1154,15 +1504,36 @@ fn far_calls_get_thunks() {
     assert_eq!(thunks, 1, "expected one shared thunk");
 }
 
+/// Links the link arguments in `QLD_PPC64_LINK` (objects given by absolute
+/// path) with qld and the reference linkers and compares the outputs, for
+/// checking larger programs by hand:
+/// `QLD_PPC64_LINK="-shared /tmp/sqlite.o" cargo test --test ppc64 -- --ignored`.
+#[test]
+#[ignore = "links objects named by QLD_PPC64_LINK"]
+fn external_link_matches() {
+    let tools = require!();
+    let Ok(line) = std::env::var("QLD_PPC64_LINK") else {
+        println!("SKIPPED: QLD_PPC64_LINK is not set");
+        return;
+    };
+    let dir = scratch("external");
+    let args: Vec<&str> = line.split_whitespace().collect();
+    link_and_compare(tools, &dir, "out", &args);
+}
+
 /// `-r` keeps the machine and the ELFv2 flag.
 #[test]
 fn relocatable_output_keeps_the_abi() {
     let tools = require!();
     let dir = scratch("relocatable");
-    compile(&tools, &dir, "other.c", TOC_OTHER, &["-O2"]);
+    compile(tools, &dir, "other.c", TOC_OTHER, &["-O2"]);
     qld_ok(&dir, &["-r", "-o", "combined.o", "other.o"]);
     let data = fs::read(dir.join("combined.o")).unwrap();
     assert_eq!(u16::from_le_bytes([data[18], data[19]]), 21);
+    assert_eq!(
+        u32::from_le_bytes([data[48], data[49], data[50], data[51]]),
+        2
+    );
 }
 
 /// The emulation name selects PowerPC64, and a big-endian object is
@@ -1171,7 +1542,7 @@ fn relocatable_output_keeps_the_abi() {
 fn emulation_selects_the_backend() {
     let tools = require!();
     let dir = scratch("emulation");
-    compile(&tools, &dir, "other.c", TOC_OTHER, &["-O2"]);
+    compile(tools, &dir, "other.c", TOC_OTHER, &["-O2"]);
     qld_ok(
         &dir,
         &["-m", "elf64lppc", "-shared", "-o", "lib.so", "other.o"],

@@ -1,0 +1,17 @@
+# M4: C++ exceptions on PowerPC64 LE need `.eh_frame` relocated and
+# `.eh_frame_hdr` sorted so the unwinder finds the FDE of a frame two calls
+# deep, and every call into libstdc++ restores r2 after its PLT stub.
+description = "C++ exceptions across two frames, for PowerPC64 LE"
+compile = ["c++ -O2 -fPIE -c throw.cpp"]
+driver = "c++"
+link = "-pie -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "PowerPC64",
+  "GNU_EH_FRAME",
+  ".gcc_except_table",
+  "R_PPC64_JMP_SLOT",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true

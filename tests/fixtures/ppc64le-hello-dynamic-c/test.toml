@@ -1,0 +1,21 @@
+# M4: a dynamic PIE against glibc on PowerPC64 LE. Covers the TOC, the PLT
+# call stubs that save and restore r2, `.glink` with DT_PPC64_GLINK for lazy
+# binding, JMP_SLOT and RELATIVE relocations, and the 64 KiB page size.
+description = "dynamic PIE hello world in C, for PowerPC64 LE"
+compile = ["cc -O2 -fPIE -c hello.c"]
+driver = "cc"
+link = "-pie -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, dynamic world (20)\n"
+expect.readelf = [
+  "PowerPC64",
+  "DYN (",
+  "INTERP",
+  "ld64.so.2",
+  "R_PPC64_JMP_SLOT",
+  "R_PPC64_RELATIVE",
+  "PPC64_GLINK",
+  "0x10000",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true

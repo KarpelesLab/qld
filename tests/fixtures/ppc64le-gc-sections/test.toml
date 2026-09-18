@@ -1,0 +1,18 @@
+# M4: --gc-sections on PowerPC64 LE. Liveness follows TOC-relative
+# relocations and the `.toc` entries that hold data addresses, so the
+# referenced function and data stay and the rest goes.
+description = "--gc-sections removes dead functions and data, for PowerPC64 LE"
+compile = ["cc -O2 -ffunction-sections -fdata-sections -fPIE -c main.c"]
+driver = "cc"
+link = "-pie -o out main.o -Wl,--gc-sections"
+run = "./out"
+expect.stdout = "42\n"
+expect.readelf = [
+  "PowerPC64",
+  "live_function_qld",
+  "live_data_qld",
+  "!dead_function_qld",
+  "!dead_data_qld",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true
