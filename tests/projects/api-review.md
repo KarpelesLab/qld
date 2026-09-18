@@ -486,6 +486,9 @@ index f4a7f62..437ff21 100644
  }
 ```
 
+**Applied in e72127c** (with the follow-up below): cancellation returns
+`Error::Cancelled`. The rest of this section is kept for the record.
+
 Until this lands, cancellation uses an existing variant: `Error::Io` with
 `path: None` and an `io::Error` of kind `Interrupted`, whose payload is a
 private `Cancelled` type. It displays as `link cancelled`, and
