@@ -123,54 +123,72 @@ impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
         files: &mut [RoundFile<'_, ElfInput<'a>>],
     ) -> Result<()> {
         let round = self.claims.begin_round();
-        files.par_iter().for_each(|round_file| {
-            let file = &round_file.file;
-            // An IR file's COMDAT keys compete with the group signatures of
-            // regular objects: they name the same groups.
-            if let Some(ir) = &file.ir {
-                for &key in &ir.comdats {
-                    round.offer(SymbolName::new(key), file.position, round_file.id);
+        // Whether each group's offer held the key when it was made. An offer
+        // that did not has lost for good (the claim can only go lower); one
+        // that did must look again once every offer is in.
+        let held: Vec<Vec<bool>> = files
+            .par_iter()
+            .map(|round_file| {
+                let file = &round_file.file;
+                // An IR file's COMDAT keys compete with the group signatures
+                // of regular objects: they name the same groups.
+                if let Some(ir) = &file.ir {
+                    return ir
+                        .comdats
+                        .iter()
+                        .map(|&key| round.offer(SymbolName::new(key), file.position, round_file.id))
+                        .collect();
                 }
-                return;
-            }
-            let Some(object) = &file.object else {
-                return;
-            };
-            for (index, group) in object.groups.iter().enumerate() {
-                // A copy discarded by an earlier resolution (the one before
-                // LTO) stays discarded: the kept copy may now be in code
-                // LTO generated without a group.
-                if object.discarded_groups.get(index).copied().unwrap_or(false) {
-                    continue;
-                }
-                round.offer(group.key, file.position, round_file.id);
-            }
-        });
-        files.par_iter_mut().for_each(|round_file| {
-            let id = round_file.id;
-            if let Some(ir) = &mut round_file.file.ir {
-                let discarded: Vec<bool> = ir
-                    .comdats
+                let Some(object) = &file.object else {
+                    return Vec::new();
+                };
+                object
+                    .groups
                     .iter()
-                    .map(|&key| round.owner(&SymbolName::new(key)) != Some(id))
+                    .enumerate()
+                    .map(|(index, group)| {
+                        // A copy discarded by an earlier resolution (the one
+                        // before LTO) stays discarded: the kept copy may now
+                        // be in code LTO generated without a group.
+                        !object.discarded_groups.get(index).copied().unwrap_or(false)
+                            && round.offer(group.key, file.position, round_file.id)
+                    })
+                    .collect()
+            })
+            .collect();
+        files
+            .par_iter_mut()
+            .zip(held)
+            .for_each(|(round_file, held)| {
+                let id = round_file.id;
+                let kept = |index: usize, key: &SymbolName<'_>| {
+                    held.get(index).copied().unwrap_or(false) && round.owner(key) == Some(id)
+                };
+                if let Some(ir) = &mut round_file.file.ir {
+                    let discarded: Vec<bool> = ir
+                        .comdats
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &key)| !kept(index, &SymbolName::new(key)))
+                        .collect();
+                    if discarded.contains(&true) {
+                        ir.discard_comdats(discarded);
+                    }
+                    return;
+                }
+                let Some(object) = &mut round_file.file.object else {
+                    return;
+                };
+                let discarded: Vec<bool> = object
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .map(|(index, group)| !kept(index, &group.key))
                     .collect();
                 if discarded.contains(&true) {
-                    ir.discard_comdats(discarded);
+                    object.discard_groups(discarded);
                 }
-                return;
-            }
-            let Some(object) = &mut round_file.file.object else {
-                return;
-            };
-            let discarded: Vec<bool> = object
-                .groups
-                .iter()
-                .map(|group| round.owner(&group.key) != Some(id))
-                .collect();
-            if discarded.contains(&true) {
-                object.discard_groups(discarded);
-            }
-        });
+            });
         Ok(())
     }
 }
