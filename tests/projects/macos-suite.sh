@@ -44,7 +44,9 @@ ZLIB_VERSION=1.3.1
 LUA_VERSION=5.4.7
 SQLITE_VERSION=3460100
 SQLITE_YEAR=2024
-FMT_VERSION=11.0.2
+# 12.x: 11.0.2 specializes std::is_floating_point in a test, which the
+# libc++ of Xcode 26 rejects.
+FMT_VERSION=12.2.0
 
 mkdir -p "$SCRATCH/bin" "$SCRATCH/src" "$SCRATCH/build"
 LINKER="$SCRATCH/bin/ld64.qld"

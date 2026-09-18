@@ -27,6 +27,7 @@ use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
 use crate::input::identify::{FileFormat, TextKind};
+use crate::input::source::InputProvider;
 use crate::input::{FileTable, InputFile, Source};
 use crate::macho::read::commands::PackedVersion;
 use crate::macho::read::tbd::{StubSymbolKind, StubTarget, TextStub};
@@ -366,6 +367,8 @@ pub struct SearchPaths {
     pub roots: Vec<PathBuf>,
     /// `-search_dylibs_first`.
     pub dylibs_first: bool,
+    /// [`LinkOptions::input_provider`]: files it holds exist too.
+    pub provider: Option<Arc<dyn InputProvider>>,
 }
 
 fn join_root(root: &Path, path: &Path) -> PathBuf {
@@ -430,6 +433,7 @@ impl SearchPaths {
             ),
             roots,
             dylibs_first: darwin.search_dylibs_first,
+            provider: options.input_provider.clone(),
         }
     }
 
@@ -438,10 +442,11 @@ impl SearchPaths {
     pub fn find_library(&self, name: &str) -> Option<PathBuf> {
         if self.dylibs_first {
             let dynamic = [".tbd", ".dylib", ".so"];
-            return find_in(&self.libraries, &format!("lib{name}"), &dynamic)
-                .or_else(|| find_in(&self.libraries, &format!("lib{name}"), &[".a"]));
+            return self
+                .find_in(&self.libraries, &format!("lib{name}"), &dynamic)
+                .or_else(|| self.find_in(&self.libraries, &format!("lib{name}"), &[".a"]));
         }
-        find_in(
+        self.find_in(
             &self.libraries,
             &format!("lib{name}"),
             &[".tbd", ".dylib", ".so", ".a"],
@@ -460,7 +465,7 @@ impl SearchPaths {
             }
             candidates.push(base.join(name));
             candidates.push(base.join(format!("{name}.tbd")));
-            if let Some(found) = candidates.into_iter().find(|c| c.is_file()) {
+            if let Some(found) = candidates.into_iter().find(|c| self.exists(c)) {
                 return Some(found);
             }
         }
@@ -486,10 +491,10 @@ impl SearchPaths {
                     PathBuf::from(with)
                 }
             };
-            if tbd.is_file() {
+            if self.exists(&tbd) {
                 return Some(tbd);
             }
-            if candidate.is_file() {
+            if self.exists(&candidate) {
                 return Some(candidate);
             }
         }
@@ -497,16 +502,44 @@ impl SearchPaths {
     }
 }
 
-fn find_in(dirs: &[PathBuf], stem: &str, extensions: &[&str]) -> Option<PathBuf> {
-    for dir in dirs {
-        for ext in extensions {
-            let candidate = dir.join(format!("{stem}{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
+impl SearchPaths {
+    /// Whether `path` is a file, in the input provider or on disk.
+    fn exists(&self, path: &Path) -> bool {
+        self.provider.as_ref().is_some_and(|p| p.contains(path)) || path.is_file()
+    }
+
+    fn find_in(&self, dirs: &[PathBuf], stem: &str, extensions: &[&str]) -> Option<PathBuf> {
+        for dir in dirs {
+            for ext in extensions {
+                let candidate = dir.join(format!("{stem}{ext}"));
+                if self.exists(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
+        None
     }
-    None
+
+    /// The contents of `path`, from the input provider or the disk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when it cannot be read.
+    pub fn read(&self, path: &Path) -> Result<Vec<u8>> {
+        read_input(self.provider.as_deref(), path)
+    }
+}
+
+/// The contents of `path`, from `provider` or the disk.
+///
+/// # Errors
+///
+/// [`Error::Io`] when it cannot be read.
+pub fn read_input(provider: Option<&dyn InputProvider>, path: &Path) -> Result<Vec<u8>> {
+    if let Some(data) = provider.and_then(|p| p.read(path)) {
+        return Ok(data.to_vec());
+    }
+    std::fs::read(path).map_err(|error| Error::io(path, error))
 }
 
 struct Pending {
@@ -1099,7 +1132,7 @@ impl<'t> Walker<'_, 't> {
             )));
             return Ok(None);
         };
-        let data = std::fs::read(&path).map_err(|error| Error::io(&path, error))?;
+        let data = self.search.read(&path)?;
         let source = MachSource::new(&path);
         let data = match crate::input::identify(&data) {
             FileFormat::Fat(_) => {

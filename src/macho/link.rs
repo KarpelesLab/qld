@@ -11,7 +11,8 @@
 //! 2. [`resolve_symbols`] with [`MachRules`];
 //! 3. [`Link::new`]: what every symbol resolved to, undefined symbol
 //!    reports, `-undefined` handling; relocations are loaded in parallel;
-//! 4. [`Link::mark_live`]: weak definition coalescing and `-dead_strip`;
+//! 4. [`Link::mark_live`]: weak definition coalescing and `-dead_strip`
+//!    (after which undefined symbols only dead code refers to are dropped);
 //! 5. [`scan::scan`]: stubs, `__got`, `__thread_ptrs`, imports and dylib
 //!    ordinals;
 //! 6. [`layout::plan`] and [`Layout::assign_addresses`], with
@@ -61,15 +62,25 @@ use super::write::{self, Commands, DylibLoad, HeaderInput, Linkedit};
 /// Links a Mach-O output described by `options`.
 ///
 /// Called by [`crate::link`] when the target's format is
-/// [`BinaryFormat::MachO`](crate::BinaryFormat::MachO).
+/// [`BinaryFormat::MachO`](crate::BinaryFormat::MachO). The library options
+/// apply: inputs are read from [`LinkOptions::input_provider`] before the
+/// file system, the image goes to [`LinkOptions::output_buffer`] instead of
+/// the output file when one is set, and [`LinkOptions::cancel`] is checked
+/// between stages.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Reported`] when errors were reported to `diagnostics`,
-/// [`Error::Unimplemented`] for features a later step covers, and any I/O
-/// or parse error.
+/// [`Error::Unimplemented`] for features a later step covers,
+/// [`Error::Cancelled`] once the link is cancelled, and any I/O or parse
+/// error.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
     let bytes = link_to_bytes(options, diagnostics)?;
+    options.check_cancelled()?;
+    if let Some(buffer) = &options.output_buffer {
+        buffer.store(bytes);
+        return Ok(());
+    }
     let path = options.output_path();
     let mut output = OutputFile::create(
         &path,
@@ -128,7 +139,7 @@ fn infer_arch(options: &LinkOptions) -> Result<Arch> {
         let DarwinInputKind::File(path) = &input.kind else {
             continue;
         };
-        let Ok(data) = std::fs::read(path) else {
+        let Ok(data) = inputs::read_input(options.input_provider.as_deref(), path) else {
             continue;
         };
         if let Ok(file) = MachOFile::parse(&data, Source::new(path)) {
@@ -149,7 +160,7 @@ fn infer_platform(options: &LinkOptions, arch: Arch) -> Option<PlatformVersion> 
         let DarwinInputKind::File(path) = &input.kind else {
             continue;
         };
-        let Ok(data) = std::fs::read(path) else {
+        let Ok(data) = inputs::read_input(options.input_provider.as_deref(), path) else {
             continue;
         };
         let source = Source::new(path);
@@ -186,28 +197,40 @@ fn link_arch(
 ) -> Result<Vec<u8>> {
     // Archive members extracted during resolution may ask for more
     // libraries with LC_LINKER_OPTION; link again with them.
-    // Selector stubs (`_objc_msgSend$sel`) left undefined are generated in
-    // an extra object; link again with it.
+    // Selector stubs (`_objc_msgSend$sel`) left undefined, and selector
+    // references relative method lists need, are generated in an extra
+    // object; link again with it.
     // Bitcode inputs are compiled by LTO first; its objects follow the
     // command line.
     let lto = super::lto::prepare(options, arch, diagnostics)?;
     let mut options = lto.options;
     let mut selectors: Vec<Vec<u8>> = Vec::new();
+    let mut selrefs: Vec<Vec<u8>> = Vec::new();
     for _ in 0..8 {
         let mut generated = lto.inputs.clone();
-        if !selectors.is_empty() {
+        if !selectors.is_empty() || !selrefs.is_empty() {
+            let only: Vec<Vec<u8>> = selrefs
+                .iter()
+                .filter(|name| selectors.binary_search(name).is_err())
+                .cloned()
+                .collect();
             generated.push((
                 std::path::PathBuf::from("<objc selector stubs>"),
-                std::sync::Arc::from(super::objc_stubs::object(arch, &selectors)),
+                std::sync::Arc::from(super::objc_stubs::object(arch, &selectors, &only)),
             ));
         }
-        match link_arch_once(&options, arch, diagnostics, &generated)? {
+        match link_arch_once(&options, arch, diagnostics, &generated, &selrefs)? {
             Attempt::Done(bytes) => return Ok(bytes),
             Attempt::MoreInputs(more) => options.to_mut().darwin.inputs.extend(more),
             Attempt::Selectors(more) => {
                 selectors.extend(more);
                 selectors.sort();
                 selectors.dedup();
+            }
+            Attempt::SelRefs(more) => {
+                selrefs.extend(more);
+                selrefs.sort();
+                selrefs.dedup();
             }
         }
     }
@@ -220,6 +243,7 @@ enum Attempt {
     Done(Vec<u8>),
     MoreInputs(Vec<crate::args::darwin::DarwinInput>),
     Selectors(Vec<Vec<u8>>),
+    SelRefs(Vec<Vec<u8>>),
 }
 
 /// One link attempt for `arch`.
@@ -229,13 +253,15 @@ fn link_arch_once(
     arch: Arch,
     diagnostics: &dyn DiagnosticSink,
     generated: &[(std::path::PathBuf, std::sync::Arc<[u8]>)],
+    requested_selrefs: &[Vec<u8>],
 ) -> Result<Attempt> {
     let config = Config::new(options, arch, infer_platform(options, arch))?;
-    let table = FileTable::new();
+    let table = FileTable::for_link(options);
     let collected = inputs::collect(options, &config, &table, diagnostics, generated)?;
     let internal = InternalNames::new(options, &config);
     let mut files = collected.files(&internal)?;
 
+    options.check_cancelled()?;
     let mut symbols = SymbolTable::new();
     let resolution = resolve_symbols(&mut symbols, &MachRules, &mut files)?;
     // `-r` leaves both to the final link.
@@ -288,7 +314,19 @@ fn link_arch_once(
         &internal,
         diagnostics,
     )?;
+    if !config.is_relocatable() {
+        let missing: Vec<Vec<u8>> = super::objc::missing_selrefs(&link)?
+            .into_iter()
+            .filter(|name| requested_selrefs.binary_search(name).is_err())
+            .collect();
+        if !missing.is_empty() {
+            return Ok(Attempt::SelRefs(missing));
+        }
+    }
     link.mark_live(options)?;
+    link.report_live_undefined(options, diagnostics)?;
+    super::objc::plan(&mut link)?;
+    options.check_cancelled()?;
     if config.is_relocatable() {
         return super::relocatable::write(&link, options, diagnostics).map(Attempt::Done);
     }
@@ -331,7 +369,7 @@ fn link_arch_once(
     let mut sectcreate_data = Vec::new();
     let mut sectcreate = Vec::new();
     for (segment, section, path) in &options.darwin.sectcreate {
-        let data = std::fs::read(path).map_err(|error| Error::io(path, error))?;
+        let data = inputs::read_input(options.input_provider.as_deref(), path)?;
         sectcreate.push((
             segment.as_bytes().to_vec(),
             section.as_bytes().to_vec(),
@@ -447,6 +485,7 @@ fn link_arch_once(
         }
     }
 
+    options.check_cancelled()?;
     let linkedit_start = layout.segment(b"__LINKEDIT").map_or(0, |s| s.fileoff);
     let mut image = vec![0u8; to_usize(linkedit_start)];
     let pointer_fixups = sections::write(&addresses, &sectcreate_data, &mut image)?;

@@ -7,9 +7,10 @@
 //! failures`. Every program comes with a dylib, so each link covers an
 //! executable and a library; the C suite also loads a bundle linked with
 //! `-bundle_loader`, and the Objective-C suite links a static archive of
-//! categories with `-ObjC`. Each is built three ways: plain, with
-//! `-dead_strip`, and for macOS 11 (legacy `LC_DYLD_INFO_ONLY` instead of
-//! chained fixups).
+//! categories with `-ObjC`. Each is built four ways: plain, with
+//! `-dead_strip`, for macOS 11 (legacy `LC_DYLD_INFO_ONLY` instead of
+//! chained fixups), and with Objective-C category merging (and
+//! `-dead_strip`). Objective-C method lists are relative in all of them.
 //!
 //! The programs need the SDK's headers, so elsewhere the test only says it
 //! skips. Larger downloaded projects (zlib, Lua, SQLite, {fmt}) are built
@@ -38,6 +39,10 @@ const VARIANTS: &[Variant] = &[
     Variant {
         name: "macos11",
         flags: &["-mmacosx-version-min=11.0"],
+    },
+    Variant {
+        name: "objc_merging",
+        flags: &["-Wl,-objc_category_merging", "-Wl,-dead_strip"],
     },
 ];
 
