@@ -10,7 +10,8 @@ use crate::error::{Error, Result};
 use crate::macho::read::Arch;
 use crate::macho::read::commands::PackedVersion;
 use crate::macho::read::consts::{
-    CPU_TYPE_ARM64, CPU_TYPE_X86_64, PLATFORM_BRIDGEOS, PLATFORM_DRIVERKIT, PLATFORM_IOS,
+    CPU_TYPE_ARM64, CPU_TYPE_X86_64, DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_ARM64E,
+    DYLD_CHAINED_PTR_ARM64E_USERLAND24, PLATFORM_BRIDGEOS, PLATFORM_DRIVERKIT, PLATFORM_IOS,
     PLATFORM_IOSSIMULATOR, PLATFORM_MACCATALYST, PLATFORM_MACOS, PLATFORM_TVOS,
     PLATFORM_TVOSSIMULATOR, PLATFORM_WATCHOS, PLATFORM_WATCHOSSIMULATOR, PLATFORM_XROS,
     PLATFORM_XROS_SIMULATOR,
@@ -29,6 +30,10 @@ pub struct Config {
     pub page_size: u64,
     /// `LC_DYLD_CHAINED_FIXUPS` rather than `LC_DYLD_INFO_ONLY`.
     pub chained_fixups: bool,
+    /// The chained pointer format (`DYLD_CHAINED_PTR_*`): `_64`, or on
+    /// arm64e `_ARM64E` or `_ARM64E_USERLAND24` (from macOS 12, iOS 15,
+    /// as ld64 chooses).
+    pub pointer_format: u16,
     /// `__DATA_CONST` is used for pointers made read-only after fixups.
     pub data_const: bool,
     /// Size of `__PAGEZERO` (executables only; 0 means none).
@@ -139,11 +144,6 @@ impl Config {
                 )));
             }
         };
-        if arch == Arch::ARM64E {
-            return Err(Error::Unimplemented(
-                "arm64e output (pointer authentication; roadmap M8 covers arm64)".into(),
-            ));
-        }
         let platform = darwin
             .platform
             .or(inferred_platform)
@@ -203,14 +203,30 @@ impl Config {
             (None, _) => Vec::new(),
         };
         let relocatable = output_type == MachOutputType::Object;
+        let arm64e = arch == Arch::ARM64E;
+        // arm64e images always use chained fixups: authenticated pointers
+        // have no other encoding.
+        if arm64e && darwin.fixup_chains == Some(false) && !relocatable {
+            return Err(Error::Option(
+                "-no_fixup_chains: arm64e images need chained fixups".into(),
+            ));
+        }
+        let chained_fixups = arm64e
+            || darwin
+                .fixup_chains
+                .unwrap_or_else(|| chained_fixups_by_default(&platform));
+        let pointer_format = match (arm64e, chained_fixups_by_default(&platform)) {
+            (false, _) => DYLD_CHAINED_PTR_64,
+            (true, true) => DYLD_CHAINED_PTR_ARM64E_USERLAND24,
+            (true, false) => DYLD_CHAINED_PTR_ARM64E,
+        };
         Ok(Self {
             arch,
             output_type,
             platform,
             page_size,
-            chained_fixups: darwin
-                .fixup_chains
-                .unwrap_or_else(|| chained_fixups_by_default(&platform)),
+            chained_fixups,
+            pointer_format,
             data_const: data_const_by_default(&platform),
             pagezero,
             image_base,
@@ -260,9 +276,21 @@ impl Config {
         self.output_type == MachOutputType::Object
     }
 
-    /// Size of `__stubs` entries.
+    /// Whether the output is arm64e (pointer authentication).
+    #[must_use]
+    pub fn is_arm64e(&self) -> bool {
+        self.arch == Arch::ARM64E
+    }
+
+    /// Size of `__stubs` (arm64e: `__auth_stubs`) entries.
     #[must_use]
     pub fn stub_size(&self) -> u64 {
-        if self.is_arm64() { 12 } else { 6 }
+        if self.is_arm64e() {
+            16
+        } else if self.is_arm64() {
+            12
+        } else {
+            6
+        }
     }
 }

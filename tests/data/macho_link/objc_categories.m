@@ -4,6 +4,9 @@
 // with +load (left alone). Prints what the runtime sees.
 int printf(const char *, ...);
 
+// Base(Doubling) overrides -base on purpose.
+#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
+
 __attribute__((objc_root_class))
 @interface NSObject
 + (id)new;

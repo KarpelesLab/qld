@@ -48,6 +48,11 @@ pub struct Synthetic {
     pub got_index: Vec<u32>,
     /// `__thread_ptrs` index of each symbol, or [`NONE`].
     pub tlv_index: Vec<u32>,
+    /// arm64e: symbols with `__auth_got` slots (which `__auth_stubs` load),
+    /// in slot order.
+    pub auth_got: Vec<SymbolId>,
+    /// `__auth_got` index of each symbol, or [`NONE`].
+    pub auth_got_index: Vec<u32>,
     /// Common symbols, in `__common` order.
     pub commons: Vec<SymbolId>,
     /// Imports.
@@ -254,6 +259,7 @@ pub fn scan(
         stub_index: vec![NONE; count],
         got_index: vec![NONE; count],
         tlv_index: vec![NONE; count],
+        auth_got_index: vec![NONE; count],
         import_index: vec![NONE; count],
         local_got,
         local_got_index,
@@ -273,10 +279,16 @@ pub fn scan(
             synthetic.tlv_index[index] = to_u32(synthetic.thread_ptrs.len());
             synthetic.thread_ptrs.push(id);
         }
-        // Stubs load their target from `__got`.
-        if want.got || want.stub {
+        // Stubs load their target from `__got`, or on arm64e from
+        // `__auth_got`, whose pointers dyld signs.
+        let arm64e = link.config.is_arm64e();
+        if want.got || (want.stub && !arm64e) {
             synthetic.got_index[index] = to_u32(synthetic.got.len());
             synthetic.got.push(id);
+        }
+        if want.stub && arm64e {
+            synthetic.auth_got_index[index] = to_u32(synthetic.auth_got.len());
+            synthetic.auth_got.push(id);
         }
         if matches!(def, Some(SymbolDef::Common { .. })) {
             synthetic.commons.push(id);

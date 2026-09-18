@@ -14,6 +14,14 @@
 //! `DYLD_CHAINED_IMPORT_ADDEND` (or `_ADDEND64`), with one entry per
 //! symbol and addend.
 //!
+//! arm64e uses `DYLD_CHAINED_PTR_ARM64E` (to macOS 11, iOS 14) or
+//! `DYLD_CHAINED_PTR_ARM64E_USERLAND24` (8-byte strides, 11-bit `next`),
+//! as ld64 does: plain rebases (`target:43 high8:8`, the unslid address or
+//! the offset from the image base), authenticated rebases (`target:32
+//! diversity:16 addrDiv:1 key:2`, an offset), binds (`ordinal:16|24`, a
+//! 19-bit addend) and authenticated binds (`ordinal:16|24` and the signing
+//! schema; their addends go to the imports table).
+//!
 //! # Opcodes
 //!
 //! The legacy form keeps plain pointers in the image (unslid addresses for
@@ -36,14 +44,14 @@ use crate::macho::read::consts::{
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
     BIND_SPECIAL_DYLIB_WEAK_LOOKUP, BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER,
     DYLD_CHAINED_IMPORT, DYLD_CHAINED_IMPORT_ADDEND, DYLD_CHAINED_IMPORT_ADDEND64,
-    DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_START_NONE, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
-    REBASE_OPCODE_DONE, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
-    REBASE_TYPE_POINTER,
+    DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_PTR_ARM64E_USERLAND24,
+    DYLD_CHAINED_PTR_START_NONE, REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
 };
 
 use super::buf::{pad_to, push_sleb, push_uleb, push16, push32, push64, to_u64, to_usize};
 use super::layout::Layout;
-use super::reloc::{Fixup, FixupKind};
+use super::reloc::{Fixup, FixupKind, PtrAuth};
 use super::scan::Import;
 
 fn locate(layout: &Layout, address: u64) -> Result<(usize, u64, u64)> {
@@ -59,23 +67,44 @@ fn locate(layout: &Layout, address: u64) -> Result<(usize, u64, u64)> {
 /// Encodes chained fixups: rewrites every pointer of `fixups` in `image`
 /// (the whole output file) and returns the `LC_DYLD_CHAINED_FIXUPS` blob.
 ///
+/// `pointer_format` is `DYLD_CHAINED_PTR_64`, or for arm64e
+/// `DYLD_CHAINED_PTR_ARM64E` (switched to `_USERLAND24` past 65535
+/// imports, as ld64 does) or `DYLD_CHAINED_PTR_ARM64E_USERLAND24`.
+///
 /// # Errors
 ///
 /// [`Error::Limit`] for fixups that cannot be chained (misaligned, or a
-/// target beyond 64 GiB) and [`Error::Internal`] for fixups outside the
-/// image.
+/// target out of the format's reach) and [`Error::Internal`] for fixups
+/// outside the image.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn chained(
     layout: &Layout,
     image_base: u64,
     page_size: u64,
+    pointer_format: u16,
     fixups: &[Fixup],
     imports: &[Import],
     image: &mut [u8],
 ) -> Result<Vec<u8>> {
+    let arm64e = pointer_format != DYLD_CHAINED_PTR_64;
+    // The addend a bind carries in the pointer itself, if it can: 8 bits
+    // (`DYLD_CHAINED_PTR_64`), or 19 signed bits for arm64e binds that are
+    // not authenticated (authenticated binds have no addend field).
+    let inline_room = |fixup: &Fixup, addend: i64| {
+        if arm64e {
+            if fixup.auth.is_some() {
+                addend == 0
+            } else {
+                (-(1 << 18)..1 << 18).contains(&addend)
+            }
+        } else {
+            (0..=255).contains(&addend)
+        }
+    };
     // The imports table.
     let wide_addend = fixups
         .iter()
-        .any(|f| matches!(f.kind, FixupKind::Bind { addend, .. } if !(0..=255).contains(&addend)));
+        .any(|f| matches!(f.kind, FixupKind::Bind { addend, .. } if !inline_room(f, addend)));
     let huge_addend = fixups.iter().any(
         |f| matches!(f.kind, FixupKind::Bind { addend, .. } if i32::try_from(addend).is_err()),
     );
@@ -85,6 +114,14 @@ pub fn chained(
         DYLD_CHAINED_IMPORT_ADDEND
     } else {
         DYLD_CHAINED_IMPORT
+    };
+    // The addend a bind keeps inline, and its key in the table.
+    let inline = |fixup: &Fixup, import: u32, addend: i64| -> (Option<i64>, (u32, i64)) {
+        if format == DYLD_CHAINED_IMPORT || (arm64e && inline_room(fixup, addend)) {
+            (Some(addend), (import, 0))
+        } else {
+            (None, (import, addend))
+        }
     };
     // (import, addend) -> table index.
     let mut table: Vec<(u32, i64)> = Vec::new();
@@ -100,7 +137,7 @@ pub fn chained(
         let mut keys: Vec<(u32, i64)> = fixups
             .iter()
             .filter_map(|f| match f.kind {
-                FixupKind::Bind { import, addend } => Some((import, addend)),
+                FixupKind::Bind { import, addend } => Some(inline(f, import, addend).1),
                 FixupKind::Rebase(_) => None,
             })
             .collect();
@@ -113,9 +150,17 @@ pub fn chained(
             table.push(key);
         }
     }
+    let pointer_format = if pointer_format == DYLD_CHAINED_PTR_ARM64E && table.len() > 0xffff {
+        DYLD_CHAINED_PTR_ARM64E_USERLAND24
+    } else {
+        pointer_format
+    };
     if table.len() >= 1 << 24 {
         return Err(Error::Limit("more than 2^24 chained imports".into()));
     }
+    // Chains step in 4-byte units with 12 bits of `next`, or 8-byte units
+    // with 11 bits on arm64e.
+    let (stride, max_next) = if arm64e { (8u64, 2047u64) } else { (4, 4095) };
 
     // Fixups per segment and page, sorted by address.
     let mut sorted: Vec<&Fixup> = fixups.iter().collect();
@@ -133,42 +178,42 @@ pub fn chained(
             })
             .map_or(Ok(0u64), |n| {
                 let distance = n.1.saturating_sub(offset);
-                if distance % 4 != 0 || distance / 4 > 4095 {
-                    Err(Error::Limit(format!(
+                match (distance.checked_rem(stride), distance.checked_div(stride)) {
+                    (Some(0), Some(next)) if next <= max_next => Ok(next),
+                    _ => Err(Error::Limit(format!(
                         "pointers at {:#x} and {:#x} cannot be chained (misaligned)",
                         fixup.address, n.3.address
-                    )))
-                } else {
-                    Ok(distance / 4)
+                    ))),
                 }
             })?;
-        let value = match fixup.kind {
-            FixupKind::Rebase(target) => {
-                let high8 = target >> 56;
-                let low = target & 0x00ff_ffff_ffff_ffff;
-                if low >= 1 << 36 {
-                    return Err(Error::Limit(format!(
-                        "pointer at {:#x} targets {target:#x}, beyond the 64 GiB chained fixups reach",
-                        fixup.address
-                    )));
+        let ordinal_of = |import: u32, addend: i64| -> Result<(u64, u64)> {
+            let (inline_addend, key) = inline(&fixup, import, addend);
+            let ordinal = u64::from(*index_of.get(&key).ok_or_else(|| {
+                Error::Internal("bind to an import missing from the table".into())
+            })?);
+            Ok((ordinal, inline_addend.unwrap_or(0) as u64))
+        };
+        let value = if arm64e {
+            encode_arm64e(pointer_format, image_base, fixup, next, |import, addend| {
+                ordinal_of(import, addend)
+            })?
+        } else {
+            match fixup.kind {
+                FixupKind::Rebase(target) => {
+                    let high8 = target >> 56;
+                    let low = target & 0x00ff_ffff_ffff_ffff;
+                    if low >= 1 << 36 {
+                        return Err(Error::Limit(format!(
+                            "pointer at {:#x} targets {target:#x}, beyond the 64 GiB chained fixups reach",
+                            fixup.address
+                        )));
+                    }
+                    low | (high8 << 36) | (next << 51)
                 }
-                low | (high8 << 36) | (next << 51)
-            }
-            FixupKind::Bind { import, addend } => {
-                let key = if format == DYLD_CHAINED_IMPORT {
-                    (import, 0)
-                } else {
-                    (import, addend)
-                };
-                let ordinal = u64::from(*index_of.get(&key).ok_or_else(|| {
-                    Error::Internal("bind to an import missing from the table".into())
-                })?);
-                let inline = if format == DYLD_CHAINED_IMPORT {
-                    u64::try_from(addend).unwrap_or(0) & 0xff
-                } else {
-                    0
-                };
-                ordinal | (inline << 24) | (next << 51) | (1 << 63)
+                FixupKind::Bind { import, addend } => {
+                    let (ordinal, inline) = ordinal_of(import, addend)?;
+                    ordinal | ((inline & 0xff) << 24) | (next << 51) | (1 << 63)
+                }
             }
         };
         let at = to_usize(file);
@@ -223,7 +268,7 @@ pub fn chained(
             .next_multiple_of(8);
         push32(&mut record, u32::try_from(size).unwrap_or(0));
         push16(&mut record, u16::try_from(page_size).unwrap_or(0));
-        push16(&mut record, DYLD_CHAINED_PTR_64);
+        push16(&mut record, pointer_format);
         push64(&mut record, segment.vmaddr.wrapping_sub(image_base));
         push32(&mut record, 0);
         push16(
@@ -297,6 +342,68 @@ pub fn chained(
     }
     let _ = to_u64(0);
     Ok(blob)
+}
+
+/// Encodes one arm64e chained pointer (`dyld_chained_ptr_arm64e_*`):
+/// plain rebases carry the unslid address (`DYLD_CHAINED_PTR_ARM64E`) or
+/// the offset from the image base (`_USERLAND24`), authenticated rebases
+/// a 32-bit offset and the signing schema, binds a 16- or 24-bit ordinal
+/// and either a 19-bit addend or the schema.
+fn encode_arm64e(
+    pointer_format: u16,
+    image_base: u64,
+    fixup: Fixup,
+    next: u64,
+    ordinal_of: impl Fn(u32, i64) -> Result<(u64, u64)>,
+) -> Result<u64> {
+    let schema = |auth: PtrAuth| {
+        (u64::from(auth.diversity) << 32)
+            | (u64::from(auth.address_diversity) << 48)
+            | (u64::from(auth.key & 3) << 49)
+    };
+    let out_of_reach = |what: &str| {
+        Error::Limit(format!(
+            "pointer at {:#x}: {what} out of the reach of arm64e chained fixups",
+            fixup.address
+        ))
+    };
+    Ok(match (fixup.kind, fixup.auth) {
+        (FixupKind::Rebase(target), None) => {
+            let target = if pointer_format == DYLD_CHAINED_PTR_ARM64E {
+                target
+            } else {
+                target.wrapping_sub(image_base)
+            };
+            let high8 = target >> 56;
+            let low = target & 0x00ff_ffff_ffff_ffff;
+            if low >= 1 << 43 {
+                return Err(out_of_reach("target"));
+            }
+            low | (high8 << 43) | (next << 51)
+        }
+        (FixupKind::Rebase(target), Some(auth)) => {
+            let offset = target
+                .checked_sub(image_base)
+                .filter(|&o| o < 1 << 32)
+                .ok_or_else(|| out_of_reach("authenticated target"))?;
+            offset | schema(auth) | (next << 51) | (1 << 63)
+        }
+        (FixupKind::Bind { import, addend }, auth) => {
+            let (ordinal, inline) = ordinal_of(import, addend)?;
+            let ordinal_bits = if pointer_format == DYLD_CHAINED_PTR_ARM64E {
+                16
+            } else {
+                24
+            };
+            if ordinal >= 1 << ordinal_bits {
+                return Err(out_of_reach("import ordinal"));
+            }
+            match auth {
+                Some(auth) => ordinal | schema(auth) | (next << 51) | (1 << 62) | (1 << 63),
+                None => ordinal | ((inline & 0x7_ffff) << 32) | (next << 51) | (1 << 62),
+            }
+        }
+    })
 }
 
 /// The opcode streams of `LC_DYLD_INFO_ONLY`.

@@ -494,7 +494,7 @@ pub fn build(
     pad_to(&mut strings, 8);
     tables.strings = strings;
 
-    // Indirect symbols: __got, __thread_ptrs, __stubs.
+    // Indirect symbols: __got, __auth_got, __thread_ptrs, __stubs.
     let indirect_entry = |id: SymbolId| -> u32 {
         let bound = link.is_imported(id)
             || addresses
@@ -519,7 +519,15 @@ pub fn build(
     for _ in &synthetic.local_got {
         push32(&mut tables.indirect, INDIRECT_SYMBOL_LOCAL);
     }
-    tables.tlv_first = u32::try_from(synthetic.got_slots()).unwrap_or(0);
+    for &id in &synthetic.auth_got {
+        push32(&mut tables.indirect, indirect_entry(id));
+    }
+    tables.tlv_first = u32::try_from(
+        synthetic
+            .got_slots()
+            .saturating_add(synthetic.auth_got.len()),
+    )
+    .unwrap_or(0);
     for &id in &synthetic.thread_ptrs {
         push32(&mut tables.indirect, indirect_entry(id));
     }

@@ -354,6 +354,7 @@ fn link_arch_once(
     let sizes = SyntheticSizes {
         stubs: to_u64(synthetic.stubs.len()),
         got: to_u64(synthetic.got_slots()),
+        auth_got: to_u64(synthetic.auth_got.len()),
         thread_ptrs: to_u64(synthetic.thread_ptrs.len()),
         unwind_info: unwind_plan.size(),
         eh_frame: eh_frame_plan.size(),
@@ -500,6 +501,7 @@ fn link_arch_once(
             &layout,
             base,
             config.page_size,
+            config.pointer_format,
             &pointer_fixups,
             &synthetic.imports,
             &mut image,
@@ -608,12 +610,14 @@ fn link_arch_once(
 /// Sets `reserved1` of the sections the indirect symbol table indexes.
 fn fill_section_indices(layout: &mut Layout, synthetic: &scan::Synthetic) {
     let got = u32::try_from(synthetic.got_slots()).unwrap_or(0);
+    let auth_got = u32::try_from(synthetic.auth_got.len()).unwrap_or(0);
     let tlv = u32::try_from(synthetic.thread_ptrs.len()).unwrap_or(0);
     for section in &mut layout.sections {
         section.reserved1 = match section.kind {
             layout::SectionKind::Got => 0,
-            layout::SectionKind::ThreadPtrs => got,
-            layout::SectionKind::Stubs => got.saturating_add(tlv),
+            layout::SectionKind::AuthGot => got,
+            layout::SectionKind::ThreadPtrs => got.saturating_add(auth_got),
+            layout::SectionKind::Stubs => got.saturating_add(auth_got).saturating_add(tlv),
             _ => section.reserved1,
         };
     }
