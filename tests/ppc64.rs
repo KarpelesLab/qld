@@ -370,7 +370,7 @@ mod elf {
         pub fn section_at(&self, address: u64) -> Option<&Section> {
             self.sections
                 .iter()
-                .find(|s| s.flags & 2 != 0 && s.addr <= address && address < s.addr + s.size.max(1))
+                .find(|s| s.flags & 2 != 0 && s.addr <= address && address < s.addr + s.size)
         }
 
         /// The file bytes at `address`, if it is in a section with contents.
@@ -972,9 +972,11 @@ mod canon {
                     };
                     let target = match (reloc.r_type, &reloc.symbol) {
                         (_, Some(name)) => format!("{name}+{:#x}", reloc.addend),
-                        (R_PPC64_RELATIVE | R_PPC64_IRELATIVE, None) => {
-                            self.describe(reloc.addend as u64)
-                        }
+                        // A code address may be a stub standing for a
+                        // function (an IFUNC's canonical address): name
+                        // where it leads.
+                        (R_PPC64_RELATIVE, None) => self.destination(reloc.addend as u64, 0),
+                        (R_PPC64_IRELATIVE, None) => self.describe(reloc.addend as u64),
                         (_, None) => format!("{:#x}", reloc.addend),
                     };
                     // Unnamed read-only data is compared by kind only (see
@@ -1296,6 +1298,37 @@ fn dynamic_linking_matches() {
         args.extend(["-z", "now"]);
         link_and_compare(tools, &dir, &format!("{name}-now"), &args);
     }
+}
+
+const IFUNC: &str = r#"
+static int impl_one(void) { return 1; }
+static int impl_two(void) { return 2; }
+volatile int choose_one;
+static void *resolve_pick(void) { return choose_one ? (void *)impl_one : (void *)impl_two; }
+int pick(void) __attribute__((ifunc("resolve_pick")));
+int (*pick_pointer)(void) = pick;
+__attribute__((noinline)) int use_pick(void) { return pick() + pick_pointer() + impl_one(); }
+"#;
+
+/// An IFUNC in a static executable and in a PIE: calls go through a stub
+/// that saves r2, and in the PIE the `IRELATIVE` relocation is in
+/// `.rela.dyn`, where PowerPC64's dynamic linker applies it (not in
+/// `.rela.plt`, whose slots it sets up for lazy binding).
+#[test]
+fn ifunc_matches() {
+    let tools = require!();
+    let dir = scratch("ifunc");
+    compile(tools, &dir, "ifunc.c", IFUNC, &["-O2", "-fPIC"]);
+    link_and_compare(
+        tools,
+        &dir,
+        "static",
+        &["-static", "-e", "use_pick", "ifunc.o"],
+    );
+    let pie = link_and_compare(tools, &dir, "pie", &["-pie", "-e", "use_pick", "ifunc.o"]);
+    let rela_plt = pie.section(".rela.plt").map_or(0, |s| s.size);
+    assert_eq!(rela_plt, 0, "IRELATIVE relocations belong in .rela.dyn");
+    assert!(pie.relocs.iter().any(|r| r.r_type == 248));
 }
 
 const TLS_DEFS: &str = r#"

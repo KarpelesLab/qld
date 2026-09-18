@@ -842,6 +842,15 @@ impl Arch {
         self != Self::Ppc64
     }
 
+    /// Whether a dynamic output's `IRELATIVE` relocations go to
+    /// `.rela.plt`, with the lazy PLT relocations. PowerPC64's dynamic
+    /// linker sets the lazy slots up itself and never applies `.rela.plt`
+    /// entries one by one, so GNU ld puts them in `.rela.dyn` there.
+    #[must_use]
+    pub fn irelative_in_rela_plt(self) -> bool {
+        self != Self::Ppc64
+    }
+
     /// Size of one `.plt.sec` entry.
     #[must_use]
     pub fn plt_sec_entry_size(self, flags: PltFlags) -> u64 {

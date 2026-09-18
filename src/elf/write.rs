@@ -1045,6 +1045,22 @@ fn collect_dyn_relocs(
     {
         relocs.push(dyn_reloc(arch, address, 0, DynKind::DtpMod, 0));
     }
+    if !arch.irelative_in_rela_plt() {
+        let first = synth.plt.len();
+        for (index, owner) in synth.iplt.iter().enumerate() {
+            let slot = addresses
+                .igot_address(first.saturating_add(index))
+                .unwrap_or(0);
+            let resolver = symbol_value(addresses, owner);
+            relocs.push(dyn_reloc(
+                arch,
+                slot,
+                0,
+                DynKind::Irelative,
+                resolver as i64,
+            ));
+        }
+    }
     for copy in &synth.copies {
         let address = addresses
             .globals

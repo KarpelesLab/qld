@@ -1067,7 +1067,7 @@ fn dynamic_entries(
     if synth.got_plt_reserved > 0 {
         entries.push((DT_PLTGOT, Address(Synthetic::GotPlt)));
     }
-    if synth.plt_entries() > 0 {
+    if synth.size_align(Synthetic::RelaPlt).0 > 0 {
         entries.push((DT_PLTRELSZ, Size(Synthetic::RelaPlt)));
         entries.push((DT_PLTREL, Value(crate::elf::read::consts::DT_RELA as u64)));
         entries.push((DT_JMPREL, Address(Synthetic::RelaPlt)));

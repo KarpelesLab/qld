@@ -441,6 +441,10 @@ impl Synth {
             add(SlotReloc::Module(DynKind::DtpMod));
         }
         other = other.saturating_add(u64_len(self.copies.len()));
+        // IFUNC slots whose IRELATIVE relocations go to `.rela.dyn`.
+        if !self.arch.irelative_in_rela_plt() {
+            other = other.saturating_add(u64_len(self.iplt.len()));
+        }
         (relative, other)
     }
 
@@ -574,7 +578,9 @@ impl Synth {
                 }
             }
             Synthetic::RelaPlt => {
-                let entries = if dynamic {
+                let entries = if dynamic && !self.arch.irelative_in_rela_plt() {
+                    u64_len(self.plt.len())
+                } else if dynamic {
                     self.plt_entries()
                 } else {
                     count(&self.iplt)
