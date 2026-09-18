@@ -10,12 +10,19 @@
 //! # Library use
 //!
 //! Build [`LinkOptions`] by hand or from a command line ([`parse_gnu`]), and
-//! call [`link`]. Diagnostics go to a [`DiagnosticSink`] of your choice;
-//! nothing is printed and the process never exits. Inputs can be byte
-//! buffers ([`InputKind::bytes`], [`MemoryFiles`]), the output can come back
-//! as bytes ([`link_to_memory`], [`OutputBuffer`]), a link can be cancelled
-//! from another thread ([`CancelToken`]), and it runs in the caller's rayon
-//! pool when called inside [`rayon::ThreadPool::install`].
+//! call [`link`]. Diagnostics go to a [`DiagnosticSink`] of your choice.
+//! Inputs can be byte buffers ([`InputKind::bytes`], [`MemoryFiles`]), the
+//! output can come back as bytes ([`link_to_memory`], [`OutputBuffer`]), a
+//! link can be cancelled from another thread ([`CancelToken`]), and it runs
+//! in the caller's rayon pool, as it is, when called inside
+//! [`rayon::ThreadPool::install`].
+//!
+//! A link built with [`LinkOptions::new`] is hermetic and silent: the
+//! process never exits, nothing is written to its standard output or
+//! standard error, and no environment variable is read.
+//! [`LinkOptions::use_process_defaults`] opts into all three, and
+//! [`parse_gnu`] applies it, because it describes the link the `qld` binary
+//! runs.
 //!
 //! ```no_run
 //! use qld::{InputAttrs, InputKind, LinkOptions, OutputKind};
@@ -96,8 +103,8 @@ pub mod symbols;
 pub mod target;
 
 pub use args::{
-    CancelToken, InputAttrs, InputKind, LinkOptions, OutputBuffer, OutputKind, ParseOutcome,
-    parse_gnu, parse_gnu_with,
+    CancelToken, InputAttrs, InputKind, InputSpec, LinkOptions, OutputBuffer, OutputKind,
+    ParseOutcome, TextOutput, parse_gnu, parse_gnu_with,
 };
 pub use diag::{Diagnostic, DiagnosticSink, Severity};
 pub use error::{Error, Result};
@@ -124,12 +131,14 @@ pub fn version_line() -> String {
 
 /// Runs a link described by `options`.
 ///
-/// With `--threads`, parallel stages run in a rayon pool of that size created
-/// for the duration of the link. Without it, the format driver chooses: the
-/// ELF driver sizes a pool from the input (small links run faster on few
-/// threads), never larger than the current pool. To run in a pool you already
-/// own, call `link` (or a format driver such as [`elf::link`](fn@elf::link))
-/// inside your pool's `install`.
+/// With [`LinkOptions::threads`] (`--threads`), parallel stages run in a
+/// rayon pool of that size, created for the duration of the link. Without
+/// it, the format driver chooses: outside any pool the ELF driver sizes one
+/// from the input, because small links run faster on few threads. To run in
+/// a pool you already own, call `link` (or a format driver such as
+/// [`elf::link`](fn@elf::link)) inside your pool's `install`: that pool is
+/// then used as it is, whatever its size, and the driver creates none of its
+/// own.
 ///
 /// A successful link runs [`LinkOptions::on_output_complete`] once the
 /// output is complete: the ELF driver runs it before freeing its data and
