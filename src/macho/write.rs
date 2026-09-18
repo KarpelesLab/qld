@@ -166,6 +166,8 @@ pub struct Linkedit {
     pub rebase: Vec<u8>,
     /// Bind opcodes (legacy).
     pub bind: Vec<u8>,
+    /// Weak binding opcodes (legacy).
+    pub weak_bind: Vec<u8>,
     /// Export trie.
     pub exports: Vec<u8>,
     /// Function starts.
@@ -190,6 +192,7 @@ pub struct LinkeditOffsets {
     chained_fixups: u64,
     rebase: u64,
     bind: u64,
+    weak_bind: u64,
     exports: u64,
     function_starts: u64,
     data_in_code: u64,
@@ -218,6 +221,7 @@ impl Linkedit {
         } else {
             offsets.rebase = next(self.rebase.len());
             offsets.bind = next(self.bind.len());
+            offsets.weak_bind = next(self.weak_bind.len());
             offsets.exports = next(self.exports.len());
         }
         offsets.function_starts = next(self.function_starts.len());
@@ -235,10 +239,11 @@ impl Linkedit {
     ///
     /// [`Error::Internal`] if the image is too short.
     pub fn copy_into(&self, image: &mut [u8], offsets: &LinkeditOffsets) -> Result<()> {
-        let blobs: [(&[u8], u64); 9] = [
+        let blobs: [(&[u8], u64); 10] = [
             (&self.chained_fixups, offsets.chained_fixups),
             (&self.rebase, offsets.rebase),
             (&self.bind, offsets.bind),
+            (&self.weak_bind, offsets.weak_bind),
             (&self.exports, offsets.exports),
             (&self.function_starts, offsets.function_starts),
             (&self.data_in_code, offsets.data_in_code),
@@ -434,8 +439,11 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
         push32(&mut out, blob(linkedit.rebase.len()));
         push32(&mut out, offset(offsets.bind, linkedit.bind.len()));
         push32(&mut out, blob(linkedit.bind.len()));
-        push32(&mut out, 0);
-        push32(&mut out, 0);
+        push32(
+            &mut out,
+            offset(offsets.weak_bind, linkedit.weak_bind.len()),
+        );
+        push32(&mut out, blob(linkedit.weak_bind.len()));
         push32(&mut out, 0);
         push32(&mut out, 0);
         push32(&mut out, offset(offsets.exports, linkedit.exports.len()));

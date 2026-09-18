@@ -333,9 +333,17 @@ Still open for the exit criteria: a broader test suite through `-fuse-ld`.
 
 ## M9: Library API stabilization and 1.0
 
-- [ ] Public API review ([library-api.md](docs/library-api.md)); semver guarantees
-- [ ] In-memory inputs and outputs, caller-provided thread pool, cancellation
-- [ ] Complete rustdoc with examples; published on crates.io
+- [~] Public API review ([library-api.md](docs/library-api.md)); semver guarantees.
+      Review done ([api-review.md](tests/projects/api-review.md)): the 1.0 surface is
+      the crate root, `args`, `diag`, `error` and `target`; other modules are
+      `#[doc(hidden)]`. Open 1.0 blockers are listed in the review
+      (`Default` vs `new()`, string-typed options, `darwin.inputs`, printing
+      and environment reads in the library).
+- [~] In-memory inputs and outputs (`InputKind::bytes`, `MemoryFiles`,
+      `link_to_memory`), caller-provided thread pool, cancellation
+      (`CancelToken`, `Error::Cancelled`): done for ELF; PE and Mach-O pending
+- [~] Complete rustdoc with examples (crate-level and `link` examples, five
+      programs in `examples/`); published on crates.io
 - [ ] Packaging: prebuilt binaries, distribution packages, `ld.qld` and `ld64.qld` symlinks
 
 **Exit criteria:** M1–M8 exit criteria still pass. The API has had no breaking

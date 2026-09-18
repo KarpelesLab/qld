@@ -19,7 +19,10 @@
 //! The legacy form keeps plain pointers in the image (unslid addresses for
 //! rebases, zero for binds) and describes them with the opcode streams of
 //! `LC_DYLD_INFO_ONLY`. qld binds everything at load time, so the lazy
-//! binding stream is empty.
+//! binding stream is empty. A pointer to an exported weak definition (a
+//! weak-lookup import) is rebased to the image's own definition and also
+//! listed, sorted by symbol name, in the weak binding stream, so that dyld
+//! can redirect it to the definition that wins across images.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -31,10 +34,11 @@ use crate::macho::read::consts::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER, DYLD_CHAINED_IMPORT,
-    DYLD_CHAINED_IMPORT_ADDEND, DYLD_CHAINED_IMPORT_ADDEND64, DYLD_CHAINED_PTR_64,
-    DYLD_CHAINED_PTR_START_NONE, REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DONE,
-    REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
+    BIND_SPECIAL_DYLIB_WEAK_LOOKUP, BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER,
+    DYLD_CHAINED_IMPORT, DYLD_CHAINED_IMPORT_ADDEND, DYLD_CHAINED_IMPORT_ADDEND64,
+    DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_START_NONE, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    REBASE_OPCODE_DONE, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
+    REBASE_TYPE_POINTER,
 };
 
 use super::buf::{pad_to, push_sleb, push_uleb, push16, push32, push64, to_u64, to_usize};
@@ -295,8 +299,22 @@ pub fn chained(
     Ok(blob)
 }
 
-/// The rebase and bind opcode streams of `LC_DYLD_INFO_ONLY`. Also writes
-/// the plain pointer values into `image`.
+/// The opcode streams of `LC_DYLD_INFO_ONLY`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Opcodes {
+    /// Rebase opcodes.
+    pub rebase: Vec<u8>,
+    /// Bind opcodes.
+    pub bind: Vec<u8>,
+    /// Weak binding opcodes.
+    pub weak_bind: Vec<u8>,
+}
+
+/// The rebase, bind and weak binding opcode streams of
+/// `LC_DYLD_INFO_ONLY`. Also writes the plain pointer values into `image`.
+///
+/// `weak_targets` gives, for each weak-lookup import, the address of the
+/// image's own definition.
 ///
 /// # Errors
 ///
@@ -305,21 +323,44 @@ pub fn opcodes(
     layout: &Layout,
     fixups: &[Fixup],
     imports: &[Import],
+    weak_targets: &[Option<u64>],
     image: &mut [u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<Opcodes> {
     let mut sorted: Vec<&Fixup> = fixups.iter().collect();
     sorted.sort_by_key(|f| f.address);
     let mut rebase = Vec::new();
     let mut bind = Vec::new();
     let mut rebase_started = false;
     let mut current_bind: Option<(i32, u32, i64)> = None;
+    // (name, segment, offset, addend) of each weak binding.
+    let mut weak: Vec<(&[u8], u8, u64, i64)> = Vec::new();
     for fixup in sorted {
         let (segment, offset, file) = locate(layout, fixup.address)?;
         let segment = u8::try_from(segment)
             .ok()
             .filter(|&s| s < 16)
             .ok_or_else(|| Error::Limit("fixup in segment 16 or later".into()))?;
-        match fixup.kind {
+        let mut kind = fixup.kind;
+        if let FixupKind::Bind { import, addend } = kind {
+            let entry = imports
+                .get(to_usize(u64::from(import)))
+                .ok_or_else(|| Error::Internal("import index out of range".into()))?;
+            if entry.ordinal == BIND_SPECIAL_DYLIB_WEAK_LOOKUP {
+                let target = weak_targets
+                    .get(to_usize(u64::from(import)))
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        Error::Internal(format!(
+                            "weak binding of {} without a definition",
+                            String::from_utf8_lossy(&entry.name)
+                        ))
+                    })?;
+                weak.push((&entry.name, segment, offset, addend));
+                kind = FixupKind::Rebase(target.wrapping_add(addend as u64));
+            }
+        }
+        match kind {
             FixupKind::Rebase(target) => {
                 super::buf::put64(image, to_usize(file), target)
                     .ok_or_else(|| Error::Internal("fixup outside the output".into()))?;
@@ -384,5 +425,39 @@ pub fn opcodes(
         bind.push(BIND_OPCODE_DONE);
         pad_to(&mut bind, 8);
     }
-    Ok((rebase, bind))
+    Ok(Opcodes {
+        rebase,
+        bind,
+        weak_bind: weak_bind_opcodes(weak),
+    })
+}
+
+/// The weak binding stream: entries sorted by symbol name, as dyld walks
+/// the streams of every image in step.
+fn weak_bind_opcodes(mut entries: Vec<(&[u8], u8, u64, i64)>) -> Vec<u8> {
+    let mut out = Vec::new();
+    if entries.is_empty() {
+        return out;
+    }
+    entries.sort_unstable();
+    out.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+    let mut current: Option<(&[u8], i64)> = None;
+    for (name, segment, offset, addend) in entries {
+        if current.map(|(n, _)| n) != Some(name) {
+            out.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM);
+            out.extend_from_slice(name);
+            out.push(0);
+        }
+        if current.map(|(_, a)| a) != Some(addend) {
+            out.push(BIND_OPCODE_SET_ADDEND_SLEB);
+            push_sleb(&mut out, addend);
+        }
+        out.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment);
+        push_uleb(&mut out, offset);
+        out.push(BIND_OPCODE_DO_BIND);
+        current = Some((name, addend));
+    }
+    out.push(BIND_OPCODE_DONE);
+    pad_to(&mut out, 8);
+    out
 }
