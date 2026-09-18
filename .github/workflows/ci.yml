@@ -67,6 +67,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # the Rust test also links an x86_64 binary and runs it under Rosetta
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       # x86_64 slices of the fixtures run under Rosetta on the arm64 runner.
       - run: softwareupdate --install-rosetta --agree-to-license || true
