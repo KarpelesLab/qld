@@ -72,6 +72,15 @@ fn metadata(file: &Path) -> Option<Vec<(String, BTreeSet<String>)>> {
             // categories differently), then its fields.
             flush(&mut entry, &mut sections);
             entry.push_str("entry\n");
+        } else if sections
+            .last()
+            .is_some_and(|(name, _)| name.contains("refs)"))
+        {
+            // Selector and class references: one entry per line, in
+            // whatever order the compiler emitted them for this target.
+            flush(&mut entry, &mut sections);
+            entry.push_str(&line);
+            flush(&mut entry, &mut sections);
         } else {
             entry.push_str(&line);
             entry.push('\n');
@@ -79,6 +88,37 @@ fn metadata(file: &Path) -> Option<Vec<(String, BTreeSet<String>)>> {
     }
     flush(&mut entry, &mut sections);
     Some(sections)
+}
+
+/// Compares two metadata dumps; on a difference, panics with the first
+/// section and the entries only one side has, in full.
+fn same_metadata(
+    ours: &[(String, BTreeSet<String>)],
+    theirs: &[(String, BTreeSet<String>)],
+    what: &str,
+) {
+    let names =
+        |m: &[(String, BTreeSet<String>)]| m.iter().map(|s| s.0.clone()).collect::<Vec<_>>();
+    assert_eq!(names(ours), names(theirs), "{what}: sections");
+    for ((name, left), (_, right)) in ours.iter().zip(theirs) {
+        if left != right {
+            let only_left: Vec<&String> = left.difference(right).collect();
+            let only_right: Vec<&String> = right.difference(left).collect();
+            panic!(
+                "{what}: {name} differs\n--- only in the first:\n{}\n--- only in the second:\n{}",
+                only_left
+                    .iter()
+                    .map(|e| e.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                only_right
+                    .iter()
+                    .map(|e| e.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+    }
 }
 
 /// Reads the 8-byte pointer at `address` in an image with rebase opcodes.
@@ -222,7 +262,7 @@ fn relative_method_lists_and_category_merging() {
             if arch == "arm64" {
                 arm64_metadata.insert(variant, ours.clone());
             } else if let (Some(ours), Some(Some(arm64))) = (&ours, arm64_metadata.get(variant)) {
-                assert_eq!(ours, arm64, "{variant}: x86_64 vs arm64 metadata");
+                same_metadata(ours, arm64, &format!("{variant}: x86_64 vs arm64"));
             }
             if variant.ends_with("merged") {
                 // One category is left for NSObject and one for +load.
@@ -250,7 +290,11 @@ fn relative_method_lists_and_category_merging() {
                 continue;
             }
             if let (Some(ours), Some(theirs)) = (ours, metadata(&reference)) {
-                assert_eq!(ours, theirs, "{arch} {variant}: qld vs ld64.lld metadata");
+                same_metadata(
+                    &ours,
+                    &theirs,
+                    &format!("{arch} {variant}: qld vs ld64.lld"),
+                );
             }
         }
     }
