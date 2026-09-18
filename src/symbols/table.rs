@@ -44,8 +44,8 @@
 //!
 //! Passes 2 and 3, and the parallelism of pass 1, only pay off for large
 //! batches. A batch of fewer than 65,536 names (16,384 once the table holds
-//! names, as most names of later batches then exist already) whose jobs
-//! all have distinct positions (always the case for the resolution driver) is
+//! names, as most names of later batches then exist already), or any batch
+//! in a pool of one thread, whose jobs all have distinct positions (always the case for the resolution driver) is
 //! interned on the calling thread, jobs in position order and names in job
 //! order. Each new name is then first seen at its first occurrence, so
 //! numbering names as they are inserted gives the same IDs as the three
@@ -502,7 +502,9 @@ impl<'a> SymbolTable<'a> {
         } else {
             MIN_PARALLEL_LOOKUP_KNOWN
         };
-        if total < min_parallel {
+        // On one thread, the in-order path is always cheaper: no pending
+        // records, sort or rewrite.
+        if total < min_parallel || rayon::current_num_threads() == 1 {
             let mut order: Vec<usize> = (0..jobs.len()).collect();
             order.sort_unstable_by_key(|&j| jobs[j].position);
             if order
