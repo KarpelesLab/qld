@@ -152,6 +152,7 @@ const SETS_DEFAULT: &[&str] = &[
     "error-unresolved-symbols",
     "no-allow-multiple-definition",
     "no-gc-sections",
+    "no-relax-gp",
     "no-print-gc-sections",
     "no-print-icf-sections",
     "no-omagic",

@@ -353,8 +353,32 @@ struct Plan<'a> {
     os_abi: u8,
     /// `e_machine` of the output, taken from the inputs.
     machine: u16,
-    /// `e_flags` of the output, taken from the inputs.
+    /// `e_flags` of the output (RISC-V: the merged ABI flags).
     flags: u32,
+    /// RISC-V: the merged `.riscv.attributes`, written in place of the
+    /// first input section (the others become empty).
+    riscv_attributes: Option<crate::elf::arch::riscv::attributes::Output>,
+}
+
+/// The bytes input section `section` (`id`) contributes: its size, except
+/// for RISC-V attributes, merged into the first section.
+fn member_size(
+    riscv_attributes: Option<&crate::elf::arch::riscv::attributes::Output>,
+    id: Option<crate::ids::SectionId>,
+    section: &crate::elf::object::InputSection<'_>,
+) -> u64 {
+    match riscv_attributes {
+        Some(merged)
+            if section.header.sh_type == crate::elf::read::consts::SHT_RISCV_ATTRIBUTES =>
+        {
+            if id == Some(merged.first) {
+                u64::try_from(merged.bytes.len()).unwrap_or(u64::MAX)
+            } else {
+                0
+            }
+        }
+        _ => section.header.sh_size,
+    }
 }
 
 fn align_to(value: u64, align: u64) -> Result<u64> {
@@ -409,6 +433,9 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
     let arch = crate::elf::arch::Arch::of_files(files).unwrap_or_default();
     let machine = arch.machine();
     let flags = arch.output_flags(files);
+    let riscv_attributes = (arch == crate::elf::arch::Arch::RiscV64)
+        .then(|| crate::elf::arch::riscv::attributes::collect(refs))
+        .flatten();
     let mut kept: KeptGroups<'a> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6b65_7074));
     for (file_index, file) in files.iter().enumerate() {
@@ -639,7 +666,8 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
             };
             let offset = align_to(size, section.header.sh_addralign)?;
             member.offset = offset;
-            size = add(offset, section.header.sh_size)?;
+            let id = sections.id(member.file as usize, member.section);
+            size = add(offset, member_size(riscv_attributes.as_ref(), id, section))?;
             if let Some(id) = sections.id(member.file as usize, member.section)
                 && let Some(slot) = offsets.get_mut(id.index())
             {
@@ -883,6 +911,7 @@ fn plan<'a>(input: &RelocatableInput<'_, 'a>) -> Result<Plan<'a>> {
         os_abi,
         machine,
         flags,
+        riscv_attributes,
     })
 }
 
@@ -1416,15 +1445,16 @@ fn write_file<'a>(input: &RelocatableInput<'_, 'a>, plan: &Plan<'a>) -> Result<(
                             .get(member.file as usize)
                             .and_then(|f| f.object.as_ref())
                             .and_then(|o| o.section(member.section));
+                        let id = input.refs.sections.id(member.file as usize, member.section);
+                        let size = section.map_or(0, |section| {
+                            member_size(plan.riscv_attributes.as_ref(), id, section)
+                        });
                         if let Some(section) = section
                             && !section.is_nobits()
-                            && section.header.sh_size > 0
+                            && size > 0
                         {
                             chunks.push((
-                                ChunkRange::new(
-                                    add(out.offset, member.offset)?,
-                                    section.header.sh_size,
-                                ),
+                                ChunkRange::new(add(out.offset, member.offset)?, size),
                                 Chunk::Member(out_u32, member_u32),
                             ));
                         }
@@ -1531,7 +1561,17 @@ fn write_chunk<'a>(
             let Some(section) = object.section(member.section) else {
                 return Ok(());
             };
-            let data = object.section_data(section)?;
+            let mut data = object.section_data(section)?;
+            if section.header.sh_type == crate::elf::read::consts::SHT_RISCV_ATTRIBUTES
+                && let Some(merged) = &plan.riscv_attributes
+            {
+                let id = input.refs.sections.id(member.file as usize, member.section);
+                data = if id == Some(merged.first) {
+                    &merged.bytes
+                } else {
+                    &[]
+                };
+            }
             if let Some(dest) = out.get_mut(..data.len()) {
                 dest.copy_from_slice(data);
             }

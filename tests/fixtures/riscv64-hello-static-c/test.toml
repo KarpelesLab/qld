@@ -1,0 +1,21 @@
+# M4: the RISC-V counterpart of `hello-static-c`. Static glibc: libc's TLS
+# accesses use initial-exec GOT entries the linker fills, the C runtime
+# loads `gp` from `__global_pointer$`, and relaxation shrinks libc's code.
+description = "static hello world in C, for RISC-V 64"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "RISC-V",
+  "EXEC (Executable file)",
+  "RVC, double-float ABI",
+  "__global_pointer$",
+  ".riscv.attributes",
+  "!INTERP",
+  "!.dynamic",
+  "!R_RISCV_JUMP_SLOT",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true

@@ -1,0 +1,34 @@
+# M4: a RISC-V shared library and an executable linked against it. Covers
+# the PLT and GOT of a shared object, general-dynamic TLS in the library
+# (DTPMOD64/DTPREL64), the library's TLS variable read from the executable
+# (initial-exec through a TPREL64 GOT entry), and the callback that needs
+# --export-dynamic.
+description = "RISC-V shared library plus executable, with a callback and library TLS"
+compile = ["cc -O2 -fPIC -c greet.c", "cc -O2 -fPIE -c main.c"]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libgreet.so -o libgreet.so greet.o",
+  "-o out main.o -L. -lgreet -Wl,-rpath,$ORIGIN -rdynamic",
+]
+run = "./out"
+expect.stdout = """
+hello from libgreet (tls=5)
+callback: 10
+greet_calls=1 lib_tls=5
+"""
+expect.readelf = [
+  "RISC-V",
+  "Shared library: [libgreet.so]",
+  "$ORIGIN",
+  "exe_callback_qld",
+  "R_RISCV_JUMP_SLOT",
+  "R_RISCV_TLS_TPREL64",
+]
+expect.readelf_files."libgreet.so" = [
+  "DYN (",
+  "Library soname: [libgreet.so]",
+  "R_RISCV_TLS_DTPMOD64",
+  "greet_calls_qld",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true

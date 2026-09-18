@@ -1,0 +1,18 @@
+# M4: C++ exceptions on RISC-V. `.eh_frame` holds label differences
+# (`ADD32`/`SUB32`, `SET6`/`SUB6` in the call frame instructions) across
+# relaxed code, and `.gcc_except_table` ULEB128 call-site ranges, so the
+# unwinder only finds its way if both follow the shrunk code.
+description = "C++ exceptions across two frames, for RISC-V 64"
+compile = ["c++ -O2 -fPIE -c throw.cpp"]
+driver = "c++"
+link = "-pie -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "RISC-V",
+  "GNU_EH_FRAME",
+  ".gcc_except_table",
+  "R_RISCV_JUMP_SLOT",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true

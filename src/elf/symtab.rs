@@ -461,14 +461,15 @@ pub fn write_symtab(
                     continue;
                 };
                 let name_len = symbols.name(index, &raw).map_or(0, <[u8]>::len);
-                let (shndx, value) = match symbols.section(index, &raw) {
+                let (shndx, value, size) = match symbols.section(index, &raw) {
                     Ok(SectionIndex::Section(section)) => (
                         shndx_for(addresses, file_index, section),
                         addresses
                             .section_offset_address(file_index, section, raw.st_value)
                             .unwrap_or(0),
+                        addresses.symbol_size(file_index, section, raw.st_value, raw.st_size),
                     ),
-                    _ => (SHN_ABS, raw.st_value),
+                    _ => (SHN_ABS, raw.st_value, raw.st_size),
                 };
                 let value = tls_relative(addresses, raw.kind(), value, shndx);
                 put_sym(
@@ -478,7 +479,7 @@ pub fn write_symtab(
                     raw.st_other,
                     shndx,
                     value,
-                    raw.st_size,
+                    size,
                 );
                 name_offset = name_offset.saturating_add(name_len).saturating_add(1);
             }
@@ -489,14 +490,18 @@ pub fn write_symtab(
             let target = refs.global_target(id, true);
             let value = addresses.globals.get(id.index()).copied().unwrap_or(0);
             let (binding, kind, other, shndx, size) = match target.def {
-                Def::Section { file, section, .. } => {
+                Def::Section {
+                    file,
+                    section,
+                    value,
+                } => {
                     let raw = target.raw.unwrap_or_default();
                     (
                         raw.binding(),
                         raw.kind(),
                         raw.st_other,
                         shndx_for(addresses, file, section),
-                        raw.st_size,
+                        addresses.symbol_size(file, section, value, raw.st_size),
                     )
                 }
                 Def::Absolute(_) => {

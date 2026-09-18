@@ -1,0 +1,23 @@
+# M4: RISC-V linker relaxation with section shrinking. Calls become `jal`
+# or `c.j`, alignment padding is trimmed so the 64-byte aligned function
+# stays aligned, local-exec TLS loses its `lui`, and the jump table's label
+# differences follow the moved code. `--no-relax` keeps every sequence but
+# still honors the alignment; both programs compute the same thing.
+description = "RISC-V linker relaxation, with and without --no-relax"
+compile = ["cc -O2 -fPIE -c relax.c"]
+driver = "cc"
+link = [
+  "-pie -o out relax.o",
+  "-pie -Wl,--no-relax -o out-norelax relax.o",
+]
+run = "./out && ./out-norelax"
+expect.stdout = "relaxed 2444827709 34\nrelaxed 2444827709 34\n"
+expect.readelf = [
+  "RISC-V",
+  "RVC, double-float ABI",
+  ".riscv.attributes",
+  "aligned_qld",
+  "dispatch_qld",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true

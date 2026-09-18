@@ -955,6 +955,10 @@ pub struct LinkOptions {
     pub magic: MagicMode,
     /// `--relax` (default) / `--no-relax`.
     pub relax: bool,
+    /// RISC-V `--relax-gp`: relax absolute accesses within 2 KiB of
+    /// `__global_pointer$` to `gp`-relative ones (off by default, as in
+    /// lld).
+    pub relax_gp: bool,
     /// `--image-base`.
     pub image_base: Option<u64>,
     /// `--section-start`, `-Ttext`, `-Tdata`, `-Tbss`: section addresses, in
@@ -1069,6 +1073,7 @@ impl LinkOptions {
             extern_protected_data: true,
             section_header: true,
             relax: true,
+            relax_gp: false,
             dependent_libraries: true,
             fork: true,
             ..Self::default()

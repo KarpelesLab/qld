@@ -203,6 +203,9 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
         return result;
     };
     let order = file.position.raw();
+    if let Some(error) = context.arch.incompatible(refs.files, file_index) {
+        result.errors.push(Diagnostic::error(error).order(order));
+    }
     for (section_index, section) in object.sections.iter().enumerate() {
         let section_index = u32::try_from(section_index).unwrap_or(u32::MAX);
         if section.relocs == 0

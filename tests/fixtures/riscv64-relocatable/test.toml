@@ -1,0 +1,24 @@
+# M4: `-r` on RISC-V. The partial link keeps `e_machine` and the ABI flags,
+# merges `.riscv.attributes`, and passes the relocations (with their
+# `R_RISCV_RELAX` and `R_RISCV_ALIGN` markers) through, so the final link
+# can still relax; the result runs like the objects it came from.
+description = "relocatable output (-r) on RISC-V 64, then a final link"
+compile = ["cc -O2 -fPIE -c part_a.c", "cc -O2 -fPIE -c part_b.c"]
+driver = "cc"
+link = [
+  "-r -nostdlib -o combined.o part_a.o part_b.o",
+  "-pie -o out combined.o",
+]
+output = "out"
+run = "./out"
+expect.stdout = "sum 226\n"
+expect.readelf = ["RISC-V", "DYN ("]
+expect.readelf_files."combined.o" = [
+  "RISC-V",
+  "REL (Relocatable file)",
+  "RVC, double-float ABI",
+  "R_RISCV_PCREL_HI20",
+  "R_RISCV_RELAX",
+]
+targets = ["riscv64-linux-gnu"]
+determinism = true

@@ -838,7 +838,9 @@ fn write_got_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) {
     let (words, _) = out.as_chunks_mut::<8>();
     let reserved = usize::try_from(synth.got_plt_reserved).unwrap_or(0);
     if synth.dynamic() {
-        if let Some(first) = words.first_mut() {
+        if synth.arch.got_plt_holds_dynamic()
+            && let Some(first) = words.first_mut()
+        {
             let dynamic = addresses
                 .layout
                 .synthetic(Synthetic::Dynamic)
@@ -1279,7 +1281,8 @@ fn offset_address(
 ) -> u64 {
     // Callers pass a section of the output, which always has an ID.
     let merge = addresses.refs.sections.kind_in(file, section) == Some(SectionKind::Merge);
-    if merge {
+    // Merged pieces and relaxed code (RISC-V) move offsets.
+    if merge || !addresses.layout.relax.is_empty() {
         return addresses
             .section_offset_address(file, section, offset)
             .unwrap_or(0);
@@ -1354,7 +1357,7 @@ fn write_eh_frame_hdr(addresses: &Addresses<'_, '_>, out: &mut [u8]) {
 }
 
 /// Why a relocation's target section is not in the output, if it is not.
-fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
+pub(crate) fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<DeadTarget> {
     let id = refs.target_section(target)?;
     if refs.sections.is_live(id) {
         return None;
@@ -1516,6 +1519,18 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
             return Ok(());
         };
         return write_eh_frame(input, eh, base, out);
+    }
+    // RISC-V relocations depend on each other and on linker relaxation.
+    if input.context.arch == Arch::RiscV64 {
+        let section = super::arch::riscv::apply::SectionWrite {
+            id,
+            file: file_index,
+            index: section_index,
+            section,
+            data,
+            base,
+        };
+        return super::arch::riscv::apply::write_section(input, section, out);
     }
 
     if let Some(dest) = out.get_mut(..data.len()) {
@@ -1882,7 +1897,7 @@ fn add_delta(kind: Kind, value: u64) -> Option<u64> {
 /// `target` when a `NOCROSSREFS` list prohibits it, as GNU ld checks: both
 /// output sections are in one list and differ, and for `NOCROSSREFS_TO`
 /// the target is in the list's first section.
-fn prohibited_cross_reference(
+pub(crate) fn prohibited_cross_reference(
     input: &WriteInput<'_, '_, '_>,
     from: SectionId,
     target: &super::refs::Target,
@@ -1933,7 +1948,7 @@ fn prohibited_cross_reference(
 
 /// The name a cross-reference error uses for a symbol: GNU ld names a
 /// section symbol after its input section, which has no symbol name.
-fn cross_reference_name(
+pub(crate) fn cross_reference_name(
     refs: &Refs<'_, '_>,
     file: usize,
     symbol: u32,
@@ -1953,7 +1968,7 @@ fn cross_reference_name(
     symbol_name(refs, file, symbol)
 }
 
-fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {
+pub(crate) fn symbol_name(refs: &Refs<'_, '_>, file: usize, symbol: u32) -> String {
     refs.symbol_name(file, symbol)
         .unwrap_or_else(|| format!("symbol {symbol}"))
 }
