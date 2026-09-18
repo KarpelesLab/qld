@@ -35,6 +35,8 @@
 
 #![deny(clippy::arithmetic_side_effects)]
 
+use std::cell::OnceCell;
+
 use rayon::prelude::*;
 
 use crate::elf::common::Commons;
@@ -46,6 +48,7 @@ use crate::elf::read::consts::{SHF_ALLOC, SHF_EXECINSTR};
 use crate::elf::read::{Relocation, Relocations};
 use crate::elf::refs::Def;
 use crate::elf::reloc::{self, Context};
+use crate::elf::synth::Owner;
 use crate::elf::values::Addresses;
 use crate::error::{Error, Result};
 use crate::ids::SectionId;
@@ -57,6 +60,34 @@ use super::{Arch, TlsMode};
 pub const MAX_PASSES: u32 = 30;
 
 const NONE: u32 = u32::MAX;
+
+/// Where a relocation's target is, resolved once for all passes.
+#[derive(Clone, Copy, Debug)]
+enum Place {
+    /// Not known before the write (commons, linker-defined and shared
+    /// symbols without a PLT entry).
+    Unknown,
+    /// A fixed address.
+    Absolute(u64),
+    /// Offset `value` of live regular section `id`, plus `addend`: moves
+    /// with the section's relaxation edits.
+    Section {
+        id: SectionId,
+        value: u64,
+        addend: i64,
+    },
+    /// Anywhere else in a section (merged, folded): looked up in full.
+    Offset {
+        file: usize,
+        section: u32,
+        value: u64,
+        addend: i64,
+    },
+    /// A PLT entry.
+    Plt { owner: Owner, addend: i64 },
+    /// An IFUNC stub.
+    Iplt { owner: Owner, addend: i64 },
+}
 
 /// What relaxation does to the instruction (or padding) of one
 /// relocation.
@@ -423,6 +454,16 @@ pub fn layout<'a>(
         };
         return inner(&round);
     }
+    // Relocations are read, and their targets resolved, once; each pass
+    // only recomputes addresses.
+    let prepared: Vec<Result<Option<SectionInput<'_, 'a>>>> = candidates
+        .par_iter()
+        .map(|candidate| prepare(input, *candidate))
+        .collect();
+    let mut sections = Vec::with_capacity(prepared.len());
+    for section in prepared {
+        sections.extend(section?);
+    }
     for pass in 0..MAX_PASSES {
         let round = LayoutInput {
             relax: Some(&state),
@@ -430,7 +471,7 @@ pub fn layout<'a>(
         };
         let mut layout = inner(&round)?;
         layout.relax = state;
-        let next = relax_pass(input, &layout, &candidates, pass)?;
+        let next = relax_pass(input, &layout, &mut sections, pass)?;
         if next.same_shape(&layout.relax) {
             layout.relax = next;
             return Ok(layout);
@@ -463,30 +504,27 @@ pub struct Pass<'p, 'x, 'a> {
 }
 
 impl Pass<'_, '_, '_> {
-    /// `S + A` of relocation target `symbol` of `file`, through its PLT
-    /// entry or IFUNC stub when `branch` says the relocation is a call.
-    /// `None` when the address is not known yet (commons, linker-defined
-    /// and shared symbols without a PLT entry): such relocations are not
-    /// relaxed.
-    #[must_use]
-    pub fn target(&self, file: usize, symbol: u32, addend: i64, branch: bool) -> Option<u64> {
+    /// Where relocation target `symbol` of `file` (plus `addend`) is, in a
+    /// form that stays valid across passes: through its PLT entry or IFUNC
+    /// stub when `branch` says the relocation is a call.
+    fn resolve(&self, file: usize, symbol: u32, addend: i64, branch: bool) -> Place {
         let addresses = &self.addresses;
         let refs = &addresses.refs;
-        let target = refs.target(file, symbol as usize)?;
+        let Some(target) = refs.target(file, symbol as usize) else {
+            return Place::Unknown;
+        };
         let owner = Addresses::owner(&target, file, symbol);
         if branch {
-            if target.is_ifunc()
-                && let Some(stub) = addresses.iplt_address(owner)
-            {
-                return Some(stub.wrapping_add_signed(addend));
+            if target.is_ifunc() && addresses.iplt_address(owner).is_some() {
+                return Place::Iplt { owner, addend };
             }
             let flags = target
                 .global
                 .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
             if flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
-                && let Some(plt) = addresses.plt_address(owner)
+                && addresses.plt_address(owner).is_some()
             {
-                return Some(plt.wrapping_add_signed(addend));
+                return Place::Plt { owner, addend };
             }
         }
         match target.def {
@@ -495,32 +533,84 @@ impl Pass<'_, '_, '_> {
                 section,
                 value,
             } => {
-                let merge = refs.sections.kind_in(file, section) == Some(SectionKind::Merge);
-                if merge && target.is_section_symbol() {
-                    return addresses.section_offset_address(
-                        file,
-                        section,
-                        value.checked_add_signed(addend)?,
-                    );
+                let kind = refs.sections.kind_in(file, section);
+                let section_symbol = target.is_section_symbol();
+                if kind == Some(SectionKind::Merge) && section_symbol {
+                    return match value.checked_add_signed(addend) {
+                        Some(offset) => Place::Offset {
+                            file,
+                            section,
+                            value: offset,
+                            addend: 0,
+                        },
+                        None => Place::Unknown,
+                    };
                 }
-                // As `Addresses::symbol_address`: a section symbol's offset
-                // into relaxed code moves with the code.
-                if target.is_section_symbol()
+                if kind == Some(SectionKind::Regular)
                     && let Some(id) = refs.sections.id(file, section)
-                    && self.previous.section(id).is_some()
-                    && let Some(offset) = value.checked_add_signed(addend)
+                    && refs.sections.is_live(id)
                 {
-                    return addresses.section_offset_address(file, section, offset);
+                    // A section symbol's offset into relaxed code moves
+                    // with the code, as a label does.
+                    if section_symbol && let Some(offset) = value.checked_add_signed(addend) {
+                        return Place::Section {
+                            id,
+                            value: offset,
+                            addend: 0,
+                        };
+                    }
+                    return Place::Section { id, value, addend };
+                }
+                Place::Offset {
+                    file,
+                    section,
+                    value,
+                    addend,
+                }
+            }
+            Def::Absolute(value) => Place::Absolute(value.wrapping_add_signed(addend)),
+            Def::Undefined { weak: true } => Place::Absolute(addend as u64),
+            _ => Place::Unknown,
+        }
+    }
+
+    /// The address of `place` in this pass's layout; `None` when it is not
+    /// known yet (commons, linker-defined and shared symbols without a PLT
+    /// entry): such relocations are not relaxed.
+    fn address(&self, place: Place) -> Option<u64> {
+        let addresses = &self.addresses;
+        match place {
+            Place::Unknown => None,
+            Place::Absolute(value) => Some(value),
+            Place::Section { id, value, addend } => {
+                let layout = addresses.layout;
+                if layout.section_shndx.get(id.index()).copied().unwrap_or(0) == 0 {
+                    return None;
                 }
                 Some(
-                    addresses
-                        .section_offset_address(file, section, value)?
+                    layout
+                        .section_addr
+                        .get(id.index())?
+                        .wrapping_add(self.previous.map(id, value))
                         .wrapping_add_signed(addend),
                 )
             }
-            Def::Absolute(value) => Some(value.wrapping_add_signed(addend)),
-            Def::Undefined { weak: true } => Some(addend as u64),
-            _ => None,
+            Place::Offset {
+                file,
+                section,
+                value,
+                addend,
+            } => Some(
+                addresses
+                    .section_offset_address(file, section, value)?
+                    .wrapping_add_signed(addend),
+            ),
+            Place::Plt { owner, addend } => {
+                Some(addresses.plt_address(owner)?.wrapping_add_signed(addend))
+            }
+            Place::Iplt { owner, addend } => {
+                Some(addresses.iplt_address(owner)?.wrapping_add_signed(addend))
+            }
         }
     }
 
@@ -565,9 +655,24 @@ pub struct SectionInput<'s, 'a> {
     order: Option<Vec<u32>>,
     /// Its address in this pass's layout.
     pub address: u64,
+    /// The resolved target of each relocation, filled when first asked.
+    targets: Vec<OnceCell<Place>>,
 }
 
 impl SectionInput<'_, '_> {
+    /// `S + A` of the relocation at position `seq` in this pass, through
+    /// its PLT entry or IFUNC stub when `branch` says it is a call. `None`
+    /// when the address is not known (such relocations are not relaxed).
+    #[must_use]
+    pub fn target(&self, pass: &Pass<'_, '_, '_>, seq: u32, branch: bool) -> Option<u64> {
+        let rel = self.relocs.get(seq as usize)?;
+        let place = *self
+            .targets
+            .get(seq as usize)?
+            .get_or_init(|| pass.resolve(self.file, rel.symbol, rel.addend, branch));
+        pass.address(place)
+    }
+
     /// The table index of the relocation at position `seq`.
     #[must_use]
     pub fn index_of(&self, seq: u32) -> u32 {
@@ -631,7 +736,7 @@ impl Edits {
 fn relax_pass<'a>(
     input: &LayoutInput<'_, 'a>,
     layout: &Layout<'a>,
-    candidates: &[Candidate],
+    sections: &mut [SectionInput<'_, 'a>],
     pass: u32,
 ) -> Result<Relaxation> {
     let commons = Commons::default();
@@ -663,9 +768,9 @@ fn relax_pass<'a>(
         previous: &layout.relax,
         pass,
     };
-    let results: Vec<Result<Option<SectionRelax>>> = candidates
-        .par_iter()
-        .map(|candidate| relax_section(&context, *candidate))
+    let results: Vec<Result<Option<SectionRelax>>> = sections
+        .par_iter_mut()
+        .map(|section| relax_section(&context, section))
         .collect();
     let mut sections = Vec::new();
     for result in results {
@@ -680,28 +785,21 @@ fn relax_pass<'a>(
     ))
 }
 
-fn relax_section(pass: &Pass<'_, '_, '_>, candidate: Candidate) -> Result<Option<SectionRelax>> {
-    let addresses = &pass.addresses;
-    let layout = addresses.layout;
-    let refs = &addresses.refs;
-    let Some(input) = refs.files.get(candidate.file) else {
+/// Reads candidate section `candidate` for the passes: its relocations
+/// in processing order and its contents.
+fn prepare<'s, 'a>(
+    input: &'s LayoutInput<'_, 'a>,
+    candidate: Candidate,
+) -> Result<Option<SectionInput<'s, 'a>>> {
+    let Some(file) = input.refs.files.get(candidate.file) else {
         return Ok(None);
     };
-    let Some(object) = &input.object else {
+    let Some(object) = &file.object else {
         return Ok(None);
     };
     let Some(section) = object.section(candidate.section) else {
         return Ok(None);
     };
-    if layout
-        .section_shndx
-        .get(candidate.id.index())
-        .copied()
-        .unwrap_or(0)
-        == 0
-    {
-        return Ok(None);
-    }
     let Some(relocations) = object
         .section(section.relocs)
         .map(|r| object.elf.relocation_section(section.relocs, &r.header))
@@ -716,37 +814,48 @@ fn relax_section(pass: &Pass<'_, '_, '_>, candidate: Candidate) -> Result<Option
     let relocs: Vec<Relocation> = relas.iter().collect();
     let offsets: Vec<u64> = relocs.iter().map(|r| r.offset).collect();
     let order = sorted_order(&offsets);
-    let relocs = match &order {
+    let relocs: Vec<Relocation> = match &order {
         Some(order) => order
             .iter()
             .filter_map(|&i| relocs.get(i as usize).copied())
             .collect(),
         None => relocs,
     };
-    let sorted = order.is_none();
-    let section_input = SectionInput {
+    let targets = std::iter::repeat_with(OnceCell::new)
+        .take(relocs.len())
+        .collect();
+    Ok(Some(SectionInput {
         id: candidate.id,
         file: candidate.file,
-        input,
+        input: file,
         object,
         section,
         data: object.section_data(section)?,
         relocs,
         order,
-        address: layout
-            .section_addr
-            .get(candidate.id.index())
-            .copied()
-            .unwrap_or(0),
-    };
-    let edits = decide(pass, &section_input)?;
+        address: 0,
+        targets,
+    }))
+}
+
+fn relax_section(
+    pass: &Pass<'_, '_, '_>,
+    section: &mut SectionInput<'_, '_>,
+) -> Result<Option<SectionRelax>> {
+    let layout = pass.addresses.layout;
+    let index = section.id.index();
+    if layout.section_shndx.get(index).copied().unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+    section.address = layout.section_addr.get(index).copied().unwrap_or(0);
+    let edits = decide(pass, section)?;
     if edits.edits.is_empty() {
         return Ok(None);
     }
     Ok(Some(SectionRelax {
-        id: candidate.id,
+        id: section.id,
         edits: edits.edits,
-        sorted,
+        sorted: section.order.is_none(),
     }))
 }
 

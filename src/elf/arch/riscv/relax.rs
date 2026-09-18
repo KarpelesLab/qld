@@ -117,7 +117,7 @@ pub fn decide(pass: &Pass<'_, '_, '_>, section: &SectionInput<'_, '_>) -> Result
             .address
             .wrapping_add(rel.offset)
             .wrapping_sub(edits.delta());
-        let target = |branch: bool| pass.target(section.file, rel.symbol, rel.addend, branch);
+        let target = |branch: bool| section.target(pass, seq, branch);
         let word = || {
             usize::try_from(rel.offset)
                 .ok()
