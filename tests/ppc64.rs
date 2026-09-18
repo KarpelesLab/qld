@@ -1476,6 +1476,104 @@ fn power10_pcrel_matches() {
     link_and_compare(tools, &dir, "libpcrel.so", &["-shared", "library.o"]);
 }
 
+/// PC-relative general- and local-dynamic sequences whose
+/// `__tls_get_addr` call is followed by an ordinary instruction rather
+/// than a `nop`, and nothing relocated there hides a rewrite of it.
+const PCREL_TLS: &str = r#"
+	.abiversion 2
+	.section .tdata,"awT",@progbits
+	.p2align 2
+	.globl	tls_gd
+	.type	tls_gd, @object
+tls_gd:
+	.long	3
+	.size	tls_gd, 4
+	.type	tls_ld, @object
+tls_ld:
+	.long	4
+	.size	tls_ld, 4
+
+	.text
+	.globl	gd_value
+	.type	gd_value, @function
+	.p2align 6
+gd_value:
+	.localentry	gd_value, 1
+	mflr	0
+	std	0, 16(1)
+	stdu	1, -32(1)
+	paddi	3, 0, tls_gd@got@tlsgd@pcrel, 1
+	bl	__tls_get_addr@notoc(tls_gd@tlsgd)
+	lwz	3, 0(3)
+	addi	1, 1, 32
+	ld	0, 16(1)
+	mtlr	0
+	blr
+	.size	gd_value, .-gd_value
+
+	.globl	ld_value
+	.type	ld_value, @function
+	.p2align 6
+ld_value:
+	.localentry	ld_value, 1
+	mflr	0
+	std	0, 16(1)
+	stdu	1, -32(1)
+	paddi	3, 0, tls_ld@got@tlsld@pcrel, 1
+	bl	__tls_get_addr@notoc(tls_ld@tlsld)
+	lwz	3, tls_ld@dtprel(3)
+	addi	1, 1, 32
+	ld	0, 16(1)
+	mtlr	0
+	blr
+	.size	ld_value, .-ld_value
+
+	.globl	__tls_get_addr
+	.type	__tls_get_addr, @function
+	.p2align 4
+__tls_get_addr:
+	.localentry	__tls_get_addr, 1
+	blr
+	.size	__tls_get_addr, .-__tls_get_addr
+"#;
+
+/// A PC-relative `__tls_get_addr` call relaxed to local-exec becomes a
+/// `nop`, and the instruction after it is left alone: unlike the TOC form,
+/// there is no `nop` there to take the low half of the offset. Only the
+/// `R_PPC64_REL24_NOTOC` after the `R_PPC64_TLSGD`/`R_PPC64_TLSLD` marker
+/// tells the two forms apart, so this needs `Arch::annotates` for
+/// PowerPC64.
+#[test]
+fn pcrel_tls_calls_relax_in_place() {
+    let tools = require!();
+    let dir = scratch("pcrel-tls");
+    compile(tools, &dir, "tls.s", PCREL_TLS, &["-mcpu=power10"]);
+    let ours = link_and_compare(tools, &dir, "exe", &["-static", "-e", "gd_value", "tls.o"]);
+    let symbol = |name: &str| {
+        ours.symbols
+            .iter()
+            .find(|s| s.name == name && s.shndx != 0)
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+            .value
+    };
+    // mflr, std, stdu and the 8-byte paddi come before the call.
+    for function in ["gd_value", "ld_value"] {
+        let call = symbol(function) + 20;
+        assert_eq!(
+            ours.word(call),
+            Some(0x6000_0000),
+            "{function}: the call is not a nop"
+        );
+        // lwz r3, d(r3), whatever d is.
+        let after = ours.word(call + 4).unwrap();
+        assert_eq!(
+            after >> 16,
+            0x8063,
+            "{function}: the instruction after the call became {after:#010x}"
+        );
+    }
+}
+
 const FAR_CALLS: &str = r#"
 	.abiversion 2
 	.text

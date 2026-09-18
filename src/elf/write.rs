@@ -1559,12 +1559,8 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
     let tls = addresses.layout.tls.unwrap_or_default();
     let tp = tls.tp(arch);
     // PowerPC64: `.toc` entries this section takes the address of, whose
-    // accesses keep going through the entry.
-    let pinned_toc = if arch == super::arch::Arch::Ppc64 && alloc {
-        super::arch::ppc64::pinned_toc_entries(refs, file_index, Relocations::Rela(relas))
-    } else {
-        Vec::new()
-    };
+    // accesses keep going through the entry; found on first use.
+    let pinned_toc: std::cell::OnceCell<Vec<(u32, u64)>> = std::cell::OnceCell::new();
     let mut skip = false;
     arch::for_each_relocation!(arch, relas, |rel| {
         if skip {
@@ -1639,40 +1635,21 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
                 continue;
             }
         };
-        let mut via_stub = false;
         if alloc {
             if target.is_ifunc()
                 && let Some(stub) = addresses.iplt_address(owner)
             {
                 s = stub;
-                via_stub = true;
             }
-            if class.kind == Kind::Pc
+            if flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
+                && class.kind == Kind::Pc
                 && arch.is_branch(rel.r_type)
-                && flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
                 && let Some(plt) = addresses.plt_address(owner)
             {
                 s = plt;
-                via_stub = true;
             }
         }
-        let mut sa = s.wrapping_add_signed(a);
-        let mut class = class;
-        // PowerPC64: a load through a `.toc` entry becomes the TOC-relative
-        // address of the symbol the entry holds.
-        if alloc
-            && arch == super::arch::Arch::Ppc64
-            && let Some((address, field)) = super::arch::ppc64::toc_indirection(
-                addresses,
-                file_index,
-                &rel,
-                &pinned_toc,
-                input.context.mode.pic,
-            )
-        {
-            sa = address;
-            class.width = Width::Ppc(field);
-        }
+        let sa = s.wrapping_add_signed(a);
         let slot_address = || -> Result<u64, ApplyError> {
             addresses
                 .got_entry_address(owner, class.slot)
@@ -1697,41 +1674,47 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
             {
                 Ok(())
             }
-            Kind::Pc => {
+            Kind::Pc => match class.width {
                 // A branch that cannot reach its target goes through the
                 // range-extension thunk layout placed for this output
                 // section (`elf::arch::thunk`).
-                let branch = super::arch::Branch {
-                    r_type: rel.r_type,
-                    place,
-                    target: sa,
-                    st_other: target.raw.map_or(0, |raw| raw.st_other),
-                    via_stub,
-                    slot: via_stub
-                        .then(|| {
-                            super::values::plt_slot_address(
-                                addresses.synth,
-                                addresses.layout,
-                                owner,
-                            )
-                        })
-                        .flatten(),
-                };
-                let mut sa = arch.branch_destination(branch);
-                if let Some(destination) = arch.branch_thunk(branch)
-                    && let Some(output) = addresses
-                        .layout
-                        .section_shndx
-                        .get(id.index())
-                        .copied()
-                        .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
-                    && let Some(thunk) = addresses.layout.thunk_for(output, destination)
-                {
-                    sa = thunk;
+                Width::Field(crate::arch::aarch64::Field::Branch26) => {
+                    let mut sa = sa;
+                    if !crate::arch::aarch64::branch_in_range(place, sa)
+                        && let Some(output) = addresses
+                            .layout
+                            .section_shndx
+                            .get(id.index())
+                            .copied()
+                            .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
+                        && let Some(thunk) = addresses.layout.thunk_for(output, sa)
+                    {
+                        sa = thunk;
+                    }
+                    put(out, sa.wrapping_sub(place))
                 }
-                arch.finish_call(out, rel.offset, branch)
-                    .and_then(|()| put(out, sa.wrapping_sub(place)))
-            }
+                // PowerPC64 calls: local entry points, stubs and TOC
+                // restores.
+                Width::Ppc(crate::arch::ppc64::Field::Rel24) => ppc64_branch(
+                    out,
+                    addresses,
+                    id,
+                    &rel,
+                    PpcBranch {
+                        place,
+                        target: sa,
+                        st_other: target.raw.map_or(0, |raw| raw.st_other),
+                        via_stub: alloc
+                            && ((target.is_ifunc() && addresses.iplt_address(owner).is_some())
+                                || (flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
+                                    && arch.is_branch(rel.r_type)
+                                    && addresses.plt_address(owner).is_some())),
+                        owner,
+                        width: class.width,
+                    },
+                ),
+                _ => put(out, sa.wrapping_sub(place)),
+            },
             Kind::Page => put(out, page_delta(sa)),
             Kind::Got => {
                 slot_address().and_then(|g| put(out, g.wrapping_add_signed(a).wrapping_sub(place)))
@@ -1783,6 +1766,29 @@ fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8])
                 arch.relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
             }
             Kind::RelaxGotPcNoPic => arch.relax_got(out, rel.offset, class.kind, sa as i64),
+            // PowerPC64: a load through a `.toc` entry becomes the
+            // TOC-relative address of the symbol the entry holds.
+            Kind::GotRel
+                if alloc
+                    && matches!(
+                        class.width,
+                        Width::Ppc(
+                            crate::arch::ppc64::Field::HaToc | crate::arch::ppc64::Field::LoDsToc
+                        )
+                    ) =>
+            {
+                ppc64_toc_access(
+                    out,
+                    addresses,
+                    file_index,
+                    &rel,
+                    relas,
+                    &pinned_toc,
+                    input.context.mode.pic,
+                    sa,
+                    class.width,
+                )
+            }
             Kind::GotRel => put(out, sa.wrapping_sub(addresses.got_base())),
             Kind::GotBasePc => put(
                 out,
@@ -1896,6 +1902,96 @@ fn add_delta(kind: Kind, value: u64) -> Option<u64> {
         Kind::Sub => Some(value.wrapping_neg()),
         _ => None,
     }
+}
+
+/// What [`ppc64_branch`] needs to know about a call besides the relocation.
+struct PpcBranch {
+    place: u64,
+    /// `S + A`, or the stub's address.
+    target: u64,
+    st_other: u8,
+    via_stub: bool,
+    owner: Owner,
+    width: Width,
+}
+
+/// Writes a PowerPC64 branch: the callee's local entry point, the thunk
+/// the call goes through if it needs one, and the TOC restore after a call
+/// through a stub. Out of line, so the other architectures' relocation loop
+/// does not carry it.
+#[inline(never)]
+fn ppc64_branch(
+    out: &mut [u8],
+    addresses: &Addresses<'_, '_>,
+    id: SectionId,
+    rel: &crate::elf::read::Relocation,
+    call: PpcBranch,
+) -> std::result::Result<(), ApplyError> {
+    let arch = super::arch::Arch::Ppc64;
+    let slot = if call.via_stub {
+        super::values::plt_slot_address(addresses.synth, addresses.layout, call.owner)
+    } else {
+        None
+    };
+    let branch = super::arch::Branch {
+        r_type: rel.r_type,
+        place: call.place,
+        target: call.target,
+        st_other: call.st_other,
+        via_stub: call.via_stub,
+        slot,
+    };
+    let mut sa = arch.branch_destination(branch);
+    if let Some(destination) = arch.branch_thunk(branch)
+        && let Some(output) = addresses
+            .layout
+            .section_shndx
+            .get(id.index())
+            .copied()
+            .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
+        && let Some(thunk) = addresses.layout.thunk_for(output, destination)
+    {
+        sa = thunk;
+    }
+    arch.finish_call(out, rel.offset, branch)?;
+    arch::write_value(out, rel.offset, call.width, sa.wrapping_sub(call.place))
+}
+
+/// Writes a PowerPC64 TOC-relative access, relaxing it to address the
+/// symbol a `.toc` entry holds when it loads that entry. `pinned` holds the
+/// `.toc` entries the section (whose relocations are `relas`) takes the
+/// address of, found on first use.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn ppc64_toc_access(
+    out: &mut [u8],
+    addresses: &Addresses<'_, '_>,
+    file_index: usize,
+    rel: &crate::elf::read::Relocation,
+    relas: crate::elf::read::RelaSlice<'_, crate::elf::read::Elf64Le>,
+    pinned: &std::cell::OnceCell<Vec<(u32, u64)>>,
+    pic: bool,
+    sa: u64,
+    width: Width,
+) -> std::result::Result<(), ApplyError> {
+    let pinned = pinned.get_or_init(|| {
+        super::arch::ppc64::pinned_toc_entries(
+            &addresses.refs,
+            file_index,
+            Relocations::Rela(relas),
+        )
+    });
+    let (sa, width) =
+        match super::arch::ppc64::toc_indirection(addresses, file_index, rel, pinned, pic) {
+            Some((address, field)) => (address, Width::Ppc(field)),
+            None => (sa, width),
+        };
+    arch::write_value(
+        out,
+        rel.offset,
+        width,
+        sa.wrapping_sub(addresses.got_base()),
+    )
 }
 
 /// The output section names of a reference from input section `from` to

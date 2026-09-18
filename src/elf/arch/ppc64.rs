@@ -99,6 +99,9 @@ fn is_pld(data: &[u8], offset: u64) -> bool {
 /// `R_PPC64_GOT_DTPREL*`; [`ClassifyError::BadTlsInstruction`] for a TLS
 /// access in a form that cannot be relaxed (the `_HI` halves).
 #[allow(clippy::too_many_lines)]
+// Out of line: large, and not to be inlined into the other architectures'
+// relocation loops.
+#[inline(never)]
 pub fn classify(
     r_type: u32,
     data: &[u8],

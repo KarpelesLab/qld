@@ -1,7 +1,9 @@
 # M4: the four TLS models in a PowerPC64 LE executable. Everything is in
 # the executable, so general-dynamic, local-dynamic and initial-exec all
 # relax to local-exec: no TLS dynamic relocation may be left, and
-# `__tls_get_addr` must not be called.
+# `__tls_get_addr` must not be called. GNU ld still gives the unused
+# `__tls_get_addr_opt` a PLT slot (its `--tls-get-addr-optimize` stub), so
+# only a versioned reference to `__tls_get_addr` itself is an error.
 description = "PowerPC64 LE TLS: general-dynamic, local-dynamic, initial-exec and local-exec relaxed to local-exec"
 compile = ["cc -O2 -fPIE -c tls.c"]
 driver = "cc"
@@ -13,7 +15,7 @@ expect.readelf = [
   "TLS",
   "!R_PPC64_DTPMOD64",
   "!R_PPC64_TPREL64",
-  "!__tls_get_addr",
+  "!__tls_get_addr@",
 ]
 targets = ["powerpc64le-linux-gnu"]
 determinism = true
