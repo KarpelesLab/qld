@@ -76,7 +76,7 @@ The first end-to-end link: fully static x86-64 Linux executables.
 - [x] `--build-id` (parallel tree hash), `-s`/`-S`, `--strip-debug`
 - [x] `--icf`, `-Map`, `--why-live`, `--print-gc-sections`
 - [x] Compressed debug sections in inputs (`-gz`)
-- [ ] Musl C programs verified (only the Rust musl target is tested so far)
+- [x] Musl C programs verified (static, static-PIE, PIE and dynamic, compared with GNU ld)
 - [x] Parallel output writer: mapped output, disjoint slices per chunk,
       replacing an existing output atomically
 - [x] Undefined-symbol diagnostics with `referenced by file.o:(.text+0x12)`
@@ -143,7 +143,7 @@ dynamic symbol tables and `DT_*` entries, apart from documented differences.
       `_binary_<name>_start/_end/_size` symbols
 - [x] Intel HEX and S-record output (`--oformat ihex`/`srec`)
 - [x] `--no-relax`, `--nmagic`/`--omagic`, `-N`/`-n`
-- [ ] `-r` together with `-T`, and `--defsym` expressions beyond `symbol+offset`
+- [x] `-r` together with `-T`, and `--defsym` with full linker-script expressions
 
 **Status: exit criteria met** (W19, verified by the integrator with
 `tests/projects/kernel.sh` and `baremetal.sh`).
@@ -236,29 +236,30 @@ its linker.
       Thread scaling from 1 to 64+ cores: qld stops scaling at 12–16 threads.
 - [x] Identical code folding: `--icf=safe` (using `.llvm_addrsig`) and `--icf=all`
 - [x] String tail merging (`-O2`)
-- [ ] Section ordering: `--symbol-ordering-file`, `--call-graph-profile-sort`
+- [x] Section ordering: `--symbol-ordering-file`, `--call-graph-profile-sort` (hfsort/C3 and cdsort), `--call-graph-ordering-file`, `--print-symbol-order`
 - [x] Compressed debug sections: read and write zlib and zstd
       (`--compress-debug-sections`), in-crate codecs, parallel
-- [ ] `--gdb-index` and `--debug-names` generation
+- [x] `--gdb-index` (version 8, DIE scan when pubnames are absent) and `--debug-names` generation
 - [x] Unlinking a large old output file in the background
-- [ ] Optional separate-debug output (`--separate-debug-file`) with
-      `.gnu_debuglink`
+- [x] Optional separate-debug output (`--separate-debug-file`) with
+      `.gnu_debuglink`, following mold (GNU ld has no such option)
 
 **Exit criteria:** On the benchmark suite, qld's wall-clock time is at or below
 mold's and wild's on x86-64, on both 8-core and 64-core machines, with peak
 RSS no higher than lld's. Output is identical across 1, 2 and N threads for
 every benchmark.
 
-**Status (W26, 2026-09-18, 32-core Threadripper):** met against mold at
-default and 64 threads on every benchmark (clang: qld 149–160 ms, mold
-180–210 ms; clang-debug: 692 vs 1170 ms), but not at 8 threads or on one
-thread. wild is still faster (clang: 101 ms) except on clang-debug at
-default/64 threads (a tie, ~640–700 ms). Peak RSS is below lld's, mold's and
-wild's on every large link, and output is identical across 1, 2, 8 and 64
-threads. Remaining: symbol resolution (35–45 ms on clang, wild ~15 ms; needs
-a new design that keeps symbol IDs stable), the dynamic and layout stages at
-8 threads, and single-threaded relocation processing and parsing. Full
-tables: [tests/projects/bench.md](tests/projects/bench.md).
+**Status (W28–W31, 2026-09-18, 32-core Threadripper):** met against mold at
+default and 64 threads on every benchmark, not at 8 threads or on one thread;
+wild still leads on whole links (clang: wild 94 ms, qld 128–149 ms).
+Resolution is 30–57% faster after W28 (clang 37–45 → 23–26 ms at 16 threads)
+and output is unchanged. Peak RSS stays below lld's, mold's and wild's, and
+output is identical at 1, 2, 8 and 64 threads. Remaining: member loading stops
+scaling past ~8 threads (kernel page-fault cost), the dynamic and layout
+stages at 8 threads, and single-threaded relocation processing and parsing.
+Adding four architectures cost x86-64 about 1.6% in instructions
+(4.939G → 5.018G on the clang link). Full tables:
+[tests/projects/bench.md](tests/projects/bench.md).
 
 ---
 

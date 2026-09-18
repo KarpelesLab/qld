@@ -318,13 +318,27 @@ Layout from scripts follows GNU ld's algorithms, including orphan placement
 and the address fixpoint ("address assignment did not converge after 12
 passes" when it cannot settle). Known differences:
 
-- `-r` together with `-T` is not supported yet (relocatable output has its own
-  layout path).
 - `--verbose` does not dump the effective default script.
-- `--defsym` expressions beyond `symbol+offset` are not supported.
-- GLOBAL HIDDEN input symbols are written LOCAL in static links (17 `__pi_*`
-  symbols differ this way in a kernel build); GNU ld keeps them GLOBAL.
-- qld does not emit `FILE` symbols.
+- **`-r` with `-T`** runs the script for relocatable output, with GNU's rules:
+  COMDAT members never match wildcards, orphans follow the script's sections,
+  and `. = ALIGN(n)` pads as GNU does. Without a script, x86-64 uses GNU's
+  built-in `-r` section order; other architectures keep first-appearance
+  order.
+- **`--defsym`** takes full linker-script expressions (`ADDR`, `SIZEOF`,
+  `ALIGN`, `LOADADDR`, `MAX`, `DEFINED`, `CONSTANT`, forward references).
+  Arithmetic gives an absolute symbol and a lone symbol keeps its section, as
+  in GNU ld.
+- **Symbol tables** follow GNU ld: hidden input symbols stay GLOBAL in
+  executables and become local in shared objects; linker and script symbols
+  that are hidden are local without visibility; each input contributes a
+  `FILE` symbol.
+- Remaining `-r` differences from GNU ld: section addresses are written as 0;
+  `.eh_frame` keeps the FDEs of discarded COMDAT copies and the last FDE's
+  padding. In PIEs, hidden functions called through `PLT32` stay
+  `GLOBAL HIDDEN`.
+- Other known differences: `.dynstr` has no tail merging; `.dynamic` has no
+  spare `DT_NULL` slots and orders tags differently; there is no
+  version-definition symbol in `.symtab`; no empty `.got.plt` is kept.
 
 ### Demangled names
 
@@ -374,6 +388,27 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   linker to choose (lld uses 1, MSVC and GNU ld use 16).
 - **Data exports of a DLL linked directly** are recognized from the section's
   code/execute flags; GNU ld looks at the section name.
+
+## Debug indexes and section ordering
+
+- **`--symbol-ordering-file`** follows lld, including its warnings and
+  `--no-warn-symbol-ordering`. Ties keep input order, where lld's order is
+  unspecified.
+- **`--call-graph-profile-sort`** implements lld's hfsort/C3 and cdsort, from
+  `.llvm.call-graph-profile` or `--call-graph-ordering-file`. qld sorts only
+  when asked; lld sorts by default when the inputs carry a profile.
+- **`--gdb-index`** writes version 8 (lld writes 7) and is otherwise
+  byte-identical to lld's. Objects without `.debug_gnu_pub*` have their DIEs
+  scanned, so the index covers them too.
+- **`--debug-names`** merges the inputs' DWARF 5 indexes as lld 18+ does. It
+  also merges type unit lists, which lld drops with a warning, and it is
+  compressed with the other debug sections. String offsets follow qld's own
+  `.debug_str`.
+- **`--separate-debug-file[=FILE]`** follows mold, since GNU ld has no such
+  option: the output keeps `.gnu_debuglink` and loses its debug sections,
+  `.symtab` and `.strtab`; the debug file defaults to `OUTPUT.dbg`.
+- `-r` with `--gdb-index` or `--debug-names` is an error, and section
+  ordering with `-r` is unimplemented.
 
 ## AArch64 ELF
 

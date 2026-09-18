@@ -66,8 +66,8 @@ can work at the same time without colliding.
 | W22 | PE command-line options | `src/args/**`, `src/coff/options.rs` | W21 | merged |
 | W26 | Performance round 2 (M5) | `src/main.rs` (fork on exit, agreed), `--fork`/`--no-fork` in `src/args/`, performance changes in `src/elf/**`, `src/symbols/**`, `src/passes/**`, `src/output/**` (except `hash/sha256.rs`), `src/input/**`, `src/debug/**`, `benches/**`, `tests/projects/bench*` | W24 | merged |
 | W27 | Mach-O follow-ups (M8) | `src/macho/**`, `src/args/darwin.rs`, `src/output/hash/sha256.rs` (moved from `src/macho/`), `tests/macho_link*` | W25 | merged |
-| W28 | Symbol resolution redesign (M5) | `src/symbols/**`, `src/elf/{resolve,object}*.rs`, `benches/**`, `tests/projects/bench*` | W26 | in progress |
-| W29 | Debug and ordering outputs (M5) | new `src/debug/{gdb_index,debug_names}*`, new `src/elf/{ordering,separate_debug}*`, hooks in `src/elf/{layout,write,synth}.rs`, `tests/debug_index*`, `tests/ordering*` | W24 | in progress |
+| W28 | Symbol resolution redesign (M5) | `src/symbols/**`, `src/elf/{resolve,object}*.rs`, `benches/**`, `tests/projects/bench*` | W26 | merged |
+| W29 | Debug and ordering outputs (M5) | new `src/debug/{gdb_index,debug_names}*`, new `src/elf/{ordering,separate_debug}*`, hooks in `src/elf/{layout,write,synth}.rs`, `tests/debug_index*`, `tests/ordering*` | W24 | merged |
 | W30 | RISC-V 64 (M4) | `src/elf/arch/riscv*`, `src/arch/riscv*`, relaxation/shrinking hooks, `tests/riscv*`, `tests/fixtures/riscv64-*` | W20 | merged |
 | W31 | PowerPC64 LE, ELFv2 (M4) | `src/elf/arch/ppc64*`, `src/arch/ppc64*`, `tests/ppc64*`, `tests/fixtures/ppc64le-*` | W20 | merged |
 | W32 | LoongArch64 (M4) | `src/elf/arch/loongarch*`, `src/arch/loongarch*`, `tests/loongarch*`, `tests/fixtures/loongarch64-*` | W20 | merged |
@@ -76,7 +76,7 @@ can work at the same time without colliding.
 | W35 | Mach-O LTO through libLTO (M8) | new `src/plugin/liblto*`, `src/macho/lto*`, one hook in `src/macho/link.rs`, `tests/macho_lto*` | W17, W27 | merged |
 | W36 | Library API for 1.0 (M9) | `examples/**`, `tests/api*`, new `src/input/source*`, API-only changes in `src/args/options.rs`; proposals for `lib.rs` | — | merged |
 | W37 | AArch64 completeness (M4) | `src/elf/arch/aarch64.rs`, `src/arch/aarch64.rs`, `tests/aarch64*`, `tests/fixtures/aarch64-*` | W20 | merged |
-| W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | in progress |
+| W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | merged |
 | W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -576,9 +576,15 @@ links, distribution package recipes.
   `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis
   in `-r`; move the `R_LARCH_*` constants to `src/elf/read/consts/`; remove
   the per-relocation lookahead cost on x86-64/AArch64 (in progress).
-- **W31 (PowerPC64):** remove the +5% x86-64 instruction cost (in
-  progress); a test for PC-relative `__tls_get_addr` annotation; the
-  outstanding items in ROADMAP M4.
+- **W28 (resolution):** `mallopt(M_TOP_PAD)` at startup is worth ~3 ms on
+  clang but needs an `unsafe extern` call and a frozen-file change; slimmer
+  `ObjectInput`/`InputSection`; COMDAT slots keyed by symbol ID.
+- **W29 (debug indexes):** `.debug_names` built from DIEs for objects with no
+  index; section ordering with `-r`; PE links accept `--gdb-index` and the
+  other new options silently (W33 should reject them).
+- **W38 (scripts):** `-r` `.eh_frame` editing; `.dynstr` tail merging; GNU's
+  spare `.dynamic` slots and tag order; version-definition symbols in
+  `.symtab`; a built-in `-r` layout for architectures other than x86-64.
 - **W37 (AArch64):** erratum fixes with linker-script layout; a patch pool
   per 128 MiB of code; `$x` and `__CortexA53843419_*` symbols for patches;
   check `DT_AARCH64_VARIANT_PCS`. `src/elf/arch/aarch64_errata.rs` and

@@ -48,6 +48,25 @@ jobs:
           sudo ln -sf /usr/bin/loongarch64-linux-gnu-g++-14 /usr/local/bin/loongarch64-linux-gnu-g++
       - run: cargo test --all-features --test fixtures -- --ignored --nocapture
 
+  debug-indexes:
+    name: Debug indexes and section ordering compared with lld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+      QLD_TEST_LLD: ld.lld-22
+      RAYON_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # the .gdb_index and .debug_names comparisons assume LLVM 22 or 23
+      - run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y lld-22 llvm-22 gdb
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+      - run: cargo test --all-features --test ordering --test debug_index -- --test-threads=2
+
   riscv64:
     name: RISC-V 64 links compared with lld
     runs-on: ubuntu-24.04
