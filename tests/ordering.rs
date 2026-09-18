@@ -369,3 +369,57 @@ fn call_graph_ordering_file_and_symbol_order() {
     assert_eq!(&names(&symbols)[..2], ["f4", "f2"]);
     compare_with_lld(&dir, &args, &symbols);
 }
+
+const FOLDABLE: &str = r#"
+    .section .text.g1,"ax",@progbits
+    .globl g1
+    .type g1,@function
+g1: movl $1, %eax
+    ret
+    .size g1, 6
+    .section .text.g2,"ax",@progbits
+    .globl g2
+    .type g2,@function
+g2: movl $2, %eax
+    ret
+    .size g2, 6
+    .section .text.g3,"ax",@progbits
+    .globl g3
+    .type g3,@function
+g3: movl $1, %eax
+    ret
+    .size g3, 6
+    .section .text._start,"ax",@progbits
+    .globl _start
+    .type _start,@function
+_start: call g1
+    call g2
+    call g3
+    ret
+    .size _start, 16
+"#;
+
+#[test]
+fn symbols_of_folded_sections_order_the_kept_section() {
+    let Some(cc) = compiler() else { return };
+    let dir = scratch("symbol-ordering-icf");
+    assemble(&cc, &dir, "f", FOLDABLE);
+    // g3 folds into g1: listing g3 first moves g1's section first.
+    fs::write(dir.join("order.txt"), "g3\ng2\n").unwrap();
+    let args = [
+        "f.o",
+        "--icf=all",
+        "--symbol-ordering-file=order.txt",
+        "--no-warn-symbol-ordering",
+    ];
+    let mut ours = args.to_vec();
+    ours.extend(["-o", "qld.out"]);
+    qld(&dir, &ours);
+    let symbols = symbols_by_address(&dir.join("qld.out"));
+    let first = symbols.first().unwrap();
+    let g1 = symbols.iter().find(|(_, n)| n == "g1").unwrap();
+    let g3 = symbols.iter().find(|(_, n)| n == "g3").unwrap();
+    assert_eq!(g1.0, g3.0, "g3 is folded into g1");
+    assert_eq!(first.0, g1.0, "{symbols:?}");
+    compare_with_lld(&dir, &args, &symbols);
+}

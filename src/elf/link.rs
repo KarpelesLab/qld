@@ -235,10 +235,25 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     {
         return unimplemented("--compress-debug-sections with -r", "M5");
     }
-    if options.gdb_index && options.kind == OutputKind::Relocatable {
-        return Err(Error::Option(
-            "-r and --gdb-index may not be used together".into(),
-        ));
+    if options.kind == OutputKind::Relocatable {
+        if options.gdb_index {
+            return Err(Error::Option(
+                "-r and --gdb-index may not be used together".into(),
+            ));
+        }
+        if options.debug_names {
+            return Err(Error::Option(
+                "-r and --debug-names may not be used together".into(),
+            ));
+        }
+        if options.symbol_ordering_file.is_some()
+            || options.call_graph_ordering_file.is_some()
+            || options
+                .call_graph_profile_sort
+                .is_some_and(|s| s != crate::args::options::CallGraphSort::None)
+        {
+            return unimplemented("section ordering with -r", "M5");
+        }
     }
     if options.separate_debug_file.is_some()
         && (options.kind == OutputKind::Relocatable

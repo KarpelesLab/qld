@@ -618,6 +618,37 @@ fn debug_names_merges_the_input_indexes() {
 }
 
 #[test]
+fn debug_names_are_deterministic_across_threads() {
+    let Some((cc, cxx)) = clang() else { return };
+    let dir = scratch("debug-names-threads");
+    compile(&dir, &cc, &cxx, &["-g", "-gdwarf-5", "-gpubnames", "-O1"]);
+    let mut first: Option<Vec<u8>> = None;
+    for threads in ["1", "2"] {
+        let out = format!("t{threads}.out");
+        let threads = format!("--threads={threads}");
+        qld(
+            &dir,
+            &[
+                "a.o",
+                "b.o",
+                "-e",
+                "_start",
+                "--debug-names",
+                "--gdb-index",
+                &threads,
+                "-o",
+                &out,
+            ],
+        );
+        let bytes = fs::read(dir.join(&out)).unwrap();
+        match &first {
+            None => first = Some(bytes),
+            Some(first) => assert!(*first == bytes, "output differs with {threads}"),
+        }
+    }
+}
+
+#[test]
 fn debug_names_merges_type_units() {
     let Some((cc, cxx)) = clang() else { return };
     let dir = scratch("debug-names-types");
