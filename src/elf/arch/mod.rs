@@ -419,7 +419,10 @@ impl Arch {
         match target.arch {
             Architecture::X86_64 => Some(Self::X86_64),
             Architecture::Aarch64 => Some(Self::AArch64),
-            Architecture::Riscv64 => Some(Self::RiscV64),
+            // Only little-endian RISC-V: `elf64briscv` needs big-endian ELF.
+            Architecture::Riscv64 if target.endian == crate::target::Endianness::Little => {
+                Some(Self::RiscV64)
+            }
             Architecture::LoongArch64 => Some(Self::LoongArch64),
             Architecture::PowerPc64 if target.endian == crate::target::Endianness::Little => {
                 Some(Self::Ppc64)
