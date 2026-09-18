@@ -35,6 +35,7 @@
 //! | [`icf`] | 8: `--icf` through [`crate::passes::icf`] |
 //! | [`synth`] | 9: GOT, PLT, copy relocations, `.interp`, build-id and property notes, `.comment` |
 //! | [`dynsym`] | 9: `.dynsym`, `.dynstr`, hash tables, symbol versions, `.dynamic` |
+//! | [`ordering`] | 10: `--symbol-ordering-file` and `--call-graph-profile-sort` priorities |
 //! | [`symtab`] | `.symtab` and `.strtab` planning and writing |
 //! | [`layout`] | 10: output section contents, segments (RELRO included), addresses |
 //! | [`values`] | Symbol, section, GOT and PLT addresses after layout |
@@ -83,6 +84,7 @@ pub mod lto;
 pub mod map;
 pub mod merge;
 pub mod object;
+pub mod ordering;
 pub mod place;
 pub mod rawout;
 pub mod read;

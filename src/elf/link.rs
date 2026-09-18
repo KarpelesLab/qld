@@ -234,6 +234,22 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
     {
         return unimplemented("--compress-debug-sections with -r", "M5");
     }
+    if options.gdb_index {
+        return unimplemented("--gdb-index", "M5");
+    }
+    if options.debug_names {
+        return unimplemented("--debug-names", "M5");
+    }
+    if options.separate_debug_file.is_some() {
+        return unimplemented("--separate-debug-file", "M5");
+    }
+    if options.call_graph_ordering_file.is_some()
+        || options
+            .call_graph_profile_sort
+            .is_some_and(|s| s != crate::args::options::CallGraphSort::None)
+    {
+        return unimplemented("--call-graph-profile-sort", "M5");
+    }
     for (name, expr) in &options.defsym {
         if inputs::parse_defsym(expr).is_none() {
             return unimplemented(
@@ -555,6 +571,7 @@ fn link_inputs<'a>(
         sections: &sections,
     };
     narrow.run(|| eh_frames.finalize(&refs));
+    let order = super::ordering::for_link(&refs, options, diagnostics)?;
 
     let mut synth = Synth {
         arch: context.arch,
@@ -643,6 +660,7 @@ fn link_inputs<'a>(
             exec_stack,
             mode,
             compressed: &[],
+            order: order.as_ref(),
         })
     })?;
     // `.relr.dyn`'s size depends on the addresses it encodes: lay out with an
@@ -687,6 +705,7 @@ fn link_inputs<'a>(
                 exec_stack,
                 mode,
                 compressed: &[],
+                order: order.as_ref(),
             })?;
         }
     }
@@ -767,6 +786,7 @@ fn link_inputs<'a>(
                 exec_stack,
                 mode,
                 compressed: &sizes,
+                order: order.as_ref(),
             })?;
         }
         lap("compress");

@@ -185,6 +185,19 @@ pub enum ExecStack {
     NonExecutable,
 }
 
+/// `--call-graph-profile-sort=`: the algorithm that orders sections by call
+/// graph profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CallGraphSort {
+    /// `none`: no ordering by profile.
+    None,
+    /// `hfsort`: the C3 heuristic (Ottoni and Maher, CGO 2017).
+    Hfsort,
+    /// `cdsort`: cache-directed sort, lld's default.
+    #[default]
+    Cdsort,
+}
+
 /// Dynamic section flags set by `-z` keywords (`DT_FLAGS` / `DT_FLAGS_1`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DynamicFlags {
@@ -725,6 +738,30 @@ pub struct LinkOptions {
     pub compress_debug_sections: Option<String>,
     /// `--package-metadata=`: contents of `.note.package`.
     pub package_metadata: Option<String>,
+    /// `--symbol-ordering-file`: order input sections by the symbols listed
+    /// in this file (lld).
+    pub symbol_ordering_file: Option<PathBuf>,
+    /// `--no-warn-symbol-ordering`: do not warn about symbols of the
+    /// ordering file that cannot be ordered.
+    pub no_warn_symbol_ordering: bool,
+    /// `--call-graph-profile-sort=`: how to order sections by call graph
+    /// profile. `None` when not given: qld then orders only with
+    /// `--call-graph-ordering-file` (lld also sorts by default when an
+    /// input has a `.llvm.call-graph-profile` section).
+    pub call_graph_profile_sort: Option<CallGraphSort>,
+    /// `--call-graph-ordering-file`: call graph edges (`from to weight`).
+    pub call_graph_ordering_file: Option<PathBuf>,
+    /// `--print-symbol-order=`: write the symbol order the call graph sort
+    /// chose to this file.
+    pub print_symbol_order: Option<PathBuf>,
+    /// `--gdb-index`: write a `.gdb_index` section.
+    pub gdb_index: bool,
+    /// `--debug-names`: write a merged `.debug_names` section.
+    pub debug_names: bool,
+    /// `--separate-debug-file[=FILE]`: write the debug sections to FILE
+    /// (`Some(None)`: the output path plus `.dbg`) and link it from the
+    /// output with `.gnu_debuglink`, as mold does.
+    pub separate_debug_file: Option<Option<PathBuf>>,
     /// `--dependency-file`.
     pub dependency_file: Option<PathBuf>,
     /// `--dependent-libraries` (default) / `--no-dependent-libraries`.

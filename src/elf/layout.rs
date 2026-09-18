@@ -352,6 +352,9 @@ pub struct LayoutInput<'l, 'a> {
     pub mode: Mode,
     /// Output sections written compressed (`--compress-debug-sections`).
     pub compressed: &'l [CompressedOutput],
+    /// Section priorities from `--symbol-ordering-file` or
+    /// `--call-graph-profile-sort` ([`super::ordering`]).
+    pub order: Option<&'l super::ordering::SectionOrder>,
 }
 
 /// The compressed size of an output section.
@@ -568,6 +571,29 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
                                 .then(a.id.cmp(&b.id))
                         });
                     }
+                }
+            }
+            if let Some(order) = input.order.filter(|o| !o.is_empty())
+                && let Some(output) = output.filter(|o| super::ordering::reorders(o.name))
+            {
+                let spacing = if output.flags & SHF_EXECINSTR != 0 {
+                    super::ordering::thunk_spacing(input.synth.arch)
+                } else {
+                    0
+                };
+                let id = |k: &Key| match k.member {
+                    Member::Input(id) => Some(id),
+                    _ => None,
+                };
+                let size = |k: &Key| member_size(input, k.member).map_or(0, |(size, _)| size);
+                // Sections sorted by init priority keep that order first.
+                if rule.is_some_and(|r| r.inputs.iter().any(|i| i.sort == SortMode::InitPriority)) {
+                    for run in keys.chunk_by_mut(|a, b| a.sub == b.sub && a.priority == b.priority)
+                    {
+                        order.arrange(run, id, spacing, size);
+                    }
+                } else {
+                    order.arrange(&mut keys, id, spacing, size);
                 }
             }
             let synthetic = output.map_or(Synthetic::None, |o| o.synthetic);
