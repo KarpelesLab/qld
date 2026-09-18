@@ -211,10 +211,14 @@ fn drive_both(tools: &Tools, dir: &Path, cxx: bool, output: &str, args: &[&str])
 }
 
 /// `ld -m elf_i386` and qld on the same arguments.
+///
+/// The hash style is explicit: the default is a configure-time choice of
+/// GNU ld's (Ubuntu's emits both tables, Gentoo's only `.gnu.hash`). Both
+/// also covers qld's ELF32 `.hash`.
 fn ld_both(tools: &Tools, dir: &Path, output: &str, args: &[&str]) {
     for linker in ["gnu", "qld"] {
         let out = format!("{linker}/{output}");
-        let mut all = vec!["-m", "elf_i386"];
+        let mut all = vec!["-m", "elf_i386", "--hash-style=both"];
         all.extend_from_slice(args);
         all.extend_from_slice(&["-o", &out]);
         let program = if linker == "gnu" {
@@ -535,6 +539,24 @@ impl Image {
     }
 }
 
+/// Whether `file` has a `.rel.plt` holding nothing but `R_386_TLS_DESC`
+/// relocations. GNU ld before 2.46 puts TLS descriptors there, so its
+/// output has `DT_JMPREL`, `DT_PLTREL` and `DT_PLTRELSZ` without a PLT
+/// relocation; 2.46 moved them to `.rel.dyn` (a `.rel.tls` input section),
+/// where qld puts them.
+fn only_tls_descriptors_in_rel_plt(tools: &Tools, dir: &Path, file: &str) -> bool {
+    let listing = run_ok(dir, &tools.readelf, &["-rW", file]);
+    let mut lines = listing.lines();
+    if !lines.any(|l| l.starts_with("Relocation section '.rel.plt'")) {
+        return false;
+    }
+    lines
+        .skip_while(|l| !l.trim_start().starts_with("Offset"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .all(|l| l.split_whitespace().nth(2) == Some("R_386_TLS_DESC"))
+}
+
 /// The `.dynamic` tags of `file`, sorted, without values.
 fn dynamic_tags(tools: &Tools, dir: &Path, file: &str) -> Vec<String> {
     let mut tags: Vec<String> = run_ok(dir, &tools.readelf, &["-dW", file])
@@ -608,9 +630,13 @@ fn compare(tools: &Tools, dir: &Path, file: &str, functions: &[&str]) {
         actual, expected,
         "{file}: dynamic relocations (left: qld, right: GNU ld)"
     );
+    let mut expected = dynamic_tags(tools, dir, &gnu_file);
+    if only_tls_descriptors_in_rel_plt(tools, dir, &gnu_file) {
+        expected.retain(|tag| !matches!(tag.as_str(), "JMPREL" | "PLTREL" | "PLTRELSZ"));
+    }
     assert_eq!(
         dynamic_tags(tools, dir, &qld_file),
-        dynamic_tags(tools, dir, &gnu_file),
+        expected,
         "{file}: .dynamic tags (left: qld, right: GNU ld)"
     );
     let header = run_ok(dir, &tools.readelf, &["-hW", &qld_file]);
@@ -707,7 +733,16 @@ fn tls_shared() {
         compile(tools, &dir, "tls_lib.c", "lib.o", &["-fPIC", dialect]);
         compile(tools, &dir, "tls_main.c", "main.o", &[dialect]);
         compile(tools, &dir, "tls_main.c", "main-pic.o", &["-fPIC", dialect]);
-        drive_both(tools, &dir, false, "libtls.so", &["-shared", "lib.o"]);
+        // Lazy binding whatever the compiler driver's default (Gentoo's
+        // passes `-z now`): GNU ld before 2.46 then puts TLS descriptors in
+        // `.rel.plt` (see `only_tls_descriptors_in_rel_plt`).
+        drive_both(
+            tools,
+            &dir,
+            false,
+            "libtls.so",
+            &["-shared", "-Wl,-z,lazy", "lib.o"],
+        );
         drive_both(tools, &dir, false, "tls", &["main.o", "-ltls", "-pthread"]);
         drive_both(
             tools,
@@ -793,8 +828,8 @@ fn foreign_objects_rejected() {
             continue;
         }
         for args in [
-            ["-m", "elf_i386", "-r", object, "-o", "out.o"].as_slice(),
-            ["-r", "i386.o", object, "-o", "out.o"].as_slice(),
+            ["-m", "elf_i386", "-shared", object, "-o", "out.so"].as_slice(),
+            ["-shared", "i386.o", object, "-o", "out.so"].as_slice(),
         ] {
             let output = run(&dir, &qld, args);
             let stderr = String::from_utf8_lossy(&output.stderr);
