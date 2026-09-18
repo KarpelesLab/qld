@@ -45,6 +45,7 @@ pub enum OutputKind {
 }
 
 /// How much of the symbol table survives into the output.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StripMode {
     /// Keep everything (default).
@@ -57,6 +58,7 @@ pub enum StripMode {
 }
 
 /// Which local symbols are dropped from the output symbol table.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DiscardMode {
     /// The linker's default: drop compiler-generated temporary locals
@@ -91,6 +93,7 @@ pub enum BuildId {
 }
 
 /// Which symbol hash tables the dynamic output carries (`--hash-style`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HashStyle {
     /// `.hash` only.
@@ -104,6 +107,7 @@ pub enum HashStyle {
 
 /// `-Bsymbolic` and its variants: which default-visibility definitions in a
 /// shared library bind locally.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SymbolicMode {
     /// `-Bno-symbolic` (default): nothing binds locally.
@@ -121,6 +125,7 @@ pub enum SymbolicMode {
 }
 
 /// `--unresolved-symbols=<method>`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnresolvedSymbols {
     /// `ignore-all`: report nothing.
@@ -135,6 +140,7 @@ pub enum UnresolvedSymbols {
 }
 
 /// Colored diagnostics (`--color-diagnostics`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ColorChoice {
     /// Color when stderr is a terminal (default).
@@ -147,6 +153,7 @@ pub enum ColorChoice {
 }
 
 /// Page alignment mode (`-n`, `-N`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MagicMode {
     /// Normal demand-paged output (default).
@@ -159,6 +166,7 @@ pub enum MagicMode {
 }
 
 /// `-z separate-code` and related segment layout choices.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeparateCode {
     /// `-z noseparate-code`: code may share a segment with other read-only
@@ -173,6 +181,7 @@ pub enum SeparateCode {
 }
 
 /// `-z execstack` / `-z noexecstack` / `-z execstack-if-needed`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecStack {
     /// No option given: decided from the inputs' `.note.GNU-stack` sections
@@ -186,6 +195,7 @@ pub enum ExecStack {
 }
 
 /// Dynamic section flags set by `-z` keywords (`DT_FLAGS` / `DT_FLAGS_1`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DynamicFlags {
     /// `-z nodelete` (`DF_1_NODELETE`).
@@ -211,6 +221,7 @@ pub struct DynamicFlags {
 }
 
 /// x86 control-flow enforcement options (`-z ibt`, `-z shstk`, …).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Features {
     /// `-z ibt`: mark the output as IBT-compatible.
@@ -239,6 +250,7 @@ pub struct Aarch64Features {
 }
 
 /// Severity for the `-z *-report=` keywords.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReportLevel {
     /// Report nothing (default).
@@ -251,6 +263,7 @@ pub enum ReportLevel {
 }
 
 /// How the inputs that follow `-b` / `--format` are interpreted.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InputFormat {
     /// Identify the format from the file contents (default).
@@ -307,6 +320,30 @@ pub enum InputKind {
     },
 }
 
+impl InputKind {
+    /// An in-memory input ([`InputKind::Bytes`]) named `name` in
+    /// diagnostics.
+    ///
+    /// `data` is anything that converts into an `Arc<[u8]>`: an
+    /// `Arc<[u8]>` is shared as is, a `Vec<u8>` or a `&'static [u8]` is
+    /// copied once.
+    ///
+    /// ```
+    /// use qld::args::InputKind;
+    ///
+    /// static OBJECT: &[u8] = b"\x7fELF...";
+    /// let input = InputKind::bytes("embedded.o", OBJECT);
+    /// assert!(matches!(input, InputKind::Bytes { .. }));
+    /// ```
+    #[must_use]
+    pub fn bytes(name: impl Into<String>, data: impl Into<std::sync::Arc<[u8]>>) -> Self {
+        Self::Bytes {
+            name: name.into(),
+            data: data.into(),
+        }
+    }
+}
+
 /// One input, with the positional state that applied to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSpec {
@@ -328,6 +365,7 @@ pub struct InputSpec {
 /// [`PeOptions::from_link_options`](crate::coff::PeOptions::from_link_options);
 /// ELF and Mach-O links ignore them, which is why GNU ld's per-emulation
 /// options are accepted whatever the target is.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeArgs {
     /// `--subsystem NAME[,MAJOR[.MINOR]]`, as an `IMAGE_SUBSYSTEM_*` value.
@@ -509,6 +547,182 @@ impl std::fmt::Debug for OutputCompleteHook {
                 &self.called.load(std::sync::atomic::Ordering::Acquire),
             )
             .finish_non_exhaustive()
+    }
+}
+
+/// Receives the output image of a link instead of the output file, set in
+/// [`LinkOptions::output_buffer`].
+///
+/// A link with an output buffer writes nothing at [`LinkOptions::output`]:
+/// the image is built in memory and handed to the buffer when the link
+/// succeeds. The output path still names the output where a name is needed
+/// (the default `DT_SONAME`, the symbols of `-b binary`-style raw outputs).
+/// Side outputs such as `-Map` and `--dependency-file` are still files.
+///
+/// Clones share the image, so keep a clone and read it with
+/// [`OutputBuffer::take`] after the link returns `Ok`. The image is stored
+/// as soon as it is complete, so a link that fails later (writing a map
+/// file, say) can leave one behind; a cancelled link never does.
+///
+/// The ELF driver supports it, including `-r` and raw formats
+/// (`--oformat binary`); the PE and Mach-O drivers do not yet and still
+/// write the output file.
+///
+/// # Example
+///
+/// ```no_run
+/// use qld::args::{LinkOptions, OutputBuffer};
+///
+/// # fn main() -> qld::Result<()> {
+/// let mut options = LinkOptions::new();
+/// // ... inputs ...
+/// let buffer = OutputBuffer::new();
+/// options.output_buffer = Some(buffer.clone());
+/// qld::link(&options, &qld::diag::Collect::new())?;
+/// let image: Vec<u8> = buffer.take().expect("the link succeeded");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Default)]
+pub struct OutputBuffer {
+    image: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+impl OutputBuffer {
+    /// Creates an empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores the output image, replacing any earlier one. Link drivers call
+    /// this when the output is complete.
+    pub fn store(&self, image: Vec<u8>) {
+        match self.image.lock() {
+            Ok(mut slot) => *slot = Some(image),
+            Err(poisoned) => *poisoned.into_inner() = Some(image),
+        }
+    }
+
+    /// Takes the output image, leaving the buffer empty. `None` until a link
+    /// using this buffer has succeeded.
+    #[must_use]
+    pub fn take(&self) -> Option<Vec<u8>> {
+        match self.image.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+
+    /// Whether an image is waiting to be taken.
+    #[must_use]
+    pub fn is_filled(&self) -> bool {
+        match self.image.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+}
+
+impl PartialEq for OutputBuffer {
+    /// Two buffers are equal when they are clones of each other.
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.image, &other.image)
+    }
+}
+
+impl Eq for OutputBuffer {}
+
+impl std::fmt::Debug for OutputBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputBuffer")
+            .field("filled", &self.is_filled())
+            .finish()
+    }
+}
+
+/// Cancels a running link from another thread, set in
+/// [`LinkOptions::cancel`].
+///
+/// Clones share one flag: keep a clone, hand the other to the link, and call
+/// [`CancelToken::cancel`] from any thread. The link checks the flag between
+/// pipeline stages and inside the long parallel loops (loading inputs,
+/// writing the output), and returns the error [`CancelToken::error`] makes;
+/// [`CancelToken::is_cancellation`] recognizes it. A cancelled link leaves
+/// no output behind: a previous output file at the same path is untouched,
+/// and an [`OutputBuffer`] stays empty.
+///
+/// Cancelling a link that already finished has no effect. A token cannot
+/// be reset; use a new one for the next link.
+///
+/// # Example
+///
+/// ```
+/// use qld::args::{CancelToken, LinkOptions};
+///
+/// let token = CancelToken::new();
+/// let mut options = LinkOptions::new();
+/// options.cancel = Some(token.clone());
+/// token.cancel(); // from any thread, at any time
+/// let error = qld::link(&options, &qld::diag::Collect::new()).unwrap_err();
+/// assert!(CancelToken::is_cancellation(&error));
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PartialEq for CancelToken {
+    /// Two tokens are equal when they are clones of each other.
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+}
+
+impl Eq for CancelToken {}
+
+impl CancelToken {
+    /// Creates a token that is not cancelled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks every link using this token (or a clone) to stop.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`CancelToken::cancel`] was called.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns [`CancelToken::error`] if the token was cancelled.
+    ///
+    /// # Errors
+    ///
+    /// The cancellation error, once [`CancelToken::cancel`] was called.
+    pub fn check(&self) -> crate::Result<()> {
+        if self.is_cancelled() {
+            Err(Self::error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The error a cancelled link returns, [`Error::Cancelled`](crate::Error::Cancelled).
+    #[must_use]
+    pub fn error() -> crate::Error {
+        crate::Error::Cancelled
+    }
+
+    /// Whether `error` is the error of a cancelled link.
+    #[must_use]
+    pub fn is_cancellation(error: &crate::Error) -> bool {
+        matches!(error, crate::Error::Cancelled)
     }
 }
 
@@ -794,6 +1008,23 @@ pub struct LinkOptions {
     /// [`OutputCompleteHook`]. `None` by default. The `qld` binary sets it
     /// in the child process of `--fork` to let its parent exit early.
     pub on_output_complete: Option<OutputCompleteHook>,
+    /// Files that exist only in memory, looked up by path before the file
+    /// system: inputs named by path, `-l` libraries found in the search
+    /// directories, `INPUT`/`GROUP` entries of input scripts, and thin
+    /// archive members. `None` by default (only the file system). See
+    /// [`MemoryFiles`](crate::input::source::MemoryFiles) and
+    /// [`InputProvider`](crate::input::source::InputProvider).
+    ///
+    /// The ELF driver uses it. Files read outside the input list (`-T`
+    /// scripts, version scripts, dynamic lists) still come from the file
+    /// system; so do all inputs of PE and Mach-O links.
+    pub input_provider: Option<std::sync::Arc<dyn crate::input::source::InputProvider>>,
+    /// Hand the output image to this buffer instead of writing the output
+    /// file; see [`OutputBuffer`]. `None` by default.
+    pub output_buffer: Option<OutputBuffer>,
+    /// Stop the link with an error once this token is cancelled; see
+    /// [`CancelToken`]. `None` by default.
+    pub cancel: Option<CancelToken>,
     /// Options that were recognized but have no effect yet, kept so that
     /// `--verbose` and tests can report them.
     pub ignored: Vec<OsString>,
@@ -831,6 +1062,20 @@ impl LinkOptions {
     pub fn output_complete(&self) {
         if let Some(hook) = &self.on_output_complete {
             hook.call();
+        }
+    }
+
+    /// Returns an error if the link was cancelled through
+    /// [`LinkOptions::cancel`]. Link drivers call this between stages.
+    ///
+    /// # Errors
+    ///
+    /// [`CancelToken::error`] once the token is cancelled.
+    #[inline]
+    pub fn check_cancelled(&self) -> crate::Result<()> {
+        match &self.cancel {
+            Some(token) => token.check(),
+            None => Ok(()),
         }
     }
 

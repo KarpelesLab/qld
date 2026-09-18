@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
+use crate::args::{CancelToken, LinkOptions};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
 
@@ -25,6 +26,7 @@ use super::archive::{Archive, Member, MemberData};
 use super::identify::{FileFormat, GccLtoProbe, identify_with};
 use super::map::{self, Backing};
 use super::read;
+use super::source::InputProvider;
 
 /// Something to load into a [`FileTable`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +124,10 @@ impl InputFile {
 pub struct FileTable {
     files: AppendVec<InputFile>,
     gcc_lto_probe: Option<GccLtoProbe>,
+    /// Consulted before the file system for every path loaded.
+    provider: Option<Arc<dyn InputProvider>>,
+    /// Checked before each file is loaded.
+    cancel: Option<CancelToken>,
 }
 
 fn too_many_files(path: &Path) -> Error {
@@ -140,9 +146,42 @@ impl FileTable {
     #[must_use]
     pub fn with_gcc_lto_probe(probe: GccLtoProbe) -> Self {
         Self {
-            files: AppendVec::new(),
             gcc_lto_probe: Some(probe),
+            ..Self::default()
         }
+    }
+
+    /// Creates an empty table for a link with `options`: paths are looked up
+    /// in [`LinkOptions::input_provider`] before the file system, and loading
+    /// stops once [`LinkOptions::cancel`] is cancelled.
+    #[must_use]
+    pub fn for_link(options: &LinkOptions) -> Self {
+        Self {
+            provider: options.input_provider.clone(),
+            cancel: options.cancel.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// The provider consulted before the file system, if any.
+    #[must_use]
+    pub fn provider(&self) -> Option<&dyn InputProvider> {
+        self.provider.as_deref()
+    }
+
+    /// Returns the cancellation error if the link was cancelled.
+    fn check_cancelled(&self) -> Result<()> {
+        self.cancel.as_ref().map_or(Ok(()), CancelToken::check)
+    }
+
+    /// The bytes of the file at `path`: from the provider if it has them,
+    /// otherwise mapped or read from the file system.
+    fn open(&self, path: &Path) -> Result<Backing> {
+        self.check_cancelled()?;
+        if let Some(data) = self.provider.as_ref().and_then(|p| p.read(path)) {
+            return Ok(Backing::Shared(data));
+        }
+        map::load(path).map_err(|error| Error::io(path, error))
     }
 
     /// The number of entries.
@@ -202,7 +241,7 @@ impl FileTable {
     ///
     /// Returns [`Error::Io`] if the file cannot be opened or read.
     pub fn load_path(&self, path: &Path) -> Result<FileId> {
-        let backing = map::load(path).map_err(|error| Error::io(path, error))?;
+        let backing = self.open(path)?;
         self.push(self.whole(path.to_path_buf(), backing))
     }
 
@@ -212,6 +251,7 @@ impl FileTable {
     ///
     /// Fails only when the table is full (more than `u32::MAX` entries).
     pub fn add_bytes(&self, name: impl Into<PathBuf>, data: Arc<[u8]>) -> Result<FileId> {
+        self.check_cancelled()?;
         self.push(self.whole(name.into(), Backing::Shared(data)))
     }
 
@@ -258,12 +298,12 @@ impl FileTable {
             .zip(&repeat_of)
             .map(|(source, repeat)| {
                 repeat.is_none().then(|| match source {
-                    Source::Path(path) => map::load(path)
-                        .map(|backing| self.whole(path.clone(), backing))
-                        .map_err(|error| Error::io(path, error)),
-                    Source::Bytes { name, data } => {
-                        Ok(self.whole(name.clone(), Backing::Shared(Arc::clone(data))))
-                    }
+                    Source::Path(path) => self
+                        .open(path)
+                        .map(|backing| self.whole(path.clone(), backing)),
+                    Source::Bytes { name, data } => self
+                        .check_cancelled()
+                        .map(|()| self.whole(name.clone(), Backing::Shared(Arc::clone(data)))),
                 })
             })
             .collect();
@@ -284,9 +324,9 @@ impl FileTable {
                 Some(match (earlier, source) {
                     (Ok(file), _) => Ok(copy(file)),
                     // Loading again reports the same problem.
-                    (Err(_), Source::Path(path)) => map::load(path)
-                        .map(|backing| self.whole(path.clone(), backing))
-                        .map_err(|error| Error::io(path, error)),
+                    (Err(_), Source::Path(path)) => self
+                        .open(path)
+                        .map(|backing| self.whole(path.clone(), backing)),
                     (Err(_), Source::Bytes { .. }) => {
                         Err(Error::Internal("repeated in-memory input".into()))
                     }
@@ -376,7 +416,7 @@ impl FileTable {
             }
             MemberData::External { .. } => {
                 let path = member.external_path().unwrap_or_default();
-                let backing = map::load(&path).map_err(|error| Error::io(&path, error))?;
+                let backing = self.open(&path)?;
                 let mut file = self.whole(path, backing);
                 file.member = Some(name);
                 file.parent = Some(archive);

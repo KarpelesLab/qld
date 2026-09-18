@@ -1,15 +1,20 @@
-//! Small, dependency-free hash functions used for `--build-id`.
+//! Small, dependency-free hash functions for build-ids, Mach-O UUIDs and
+//! Mach-O code signatures.
 //!
 //! - [`Md5`] (RFC 1321) and [`Sha1`] (FIPS 180-4) are the classic build-id
-//!   digests. They are implemented here rather than pulled in as
-//!   dependencies because they are short and have no performance-critical
-//!   variants that matter at build-id sizes.
-//! - [`xxh64`] is xxHash64, used for `--build-id=fast`. Its output is defined
+//!   digests; MD5 also derives the Mach-O `LC_UUID`. They are implemented
+//!   here rather than pulled in as dependencies because they are short and
+//!   have no performance-critical variants that matter at build-id sizes.
+//! - [`Sha256`] (FIPS 180-4) hashes the pages of a Mach-O ad-hoc code
+//!   signature, which arm64 macOS requires before it runs a binary.
+//! - [`xxh64()`] is xxHash64, used for `--build-id=fast`. Its output is defined
 //!   by the xxHash specification, so it is identical on every platform and
 //!   will not change between qld releases.
 //!
 //! None of these are used for security. MD5 and SHA-1 are broken as
-//! cryptographic hashes; for build-ids they only need to identify content.
+//! cryptographic hashes; for build-ids and UUIDs they only need to identify
+//! content. SHA-256 is what the code signature format prescribes; an ad-hoc
+//! signature proves integrity, not identity.
 
 mod md5;
 mod sha1;

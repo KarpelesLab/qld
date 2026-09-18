@@ -22,6 +22,9 @@
 //! - [`search`] resolves `-l` names and linker-script paths against search
 //!   directories and the sysroot, through the [`FileSystem`] trait so that
 //!   tests stay hermetic.
+//! - [`source`] lets library callers supply files that exist only in memory
+//!   ([`InputProvider`], [`MemoryFiles`]); [`FileTable::for_link`] and
+//!   library search look there before the file system.
 //!
 //! Mapping needs `unsafe`; it is confined to the private `map` submodule.
 //! Everything else treats input as untrusted: no panics, no unchecked
@@ -39,6 +42,7 @@ pub mod identify;
 mod map;
 mod read;
 pub mod search;
+pub mod source;
 pub mod table;
 
 pub use archive::{
@@ -46,4 +50,5 @@ pub use archive::{
 };
 pub use identify::{FileFormat, GccLtoProbe, identify, identify_with};
 pub use search::{FileSystem, LibraryNaming, RealFileSystem, SearchContext};
+pub use source::{InputProvider, MemoryFiles};
 pub use table::{FileTable, InputFile, MemberEntry, Source};

@@ -74,7 +74,7 @@ can work at the same time without colliding.
 | W33 | PE i386 and ARM64 (M7) | `src/coff/**`, `tests/coff_link*` and its data | W21 | in progress |
 | W34 | Mach-O completeness (M8) | `src/macho/**` except `lto*`, `src/args/darwin.rs`, `tests/macho_link*` | W27 | in progress |
 | W35 | Mach-O LTO through libLTO (M8) | new `src/plugin/liblto*`, `src/macho/lto*`, one hook in `src/macho/link.rs`, `tests/macho_lto*` | W17, W27 | in progress |
-| W36 | Library API for 1.0 (M9) | `examples/**`, `tests/api*`, new `src/input/source*`, API-only changes in `src/args/options.rs`; proposals for `lib.rs` | — | in progress |
+| W36 | Library API for 1.0 (M9) | `examples/**`, `tests/api*`, new `src/input/source*`, API-only changes in `src/args/options.rs`; proposals for `lib.rs` | — | merged |
 | W37 | AArch64 completeness (M4) | `src/elf/arch/aarch64.rs`, `src/arch/aarch64.rs`, `tests/aarch64*`, `tests/fixtures/aarch64-*` | W20 | in progress |
 | W38 | Scripts and M1/M3 leftovers | `src/script/**`, `src/elf/{script_layout,defined,rules}*`, `tests/script_link*`, musl tests under `tests/projects/musl*` | W19 | in progress |
 | W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | in progress |
@@ -543,6 +543,15 @@ merging and relative method lists, arm64e.
 
 **Goal:** API review, in-memory inputs and outputs, cancellation, rustdoc
 examples; proposals for frozen files.
+
+**Merged**, including the agreed `lib.rs`/`error.rs` changes. Open:
+- PE and Mach-O support for `input_provider`, `output_buffer` and `cancel`
+  (one-line hooks each; W33, W34/W35).
+- Cancellation checks inside resolution (W28).
+- `-T` scripts and version scripts read through the provider (W38).
+- Replace struct literals in `tests/coff_link.rs` and `tests/input.rs` so
+  `LinkOptions`, `InputSpec` and `InputAttrs` can be `#[non_exhaustive]`.
+- The 1.0 blockers in `tests/projects/api-review.md`.
 
 ## W37: AArch64 completeness (M4)
 
