@@ -226,6 +226,15 @@ or was slower somewhere:
   correct, as the dynamic plan sets reference flags on strong aliases of
   weak imports (`environ`) that the symbol table reads.
 - glibc malloc tunables in the child's environment (see above).
+- The symbol table's shard locks, COMDAT claim locks and definition locks
+  each alone in a 128-byte cache line pair (the first interning pass was
+  no faster on 16 threads than on 8; false sharing was a suspect): no
+  change in the pass or in resolution.
+- Presizing each shard's table and pending list from a count of the first
+  batch's names per shard: no change (the lookup pass took 10-11 ms at 16
+  threads either way).
+- Reusing the input stage's pool of 16 threads for the rest of the link
+  instead of starting a second one: no change.
 
 Not attempted, for later: freeing the inputs' mappings in parallel
 (`madvise(MADV_DONTNEED)`, as mold does) for `--no-fork` and library links;

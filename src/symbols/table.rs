@@ -45,15 +45,16 @@
 //! Passes 2 and 3, and the parallelism of pass 1, only pay off for large
 //! batches. A batch of fewer than 65,536 names (16,384 once the table holds
 //! names, as most names of later batches then exist already), or any batch
-//! in a pool of one thread, whose jobs all have distinct positions (always the case for the resolution driver) is
-//! interned on the calling thread, jobs in position order and names in job
-//! order. Each new name is then first seen at its first occurrence, so
-//! numbering names as they are inserted gives the same IDs as the three
-//! passes, with no provisional handles. In large batches, passes 2 and 3
-//! visit only the shards that received new names, and each step runs on the
-//! calling thread below its own size threshold. So the cost of a batch
-//! follows its size, not the size of the table: late resolution rounds that
-//! add a few hundred names cost microseconds.
+//! in a pool of one thread, whose jobs all have distinct positions (always
+//! the case for the resolution driver) is interned on the calling thread,
+//! jobs in position order and names in job order. Each new name is then
+//! first seen at its first occurrence, so numbering names as they are
+//! inserted gives the same IDs as the three passes, with no provisional
+//! handles. In large batches, passes 2 and 3 visit only the shards that
+//! received new names, and each step runs on the calling thread below its
+//! own size threshold. So the cost of a batch follows its size, not the
+//! size of the table: late resolution rounds that add a few hundred names
+//! cost microseconds.
 //!
 //! # Limits
 //!
