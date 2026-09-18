@@ -44,6 +44,7 @@ use super::read::consts::{
 };
 use super::reloc::{self, Addresses, Value};
 use super::resolve::{CoffRules, ComdatHook};
+use super::safeseh;
 use super::write::{self, WriteInput};
 
 /// Largest alignment a common symbol gets without `-aligncomm:`.
@@ -93,7 +94,7 @@ pub fn link_with(
     let prescan = {
         let empty = InternalNames::default();
         let table = FileTable::new();
-        let scan = inputs::collect(options, &table, &empty)?;
+        let scan = inputs::collect(options, &table, &empty, pe.machine)?;
         let mut directives = Directives::default();
         let mut files = scan.files;
         for file in &mut files {
@@ -149,7 +150,7 @@ fn link_once<'a>(
     table: &'a FileTable,
     internal: &'a InternalNames,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut inputs = inputs::collect(options, table, internal)?;
+    let mut inputs = inputs::collect(options, table, internal, pe.machine)?;
     let files = &mut inputs.files;
 
     let rules = CoffRules {
@@ -170,6 +171,9 @@ fn link_once<'a>(
         directives.add_from(file)?;
     }
     let mut aliases = alias_table(&symbols, files, &resolution, &directives);
+    // GNU ld's stdcall fixup binds `_foo@8` to `_foo` and back on i386,
+    // before auto-import looks at what is left.
+    let fixups = stdcall_fixups(&symbols, pe, &mut aliases);
     // Auto-import must be decided before undefined symbols are reported: it
     // is what binds a reference to a DLL's data that was compiled without
     // `__declspec(dllimport)`.
@@ -182,6 +186,12 @@ fn link_once<'a>(
     } else {
         HashMap::default()
     };
+    if pe.enable_stdcall_fixup.is_none() {
+        let mut warned = false;
+        for (from, to) in &fixups {
+            edata::warn_fixup(from, to, &mut warned, diagnostics);
+        }
+    }
     errors = errors.saturating_add(report_undefined(
         &symbols,
         &resolution,
@@ -195,6 +205,7 @@ fn link_once<'a>(
     }
 
     let commons = allocate_commons(&symbols, files, &resolution, &directives);
+    let seh = safeseh::plan(pe, &symbols, files, &resolution)?;
     let emit_relocs = pe.dynamicbase && !pe.disable_reloc_section;
     let output_path = options.output_path();
 
@@ -209,7 +220,15 @@ fn link_once<'a>(
         .implib_dll_name
         .clone()
         .unwrap_or_else(|| edata::default_dll_name(&output_path));
-    let exports = edata::plan(&requests, &symbols, files, &resolution, pe, &dll_name);
+    let exports = edata::plan(
+        &requests,
+        &symbols,
+        files,
+        &resolution,
+        pe,
+        &dll_name,
+        diagnostics,
+    );
     let export_size = exports.size();
     if let Some(path) = &pe.out_implib {
         implib::write(path, &exports, pe.machine)?;
@@ -243,9 +262,10 @@ fn link_once<'a>(
             synthetic: &synthetic,
             pseudo_reloc_size: pseudo_size,
             thunks: &thunks,
+            safe_seh_size: seh.reserved_size(),
         })?;
         let linker = defined::values(&plan, &symbols, pe.section_alignment);
-        let addresses = Addresses {
+        let mut addresses = Addresses {
             files,
             symbols: &symbols,
             resolution: &resolution,
@@ -255,6 +275,37 @@ fn link_once<'a>(
             commons: common_values(&plan, &commons),
             aliases: aliases.clone(),
             auto_imported: auto_imported.clone(),
+        };
+        // The SafeSEH table's symbols must be known before relocating the
+        // load configuration that refers to them.
+        let seh_table = match &seh {
+            safeseh::Plan::Nothing => None,
+            safeseh::Plan::Zero => {
+                addresses
+                    .linker
+                    .extend(safeseh::symbol_values(&symbols, None, 0));
+                None
+            }
+            safeseh::Plan::Table(handlers) => {
+                let rvas = safeseh::handler_rvas(&addresses, handlers);
+                let at = plan.markers.iter().find_map(|&(marker, section, offset)| {
+                    (marker == layout::Marker::SafeSehTable).then_some((section, offset))
+                });
+                let table = at.and_then(|(section, offset)| {
+                    Some(Value::Address {
+                        rva: plan
+                            .sections
+                            .get(section as usize)?
+                            .rva
+                            .wrapping_add(offset),
+                        section,
+                    })
+                });
+                addresses
+                    .linker
+                    .extend(safeseh::symbol_values(&symbols, table, rvas.len()));
+                at.map(|(section, offset)| (section, offset, safeseh::encode(&rvas)))
+            }
         };
         let mut generated: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         // Export problems are reported once, from the final pass.
@@ -316,6 +367,15 @@ fn link_once<'a>(
             let end = start.saturating_add(pseudo.len());
             if let Some(slot) = bytes.get_mut(start..end) {
                 slot.copy_from_slice(&pseudo);
+            }
+        }
+
+        if let Some((section, offset, bytes)) = &seh_table
+            && let Some(data) = contents.get_mut(*section as usize)
+        {
+            let start = *offset as usize;
+            if let Some(slot) = data.get_mut(start..start.saturating_add(bytes.len())) {
+                slot.copy_from_slice(bytes);
             }
         }
 
@@ -555,6 +615,47 @@ fn alias_table<'a>(
     aliases
 }
 
+/// GNU `ld`'s stdcall fixup: an undefined `_foo@N` (or `@foo@N`) binds to
+/// a defined `_foo`, and an undefined `_foo` to a defined `_foo@N`.
+///
+/// Only i386 decorates names this way. `--disable-stdcall-fixup` turns
+/// the fixup off; without `--enable-stdcall-fixup` the caller warns about
+/// each one. Returns the `(from, to)` pairs, in symbol order.
+fn stdcall_fixups(
+    symbols: &SymbolTable<'_>,
+    pe: &PeOptions,
+    aliases: &mut HashMap<SymbolId, SymbolId>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut fixed = Vec::new();
+    if !pe.target().underscores() || pe.enable_stdcall_fixup == Some(false) {
+        return fixed;
+    }
+    let defined = |name: &[u8]| {
+        symbols
+            .lookup(&SymbolName::new(name))
+            .is_some_and(|id| symbols.definition_kind(id) == DefinitionKind::Regular)
+    };
+    for id in symbols.ids() {
+        if !is_unresolved(symbols, id)
+            || aliases.contains_key(&id)
+            || !symbols
+                .flags(id)
+                .intersects(SymbolFlags::REFERENCED | SymbolFlags::WEAK_REFERENCED)
+        {
+            continue;
+        }
+        let name = symbols.name(id).bytes();
+        let Some(twin) = edata::stdcall_twin(symbols, name, &defined) else {
+            continue;
+        };
+        if let Some(target) = symbols.lookup(&SymbolName::new(&twin)) {
+            aliases.insert(id, target);
+            fixed.push((name.to_vec(), twin));
+        }
+    }
+    fixed
+}
+
 /// The `__imp_` symbols auto-import needs but that resolution left lazy,
 /// because nothing referred to them: an import library member defines them,
 /// and only an extra root pulls it in.
@@ -746,7 +847,9 @@ fn report_undefined(
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
-    let linker_defined: Vec<&[u8]> = defined::names().collect();
+    let linker_defined: Vec<&[u8]> = defined::names()
+        .chain([safeseh::TABLE_SYMBOL, safeseh::COUNT_SYMBOL])
+        .collect();
     let mut errors = 0usize;
     for undefined in resolution.undefined() {
         let name = undefined.name.bytes();

@@ -269,8 +269,8 @@ pub struct Applied {
     /// Sites the MinGW runtime relocator must fix up.
     pub pseudo_relocs: Vec<PseudoReloc>,
     /// ARM64 branches that cannot reach their destination and have no
-    /// range-extension thunk yet, as `(file, section, destination RVA)`.
-    pub thunk_requests: Vec<(u32, u32, u32)>,
+    /// range-extension thunk yet, as `(file, section, target)`.
+    pub thunk_requests: Vec<(u32, u32, super::arm64::ThunkTarget)>,
     /// Problems found, as diagnostics.
     pub errors: Vec<Diagnostic>,
 }
@@ -350,6 +350,7 @@ pub fn apply(
             section,
             offset,
             section_rva: rva,
+            record,
         };
         if let Err(problem) = write_field(addresses, data, site, r_type, value, machine, out) {
             out.errors.push(Diagnostic::error(problem).at(location(
@@ -410,6 +411,8 @@ pub struct Site {
     pub offset: u32,
     /// RVA the section was placed at.
     pub section_rva: u32,
+    /// The symbol record the relocation refers to.
+    pub record: u32,
 }
 
 impl Site {
@@ -569,8 +572,9 @@ impl Field<'_, '_, '_> {
     /// `ADDR32` / i386 `DIR32`: a 32-bit virtual address, rebased with
     /// `HIGHLOW`.
     pub fn addr32(self, data: &mut [u8], out: &mut Applied) -> Result<(), String> {
-        let addend = read32(data, self.site.at());
-        let target = self.address().wrapping_add(u64::from(addend));
+        // The addend is signed: `movl table-4(,%eax,4)` stores -4.
+        let addend = i64::from(read32(data, self.site.at()).cast_signed());
+        let target = (self.address() as i64).wrapping_add(addend);
         let truncated = u32::try_from(target)
             .map_err(|_| format!("32-bit address relocation overflows: {target:#x}"))?;
         store32(data, self.site.at(), truncated)?;

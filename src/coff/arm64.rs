@@ -18,9 +18,10 @@
 //! relocating: a branch out of range with no thunk yet is recorded in
 //! [`Applied::thunk_requests`], the driver adds it to the [`Thunks`] plan
 //! and lays the image out again, until no branch asks for a new thunk.
-//! Blocks only grow, so this settles; the ordering of every block is by
-//! destination, so the image does not depend on the order the requests
-//! arrived in.
+//! A thunk is known by its [`ThunkTarget`] — the branch's symbol record
+//! and addend — rather than by an address, which moves from one layout to
+//! the next. Blocks only grow, so this settles, and each block is sorted,
+//! so the image does not depend on the order the requests arrived in.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -41,12 +42,22 @@ use super::reloc::{Applied, Field, past_the_end};
 /// Size of one thunk: three instructions.
 pub const THUNK_SIZE: u32 = 12;
 
+/// Where a thunk goes: the symbol record a branch refers to, in the file
+/// of the branch, and the addend its immediate held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ThunkTarget {
+    /// The symbol table record index.
+    pub record: u32,
+    /// Bytes added to the symbol.
+    pub addend: i64,
+}
+
 /// The thunks of an image: for each input section `(file, section)` whose
-/// branches need them, the destination RVAs of its block, sorted.
+/// branches need them, the targets of its block, sorted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Thunks {
-    /// Destinations by input section.
-    pub blocks: BTreeMap<(u32, u32), Vec<u32>>,
+    /// Targets by input section.
+    pub blocks: BTreeMap<(u32, u32), Vec<ThunkTarget>>,
 }
 
 impl Thunks {
@@ -67,7 +78,7 @@ impl Thunks {
     }
 
     /// Adds the requested thunks. Returns whether any was new.
-    pub fn add(&mut self, requests: &[(u32, u32, u32)]) -> bool {
+    pub fn add(&mut self, requests: &[(u32, u32, ThunkTarget)]) -> bool {
         let mut changed = false;
         for &(file, section, target) in requests {
             let block = self.blocks.entry((file, section)).or_default();
@@ -82,7 +93,7 @@ impl Thunks {
     /// The index of the thunk for `target` in the block of `(file,
     /// section)`.
     #[must_use]
-    pub fn index_of(&self, file: u32, section: u32, target: u32) -> Option<u32> {
+    pub fn index_of(&self, file: u32, section: u32, target: ThunkTarget) -> Option<u32> {
         let block = self.blocks.get(&(file, section))?;
         let at = block.binary_search(&target).ok()?;
         u32::try_from(at).ok()
@@ -193,10 +204,13 @@ fn branch(
         return store(data, at, patched);
     }
     // Out of reach: branch to the thunk, or ask for one.
-    let target = target as u32;
+    let key = ThunkTarget {
+        record: site.record,
+        addend,
+    };
     let layout = field.addresses.layout;
-    let Some(index) = layout.thunks.index_of(site.file, site.section, target) else {
-        out.thunk_requests.push((site.file, site.section, target));
+    let Some(index) = layout.thunks.index_of(site.file, site.section, key) else {
+        out.thunk_requests.push((site.file, site.section, key));
         return Ok(());
     };
     let thunk = layout
@@ -275,13 +289,14 @@ mod tests {
 
     #[test]
     fn thunk_blocks_are_sorted_and_deduplicated() {
+        let target = |record| ThunkTarget { record, addend: 0 };
         let mut thunks = Thunks::default();
-        assert!(thunks.add(&[(1, 2, 0x9000), (1, 2, 0x5000), (1, 2, 0x9000)]));
-        assert!(!thunks.add(&[(1, 2, 0x5000)]));
-        assert_eq!(thunks.blocks[&(1, 2)], [0x5000, 0x9000]);
+        assert!(thunks.add(&[(1, 2, target(9)), (1, 2, target(5)), (1, 2, target(9))]));
+        assert!(!thunks.add(&[(1, 2, target(5))]));
+        assert_eq!(thunks.blocks[&(1, 2)], [target(5), target(9)]);
         assert_eq!(thunks.block_size(1, 2), 24);
         assert_eq!(thunks.block_size(1, 3), 0);
-        assert_eq!(thunks.index_of(1, 2, 0x9000), Some(1));
+        assert_eq!(thunks.index_of(1, 2, target(9)), Some(1));
     }
 
     #[test]

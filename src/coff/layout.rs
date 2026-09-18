@@ -141,6 +141,9 @@ pub enum Marker {
     TlsStart,
     /// `___tls_end__`.
     TlsEnd,
+    /// The i386 SafeSEH handler table, `___safe_se_handler_table`, at the
+    /// end of `.rdata`.
+    SafeSehTable,
 }
 
 /// One step of the output section recipe: a rule, a marker or an alignment.
@@ -241,6 +244,8 @@ const RECIPE: &[Step] = &[
     Step::Place(rule(b".rdata", Match::Prefix(b".CRT$XD"), Sort::ByName)),
     Step::Insert(b".rdata", Marker::CrtXdEnd),
     Step::Place(rule(b".rdata", Match::Prefix(b".CRT$"), Sort::ByName)),
+    Step::Align(b".rdata", 4),
+    Step::Insert(b".rdata", Marker::SafeSehTable),
     Step::Place(rule(b".eh_frame", Match::Prefix(b".eh_frame"), Sort::None)),
     Step::Place(rule(b".pdata", Match::Prefix(b".pdata"), Sort::None)),
     Step::Place(rule(b".xdata", Match::Prefix(b".xdata"), Sort::None)),
@@ -494,6 +499,8 @@ pub struct LayoutInput<'i, 'a> {
     /// ARM64 range-extension thunks, each block placed after the input
     /// section whose branches need it.
     pub thunks: &'i Thunks,
+    /// Bytes to reserve for the i386 SafeSEH handler table.
+    pub safe_seh_size: u32,
 }
 
 /// Assigns every live input section to an output section and gives each one
@@ -578,6 +585,14 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                 if section.header.is_code() {
                     out.characteristics |= IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE;
                 }
+                // GNU ld's output flags are the union of the inputs': code
+                // that also claims initialized data (some i386 runtime
+                // objects) makes `.text` count as both.
+                if out.characteristics & IMAGE_SCN_CNT_CODE != 0
+                    && section.header.is_initialized_data()
+                {
+                    out.characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+                }
             }
         }
         placements.push(per_section);
@@ -636,13 +651,18 @@ pub fn layout(input: &LayoutInput<'_, '_>) -> Result<Layout> {
                     // where GNU ld's script puts the input sections of the
                     // same name: inside the `__RUNTIME_PSEUDO_RELOC_LIST__`
                     // bounds. Its bytes are patched in after layout.
-                    if *marker == Marker::PseudoStart && input.pseudo_reloc_size > 0 {
+                    let reserved = match marker {
+                        Marker::PseudoStart => input.pseudo_reloc_size,
+                        Marker::SafeSehTable => input.safe_seh_size,
+                        _ => 0,
+                    };
+                    if reserved > 0 {
                         chunks.push(Chunk {
                             offset,
-                            size: input.pseudo_reloc_size,
+                            size: reserved,
                             piece: Piece::Zero,
                         });
-                        offset = offset.saturating_add(input.pseudo_reloc_size);
+                        offset = offset.saturating_add(reserved);
                     }
                 }
                 Step::Place(_) => {

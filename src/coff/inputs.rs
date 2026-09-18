@@ -26,6 +26,7 @@ use crate::input::{FileTable, InputFile, LibraryNaming, RealFileSystem, SearchCo
 use crate::symbols::{InputPosition, ResolveFile, SymbolName, SymbolUse};
 
 use super::imports::{self, Groups};
+use super::machine::Machine;
 use super::object::ParsedObject;
 use super::read::{CoffObject, PeImage, ShortImport, Source as CoffSource};
 
@@ -202,17 +203,24 @@ struct Pending {
     attrs: InputAttrs,
 }
 
-/// Resolves, loads and expands every input.
+/// Resolves, loads and expands every input for an image of `machine`.
+///
+/// An object named on the command line must be for `machine` (or for no
+/// machine in particular); archive members and import objects for another
+/// machine are skipped, as GNU `ld` skips an incompatible library, so that
+/// a multilib search path can list both 32- and 64-bit directories.
 ///
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] for missing libraries, [`Error::Io`] for files
 /// that cannot be read, [`Error::Unimplemented`] for inputs a later milestone
-/// covers, and parse errors for malformed archives.
+/// covers, [`Error::Option`] for an object of another machine, and parse
+/// errors for malformed archives.
 pub fn collect<'a>(
     options: &LinkOptions,
     table: &'a FileTable,
     internal: &'a InternalNames,
+    machine: u16,
 ) -> Result<Inputs<'a>> {
     let fs = RealFileSystem;
     let search = SearchContext {
@@ -254,7 +262,7 @@ pub fn collect<'a>(
     let mut walker = Walker {
         table,
         groups: Groups::new(),
-        machine: None,
+        machine,
         files: vec![CoffInput {
             position: InputPosition::new(0, 0),
             role: InputRole::Internal,
@@ -283,11 +291,18 @@ struct Walker<'a> {
     /// Imports collected from short import libraries and from DLLs named on
     /// the command line, turned into objects once the walk is over.
     groups: Groups,
-    /// The machine the inputs agree on, for the generated import objects.
-    machine: Option<u16>,
+    /// The machine of the image, which the inputs must be for.
+    machine: u16,
 }
 
 impl<'a> Walker<'a> {
+    /// Whether an input for `machine` can go into the image. Machine 0
+    /// (`IMAGE_FILE_MACHINE_UNKNOWN`) is what machine-independent objects
+    /// carry.
+    fn compatible(&self, machine: u16) -> bool {
+        machine == self.machine || machine == super::read::consts::IMAGE_FILE_MACHINE_UNKNOWN
+    }
+
     fn next_position(&mut self) -> Result<u32> {
         self.ordinal = self
             .ordinal
@@ -315,7 +330,9 @@ impl<'a> Walker<'a> {
         };
         match file.format() {
             FileFormat::Coff(ident) => {
-                self.machine.get_or_insert(ident.machine);
+                if !self.compatible(ident.machine) {
+                    return Err(incompatible(file, ident.machine, self.machine));
+                }
                 let number = self.next_position()?;
                 let mut input = self.input(InputPosition::new(number, 0), InputRole::Object);
                 input.file = Some(file);
@@ -330,21 +347,26 @@ impl<'a> Walker<'a> {
             FileFormat::Archive | FileFormat::ThinArchive => self.add_archive(id, file, attrs),
             FileFormat::Empty => Ok(()),
             FileFormat::CoffImport(ident) => {
-                self.machine.get_or_insert(ident.machine);
+                if !self.compatible(ident.machine) {
+                    return Err(incompatible(file, ident.machine, self.machine));
+                }
                 let number = self.next_position()?;
                 let import = ShortImport::parse(file.data(), source_of(file))?;
                 self.groups.add_short_import(&import, number);
                 Ok(())
             }
             FileFormat::Pe(ident) => {
-                self.machine.get_or_insert(ident.machine);
+                if !self.compatible(ident.machine) {
+                    return Err(incompatible(file, ident.machine, self.machine));
+                }
                 let number = self.next_position()?;
                 let image = PeImage::parse(file.data(), source_of(file))?;
                 let fallback = file
                     .path()
                     .file_name()
                     .map_or(b"".as_slice(), |name| name.as_encoded_bytes());
-                self.groups.add_dll(&image, number, fallback)
+                self.groups
+                    .add_dll(&image, number, fallback, Machine::or_default(self.machine))
             }
             _ => Err(Error::malformed(
                 file.path(),
@@ -379,14 +401,20 @@ impl<'a> Walker<'a> {
             // A short import member becomes a generated `.idata$N` object,
             // not a link input of its own.
             if let FileFormat::CoffImport(ident) = member_file.format() {
-                self.machine.get_or_insert(ident.machine);
+                if !self.compatible(ident.machine) {
+                    consumed.push(member.header_offset);
+                    continue;
+                }
                 let import = ShortImport::parse(member_file.data(), source_of(member_file))?;
                 self.groups.add_short_import(&import, number);
                 consumed.push(member.header_offset);
                 continue;
             }
             if let FileFormat::Coff(ident) = member_file.format() {
-                self.machine.get_or_insert(ident.machine);
+                if !self.compatible(ident.machine) {
+                    consumed.push(member.header_offset);
+                    continue;
+                }
                 // The helper objects an MSVC-style import library carries
                 // (`__IMPORT_DESCRIPTOR_*`, `__NULL_IMPORT_DESCRIPTOR`,
                 // `*_NULL_THUNK_DATA`) describe the same import directory
@@ -451,9 +479,7 @@ impl<'a> Walker<'a> {
         if self.groups.is_empty() {
             return Ok(());
         }
-        let machine = self
-            .machine
-            .unwrap_or(super::read::consts::IMAGE_FILE_MACHINE_AMD64);
+        let machine = self.machine;
         imports::check_machine(machine)?;
         for generated in imports::generate(self.table, &self.groups, machine)? {
             let Some(file) = self.table.get(generated.id) else {
@@ -478,6 +504,26 @@ impl<'a> Walker<'a> {
         }
         Ok(())
     }
+}
+
+/// The error for an input built for another machine, worded as GNU `ld`
+/// words it.
+fn incompatible(file: &InputFile, found: u16, wanted: u16) -> Error {
+    let name = |machine: u16| {
+        super::read::consts::machine_name(machine).map_or_else(
+            || format!("machine {machine:#06x}"),
+            |name| {
+                name.trim_start_matches("IMAGE_FILE_MACHINE_")
+                    .to_ascii_lowercase()
+            },
+        )
+    };
+    Error::Option(format!(
+        "{}: {} architecture of input file is incompatible with {} output",
+        file.path().display(),
+        name(found),
+        name(wanted)
+    ))
 }
 
 /// Whether an archive member is one of the helper objects an MSVC-style

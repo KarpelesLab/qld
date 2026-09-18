@@ -20,6 +20,7 @@
 //! | [`defined`] | The symbols MinGW's C runtime expects the linker to define |
 //! | [`reloc`] | Symbol addresses, relocation application, base relocations |
 //! | [`arm64`] | ARM64 relocations and range-extension thunks |
+//! | [`safeseh`] | The i386 SafeSEH handler table |
 //! | [`symtab`] | The image's COFF symbol table |
 //! | [`write`](mod@write) | Headers, section contents and the image checksum |
 //! | [`link`](mod@link) | The driver |
@@ -43,6 +44,7 @@ pub mod options;
 pub mod read;
 pub mod reloc;
 pub mod resolve;
+pub mod safeseh;
 pub mod symtab;
 pub mod write;
 

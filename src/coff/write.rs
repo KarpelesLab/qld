@@ -46,6 +46,8 @@ pub const OPTIONAL_HEADER_SIZE_64: usize = 240;
 pub const OPTIONAL_HEADER_SIZE_32: usize = 224;
 /// Number of data directories in the optional header.
 pub const DATA_DIRECTORIES: usize = 16;
+/// `IMAGE_SCN_CNT_CODE`.
+const IMAGE_SCN_CNT_CODE_FLAG: u32 = 0x20;
 /// Size of one section header.
 const SECTION_HEADER_SIZE: usize = 40;
 /// Size of the `PE\0\0` signature plus `IMAGE_FILE_HEADER`.
@@ -120,7 +122,15 @@ pub fn render(
             contents.push(Vec::new());
             continue;
         }
-        let mut bytes = vec![0u8; section.virtual_size as usize];
+        // GNU ld pads x86 code with `nop` between input sections.
+        let fill = if section.characteristics & IMAGE_SCN_CNT_CODE_FLAG != 0
+            && layout.machine != Machine::Arm64
+        {
+            0x90
+        } else {
+            0
+        };
+        let mut bytes = vec![fill; section.virtual_size as usize];
         if let Some((_, made)) = generated
             .iter()
             .find(|(name, _)| name.as_slice() == section.name.as_slice())
@@ -141,14 +151,26 @@ pub fn render(
                     file,
                     section: number,
                 } => {
-                    let targets = layout
+                    let targets: Vec<u32> = layout
                         .thunks
                         .blocks
                         .get(&(file, number))
-                        .map_or(&[][..], Vec::as_slice);
+                        .map_or(&[][..], Vec::as_slice)
+                        .iter()
+                        .map(|target| {
+                            let base = addresses.record_value(file as usize, target.record).map_or(
+                                0,
+                                |value| match value {
+                                    reloc::Value::Address { rva, .. } => u64::from(rva),
+                                    reloc::Value::Absolute(number) => number,
+                                },
+                            );
+                            base.wrapping_add(target.addend as u64) as u32
+                        })
+                        .collect();
                     let rva = section.rva.wrapping_add(chunk.offset);
                     if let Some(slot) = bytes.get_mut(start..end)
-                        && let Err(problem) = super::arm64::render_block(slot, rva, targets)
+                        && let Err(problem) = super::arm64::render_block(slot, rva, &targets)
                     {
                         applied.errors.push(Diagnostic::error(problem));
                     }
@@ -341,9 +363,21 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
             })
     };
     let code = sum(|section| section.characteristics & 0x20 != 0);
-    let initialized =
-        sum(|section| section.characteristics & 0x40 != 0 && section.characteristics & 0x20 == 0);
-    let uninitialized = sum(super::layout::OutSection::is_bss);
+    // As GNU ld counts: every section flagged as initialized data, code
+    // included, and `.bss` rounded up to the file alignment.
+    let initialized = sum(|section| section.characteristics & 0x40 != 0);
+    let uninitialized = layout
+        .sections
+        .iter()
+        .filter(|section| section.is_bss())
+        .fold(0u32, |total, section| {
+            let rounded = u32::try_from(align_up64(
+                u64::from(section.virtual_size),
+                u64::from(options.file_alignment),
+            ))
+            .unwrap_or(u32::MAX);
+            total.saturating_add(rounded)
+        });
     let base_of_code = layout.by_name(b".text").map_or(0, |section| section.rva);
     // GNU ld's `BaseOfData` is the first section after the code.
     let base_of_data = layout
