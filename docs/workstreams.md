@@ -69,7 +69,7 @@ can work at the same time without colliding.
 | W28 | Symbol resolution redesign (M5) | `src/symbols/**`, `src/elf/{resolve,object}*.rs`, `benches/**`, `tests/projects/bench*` | W26 | in progress |
 | W29 | Debug and ordering outputs (M5) | new `src/debug/{gdb_index,debug_names}*`, new `src/elf/{ordering,separate_debug}*`, hooks in `src/elf/{layout,write,synth}.rs`, `tests/debug_index*`, `tests/ordering*` | W24 | in progress |
 | W30 | RISC-V 64 (M4) | `src/elf/arch/riscv*`, `src/arch/riscv*`, relaxation/shrinking hooks, `tests/riscv*`, `tests/fixtures/riscv64-*` | W20 | in progress |
-| W31 | PowerPC64 LE, ELFv2 (M4) | `src/elf/arch/ppc64*`, `src/arch/ppc64*`, `tests/ppc64*`, `tests/fixtures/ppc64-*` | W20 | in progress |
+| W31 | PowerPC64 LE, ELFv2 (M4) | `src/elf/arch/ppc64*`, `src/arch/ppc64*`, `tests/ppc64*`, `tests/fixtures/ppc64le-*` | W20 | merged |
 | W32 | LoongArch64 (M4) | `src/elf/arch/loongarch*`, `src/arch/loongarch*`, `tests/loongarch*`, `tests/fixtures/loongarch64-*` | W20 | merged |
 | W33 | PE i386 and ARM64 (M7) | `src/coff/**`, `tests/coff_link*` and its data | W21 | merged |
 | W34 | Mach-O completeness (M8) | `src/macho/**` except `lto*`, `src/args/darwin.rs`, `tests/macho_link*` | W27 | in progress |
@@ -576,6 +576,9 @@ links, distribution package recipes.
   `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis
   in `-r`; move the `R_LARCH_*` constants to `src/elf/read/consts/`; remove
   the per-relocation lookahead cost on x86-64/AArch64 (in progress).
+- **W31 (PowerPC64):** remove the +5% x86-64 instruction cost (in
+  progress); a test for PC-relative `__tls_get_addr` annotation; the
+  outstanding items in ROADMAP M4.
 - **W37 (AArch64):** erratum fixes with linker-script layout; a patch pool
   per 128 MiB of code; `$x` and `__CortexA53843419_*` symbols for patches;
   check `DT_AARCH64_VARIANT_PCS`. `src/elf/arch/aarch64_errata.rs` and

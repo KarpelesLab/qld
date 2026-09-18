@@ -420,6 +420,18 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   - x86 code padding is `nop`;
   - DLLs use a fixed default image base, not GNU's automatic one.
 
+## PowerPC64 LE
+
+- Call stubs for PLT calls are in `.plt.sec`, not placed near callers (lld)
+  or in `.text` (GNU ld). `.plt` holds the glink code and `.got.plt` the
+  slots; GNU ld and lld call these `.glink` and `.plt`.
+- A `bl` to an undefined weak symbol becomes a `nop`, as in GNU ld (lld
+  branches to itself).
+- Thunks never use Power10 instructions (no `--power10-stubs`).
+- In dynamic outputs, IFUNC `IRELATIVE` relocations go to `.rela.dyn`, as
+  GNU ld does: glibc's loader does not apply them from `.rela.plt`.
+- `.toc` is placed as an orphan after `.data`, not right after `.got`.
+
 ## LoongArch64
 
 - **Relaxation keeps code size:** relaxed sequences leave `nop`s, and
