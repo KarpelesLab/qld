@@ -19,6 +19,7 @@
 //!   copy needs, without naming its number.
 
 pub mod aarch64;
+pub mod aarch64_errata;
 pub mod loongarch;
 pub mod thunk;
 pub mod x86_64;
@@ -350,10 +351,14 @@ pub struct PltFlags {
     /// `br x17`.
     pub landing_pad: bool,
     /// PLT entries start with one too. On x86-64 that is IBT (and the
-    /// jumps move to `.plt.sec`); on AArch64 entries are only reached by
-    /// direct branches, so GNU ld leaves them without one unless
-    /// `-z force-bti` asks.
+    /// jumps move to `.plt.sec`); on AArch64 it is an executable's BTI PLT,
+    /// whose entries may be a function's canonical address and so the
+    /// target of an indirect call (GNU ld gives a shared object's entries
+    /// none).
     pub entry_landing_pad: bool,
+    /// AArch64 `-z pac-plt`: entries authenticate the address they loaded
+    /// (`autia1716`) before branching to it.
+    pub authenticate: bool,
 }
 
 impl Arch {
@@ -559,12 +564,24 @@ impl Arch {
     ///
     /// # Errors
     ///
+    /// None at present.
+    pub fn check_options(self, options: &LinkOptions) -> crate::error::Result<()> {
+        let _ = options;
+        Ok(())
+    }
+
+    /// Rejects options a linker script layout does not implement: it
+    /// places no thunk pool, so it has nowhere to put Cortex-A53 erratum
+    /// patches.
+    ///
+    /// # Errors
+    ///
     /// [`crate::error::Error::Unimplemented`] for the Cortex-A53 erratum
     /// workarounds.
-    pub fn check_options(self, options: &LinkOptions) -> crate::error::Result<()> {
-        if self == Self::AArch64 && options.fix_cortex_a53_843419 {
+    pub fn check_script_options(self, options: &LinkOptions) -> crate::error::Result<()> {
+        if self == Self::AArch64 && aarch64_errata::enabled(options) {
             return Err(crate::error::Error::Unimplemented(
-                "--fix-cortex-a53-843419 (roadmap M4: the erratum workaround)".into(),
+                "--fix-cortex-a53-843419 and --fix-cortex-a53-835769 with a linker script".into(),
             ));
         }
         Ok(())
@@ -749,8 +766,7 @@ impl Arch {
     pub fn plt_entry_size(self, flags: PltFlags) -> u64 {
         match self {
             Self::X86_64 => 16,
-            Self::AArch64 if flags.entry_landing_pad => 24,
-            Self::AArch64 => 16,
+            Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
         }
     }
@@ -761,8 +777,7 @@ impl Arch {
         match self {
             Self::X86_64 if flags.landing_pad => 16,
             Self::X86_64 => 8,
-            Self::AArch64 if flags.entry_landing_pad => 24,
-            Self::AArch64 => 16,
+            Self::AArch64 => aarch64::plt_entry_size(aarch64::plt_got_flags(flags)),
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
         }
     }
@@ -775,8 +790,12 @@ impl Arch {
 
     /// Size of an IFUNC stub in a static executable.
     #[must_use]
-    pub fn iplt_entry_size(self) -> u64 {
-        16
+    pub fn iplt_entry_size(self, flags: PltFlags) -> u64 {
+        match self {
+            Self::X86_64 => 16,
+            Self::AArch64 => aarch64::plt_entry_size(flags),
+            Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
+        }
     }
 
     /// The value a lazy `.got.plt` slot holds before the dynamic linker
@@ -853,8 +872,9 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::X86_64 => x86_64::write_plt_jump(out, entry, slot, flags.landing_pad),
-            #[allow(clippy::match_same_arms)]
-            Self::AArch64 => aarch64::write_plt_entry(out, entry, slot, flags),
+            Self::AArch64 => {
+                aarch64::write_plt_entry(out, entry, slot, aarch64::plt_got_flags(flags))
+            }
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
         }
     }
@@ -870,10 +890,13 @@ impl Arch {
         out: &mut [u8],
         stub: u64,
         slot_address: u64,
+        flags: PltFlags,
     ) -> Result<(), ApplyError> {
         match self {
             Self::X86_64 => x86_64::write_iplt(out, stub, slot_address),
-            Self::AArch64 => aarch64::write_plt_entry(out, stub, slot_address, PltFlags::default()),
+            // GNU ld writes IFUNC stubs as ordinary PLT entries, landing
+            // pad and authentication included.
+            Self::AArch64 => aarch64::write_plt_entry(out, stub, slot_address, flags),
             Self::LoongArch64 => loongarch::write_plt_entry(out, stub, slot_address),
         }
     }

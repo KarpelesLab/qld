@@ -172,13 +172,14 @@ binary.
 In priority order. Each one needs its relocations, thunks and relaxations,
 and TLS models.
 
-- [~] **AArch64**: done — the static and dynamic relocation set, range
-      extension thunks, PLT/GOT, all four TLS models with TLSDESC and the TLS
-      relaxations, BTI properties, `-r`, and script layout. Outstanding:
-      ADRP+LDR→ADRP+ADD and ADRP+ADD→ADR+NOP relaxations (need relocation
-      lookahead), the Cortex-A53 erratum workarounds and `-z pac-plt` (both
-      rejected with a clear error), `-z force-bti` (needs an option), and the
-      lazy TLSDESC PLT (qld binds eagerly, as lld does)
+- [x] **AArch64**: the static and dynamic relocation set, range extension
+      thunks, PLT/GOT, all four TLS models with TLSDESC and the TLS
+      relaxations, ADRP+LDR→ADRP+ADD and ADRP+ADD→NOP+ADR relaxations, BTI
+      properties, `-z force-bti`, `-z pac-plt`, the Cortex-A53 843419 and
+      835769 workarounds, `-r`, and script layout. TLSDESC is bound eagerly,
+      as in lld: glibc and musl need no lazy TLSDESC PLT. Outstanding: erratum
+      fixes under linker-script layout (the kernel uses them), a patch pool
+      per 128 MiB of code
 - [ ] **RISC-V 64/32**: linker relaxation with section shrinking (iterative
       layout), `__global_pointer$`, attribute section merging
 - [ ] **i386**: GOT-relative relocations, `-z ibtplt`, TLS GNU dialect
@@ -186,7 +187,13 @@ and TLS models.
       ordering and synthesis, BE8, `R_ARM_V4BX`
 - [ ] **x32** (`elf32_x86_64`)
 - [ ] **PowerPC64 LE/BE** (ELFv2 / ELFv1 with OPDs, TOC, long-branch stubs)
-- [ ] **LoongArch64**, **s390x**
+- [~] **LoongArch64**: the relocation set (including the extreme code model
+      and ADD/SUB/ULEB128), PLT/GOT, all TLS models with TLSDESC and IE/TLSDESC
+      relaxation, size-preserving relaxation, `-r`; compared with lld by
+      meaning. Outstanding: shrinking relaxation (deleting `nop`s,
+      `R_LARCH_ALIGN`), B26 thunks, ALIGN synthesis in `-r`; the fixtures run
+      under qemu in CI
+- [ ] **s390x**
 - [ ] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths)
 
@@ -275,22 +282,22 @@ drops the FFI entirely).
 - [x] COFF object and archive parsing, `.drectve` linker directives
 - [x] Short import libraries (MSVC/LLVM style) and long import libraries
       (GNU dlltool `.idata$N` objects); linking directly against `.dll` files
-- [~] PE32+ (x86-64) done; PE32 (i386) and ARM64 not started
+- [x] PE32+ (x86-64), PE32 (i386) and ARM64 PE32+ (thunks, packed and unpacked `.pdata`); ARM64EC/ARM64X refused
 - [x] EXE and DLL output, `--out-implib`, `.def` files, `--export-all-symbols`,
       export and import tables, base relocations, TLS directory
-- [~] x86-64 SEH: `.pdata`/`.xdata` handling (sorted). i386 SafeSEH not started.
+- [x] x86-64 SEH: `.pdata`/`.xdata` handling (sorted); i386 SafeSEH (`.sxdata` handler table)
 - [x] Auto-import and runtime pseudo-relocations (`--enable-auto-import`,
       `__RUNTIME_PSEUDO_RELOC_LIST__`)
 - [x] Resources (`.rsrc` from windres objects), subsystem and OS version fields,
       `--dynamicbase`, `--nxcompat`, `--high-entropy-va`, deterministic timestamps
 - [x] DWARF in PE for MinGW debugging
 
-**Status:** qld links MinGW x86-64 console executables and DLLs end to end; a
-`-B` shim through `x86_64-w64-mingw32-gcc` produces a PE32+ image whose
-sections, data directories and relocated code match GNU ld's. Nothing has been
-executed yet: Wine is not installed here, so the `pe-windows` CI job runs the
-images on a Windows runner. The PE command-line options are being implemented
-(W22); until then only the plain console link works through the driver.
+**Status:** qld links MinGW x86-64 and i386 executables and DLLs (checked
+against GNU ld) and ARM64 images (checked against lld). The `pe-windows` CI
+job runs the x86-64 and i386 images on a Windows runner, including SafeSEH
+enforcement, and `pe-windows-arm64` runs the ARM64 images on Windows on ARM.
+PE links honour the library options for in-memory inputs, in-memory output
+and cancellation.
 
 **Exit criteria:** A MinGW-w64 GCC and a clang cross toolchain can use qld to
 build and run a C/C++ test suite under Wine and on a Windows CI runner. qld
@@ -309,7 +316,7 @@ builds a working `x86_64-pc-windows-gnu` Rust binary, and it runs.
 - [x] Compact unwind (`__unwind_info`) synthesis, `__eh_frame`
 - [x] Ad-hoc code signature (`LC_CODE_SIGNATURE`), which arm64 macOS requires
 - [x] STABS debug map (`N_OSO`) so `dsymutil` can find DWARF in object files
-- [~] Objective-C / Swift sections handled correctly (basic handling and selector stubs done; category merging and relative method lists later)
+- [x] Objective-C / Swift sections handled correctly: selector stubs, relative method lists (default from macOS 11), category merging (`-objc_category_merging`)
 - [x] `-r` (relocatable output; DWARF sections not carried over yet), C string and literal merging, `-init`, `-alias`, `-bundle_loader`, `-flat_namespace`
 - [x] LTO through `libLTO` (full and thin, `-object_path_lto`, `-cache_path_lto`)
 - [ ] arm64e
@@ -328,7 +335,11 @@ and runs natively on both architectures.
 (std: threads, unwinding, TLS) programs with Apple clang and rustc against
 the real SDK and runs them on arm64 and, under Rosetta, x86_64, including a
 universal binary. `-r` output is checked against Apple's `ld -r` there.
-Still open for the exit criteria: a broader test suite through `-fuse-ld`.
+The broader `-fuse-ld` suite runs there too: 18 self-checking C, C++ and
+Objective-C programs in three variants per arch, and zlib, Lua, SQLite and
+{fmt} built with `-fuse-ld=qld` running their own tests, with every image
+checked to be linked by qld. Mach-O LTO goes through Xcode's libLTO. Open:
+arm64e.
 
 ---
 

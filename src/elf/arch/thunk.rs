@@ -17,6 +17,11 @@
 //! caller in it, so an output section holding more than 128 MiB of code
 //! still gets "relocation out of range" from the writer. Splitting the pool
 //! is the next step if that ever matters.
+//!
+//! The same pool holds the Cortex-A53 erratum patches
+//! ([`super::aarch64_errata`]), after the thunks: 8 bytes each, the moved
+//! instruction and a branch back. Their sites depend on addresses too, so
+//! they take part in the same fixpoint.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -28,9 +33,11 @@ use crate::elf::read::consts::aarch64::{R_AARCH64_CALL26, R_AARCH64_JUMP26};
 use crate::elf::read::consts::{SHF_ALLOC, SHF_EXECINSTR};
 use crate::elf::refs::Def;
 use crate::elf::synth::Owner;
+use crate::ids::SectionId;
 use crate::symbols::SymbolFlags;
 
 use super::Arch;
+use super::aarch64_errata::{self, Site};
 
 /// How many times layout may be repeated before giving up on a fixpoint.
 pub const MAX_ROUNDS: u32 = 8;
@@ -47,27 +54,58 @@ pub struct Thunk {
     pub offset: u64,
 }
 
-/// The thunks of a link, sorted by output section and destination.
+/// One planned Cortex-A53 erratum patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Patch {
+    /// The instruction it replaces.
+    pub site: Site,
+    /// Offset of the patch in the site's output section.
+    pub offset: u64,
+}
+
+/// The thunks of a link, sorted by output section and destination, and
+/// the erratum patches, sorted by output section and site.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Thunks {
     /// Every thunk, sorted.
     pub entries: Vec<Thunk>,
+    /// Every erratum patch, sorted.
+    pub patches: Vec<Patch>,
 }
 
 impl Thunks {
-    /// Whether no thunk is needed.
+    /// Whether no thunk and no patch is needed.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.patches.is_empty()
+    }
+
+    /// The bytes the thunks and patches of output section `output` occupy.
+    #[must_use]
+    pub fn size_of(&self, output: u32) -> u64 {
+        self.thunk_bytes(output)
+            .saturating_add(self.patch_bytes(output))
     }
 
     /// The bytes the thunks of output section `output` occupy.
-    #[must_use]
-    pub fn size_of(&self, output: u32) -> u64 {
+    fn thunk_bytes(&self, output: u32) -> u64 {
         let count = self.entries.iter().filter(|t| t.output == output).count();
         u64::try_from(count)
             .unwrap_or(0)
             .saturating_mul(aarch64::THUNK_SIZE)
+    }
+
+    /// The bytes the erratum patches of output section `output` occupy.
+    #[must_use]
+    pub fn patch_bytes(&self, output: u32) -> u64 {
+        let count = self
+            .patches
+            .iter()
+            .filter(|p| p.site.output == output)
+            .count();
+        u64::try_from(count)
+            .unwrap_or(0)
+            .saturating_mul(aarch64::ERRATUM_PATCH_SIZE)
     }
 
     /// The offset in its output section of the thunk of `output` that
@@ -102,7 +140,27 @@ impl Thunks {
             });
             next = next.saturating_add(aarch64::THUNK_SIZE);
         }
-        Self { entries }
+        Self {
+            entries,
+            patches: Vec::new(),
+        }
+    }
+
+    /// Adds patches for `sites` (sorted), after the thunks of each output
+    /// section's pool, which starts at `pool_start`.
+    #[must_use]
+    pub fn with_patches(mut self, sites: Vec<Site>, pool_start: &dyn Fn(u32) -> u64) -> Self {
+        let mut current = None;
+        let mut next = 0u64;
+        for site in sites {
+            if current != Some(site.output) {
+                current = Some(site.output);
+                next = pool_start(site.output).saturating_add(self.thunk_bytes(site.output));
+            }
+            self.patches.push(Patch { site, offset: next });
+            next = next.saturating_add(aarch64::ERRATUM_PATCH_SIZE);
+        }
+        self
     }
 
     /// The bytes of the thunks of output section `output`, whose contents
@@ -121,15 +179,37 @@ impl Thunks {
     }
 }
 
-/// A thunk with its final address, for the writer.
+/// A thunk or erratum patch with its final address, for the writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Placed {
     /// The output section its callers are in.
     pub output: u32,
-    /// The address it branches to.
+    /// The address it branches to; for a patch, the address of the
+    /// instruction it replaces.
     pub target: u64,
     /// The thunk's own address.
     pub address: u64,
+    /// For an erratum patch, the input section and offset of the
+    /// instruction it replaces; `None` for a range-extension thunk.
+    pub patch: Option<(SectionId, u64)>,
+}
+
+/// The erratum patches among `placed` (sorted, as `Layout::thunks` is) whose
+/// sites are in output section `output` between addresses `start` and
+/// `end`.
+pub fn patches_in(
+    placed: &[Placed],
+    output: u32,
+    start: u64,
+    end: u64,
+) -> impl Iterator<Item = &Placed> {
+    let from = placed.partition_point(|p| (p.output, p.target) < (output, start));
+    placed
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(move |p| p.output == output && p.target < end)
+        .filter(|p| p.patch.is_some())
 }
 
 /// The address of the PLT entry `owner` is called through, if it has one.
@@ -252,7 +332,8 @@ pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks)
             }
         }
     }
-    if needed.is_empty() {
+    let sites = aarch64_errata::scan(refs, layout, input.options);
+    if needed.is_empty() && sites.is_empty() {
         return Thunks::default();
     }
     let pool_start = |output: u32| -> u64 {
@@ -264,7 +345,7 @@ pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks)
         let base = size.saturating_sub(previous.size_of(output));
         base.saturating_add(3) & !3
     };
-    Thunks::build(needed, &pool_start)
+    Thunks::build(needed, &pool_start).with_patches(sites, &pool_start)
 }
 
 #[cfg(test)]
@@ -285,6 +366,56 @@ mod tests {
             Some(0x100 + aarch64::THUNK_SIZE)
         );
         assert_eq!(plan.offset_of(2, 0x8000_0000), None);
+    }
+
+    #[test]
+    fn patches_follow_the_thunks_of_their_pool() {
+        let site = |output, address| Site {
+            output,
+            address,
+            section: SectionId::new(0),
+            offset: address,
+        };
+        let plan = Thunks::build(vec![(1, 0x8000_0000)], &|_| 0x100)
+            .with_patches(vec![site(1, 0x10), site(1, 0x20), site(2, 0x30)], &|_| {
+                0x100
+            });
+        assert_eq!(plan.patches[0].offset, 0x100 + aarch64::THUNK_SIZE);
+        assert_eq!(
+            plan.patches[1].offset,
+            0x100 + aarch64::THUNK_SIZE + aarch64::ERRATUM_PATCH_SIZE
+        );
+        assert_eq!(plan.patches[2].offset, 0x100);
+        assert_eq!(
+            plan.size_of(1),
+            aarch64::THUNK_SIZE + 2 * aarch64::ERRATUM_PATCH_SIZE
+        );
+        assert_eq!(plan.patch_bytes(2), aarch64::ERRATUM_PATCH_SIZE);
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn patches_are_not_thunks() {
+        let placed = [
+            Placed {
+                output: 1,
+                target: 0x40,
+                address: 0x200,
+                patch: None,
+            },
+            Placed {
+                output: 1,
+                target: 0x40,
+                address: 0x210,
+                patch: Some((SectionId::new(3), 0x40)),
+            },
+        ];
+        let found: Vec<u64> = patches_in(&placed, 1, 0, 0x100)
+            .map(|p| p.address)
+            .collect();
+        assert_eq!(found, [0x210]);
+        assert_eq!(patches_in(&placed, 1, 0x41, 0x100).count(), 0);
+        assert_eq!(patches_in(&placed, 2, 0, u64::MAX).count(), 0);
     }
 
     #[test]

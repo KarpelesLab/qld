@@ -20,9 +20,9 @@ use crate::macho::read::consts::{
     LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_ID_DYLIB,
     LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_REEXPORT_DYLIB,
     LC_ROUTINES_64, LC_RPATH, LC_SEGMENT_64, LC_SYMTAB, LC_UUID, MH_BINDS_TO_WEAK, MH_BUNDLE,
-    MH_DEAD_STRIPPABLE_DYLIB, MH_DYLDLINK, MH_DYLIB, MH_EXECUTE, MH_HAS_TLV_DESCRIPTORS,
-    MH_MAGIC_64, MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_OBJECT, MH_PIE, MH_TWOLEVEL,
-    MH_WEAK_DEFINES, S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, TOOL_LD,
+    MH_DEAD_STRIPPABLE_DYLIB, MH_DYLDLINK, MH_DYLIB, MH_EXECUTE, MH_FORCE_FLAT,
+    MH_HAS_TLV_DESCRIPTORS, MH_MAGIC_64, MH_NO_REEXPORTED_DYLIBS, MH_NOUNDEFS, MH_OBJECT, MH_PIE,
+    MH_TWOLEVEL, MH_WEAK_DEFINES, S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, TOOL_LD,
 };
 
 use super::buf::{align_up, pad_to, push_name16, push32, push64, to_u64};
@@ -382,6 +382,8 @@ pub fn write_header(input: &HeaderInput<'_>, image: &mut [u8]) -> Result<Option<
     let mut flags = MH_DYLDLINK | commands.extra_flags;
     if !config.flat_namespace {
         flags |= MH_TWOLEVEL;
+    } else if config.force_flat_namespace {
+        flags |= MH_FORCE_FLAT;
     }
     if commands.no_undefs {
         flags |= MH_NOUNDEFS;

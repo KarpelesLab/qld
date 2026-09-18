@@ -205,6 +205,12 @@ fn string_size(text: &[u8]) -> u32 {
 
 /// Builds the export table from the requests and, when nothing is requested,
 /// from every symbol the image defines.
+///
+/// Export names are C names; the symbol an export refers to is the C name
+/// decorated for the machine (`_name` on i386). On i386 an export whose
+/// symbol is not defined may be bound to its stdcall twin (`name` to
+/// `_name@N`, or `name@N` to `_name`), as GNU `ld`'s stdcall fixup does,
+/// with the same warning unless `--enable-stdcall-fixup` was given.
 #[must_use]
 pub fn plan(
     requests: &[ExportRequest],
@@ -213,24 +219,38 @@ pub fn plan(
     resolution: &crate::symbols::Resolution<'_>,
     pe: &PeOptions,
     dll_name: &[u8],
+    diagnostics: &dyn DiagnosticSink,
 ) -> Exports {
+    let machine = pe.target();
     let mut entries: Vec<Export> = Vec::new();
+    let mut fixups = Fixups::default();
     for request in requests {
         if request.private {
             continue;
         }
-        entries.push(Export {
-            name: maybe_kill_at(&request.name, pe.kill_at),
-            symbol: request
-                .forwarder
-                .is_none()
-                .then(|| request.symbol().to_vec()),
+        let symbol = request.forwarder.is_none().then(|| {
+            let wanted = machine.decorate(request.symbol());
+            fixups.resolve(symbols, pe, wanted, diagnostics)
+        });
+        let name = maybe_kill_at(&request.name, pe.kill_at);
+        let alias = stdcall_alias(&name, pe);
+        let export = Export {
+            name,
+            symbol,
             forwarder: request.forwarder.clone(),
             ordinal: request.ordinal.unwrap_or(0),
             noname: request.noname,
             data: request.data,
             private: request.private,
-        });
+        };
+        if let Some(alias) = alias {
+            entries.push(Export {
+                name: alias,
+                ordinal: 0,
+                ..export.clone()
+            });
+        }
+        entries.push(export);
     }
     // GNU ld exports everything a DLL defines when nothing asked for a
     // specific set, and `--export-all-symbols` forces it.
@@ -242,30 +262,51 @@ pub fn plan(
             if definition.kind != DefinitionKind::Regular || !resolution.is_live(definition.file) {
                 continue;
             }
-            let Some(global) = files
-                .get(definition.file.index())
-                .and_then(CoffInput::object)
+            let Some(input) = files.get(definition.file.index()) else {
+                continue;
+            };
+            let Some(global) = input
+                .object()
                 .and_then(|parsed| parsed.globals.get(definition.index as usize))
             else {
                 continue;
             };
-            let name = symbols.name(id).bytes();
+            if is_runtime_input(input) {
+                continue;
+            }
+            let symbol = symbols.name(id).bytes();
+            // An import thunk is not re-exported.
+            let imp = [super::read::IMP_PREFIX, symbol].concat();
+            if symbols
+                .lookup(&SymbolName::new(&imp))
+                .is_some_and(|slot| symbols.definition_kind(slot) == DefinitionKind::Regular)
+            {
+                continue;
+            }
+            let name = machine.undecorate(symbol);
             if is_filtered(name) || pe.exclude_symbols.iter().any(|entry| entry == name) {
                 continue;
             }
             if entries.iter().any(|export| export.name == name) {
                 continue;
             }
-            entries.push(Export {
+            let export = Export {
                 name: maybe_kill_at(name, pe.kill_at),
-                symbol: Some(name.to_vec()),
+                symbol: Some(symbol.to_vec()),
                 forwarder: None,
                 ordinal: 0,
                 noname: false,
                 data: !matches!(global.kind, GlobalKind::Defined { .. })
                     || !is_code(files, definition),
                 private: false,
-            });
+            };
+            if let Some(alias) = stdcall_alias(&export.name, pe) {
+                entries.push(Export {
+                    name: alias,
+                    ..export.clone()
+                });
+            }
+            entries.push(export);
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -280,6 +321,158 @@ pub fn plan(
         entries,
         dll_name: dll_name.to_vec(),
         ordinal_base,
+    }
+}
+
+/// `--add-stdcall-alias`: the undecorated second name of a stdcall or
+/// fastcall export (`foo` for `foo@8` and `@foo@8`).
+fn stdcall_alias(name: &[u8], pe: &PeOptions) -> Option<Vec<u8>> {
+    if !pe.add_stdcall_alias || pe.kill_at {
+        return None;
+    }
+    let killed = super::machine::kill_at(name);
+    (killed != name).then(|| killed.to_vec())
+}
+
+/// GNU `ld`'s stdcall fixup for export symbols, and the warning it gives
+/// the first time.
+#[derive(Default)]
+struct Fixups {
+    warned: bool,
+}
+
+impl Fixups {
+    /// The symbol an export of `wanted` refers to: `wanted` if it is
+    /// defined, or its stdcall twin when the fixup applies.
+    fn resolve(
+        &mut self,
+        symbols: &SymbolTable<'_>,
+        pe: &PeOptions,
+        wanted: Vec<u8>,
+        diagnostics: &dyn DiagnosticSink,
+    ) -> Vec<u8> {
+        if !pe.target().underscores() || pe.enable_stdcall_fixup == Some(false) {
+            return wanted;
+        }
+        let defined = |name: &[u8]| {
+            symbols
+                .lookup(&SymbolName::new(name))
+                .is_some_and(|id| symbols.definition_kind(id) == DefinitionKind::Regular)
+        };
+        if defined(&wanted) {
+            return wanted;
+        }
+        let Some(twin) = stdcall_twin(symbols, &wanted, &defined) else {
+            return wanted;
+        };
+        if pe.enable_stdcall_fixup.is_none() {
+            warn_fixup(&wanted, &twin, &mut self.warned, diagnostics);
+        }
+        twin
+    }
+}
+
+/// The defined stdcall twin of `name`: `_foo` for `_foo@N` and `@foo@N`,
+/// or the first (by name) defined `_foo@N` for `_foo`.
+pub fn stdcall_twin(
+    symbols: &SymbolTable<'_>,
+    name: &[u8],
+    defined: &dyn Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
+    if name.first() == Some(&b'?') {
+        return None;
+    }
+    let lead_at = name.first() == Some(&b'@');
+    let has_at = name.iter().skip(1).any(|&byte| byte == b'@');
+    if lead_at || has_at {
+        let mut cdecl = name.to_vec();
+        if lead_at && let Some(first) = cdecl.first_mut() {
+            *first = b'_';
+        }
+        if let Some(at) = cdecl.iter().position(|&byte| byte == b'@') {
+            cdecl.truncate(at);
+        }
+        return defined(&cdecl).then_some(cdecl);
+    }
+    let mut best: Option<&[u8]> = None;
+    for id in symbols.ids() {
+        let candidate = symbols.name(id).bytes();
+        let Some(rest) = candidate.strip_prefix(name) else {
+            continue;
+        };
+        if rest.first() != Some(&b'@') || !defined(candidate) {
+            continue;
+        }
+        if best.is_none_or(|current| candidate < current) {
+            best = Some(candidate);
+        }
+    }
+    best.map(<[u8]>::to_vec)
+}
+
+/// GNU `ld`'s stdcall fixup warning, with its advice the first time.
+pub fn warn_fixup(from: &[u8], to: &[u8], warned: &mut bool, diagnostics: &dyn DiagnosticSink) {
+    let mut diagnostic = Diagnostic::warning(format!(
+        "resolving {} by linking to {}",
+        String::from_utf8_lossy(from),
+        String::from_utf8_lossy(to)
+    ));
+    if !*warned {
+        diagnostic = diagnostic
+            .note("use --enable-stdcall-fixup to disable these warnings")
+            .note("use --disable-stdcall-fixup to disable these fixups");
+        *warned = true;
+    }
+    diagnostics.emit(diagnostic);
+}
+
+/// Whether an input belongs to the C runtime or a support library, whose
+/// symbols `--export-all-symbols` never exports: GNU `ld`'s
+/// `autofilter_liblist` and `autofilter_objlist`.
+fn is_runtime_input(input: &CoffInput<'_>) -> bool {
+    const LIBRARIES: &[&str] = &[
+        "libcygwin",
+        "libgcc",
+        "libgcc_s",
+        "libstdc++",
+        "libmingw32",
+        "libmingwex",
+        "libg2c",
+        "libsupc++",
+        "libobjc",
+        "libgcj",
+        "libmsvcrt",
+        "libmsvcrt-os",
+        "libucrt",
+        "libucrtbase",
+    ];
+    const OBJECTS: &[&str] = &[
+        "crt0.o",
+        "crt1.o",
+        "crt1u.o",
+        "crt2.o",
+        "crt2u.o",
+        "dllcrt1.o",
+        "dllcrt2.o",
+        "gcrt0.o",
+        "gcrt1.o",
+        "gcrt2.o",
+        "crtbegin.o",
+        "crtend.o",
+    ];
+    let Some(file) = input.file else {
+        return false;
+    };
+    let base = file
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if file.member().is_some() {
+        let stem = base.split('.').next().unwrap_or(base);
+        LIBRARIES.contains(&stem)
+    } else {
+        OBJECTS.contains(&base)
     }
 }
 
@@ -323,22 +516,14 @@ fn assign_ordinals(entries: &mut [Export]) {
     }
 }
 
-/// `--kill-at`: drops the `@N` suffix a stdcall name carries.
+/// `--kill-at`: drops the `@N` suffix a stdcall name carries, and the
+/// leading `@` of a fastcall one.
 fn maybe_kill_at(name: &[u8], kill_at: bool) -> Vec<u8> {
-    if !kill_at {
-        return name.to_vec();
+    if kill_at {
+        super::machine::kill_at(name).to_vec()
+    } else {
+        name.to_vec()
     }
-    let body = name.strip_prefix(b"@").map_or(name, |rest| rest);
-    match body.iter().rposition(|&byte| byte == b'@') {
-        Some(at) if body.get(at.saturating_add(1)..).is_some_and(is_digits) => {
-            body.get(..at).unwrap_or(body).to_vec()
-        }
-        _ => name.to_vec(),
-    }
-}
-
-fn is_digits(text: &[u8]) -> bool {
-    !text.is_empty() && text.iter().all(u8::is_ascii_digit)
 }
 
 /// Whether `--export-all-symbols` skips a name.
@@ -349,6 +534,20 @@ fn is_digits(text: &[u8]) -> bool {
 #[must_use]
 pub fn is_filtered(name: &[u8]) -> bool {
     const EXACT: &[&[u8]] = &[
+        // i386 names, after the leading underscore is dropped.
+        b"DllMain@12",
+        b"DllEntryPoint@0",
+        b"DllMainCRTStartup@12",
+        b"_cygwin_dll_entry@12",
+        b"_cygwin_crt0_common@8",
+        b"_cygwin_noncygwin_dll_entry@12",
+        b"cygwin_attach_dll",
+        b"cygwin_premain0",
+        b"cygwin_premain1",
+        b"cygwin_premain2",
+        b"cygwin_premain3",
+        b"do_pseudo_reloc",
+        b"_NULL_IMPORT_DESCRIPTOR",
         b"DllMain",
         b"DllMainCRTStartup",
         b"DllEntryPoint",

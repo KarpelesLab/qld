@@ -29,6 +29,7 @@ use crate::ids::{FileId, SymbolId};
 use crate::input::FileTable;
 use crate::symbols::{DefinitionKind, SymbolFlags, SymbolName, SymbolTable, resolve_symbols_with};
 
+use super::arm64::Thunks;
 use super::defined;
 use super::directives::{Directives, ExportRequest};
 use super::edata;
@@ -43,10 +44,15 @@ use super::read::consts::{
 };
 use super::reloc::{self, Addresses, Value};
 use super::resolve::{CoffRules, ComdatHook};
+use super::safeseh;
 use super::write::{self, WriteInput};
 
 /// Largest alignment a common symbol gets without `-aligncomm:`.
 const MAX_COMMON_ALIGN: u32 = 16;
+
+/// How many times the image is laid out before the driver gives up on the
+/// generated sizes and thunks settling. lld allows ten thunk passes.
+const MAX_LAYOUT_PASSES: u32 = 12;
 
 /// Links a PE/COFF output described by `options`.
 ///
@@ -87,8 +93,8 @@ pub fn link_with(
     // both of which change what resolution must find.
     let prescan = {
         let empty = InternalNames::default();
-        let table = FileTable::new();
-        let scan = inputs::collect(options, &table, &empty)?;
+        let table = FileTable::for_link(options);
+        let scan = inputs::collect(options, &table, &empty, pe.machine)?;
         let mut directives = Directives::default();
         let mut files = scan.files;
         for file in &mut files {
@@ -115,7 +121,7 @@ pub fn link_with(
     // so their import library members were never extracted. The first
     // attempt finds them; the second links with them as roots.
     for attempt in 0..2u32 {
-        let table = FileTable::new();
+        let table = FileTable::for_link(options);
         let extra = link_once(options, pe, diagnostics, &table, &internal)?;
         if extra.is_empty() {
             return Ok(());
@@ -144,7 +150,7 @@ fn link_once<'a>(
     table: &'a FileTable,
     internal: &'a InternalNames,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut inputs = inputs::collect(options, table, internal)?;
+    let mut inputs = inputs::collect(options, table, internal, pe.machine)?;
     let files = &mut inputs.files;
 
     let rules = CoffRules {
@@ -154,6 +160,7 @@ fn link_once<'a>(
     let mut hook = ComdatHook::default();
     let resolution = resolve_symbols_with(&mut symbols, &rules, files, &mut hook)?;
     let files = &inputs.files;
+    options.check_cancelled()?;
 
     let mut errors = super::resolve::report_conflicts(&hook.table.conflicts, files, diagnostics);
     errors = errors.saturating_add(report_duplicates(&resolution, files, options, diagnostics));
@@ -165,6 +172,9 @@ fn link_once<'a>(
         directives.add_from(file)?;
     }
     let mut aliases = alias_table(&symbols, files, &resolution, &directives);
+    // GNU ld's stdcall fixup binds `_foo@8` to `_foo` and back on i386,
+    // before auto-import looks at what is left.
+    let fixups = stdcall_fixups(&symbols, pe, &mut aliases);
     // Auto-import must be decided before undefined symbols are reported: it
     // is what binds a reference to a DLL's data that was compiled without
     // `__declspec(dllimport)`.
@@ -177,6 +187,12 @@ fn link_once<'a>(
     } else {
         HashMap::default()
     };
+    if pe.enable_stdcall_fixup.is_none() {
+        let mut warned = false;
+        for (from, to) in &fixups {
+            edata::warn_fixup(from, to, &mut warned, diagnostics);
+        }
+    }
     errors = errors.saturating_add(report_undefined(
         &symbols,
         &resolution,
@@ -190,6 +206,7 @@ fn link_once<'a>(
     }
 
     let commons = allocate_commons(&symbols, files, &resolution, &directives);
+    let seh = safeseh::plan(pe, &symbols, files, &resolution)?;
     let emit_relocs = pe.dynamicbase && !pe.disable_reloc_section;
     let output_path = options.output_path();
 
@@ -204,7 +221,15 @@ fn link_once<'a>(
         .implib_dll_name
         .clone()
         .unwrap_or_else(|| edata::default_dll_name(&output_path));
-    let exports = edata::plan(&requests, &symbols, files, &resolution, pe, &dll_name);
+    let exports = edata::plan(
+        &requests,
+        &symbols,
+        files,
+        &resolution,
+        pe,
+        &dll_name,
+        diagnostics,
+    );
     let export_size = exports.size();
     if let Some(path) = &pe.out_implib {
         implib::write(path, &exports, pe.machine)?;
@@ -214,12 +239,17 @@ fn link_once<'a>(
     }
 
     // Lay out, relocate, then lay out again with the real `.reloc` and
-    // pseudo-relocation sizes. Both only grow the end of a section, so the
-    // pass converges in two rounds.
+    // pseudo-relocation sizes, and with the ARM64 range-extension thunks the
+    // relocation pass asked for. The two sizes only grow the end of a
+    // section, so they settle in two rounds; thunks move code, and may push
+    // another branch out of range, so they take as many rounds as it takes
+    // for no branch to ask for a new one.
     let mut reloc_size = 0u32;
     let mut pseudo_size = 0u32;
+    let mut thunks = Thunks::default();
     let mut attempt = 0u32;
     loop {
+        options.check_cancelled()?;
         let mut synthetic: Vec<(Vec<u8>, u32, u32)> = Vec::new();
         if export_size > 0 {
             synthetic.push((b".edata".to_vec(), export_size, 4));
@@ -233,9 +263,11 @@ fn link_once<'a>(
             commons: &commons,
             synthetic: &synthetic,
             pseudo_reloc_size: pseudo_size,
+            thunks: &thunks,
+            safe_seh_size: seh.reserved_size(),
         })?;
         let linker = defined::values(&plan, &symbols, pe.section_alignment);
-        let addresses = Addresses {
+        let mut addresses = Addresses {
             files,
             symbols: &symbols,
             resolution: &resolution,
@@ -246,13 +278,46 @@ fn link_once<'a>(
             aliases: aliases.clone(),
             auto_imported: auto_imported.clone(),
         };
+        // The SafeSEH table's symbols must be known before relocating the
+        // load configuration that refers to them.
+        let seh_table = match &seh {
+            safeseh::Plan::Nothing => None,
+            safeseh::Plan::Zero => {
+                addresses
+                    .linker
+                    .extend(safeseh::symbol_values(&symbols, None, 0));
+                None
+            }
+            safeseh::Plan::Table(handlers) => {
+                let rvas = safeseh::handler_rvas(&addresses, handlers);
+                let at = plan.markers.iter().find_map(|&(marker, section, offset)| {
+                    (marker == layout::Marker::SafeSehTable).then_some((section, offset))
+                });
+                let table = at.and_then(|(section, offset)| {
+                    Some(Value::Address {
+                        rva: plan
+                            .sections
+                            .get(section as usize)?
+                            .rva
+                            .wrapping_add(offset),
+                        section,
+                    })
+                });
+                addresses
+                    .linker
+                    .extend(safeseh::symbol_values(&symbols, table, rvas.len()));
+                at.map(|(section, offset)| (section, offset, safeseh::encode(&rvas)))
+            }
+        };
         let mut generated: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // Export problems are reported once, from the final pass.
+        let export_diagnostics = crate::diag::Collect::new();
         if export_size > 0
             && let Some(section) = plan.by_name(b".edata")
         {
             generated.push((
                 b".edata".to_vec(),
-                exports.render(&addresses, section.rva, diagnostics),
+                exports.render(&addresses, section.rva, &export_diagnostics),
             ));
         }
         let (contents, applied) = write::render(&addresses, &generated);
@@ -265,8 +330,9 @@ fn link_once<'a>(
         let wanted = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
         let wanted_pseudo = u32::try_from(pseudo.len()).unwrap_or(u32::MAX);
         attempt = attempt.saturating_add(1);
-        if (emit_relocs && wanted != reloc_size) || wanted_pseudo != pseudo_size {
-            if attempt > 4 {
+        let more_thunks = thunks.add(&applied.thunk_requests);
+        if (emit_relocs && wanted != reloc_size) || wanted_pseudo != pseudo_size || more_thunks {
+            if attempt > MAX_LAYOUT_PASSES {
                 return Err(Error::Internal(
                     "the generated section sizes did not converge".into(),
                 ));
@@ -276,6 +342,9 @@ fn link_once<'a>(
             continue;
         }
 
+        for diagnostic in export_diagnostics.take_sorted() {
+            diagnostics.emit(diagnostic);
+        }
         let errors = write::report(&applied.errors, diagnostics);
         if errors > 0 && !options.noinhibit_exec {
             return Err(Error::Reported { errors });
@@ -303,6 +372,15 @@ fn link_once<'a>(
             }
         }
 
+        if let Some((section, offset, bytes)) = &seh_table
+            && let Some(data) = contents.get_mut(*section as usize)
+        {
+            let start = *offset as usize;
+            if let Some(slot) = data.get_mut(start..start.saturating_add(bytes.len())) {
+                slot.copy_from_slice(bytes);
+            }
+        }
+
         let symbols = if options.strip >= StripMode::All {
             super::symtab::SymbolTable::default()
         } else {
@@ -311,7 +389,8 @@ fn link_once<'a>(
         let subsystem = subsystem(&addresses, pe);
         let entry = entry_rva(&addresses, options, pe, subsystem, diagnostics);
         let mut directories = write::section_directories(&plan);
-        write::symbol_directories(&addresses, &mut directories);
+        write::symbol_directories(&addresses, pe.target(), &mut directories);
+        write::load_config_size(&plan, pe, subsystem, &contents, &mut directories);
         write::write(
             &WriteInput {
                 addresses: &addresses,
@@ -323,6 +402,7 @@ fn link_once<'a>(
                 generated: &generated,
                 emit_base_relocs: emit_relocs,
                 symbols: &symbols,
+                output: crate::output::OutputOptions::for_link(options),
             },
             &contents,
         )?;
@@ -366,10 +446,19 @@ fn check_supported(options: &LinkOptions, pe: &PeOptions) -> Result<()> {
     if options.kind == OutputKind::Relocatable {
         return unimplemented("-r");
     }
-    if pe.machine != super::read::consts::IMAGE_FILE_MACHINE_AMD64 {
-        return Err(Error::Unimplemented(format!(
-            "PE output for machine {:#x} (roadmap M7: x86-64 first)",
-            pe.machine
+    let machine = super::machine::Machine::from_coff(pe.machine)?;
+    // `--oformat` names a BFD target, which must be this machine's.
+    if let Some(format) = &options.output_format
+        && !machine.bfd_names().contains(&format.as_str())
+    {
+        return Err(Error::Option(format!(
+            "--oformat {format} does not match the {} emulation (expected {})",
+            match machine {
+                super::machine::Machine::Amd64 => "i386pep",
+                super::machine::Machine::I386 => "i386pe",
+                super::machine::Machine::Arm64 => "arm64pe",
+            },
+            machine.bfd_names().join(" or ")
         )));
     }
     if options.gc_sections {
@@ -406,17 +495,15 @@ fn with_libraries(options: &LinkOptions, libraries: &[Vec<u8>]) -> LinkOptions {
 }
 
 /// The symbol the link starts from, used as a resolution root.
+///
+/// `-e` names a COFF symbol as written (`-e _start` on i386); the default
+/// is a C name, decorated for the machine.
 fn entry_symbol(options: &LinkOptions, pe: &PeOptions) -> Vec<u8> {
     if let Some(entry) = &options.entry {
         return entry.as_bytes().to_vec();
     }
-    if pe.dll {
-        return b"DllMainCRTStartup".to_vec();
-    }
-    match pe.subsystem {
-        Some(IMAGE_SUBSYSTEM_WINDOWS_GUI) => b"WinMainCRTStartup".to_vec(),
-        _ => b"mainCRTStartup".to_vec(),
-    }
+    let gui = pe.subsystem == Some(IMAGE_SUBSYSTEM_WINDOWS_GUI);
+    pe.target().default_entry(pe.dll, gui)
 }
 
 /// The subsystem of the image: `--subsystem` if given, otherwise inferred
@@ -425,8 +512,13 @@ fn subsystem(addresses: &Addresses<'_, '_>, pe: &PeOptions) -> u16 {
     if let Some(subsystem) = pe.subsystem {
         return subsystem;
     }
-    let defined = |name: &[u8]| addresses.by_name(name).is_some();
-    let gui = defined(b"WinMain") || defined(b"wWinMain");
+    let machine = pe.target();
+    let defined = |name: &[u8]| addresses.by_name(&machine.decorate(name)).is_some();
+    // `WinMain` is `__stdcall`: `_WinMain@16` on i386.
+    let gui = defined(b"WinMain")
+        || defined(b"wWinMain")
+        || defined(b"WinMain@16")
+        || defined(b"wWinMain@16");
     let console = defined(b"main") || defined(b"wmain");
     if gui && !console {
         IMAGE_SUBSYSTEM_WINDOWS_GUI
@@ -443,16 +535,17 @@ fn entry_rva(
     subsystem: u16,
     diagnostics: &dyn DiagnosticSink,
 ) -> u32 {
+    let machine = pe.target();
     let mut candidates: Vec<Vec<u8>> = Vec::new();
     if let Some(entry) = &options.entry {
         candidates.push(entry.as_bytes().to_vec());
     } else if pe.dll {
-        candidates.push(b"DllMainCRTStartup".to_vec());
+        candidates.push(machine.default_entry(true, false));
     } else if subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI {
-        candidates.push(b"WinMainCRTStartup".to_vec());
-        candidates.push(b"mainCRTStartup".to_vec());
+        candidates.push(machine.default_entry(false, true));
+        candidates.push(machine.default_entry(false, false));
     } else {
-        candidates.push(b"mainCRTStartup".to_vec());
+        candidates.push(machine.default_entry(false, false));
     }
     for name in &candidates {
         if let Some(Value::Address { rva, .. }) = addresses.by_name(name) {
@@ -523,6 +616,47 @@ fn alias_table<'a>(
         }
     }
     aliases
+}
+
+/// GNU `ld`'s stdcall fixup: an undefined `_foo@N` (or `@foo@N`) binds to
+/// a defined `_foo`, and an undefined `_foo` to a defined `_foo@N`.
+///
+/// Only i386 decorates names this way. `--disable-stdcall-fixup` turns
+/// the fixup off; without `--enable-stdcall-fixup` the caller warns about
+/// each one. Returns the `(from, to)` pairs, in symbol order.
+fn stdcall_fixups(
+    symbols: &SymbolTable<'_>,
+    pe: &PeOptions,
+    aliases: &mut HashMap<SymbolId, SymbolId>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut fixed = Vec::new();
+    if !pe.target().underscores() || pe.enable_stdcall_fixup == Some(false) {
+        return fixed;
+    }
+    let defined = |name: &[u8]| {
+        symbols
+            .lookup(&SymbolName::new(name))
+            .is_some_and(|id| symbols.definition_kind(id) == DefinitionKind::Regular)
+    };
+    for id in symbols.ids() {
+        if !is_unresolved(symbols, id)
+            || aliases.contains_key(&id)
+            || !symbols
+                .flags(id)
+                .intersects(SymbolFlags::REFERENCED | SymbolFlags::WEAK_REFERENCED)
+        {
+            continue;
+        }
+        let name = symbols.name(id).bytes();
+        let Some(twin) = edata::stdcall_twin(symbols, name, &defined) else {
+            continue;
+        };
+        if let Some(target) = symbols.lookup(&SymbolName::new(&twin)) {
+            aliases.insert(id, target);
+            fixed.push((name.to_vec(), twin));
+        }
+    }
+    fixed
 }
 
 /// The `__imp_` symbols auto-import needs but that resolution left lazy,
@@ -716,7 +850,9 @@ fn report_undefined(
     options: &LinkOptions,
     diagnostics: &dyn DiagnosticSink,
 ) -> usize {
-    let linker_defined: Vec<&[u8]> = defined::names().collect();
+    let linker_defined: Vec<&[u8]> = defined::names()
+        .chain([safeseh::TABLE_SYMBOL, safeseh::COUNT_SYMBOL])
+        .collect();
     let mut errors = 0usize;
     for undefined in resolution.undefined() {
         let name = undefined.name.bytes();

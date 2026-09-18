@@ -30,10 +30,10 @@ use hashbrown::HashMap;
 use crate::error::{Error, Result};
 use crate::macho::read::consts::{
     S_4BYTE_LITERALS, S_8BYTE_LITERALS, S_16BYTE_LITERALS, S_ATTR_DEBUG, S_ATTR_EXT_RELOC,
-    S_ATTR_LOC_RELOC, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS,
-    S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS, S_THREAD_LOCAL_REGULAR,
-    S_THREAD_LOCAL_VARIABLE_POINTERS, S_THREAD_LOCAL_VARIABLES, S_THREAD_LOCAL_ZEROFILL,
-    S_ZEROFILL, SECTION_TYPE,
+    S_ATTR_LOC_RELOC, S_ATTR_NO_DEAD_STRIP, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS,
+    S_CSTRING_LITERALS, S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS,
+    S_THREAD_LOCAL_REGULAR, S_THREAD_LOCAL_VARIABLE_POINTERS, S_THREAD_LOCAL_VARIABLES,
+    S_THREAD_LOCAL_ZEROFILL, S_ZEROFILL, SECTION_TYPE,
 };
 
 use super::buf::align_up;
@@ -509,42 +509,68 @@ pub fn plan(
                 continue;
             }
             let (segname, sectname) = output_names(section.segname, section.sectname, data_const);
-            let out = builder.get(segname, sectname, section.flags, SectionKind::Input);
-            let Some(out_section) = builder.sections.get_mut(out) else {
-                continue;
-            };
-            // `__objc_imageinfo` is one record, whatever the input count.
-            if sectname == b"__objc_imageinfo" && !out_section.inputs.is_empty() {
-                continue;
-            }
-            out_section.inputs.push((
-                u32::try_from(file_index).unwrap_or(NONE),
-                u32::try_from(section_index).unwrap_or(NONE),
-            ));
-            if members.len() <= out {
-                members.resize_with(out.saturating_add(1), Vec::new);
-            }
-            let Some(list) = members.get_mut(out) else {
-                continue;
-            };
-            for atom in atoms {
-                let mut listed = usize::MAX;
-                let mut cold = false;
-                for &symbol in object.atoms.atom_symbols(atom) {
-                    let Ok(entry) = object.file.symbols().get(symbol) else {
-                        continue;
-                    };
-                    cold |= entry.is_cold_func();
-                    if let Some(&position) = order.get(entry.name) {
-                        listed = listed.min(position);
-                    }
+            // Relative method lists move to `__TEXT,__objc_methlist`.
+            let (moved, atoms): (Vec<usize>, Vec<usize>) = atoms.into_iter().partition(|&atom| {
+                link.objc
+                    .rewrite(link.atom_id(file_index, atom))
+                    .is_some_and(|r| r.method_list)
+            });
+            let mut groups = Vec::with_capacity(2);
+            if !atoms.is_empty() {
+                let out = builder.get(segname, sectname, section.flags, SectionKind::Input);
+                // `__objc_imageinfo` is one record, whatever the input count.
+                if sectname == b"__objc_imageinfo"
+                    && builder
+                        .sections
+                        .get(out)
+                        .is_some_and(|s| !s.inputs.is_empty())
+                {
+                    continue;
                 }
-                let key = if listed == usize::MAX {
-                    (usize::MAX, cold)
-                } else {
-                    (listed, false)
+                groups.push((out, atoms));
+            }
+            if !moved.is_empty() {
+                let out = builder.get(
+                    b"__TEXT",
+                    b"__objc_methlist",
+                    S_REGULAR | S_ATTR_NO_DEAD_STRIP,
+                    SectionKind::Input,
+                );
+                groups.push((out, moved));
+            }
+            for (out, atoms) in groups {
+                let Some(out_section) = builder.sections.get_mut(out) else {
+                    continue;
                 };
-                list.push((key, file_index, atom));
+                out_section.inputs.push((
+                    u32::try_from(file_index).unwrap_or(NONE),
+                    u32::try_from(section_index).unwrap_or(NONE),
+                ));
+                if members.len() <= out {
+                    members.resize_with(out.saturating_add(1), Vec::new);
+                }
+                let Some(list) = members.get_mut(out) else {
+                    continue;
+                };
+                for atom in atoms {
+                    let mut listed = usize::MAX;
+                    let mut cold = false;
+                    for &symbol in object.atoms.atom_symbols(atom) {
+                        let Ok(entry) = object.file.symbols().get(symbol) else {
+                            continue;
+                        };
+                        cold |= entry.is_cold_func();
+                        if let Some(&position) = order.get(entry.name) {
+                            listed = listed.min(position);
+                        }
+                    }
+                    let key = if listed == usize::MAX {
+                        (usize::MAX, cold)
+                    } else {
+                        (listed, false)
+                    };
+                    list.push((key, file_index, atom));
+                }
             }
         }
     }
@@ -593,12 +619,19 @@ pub fn plan(
                 }
                 continue;
             }
-            let align = literals.align(position).unwrap_or(info.align);
+            let rewrite = link.objc.rewrite(id);
+            let align = literals
+                .align(position)
+                .or(rewrite.map(|r| r.align))
+                .unwrap_or(info.align);
+            let size = rewrite.map_or(info.size, |r| {
+                u64::try_from(r.bytes.len()).unwrap_or(u64::MAX)
+            });
             out_section.align = out_section.align.max(align);
             let alignment = 1u64.checked_shl(align).unwrap_or(1);
             let offset = align_up(out_section.size, alignment);
             out_section.size = offset
-                .checked_add(info.size)
+                .checked_add(size)
                 .ok_or_else(|| Error::Limit("output section larger than 2^64".into()))?;
             if let Some(slot) = atom_section.get_mut(id) {
                 *slot = u32::try_from(out).unwrap_or(NONE);
