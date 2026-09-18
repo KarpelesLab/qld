@@ -614,10 +614,15 @@ fn metadata(tools: &Tools, dir: &Path, file: &str) -> String {
     }
     tags.sort();
     out.extend(tags);
+    // `_DYNAMIC` and the symbols GNU ld's default script always defines in
+    // an executable (`_edata`, `__bss_start`, `_end`) are in qld's symbol
+    // table whether or not anything refers to them; lld defines them only
+    // when something does. Everything else must match.
+    let always_defined = ["_DYNAMIC", "_edata", "__bss_start", "_end"];
     let mut sizes: Vec<String> = image
         .symbols
         .iter()
-        .filter(|(_, _, name)| name != "_DYNAMIC")
+        .filter(|(_, _, name)| !always_defined.contains(&name.as_str()))
         .map(|(_, size, name)| format!("sym {name} size {size}"))
         .collect();
     sizes.sort();
