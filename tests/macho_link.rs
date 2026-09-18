@@ -18,6 +18,9 @@
 //! library of `aarch64-apple-darwin` (and runs `x86_64-apple-darwin` too
 //! when that is installed).
 //!
+//! The `-fuse-ld` suite of C, C++ and Objective-C programs (roadmap M8)
+//! is in the [`suite`] module.
+//!
 //! Missing tools make tests skip with a message. With
 //! `QLD_REQUIRE_MACHO_TOOLS=1` (set on the macOS CI runner) a missing tool is
 //! a failure instead.
@@ -35,6 +38,11 @@ use qld::macho::read::consts::{
 };
 use qld::macho::read::{ChainedFixups, MachOFile, Source};
 use qld::output::hash::Sha256;
+
+#[path = "macho_link/suite.rs"]
+mod suite;
+#[path = "macho_link/weak_binding.rs"]
+mod weak_binding;
 
 // ---------------------------------------------------------------------------
 // Helpers
