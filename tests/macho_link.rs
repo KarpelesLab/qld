@@ -402,8 +402,21 @@ fn summarize(file: &Path) -> Option<Summary> {
             let mut parts = l.split_whitespace();
             let _index = parts.next()?.parse::<u32>().ok()?;
             let name = parts.next()?;
-            // Linker-specific extras.
-            (name != "__unwind_info" && name != "__eh_frame").then(|| name.to_owned())
+            // Linker-specific extras: lld's lazy binding for legacy
+            // (`LC_DYLD_INFO_ONLY`) outputs, which qld binds at load time.
+            if matches!(
+                name,
+                "__unwind_info" | "__eh_frame" | "__stub_helper" | "__la_symbol_ptr"
+            ) {
+                return None;
+            }
+            // lld merges the literal sections into one `__literals`; ld64
+            // and qld keep `__literal4`, `__literal8` and `__literal16`.
+            Some(if name.starts_with("__literal") {
+                "__literals".to_owned()
+            } else {
+                name.to_owned()
+            })
         })
         .collect();
     let trie = objdump(&["--macho", "--exports-trie"], file)?;
@@ -1518,6 +1531,192 @@ fn undefined_symbols_are_reported() {
     // BIND_SPECIAL_DYLIB_FLAT_LOOKUP.
     let imports = chained_imports(&bytes);
     assert_eq!(import(&imports, "_missing").lib_ordinal, -2, "{imports:?}");
+}
+
+/// The names of the sections of a Mach-O image, in load command order.
+fn section_names(data: &[u8]) -> Vec<String> {
+    let file = MachOFile::parse(data, Source::new(Path::new("out"))).unwrap();
+    let mut names = Vec::new();
+    for command in file.load_commands() {
+        let command = command.unwrap();
+        if command.cmd == qld::macho::read::consts::LC_SEGMENT_64 {
+            for section in command.segment().unwrap().sections.iter() {
+                names.push(String::from_utf8_lossy(section.sectname).into_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Whether `rustc` has the standard library for `target`.
+fn rust_std_for(target: &str) -> bool {
+    let Ok(output) = Command::new("rustc")
+        .args(["--print", "target-libdir", "--target", target])
+        .output()
+    else {
+        return false;
+    };
+    let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    output.status.success()
+        && std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("libstd-"))
+        })
+}
+
+/// How `rustc` reaches the linker.
+#[derive(Clone, Copy)]
+enum RustLinker<'a> {
+    /// `-C linker=clang -C link-arg=-fuse-ld=<path>`: Apple clang's driver
+    /// runs the linker, as `cargo` does on macOS.
+    Clang(&'a Path),
+    /// `-C linker-flavor=ld64.lld -C linker=<path>`: rustc runs the linker
+    /// itself with an ld64 command line, against `syslibroot()`.
+    Direct(&'a Path),
+}
+
+/// Builds `rust_std.rs` for `target` into `output` with `linker`, and
+/// with `MACOSX_DEPLOYMENT_TARGET=deployment` when given (rustc's default
+/// for arm64 is 11.0, which gets `LC_DYLD_INFO_ONLY`).
+fn rustc_link(
+    target: &str,
+    linker: RustLinker<'_>,
+    deployment: Option<&str>,
+    output: &Path,
+) -> Result<(), String> {
+    let mut command = Command::new("rustc");
+    command
+        .args(["--edition", "2021", "-O", "--target", target])
+        .arg(data_dir().join("rust_std.rs"))
+        .arg("-o")
+        .arg(output)
+        .current_dir(output.parent().unwrap());
+    match linker {
+        RustLinker::Clang(path) => {
+            command
+                .args(["-C", "linker=clang", "-C"])
+                .arg(format!("link-arg=-fuse-ld={}", path.display()));
+        }
+        RustLinker::Direct(path) => {
+            command
+                .args(["-C", "linker-flavor=ld64.lld", "-C"])
+                .arg(format!("linker={}", path.display()))
+                .env("SDKROOT", syslibroot());
+        }
+    }
+    match deployment {
+        Some(version) => command.env("MACOSX_DEPLOYMENT_TARGET", version),
+        None => command.env_remove("MACOSX_DEPLOYMENT_TARGET"),
+    };
+    let result = command.output().map_err(|e| e.to_string())?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&result.stderr).into_owned())
+    }
+}
+
+const RUST_STD_OUTPUT: &str = "\
+threads: [(1, 1), (2, 4), (3, 9), (4, 16)] tls-len 12 main 0
+panics: caught 3 sum 54
+thread panic: true
+words: [(\"the\", 3), (\"brown\", 1), (\"dog\", 1)] pi    3.142 hex 0xff float 1.2345e3
+";
+
+/// A Rust program using threads, `panic=unwind` with `catch_unwind`,
+/// thread-locals, formatting and `HashMap`, linked by qld (M8's exit
+/// criterion for `aarch64-apple-darwin`; `x86_64-apple-darwin` too when
+/// its standard library is installed).
+///
+/// On macOS, rustc links through Apple clang with `-fuse-ld=ld64.qld`, and
+/// the result runs. Elsewhere rustc runs `ld64.qld` directly against the
+/// stub SDK, and the output is compared with `ld64.lld`'s. Both the default
+/// deployment target (legacy dyld info) and 13.0 (chained fixups) are
+/// linked.
+#[test]
+fn rust_binary() {
+    if !cfg!(unix) {
+        eprintln!("skipping rust_binary: needs a symlink to the qld binary");
+        return;
+    }
+    let dir = scratch("rust");
+    let linker = dir.join("ld64.qld");
+    let _ = std::fs::remove_file(&linker);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_qld"), &linker).unwrap();
+    for (target, arch) in [
+        ("aarch64-apple-darwin", "arm64"),
+        ("x86_64-apple-darwin", "x86_64"),
+    ] {
+        if !rust_std_for(target) {
+            // Only arm64 is required on the macOS runner.
+            if arch == "arm64" {
+                skip("rust_binary", &format!("rustc has no std for {target}"));
+            } else {
+                eprintln!("skipping rust_binary for {target}: rustc has no std for it");
+            }
+            continue;
+        }
+        for (deployment, chained) in [(None, false), (Some("13.0"), true)] {
+            let variant = format!("{arch}-{}", deployment.unwrap_or("default"));
+            let out_dir = dir.join(&variant);
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let exe = out_dir.join("rust_std");
+            let how = if cfg!(target_os = "macos") {
+                RustLinker::Clang(&linker)
+            } else {
+                RustLinker::Direct(&linker)
+            };
+            rustc_link(target, how, deployment, &exe)
+                .unwrap_or_else(|e| panic!("{variant}: rustc with qld failed:\n{e}"));
+            let bytes = std::fs::read(&exe).unwrap();
+
+            let file = MachOFile::parse(&bytes, Source::new(&exe)).unwrap();
+            assert_eq!(file.header().file_type, MH_EXECUTE, "{variant}");
+            let commands: Vec<u32> = load_commands(&bytes).iter().map(|c| c.0).collect();
+            assert!(commands.contains(&LC_MAIN), "{variant}");
+            let dyld_info = if chained {
+                LC_DYLD_CHAINED_FIXUPS
+            } else {
+                qld::macho::read::consts::LC_DYLD_INFO_ONLY
+            };
+            assert!(commands.contains(&dyld_info), "{variant}: {commands:x?}");
+            if arch == "arm64" {
+                check_signature(&bytes);
+            }
+            let names = section_names(&bytes);
+            for wanted in [
+                "__thread_vars",
+                "__gcc_except_tab",
+                "__eh_frame",
+                "__unwind_info",
+            ] {
+                assert!(
+                    names.iter().any(|n| n == wanted),
+                    "{variant}: no {wanted} in {names:?}"
+                );
+            }
+            // The personality is reached only from `__eh_frame` CIEs, and
+            // must survive `-dead_strip`.
+            assert!(
+                symbol_address(&bytes, "_rust_eh_personality").is_some(),
+                "{variant}: _rust_eh_personality was dead-stripped"
+            );
+
+            if let Some(lld) = ld64_lld() {
+                let reference = out_dir.join("rust_std-lld");
+                rustc_link(target, RustLinker::Direct(&lld), deployment, &reference)
+                    .unwrap_or_else(|e| panic!("{variant}: rustc with ld64.lld failed:\n{e}"));
+                if let (Some(ours), Some(theirs)) = (summarize(&exe), summarize(&reference)) {
+                    assert_eq!(ours, theirs, "{variant}: qld vs ld64.lld");
+                }
+            }
+            if host_can_run(arch) {
+                assert_eq!(run(&exe).unwrap(), RUST_STD_OUTPUT, "{variant}");
+            }
+        }
+    }
 }
 
 /// Runs the link in `W25_ARGS` (whitespace-separated), for development.

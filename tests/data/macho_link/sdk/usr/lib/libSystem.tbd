@@ -6,10 +6,17 @@ current-version: 1336
 compatibility-version: 1
 reexported-libraries:
   - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
-    libraries:       [ '/usr/lib/system/libdyld.dylib', '/usr/lib/system/libsystem_c.dylib',
+    libraries:       [ '/usr/lib/system/libdyld.dylib',
+                       '/usr/lib/system/libsystem_c.dylib',
                        '/usr/lib/system/libsystem_malloc.dylib',
                        '/usr/lib/system/libsystem_pthread.dylib',
-                       '/usr/lib/system/libsystem_kernel.dylib' ]
+                       '/usr/lib/system/libsystem_kernel.dylib',
+                       '/usr/lib/system/libcommonCrypto.dylib',
+                       '/usr/lib/system/libunwind.dylib',
+                       '/usr/lib/system/libsystem_platform.dylib',
+                       '/usr/lib/system/libcopyfile.dylib',
+                       '/usr/lib/system/libdispatch.dylib',
+                       '/usr/lib/system/libsystem_info.dylib' ]
 exports:
   - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
     symbols:         [ ___crashreporter_info__, _mach_init_routine ]
@@ -23,8 +30,11 @@ parent-umbrella:
     umbrella:        System
 exports:
   - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
-    symbols:         [ __NSGetExecutablePath, __dyld_get_image_name, __tlv_atexit,
-                       __tlv_bootstrap, _dladdr, _dlclose, _dlerror, _dlopen, _dlsym,
+    symbols:         [ __NSGetArgc, __NSGetArgv, __NSGetEnviron,
+                       __NSGetExecutablePath, __dyld_get_image_header,
+                       __dyld_get_image_name, __dyld_get_image_vmaddr_slide,
+                       __dyld_image_count, __tlv_atexit, __tlv_bootstrap,
+                       _dladdr, _dlclose, _dlerror, _dlopen, _dlsym,
                        dyld_stub_binder ]
 --- !tapi-tbd
 tbd-version:     4
@@ -36,10 +46,18 @@ parent-umbrella:
     umbrella:        System
 exports:
   - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
-    symbols:         [ ___stack_chk_fail, ___stack_chk_guard, ___stderrp, ___stdoutp,
-                       _abort, _atexit, _exit, _fflush, _fprintf, _fputs, _getenv,
-                       _memcmp, _memcpy, _memmove, _memset, _printf, _putchar, _puts,
-                       _snprintf, _sprintf, _strcmp, _strcpy, _strlen, _strncmp ]
+    symbols:         [ ___stack_chk_fail, ___stack_chk_guard, ___stderrp,
+                       ___stdoutp, __exit, _abort, _atexit, _clock_gettime,
+                       _closedir, _confstr, _dirfd, _execvp, _exit, _fdopendir,
+                       _fdopendir$INODE64, _fflush, _fprintf, _fputs, _getcwd,
+                       _getenv, _gethostname, _killpg, _mach_error_string,
+                       _mach_wait_until, _memcmp, _memcpy, _memmove, _memset,
+                       _mkfifo, _nanosleep, _opendir, _opendir$INODE64, _pause,
+                       _printf, _putchar, _puts, _readdir_r,
+                       _readdir_r$INODE64, _realpath$DARWIN_EXTSN, _setenv,
+                       _sigaddset, _sigemptyset, _signal, _snprintf, _sprintf,
+                       _strcmp, _strcpy, _strerror_r, _strlen, _strncmp,
+                       _strnlen, _sysconf, _sysctlbyname, _unsetenv ]
 --- !tapi-tbd
 tbd-version:     4
 targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
@@ -50,7 +68,7 @@ parent-umbrella:
     umbrella:        System
 exports:
   - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
-    symbols:         [ _calloc, _free, _malloc, _realloc ]
+    symbols:         [ _calloc, _free, _malloc, _posix_memalign, _realloc ]
     weak-symbols:    [ _malloc_zone_weak_hook ]
 --- !tapi-tbd
 tbd-version:     4
@@ -62,7 +80,18 @@ parent-umbrella:
     umbrella:        System
 exports:
   - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
-    symbols:         [ _pthread_create, _pthread_join, _pthread_self ]
+    symbols:         [ _pthread_attr_destroy, _pthread_attr_init,
+                       _pthread_attr_setstacksize, _pthread_cond_broadcast,
+                       _pthread_cond_destroy, _pthread_cond_signal,
+                       _pthread_cond_timedwait_relative_np, _pthread_cond_wait,
+                       _pthread_create, _pthread_detach,
+                       _pthread_get_stackaddr_np, _pthread_get_stacksize_np,
+                       _pthread_join, _pthread_mutex_destroy,
+                       _pthread_mutex_init, _pthread_mutex_lock,
+                       _pthread_mutex_trylock, _pthread_mutex_unlock,
+                       _pthread_mutexattr_destroy, _pthread_mutexattr_init,
+                       _pthread_mutexattr_settype, _pthread_self,
+                       _pthread_setname_np, _pthread_threadid_np ]
 --- !tapi-tbd
 tbd-version:     4
 targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
@@ -73,5 +102,101 @@ parent-umbrella:
     umbrella:        System
 exports:
   - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
-    symbols:         [ ___error, _close, _getpid, _open, _read, _write ]
+    symbols:         [ ___error, _accept, _bind, _chdir, _chmod, _chown,
+                       _chroot, _close, _close$NOCANCEL, _connect, _dup, _dup2,
+                       _fchmod, _fchown, _fclonefileat, _fcntl, _flock, _fork,
+                       _fsetattrlist, _fstat, _fstat$INODE64, _fstatat,
+                       _fstatat$INODE64, _ftruncate, _getpeereid, _getpeername,
+                       _getpid, _getppid, _getsockname, _getsockopt, _getuid,
+                       _ioctl, _kill, _lchown, _linkat, _listen, _lseek,
+                       _lstat, _lstat$INODE64, _mach_timebase_info, _mkdir,
+                       _mmap, _mprotect, _munmap, _open, _openat, _pipe, _poll,
+                       _posix_spawn_file_actions_adddup2,
+                       _posix_spawn_file_actions_destroy,
+                       _posix_spawn_file_actions_init,
+                       _posix_spawnattr_destroy, _posix_spawnattr_init,
+                       _posix_spawnattr_setflags, _posix_spawnattr_setpgroup,
+                       _posix_spawnattr_setsigdefault, _posix_spawnp, _pread,
+                       _pwrite, _read, _readlink, _readv, _recv, _recvfrom,
+                       _rename, _rmdir, _sched_yield, _send, _sendto,
+                       _setattrlist, _setgid, _setgroups, _setpgid, _setsid,
+                       _setsockopt, _setuid, _shutdown, _sigaction,
+                       _sigaltstack, _socket, _socketpair, _stat,
+                       _stat$INODE64, _symlink, _unlink, _unlinkat, _waitpid,
+                       _write, _writev ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libcommonCrypto.dylib'
+current-version: 60198
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ _CCRandomGenerateBytes ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libunwind.dylib'
+current-version: 1700
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ __Unwind_Backtrace, __Unwind_DeleteException,
+                       __Unwind_GetCFA, __Unwind_GetDataRelBase,
+                       __Unwind_GetIP, __Unwind_GetIPInfo,
+                       __Unwind_GetLanguageSpecificData,
+                       __Unwind_GetRegionStart, __Unwind_GetTextRelBase,
+                       __Unwind_RaiseException, __Unwind_Resume,
+                       __Unwind_SetGR, __Unwind_SetIP ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libsystem_platform.dylib'
+current-version: 306
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ ___bzero, _bzero ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libcopyfile.dylib'
+current-version: 196
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ _copyfile_state_alloc, _copyfile_state_free,
+                       _copyfile_state_get, _fcopyfile ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libdispatch.dylib'
+current-version: 1462.0.4
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ _dispatch_release, _dispatch_semaphore_create,
+                       _dispatch_semaphore_signal, _dispatch_semaphore_wait,
+                       _dispatch_time ]
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/usr/lib/system/libsystem_info.dylib'
+current-version: 583.0.1
+parent-umbrella:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    umbrella:        System
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ _freeaddrinfo, _gai_strerror, _getaddrinfo, _getpwuid_r ]
 ...

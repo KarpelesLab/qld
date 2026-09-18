@@ -106,8 +106,13 @@ pub fn scan(
                             data,
                             &relocation.relocation,
                         )?;
+                        // A dead-stripped personality belongs only to CIEs
+                        // that no kept FDE uses.
                         if let Referent::Global(id) = decoded.referent
                             && reloc::needs(arm64, decoded.r_type).pointer
+                            && link
+                                .symbol_atom(id)
+                                .is_none_or(|atom| link.live.get(atom).copied().unwrap_or(false))
                         {
                             out.push((
                                 id,

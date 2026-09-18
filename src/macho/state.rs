@@ -335,7 +335,7 @@ impl<'a> Link<'a> {
                     let shown = display_name(name, options.demangle);
                     let mut diagnostic = Diagnostic::error(format!("undefined symbol: {shown}"));
                     for file in self.referencing_files(id).into_iter().take(3) {
-                        diagnostic = diagnostic.detail(format!(">>> referenced by {file}"));
+                        diagnostic = diagnostic.detail(format!("referenced by {file}"));
                     }
                     diagnostics.emit(diagnostic);
                     errors = errors.saturating_add(1);
@@ -594,25 +594,39 @@ impl<'a> Link<'a> {
                         }
                     }
                 }
-                // An FDE keeps its function's LSDA alive.
+                // An FDE keeps its function's LSDA and its CIE's personality
+                // alive.
                 if let Some((section, frame)) = super::eh_frame::parse(object)? {
                     let data = object.file.section_data(section)?;
+                    let target = |pointer| match super::eh_frame::pointer_target(
+                        self, file, object, section, data, pointer,
+                    ) {
+                        Ok(Some(super::eh_frame::Target::Place(place))) => atom_of(place),
+                        Ok(Some(super::eh_frame::Target::Got(id, _))) => self.symbol_atom(id),
+                        _ => None,
+                    };
                     for record in &frame.records {
-                        let crate::macho::read::EhFrameKind::Fde(fde) = record.kind else {
+                        let crate::macho::read::EhFrameKind::Fde(fde) = &record.kind else {
                             continue;
                         };
-                        let Some(lsda) = &fde.lsda else {
+                        let Some(function) = target(&fde.pc_begin) else {
                             continue;
                         };
-                        let target = |pointer| match super::eh_frame::pointer_target(
-                            self, file, object, section, data, pointer,
-                        ) {
-                            Ok(Some(super::eh_frame::Target::Place(place))) => atom_of(place),
-                            _ => None,
-                        };
-                        if let (Some(function), Some(lsda)) = (target(&fde.pc_begin), target(lsda))
-                        {
+                        if let Some(lsda) = fde.lsda.as_ref().and_then(target) {
                             edges.push((function, lsda));
+                        }
+                        let personality =
+                            frame
+                                .records
+                                .get(fde.cie_index)
+                                .and_then(|cie| match &cie.kind {
+                                    crate::macho::read::EhFrameKind::Cie(cie) => {
+                                        cie.personality.as_ref().and_then(target)
+                                    }
+                                    crate::macho::read::EhFrameKind::Fde(_) => None,
+                                });
+                        if let Some(personality) = personality {
+                            edges.push((function, personality));
                         }
                     }
                 }
