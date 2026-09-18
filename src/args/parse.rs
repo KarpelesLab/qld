@@ -715,6 +715,7 @@ impl GnuParser {
             }
             Action::ApplyDynamicRelocs(on) => o.apply_dynamic_relocs = on,
             Action::FixCortexA53Erratum843419 => o.fix_cortex_a53_843419 = true,
+            Action::FixCortexA53Erratum835769 => o.aarch64.fix_cortex_a53_835769 = true,
             Action::Z => {
                 let keyword = required(m)?.to_vec();
                 self.apply_z(&keyword)?;
@@ -959,6 +960,8 @@ impl GnuParser {
             ZAction::Ibt => o.x86.ibt = true,
             ZAction::Shstk => o.x86.shstk = true,
             ZAction::IbtPlt => o.x86.ibtplt = true,
+            ZAction::ForceBti => o.aarch64.force_bti = true,
+            ZAction::PacPlt => o.aarch64.pac_plt = true,
             ZAction::CetReport => {
                 o.x86.cet_report = match value {
                     "none" => ReportLevel::None,

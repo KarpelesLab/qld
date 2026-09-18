@@ -67,6 +67,9 @@ enum Chunk {
     Data(u32, u32),
     /// Padding between the contents of a code section: no-op instructions.
     Nop,
+    /// The Cortex-A53 erratum patches of a section: section position,
+    /// index of their block in its data.
+    Patches(u32, u32),
 }
 
 /// Adds no-op padding for the gaps of an executable section that nothing
@@ -227,6 +230,16 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
             }
             Trailer::None => {
                 let position32 = u32::try_from(position).unwrap_or(u32::MAX);
+                // The block of erratum patches starts at the first one.
+                let patches = if section.flags & SHF_EXECINSTR != 0
+                    && arch::aarch64_errata::enabled(input.options)
+                {
+                    arch::thunk::patches_in(&layout.thunks, section.output, 0, u64::MAX)
+                        .map(|p| p.address)
+                        .min()
+                } else {
+                    None
+                };
                 for (index, &(offset, size, _)) in section.fills.iter().enumerate() {
                     if size > 0 {
                         chunks.push((
@@ -238,9 +251,15 @@ pub fn write(input: &WriteInput<'_, '_, '_>) -> Result<()> {
                 for (index, (offset, bytes)) in section.data.iter().enumerate() {
                     let size = u64::try_from(bytes.len()).unwrap_or(0);
                     if size > 0 {
+                        let index = u32::try_from(index).unwrap_or(u32::MAX);
+                        let chunk = if patches == Some(section.addr.wrapping_add(*offset)) {
+                            Chunk::Patches(position32, index)
+                        } else {
+                            Chunk::Data(position32, index)
+                        };
                         chunks.push((
                             ChunkRange::new(section.offset.saturating_add(*offset), size),
-                            Chunk::Data(position32, u32::try_from(index).unwrap_or(u32::MAX)),
+                            chunk,
                         ));
                     }
                 }
@@ -502,6 +521,7 @@ fn write_chunk(input: &WriteInput<'_, '_, '_>, chunk: Chunk, out: &mut [u8]) -> 
             input.context.arch.write_nops(out);
             Ok(())
         }
+        Chunk::Patches(position, index) => write_patches(input, position, index, out),
         Chunk::Data(position, index) => {
             if let Some((_, bytes)) = layout
                 .sections
@@ -851,7 +871,7 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         .unwrap_or_default();
     let range = || Error::Internal("PLT slot out of range".into());
     if !synth.dynamic() {
-        let size = arch.iplt_entry_size();
+        let size = arch.iplt_entry_size(flags);
         let step = usize::try_from(size).unwrap_or(16);
         for (index, entry) in out
             .chunks_exact_mut(step)
@@ -860,7 +880,8 @@ fn write_plt(input: &WriteInput<'_, '_, '_>, out: &mut [u8]) -> Result<()> {
         {
             let stub = base.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(size));
             let slot = addresses.igot_address(index).unwrap_or(0);
-            arch.write_iplt(entry, stub, slot).map_err(|_| range())?;
+            arch.write_iplt(entry, stub, slot, flags)
+                .map_err(|_| range())?;
         }
         return Ok(());
     }
@@ -1312,8 +1333,127 @@ fn dead_target(refs: &Refs<'_, '_>, target: &super::refs::Target) -> Option<Dead
     })
 }
 
-#[allow(clippy::too_many_lines)]
+/// The Cortex-A53 erratum patches of input section `id`, which starts at
+/// `base` and is `len` bytes long, as `(offset of the site, patch address)`.
+fn erratum_patches(
+    input: &WriteInput<'_, '_, '_>,
+    id: SectionId,
+    base: u64,
+    len: usize,
+) -> Vec<(u64, u64)> {
+    if !arch::aarch64_errata::enabled(input.options) {
+        return Vec::new();
+    }
+    let layout = input.addresses.layout;
+    let Some(output) = layout
+        .section_shndx
+        .get(id.index())
+        .and_then(|&shndx| layout.output_of_shndx(shndx))
+    else {
+        return Vec::new();
+    };
+    let end = base.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+    arch::thunk::patches_in(&layout.thunks, output, base, end)
+        .filter_map(|p| match p.patch {
+            Some((section, offset)) if section == id => Some((offset, p.address)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Writes input section `id`: its relocated contents, then the branches to
+/// its Cortex-A53 erratum patches.
 fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) -> Result<()> {
+    relocate_input(input, id, out)?;
+    let base = input.addresses.section_address(id).unwrap_or(0);
+    for (offset, patch) in erratum_patches(input, id, base, out.len()) {
+        let site = base.wrapping_add(offset);
+        let written = crate::arch::aarch64::erratum_branch(site, patch)
+            .ok()
+            .and_then(|branch| {
+                crate::arch::aarch64::write_insn(out, usize::try_from(offset).ok()?, branch)
+            });
+        if written.is_none() {
+            input.diagnostics.emit(Diagnostic::error(format!(
+                "Cortex-A53 erratum patch at {patch:#x} is out of range of {site:#x}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the Cortex-A53 erratum patches of the output section at
+/// `position`, whose block is its data entry `index`: each one is the
+/// relocated instruction it replaces, and a branch back after it.
+fn write_patches(
+    input: &WriteInput<'_, '_, '_>,
+    position: u32,
+    index: u32,
+    out: &mut [u8],
+) -> Result<()> {
+    let addresses = input.addresses;
+    let layout = addresses.layout;
+    let Some(section) = layout.sections.get(position as usize) else {
+        return Ok(());
+    };
+    let Some(&(offset, _)) = section.data.get(index as usize) else {
+        return Ok(());
+    };
+    let start = section.addr.wrapping_add(offset);
+    // The relocated sections are rebuilt here, since their own chunks may
+    // not be written yet; relocation problems are reported by those.
+    let quiet = Collect::new();
+    let scratch_input = WriteInput {
+        diagnostics: &quiet,
+        ..*input
+    };
+    let mut scratch: Option<(SectionId, Vec<u8>)> = None;
+    let patches = arch::thunk::patches_in(&layout.thunks, section.output, 0, u64::MAX);
+    for placed in patches {
+        let Some((id, site_offset)) = placed.patch else {
+            continue;
+        };
+        if scratch.as_ref().is_none_or(|(current, _)| *current != id) {
+            let size = addresses
+                .refs
+                .sections
+                .locate(id)
+                .and_then(|(file, index)| {
+                    let object = addresses.refs.files.get(file)?.object.as_ref()?;
+                    object.section(index).map(|s| s.header.sh_size)
+                })
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(0);
+            let mut bytes = vec![0u8; size];
+            relocate_input(&scratch_input, id, &mut bytes)?;
+            scratch = Some((id, bytes));
+        }
+        let moved = scratch.as_ref().and_then(|(_, bytes)| {
+            crate::arch::aarch64::read_insn(bytes, usize::try_from(site_offset).ok()?)
+        });
+        let words = moved.and_then(|moved| {
+            crate::arch::aarch64::erratum_patch(placed.address, placed.target, moved).ok()
+        });
+        let at = placed
+            .address
+            .checked_sub(start)
+            .and_then(|at| usize::try_from(at).ok());
+        match (words, at) {
+            (Some([first, second]), Some(at)) => {
+                crate::arch::aarch64::write_insn(out, at, first);
+                crate::arch::aarch64::write_insn(out, at.saturating_add(4), second);
+            }
+            _ => input.diagnostics.emit(Diagnostic::error(format!(
+                "Cortex-A53 erratum patch at {:#x} is out of range of {:#x}",
+                placed.address, placed.target
+            ))),
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn relocate_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) -> Result<()> {
     let addresses = input.addresses;
     let refs = &addresses.refs;
     let (file_index, section_index) = refs
@@ -1369,9 +1509,9 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
     let arch = input.context.arch;
     let order = file.position.raw();
     let mut skip = false;
-    let mut relas = relas.iter().peekable();
-    while let Some(rel) = relas.next() {
-        let rel = arch.annotate(rel, relas.peek());
+    let mut pending = relas.iter().peekable();
+    while let Some(rel) = pending.next() {
+        let rel = arch.annotate(rel, pending.peek());
         if skip {
             skip = false;
             continue;
@@ -1623,6 +1763,29 @@ fn write_input(input: &WriteInput<'_, '_, '_>, id: SectionId, out: &mut [u8]) ->
             };
             report(message);
         }
+    }
+    if alloc && arch == Arch::AArch64 && input.context.relax {
+        // AArch64 ADRP relaxations: they look at pairs of relocations, so
+        // they run over the relocated section rather than in the loop.
+        let got_target = |symbol: u32| -> Option<u64> {
+            let target = refs.target(file_index, symbol as usize)?;
+            let flags = target
+                .global
+                .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
+            if target.is_tls() || !reloc::classify_context(&input.context, &target, flags).relax_got
+            {
+                return None;
+            }
+            let (s, a) = addresses.symbol_address(&target, 0)?;
+            Some(s.wrapping_add_signed(a))
+        };
+        // An instruction moved into an erratum patch is no longer half of a
+        // pair.
+        let patched: Vec<u64> = erratum_patches(input, id, base, out.len())
+            .into_iter()
+            .map(|(offset, _)| offset)
+            .collect();
+        arch::aarch64::relax_adrp_pairs(out, relas.iter(), base, &patched, &got_target);
     }
     Ok(())
 }
