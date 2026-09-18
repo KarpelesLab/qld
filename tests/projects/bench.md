@@ -243,6 +243,11 @@ or was slower somewhere:
   threads either way).
 - Reusing the input stage's pool of 16 threads for the rest of the link
   instead of starting a second one: no change.
+- Again (W24 tried it too) one writer thread fed by the rendering workers,
+  so that no worker waits for the inode lock (an `strace` at 8 threads
+  showed 112 ms of thread time in `pwrite` for 30 ms of copying): clang's
+  write lap 44.7 → 50.3 ms at 8 threads, 45.3 → 48.4 at 16; faster only on
+  one thread (191 → 168 ms), by using a second thread.
 
 Not attempted, for later: freeing the inputs' mappings in parallel
 (`madvise(MADV_DONTNEED)`, as mold does) for `--no-fork` and library links;
