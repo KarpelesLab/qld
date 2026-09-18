@@ -40,7 +40,7 @@ use crate::symbols::SymbolFlags;
 
 use super::super::shrink::{self, Rewrite, SectionRelax};
 use super::super::{ApplyError, Class, GotKind, Kind, Width};
-use super::relax::{X0REL, fill_nops};
+use super::relax::{GLOBAL_POINTER, GPREL, X0REL, fill_nops};
 
 /// One input section being written.
 pub struct SectionWrite<'s> {
@@ -592,6 +592,23 @@ impl<'w, 'x, 'a> Writer<'_, 'w, 'x, 'a> {
                     };
                     if let (_, Value::Write(value)) = self.value(rel, place, true) {
                         self.put(out, rel, at, Width::RiscV(field), value);
+                    }
+                    continue;
+                }
+                Some(Rewrite::Retype(GPREL)) => {
+                    let field = if rel.r_type == R_RISCV_LO12_S {
+                        insn::Field::GpRelS
+                    } else {
+                        insn::Field::GpRelI
+                    };
+                    let gp = addresses
+                        .refs
+                        .symbols
+                        .lookup(&crate::symbols::SymbolName::new(GLOBAL_POINTER))
+                        .and_then(|id| addresses.globals.get(id.index()).copied())
+                        .unwrap_or(0);
+                    if let (_, Value::Write(value)) = self.value(rel, place, true) {
+                        self.put(out, rel, at, Width::RiscV(field), value.wrapping_sub(gp));
                     }
                     continue;
                 }

@@ -204,6 +204,8 @@ struct Image {
     data: Vec<u8>,
     sections: Vec<Section>,
     tls: bool,
+    /// The value of `__global_pointer$`, which `gp` holds.
+    gp: Option<u64>,
     symbols: Vec<(u64, u64, String)>,
     tls_symbols: Vec<(u64, u64, String)>,
     plt: BTreeMap<u64, String>,
@@ -312,10 +314,15 @@ impl Image {
             };
             dynrel.entry(place).or_insert(format!("{kind} {what}"));
         }
+        let gp = symbols
+            .iter()
+            .find(|(_, _, name)| name == "__global_pointer$")
+            .map(|(value, _, _)| *value);
         Self {
             data,
             sections,
             tls,
+            gp,
             symbols,
             tls_symbols,
             plt,
@@ -516,6 +523,14 @@ fn listing(tools: &Tools, dir: &Path, file: &str) -> String {
                     rest(ops.len() - 1),
                     image.tls_symbolize(offset)
                 )
+            } else if base == "gp"
+                && let Some(gp) = image.gp
+            {
+                format!(
+                    "{op} {} {}",
+                    rest(ops.len() - 1),
+                    image.symbolize(gp.wrapping_add(offset as u64), true)
+                )
             } else {
                 format!("{op} {}", ops.join(", "))
             };
@@ -530,6 +545,14 @@ fn listing(tools: &Tools, dir: &Path, file: &str) -> String {
                 format!("{op} {} {}", ops[0], image.symbolize(target, true))
             } else if ops[1] == "tp" && image.tls {
                 format!("{op} {} {}", ops[0], image.tls_symbolize(offset))
+            } else if ops[1] == "gp"
+                && let Some(gp) = image.gp
+            {
+                format!(
+                    "{op} {} {}",
+                    ops[0],
+                    image.symbolize(gp.wrapping_add(offset as u64), true)
+                )
             } else {
                 format!("{op} {}", ops.join(", "))
             };
@@ -1279,4 +1302,66 @@ fn other_output_kinds_match_lld() {
     );
     let (lld, ours) = link_both(tools, &dir, "partial", &["-static", "partial.o", "far.o"]);
     assert_same(tools, &dir, &lld, &ours);
+}
+
+const SMALL_DATA_C: &str = r#"
+int counter = 1;
+short flags = 2;
+static int hidden_total;
+long big_table[512];
+int small_array[2];
+int bump(int x) { counter += x; hidden_total += flags; return counter + small_array[1]; }
+long peek(int i) { return big_table[i]; }
+void _start(void) {
+  __asm__ volatile(".option push\n.option norelax\nlla gp, __global_pointer$\n.option pop");
+  long r = bump(3) + peek(7) + hidden_total;
+  for (;;) __asm__ volatile("" :: "r"(r));
+}
+"#;
+
+#[test]
+fn global_pointer_relaxation_matches_lld() {
+    let tools = require!();
+    let dir = scratch("gp");
+    compile(
+        tools,
+        &dir,
+        "small.c",
+        SMALL_DATA_C,
+        "small.o",
+        &["-fno-pic", "-mcmodel=medlow", "-msmall-data-limit=8"],
+    );
+    for (name, args) in [
+        ("default", &["-static", "small.o"][..]),
+        (
+            "no-relax",
+            &["-static", "--relax-gp", "--no-relax", "small.o"],
+        ),
+    ] {
+        let (lld, ours) = link_both(tools, &dir, name, args);
+        assert_same(tools, &dir, &lld, &ours);
+    }
+    // With `--relax-gp`, `lui` + `%lo` pairs of data within 2 KiB of
+    // `__global_pointer$` become `gp`-relative accesses to the same
+    // variables. Which variables are that close depends on where each
+    // linker puts `.sbss`, so the relaxed code is checked against the
+    // unrelaxed one rather than against lld's.
+    let (_, ours) = link_both(
+        tools,
+        &dir,
+        "relax-gp",
+        &["-static", "--relax-gp", "small.o"],
+    );
+    let without_lui = |file: &str| {
+        listing(tools, &dir, file)
+            .lines()
+            .filter(|l| !l.starts_with("  lui ") && !l.starts_with("  c.j "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(without_lui(&ours), without_lui("default.qld"));
+    let objdump = run_ok(&dir, &tools.objdump, &["-d", &ours]);
+    assert!(objdump.contains("(gp)"), "{objdump}");
+    let lui = |file: &str| listing(tools, &dir, file).matches("  lui ").count();
+    assert!(lui(&ours) < lui("default.qld"));
 }

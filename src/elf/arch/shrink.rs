@@ -453,6 +453,9 @@ pub struct Pass<'p, 'x, 'a> {
     pub relax: bool,
     /// The thread pointer, when there is a TLS segment.
     pub tp: Option<u64>,
+    /// A global pointer register's value the architecture may relax
+    /// accesses against (RISC-V `--relax-gp`: `__global_pointer$`).
+    pub gp: Option<u64>,
     /// The edits this pass's layout was computed with.
     pub previous: &'p Relaxation,
     /// The pass number, from 0.
@@ -642,6 +645,12 @@ fn relax_pass<'a>(
         },
         relax: input.options.relax,
         tp: layout.tls.map(|tls| tls.tp(arch)),
+        gp: match arch {
+            Arch::RiscV64 if input.options.relax_gp => {
+                super::riscv::relax::global_pointer(input, layout)
+            }
+            _ => None,
+        },
         previous: &layout.relax,
         pass,
     };

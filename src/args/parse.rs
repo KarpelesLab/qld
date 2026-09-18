@@ -656,6 +656,7 @@ impl GnuParser {
             Action::EmitRelocs => o.emit_relocs = true,
             Action::Magic(mode) => o.magic = mode,
             Action::Relax(on) => o.relax = on,
+            Action::RelaxGp(on) => o.relax_gp = on,
             Action::ImageBase => o.image_base = Some(integer(m)?),
             Action::SectionStart => {
                 let spec = text(m)?;

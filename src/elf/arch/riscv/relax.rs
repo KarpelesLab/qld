@@ -11,7 +11,9 @@
 //! - a local-exec access whose offset fits 12 bits loses its `lui` and
 //!   `add` and addresses `tp` directly;
 //! - a `lui` of an absolute address that fits 12 bits goes away and the
-//!   access uses `x0` (no global-pointer relaxation: lld's default);
+//!   access uses `x0`; with `--relax-gp` (off by default, as in lld; GNU
+//!   ld relaxes by default), one within 2 KiB of `__global_pointer$` uses
+//!   `gp`;
 //! - in an executable, a TLS descriptor sequence loses the instructions its
 //!   local-exec or initial-exec form does not need.
 //!
@@ -21,8 +23,12 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::arch::riscv::{self as insn, C_J, JAL, TP, fits_signed, hi20};
+use crate::elf::layout::{Layout, LayoutInput};
 use crate::elf::read::consts::riscv::*;
+use crate::elf::refs::Def;
+use crate::elf::sections::NONE;
 use crate::error::Result;
+use crate::symbols::SymbolName;
 
 use super::super::TlsMode;
 use super::super::shrink::{Edits, Pass, Rewrite, SectionInput};
@@ -35,6 +41,57 @@ const FREE_PASSES: u32 = 4;
 /// The internal relocation type of a `%lo` access relaxed to `x0` (lld's
 /// `INTERNAL_R_RISCV_X0REL_*`; the original type tells I from S).
 pub const X0REL: u32 = 0x100;
+/// The internal relocation type of a `%lo` access relaxed to `gp`.
+pub const GPREL: u32 = 0x101;
+
+/// The name of the global pointer symbol.
+pub const GLOBAL_POINTER: &[u8] = b"__global_pointer$";
+
+/// The value of `__global_pointer$` in `layout`, when something defines it
+/// (lld relaxes against it only then).
+#[must_use]
+pub fn global_pointer(input: &LayoutInput<'_, '_>, layout: &Layout<'_>) -> Option<u64> {
+    let refs = &input.refs;
+    let id = refs.symbols.lookup(&SymbolName::new(GLOBAL_POINTER))?;
+    match refs.global_target(id, true).def {
+        Def::Section {
+            file,
+            section,
+            value,
+        } => {
+            let sid = refs.sections.id(file, section)?;
+            (layout.section_shndx.get(sid.index()).copied().unwrap_or(0) != 0).then(|| {
+                layout
+                    .section_addr
+                    .get(sid.index())
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_add(layout.relax.map(sid, value))
+            })
+        }
+        Def::Absolute(value) => Some(value),
+        // Linker-defined: by a script, or by qld (0x800 past `.sdata`).
+        Def::Linker(_) => match layout
+            .script_symbols
+            .iter()
+            .find(|s| s.name.as_slice() == GLOBAL_POINTER && s.defined)
+        {
+            Some(symbol) => Some(symbol.value),
+            None => Some(
+                input
+                    .placement
+                    .outputs
+                    .iter()
+                    .position(|o| o.name == b".sdata")
+                    .and_then(|i| layout.output_places.get(i))
+                    .filter(|place| place.2 != NONE)
+                    .map_or(layout.base, |place| place.0)
+                    .wrapping_add(0x800),
+            ),
+        },
+        _ => None,
+    }
+}
 
 /// The edits of one section in pass `pass`.
 ///
@@ -163,14 +220,24 @@ pub fn decide(pass: &Pass<'_, '_, '_>, section: &SectionInput<'_, '_>) -> Result
                 }
             }
             R_RISCV_HI20 | R_RISCV_LO12_I | R_RISCV_LO12_S if relaxable => {
-                if let Some(value) = target(false)
-                    && fits_signed(value as i64, 12)
-                {
+                let value = target(false);
+                let internal = match value {
+                    Some(value) if fits_signed(value as i64, 12) => Some(X0REL),
+                    Some(value)
+                        if pass
+                            .gp
+                            .is_some_and(|gp| fits_signed(value.wrapping_sub(gp) as i64, 12)) =>
+                    {
+                        Some(GPREL)
+                    }
+                    _ => None,
+                };
+                if let Some(internal) = internal {
                     if rel.r_type == R_RISCV_HI20 {
                         remove = 4;
                         rewrite = Some(Rewrite::Delete);
                     } else {
-                        rewrite = Some(Rewrite::Retype(X0REL));
+                        rewrite = Some(Rewrite::Retype(internal));
                     }
                 }
             }
