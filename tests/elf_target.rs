@@ -104,8 +104,16 @@ fn assert_incompatible(output: &Output, with: &str) {
 }
 
 fn aarch64_gcc() -> Option<PathBuf> {
-    if cfg!(target_arch = "aarch64") {
-        return in_path("gcc");
+    // The host's own `gcc` only on an AArch64 Linux host: on macOS it is
+    // Apple clang, which drives ld64.
+    if cfg!(target_arch = "aarch64")
+        && let Some(gcc) = in_path("gcc")
+        && Command::new(&gcc)
+            .arg("-dumpmachine")
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("linux"))
+    {
+        return Some(gcc);
     }
     in_path("aarch64-linux-gnu-gcc").or_else(|| in_path("aarch64-unknown-linux-gnu-gcc"))
 }
