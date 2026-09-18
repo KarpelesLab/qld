@@ -76,6 +76,22 @@ impl Addresses<'_, '_> {
         }
     }
 
+    /// The address of this image's own definition of an exported weak
+    /// symbol that references bind through weak lookup.
+    #[must_use]
+    pub fn weak_definition(&self, id: SymbolId) -> Option<u64> {
+        self.weak_import(id)?;
+        match self.link.defs.get(id.index())? {
+            SymbolDef::Object { file, symbol } => {
+                match self.object_symbol(usize::try_from(*file).ok()?, *symbol)? {
+                    Value::Address(address) | Value::Absolute(address) => Some(address),
+                    Value::Import(..) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The value of a global symbol: an address, an absolute value, or an
     /// import.
     #[must_use]

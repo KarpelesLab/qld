@@ -319,6 +319,16 @@ Who works where, and which files each task owns, is in
 - **Teardown**: the CLI exits without dropping the link state, as mold and
   lld do. The library API frees everything in the normal way.
 
+## In-memory inputs and outputs
+
+The file table (`src/input/table.rs`) asks `LinkOptions::input_provider` for
+a path before reading the disk, and `InputKind::Bytes` inputs skip mapping
+entirely. `OutputOptions::for_link` (`src/output/file.rs`) carries the
+optional `OutputBuffer` capture and the `CancelToken`: with a capture, the
+finished image is handed to the buffer instead of being written to a file.
+`LinkOptions::check_cancelled` runs between stages, per file while loading
+inputs, and per chunk while writing.
+
 ## Process model
 
 The `qld` binary forks by default on Unix (`src/main.rs`): the parent parses

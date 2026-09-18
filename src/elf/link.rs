@@ -98,7 +98,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     let mut internal = InternalNames::new(options);
     prepared.add_internal_names(&mut internal.names);
     let script = prepared.script.as_ref();
-    let table = FileTable::new();
+    let table = FileTable::for_link(options);
     let config = ParseConfig {
         strip_debug: options.strip >= StripMode::Debug,
         wrap: &wrap,
@@ -125,6 +125,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         narrow.run(|| inputs::collect(options, &table, &internal, config))?
     };
     lap("inputs");
+    options.check_cancelled()?;
 
     let threads = input_sized_threads(options, &table, own_pools);
     if own_pools
@@ -342,6 +343,7 @@ fn link_inputs<'a>(
     let files = &inputs.files;
     narrow.run(|| dso::bind_unextracted(files, &symbols, &resolution));
     lap("resolution");
+    options.check_cancelled()?;
 
     let mut sections = narrow.run(|| Sections::new(files, &resolution))?;
     let relocatable = options.kind == OutputKind::Relocatable;
@@ -439,6 +441,7 @@ fn link_inputs<'a>(
         )
     })?;
     lap("placement");
+    options.check_cancelled()?;
 
     let mut eh_frames = narrow.run(|| ehframe::split(files, &sections))?;
     if options.gc_sections {
@@ -467,6 +470,7 @@ fn link_inputs<'a>(
             .retain(|s| sections.live.get(s.id.index()).copied().unwrap_or(false));
         narrow.run(|| placement.compute_flags(files, &sections));
         lap("gc");
+        options.check_cancelled()?;
     }
 
     let refs = Refs {
@@ -536,10 +540,12 @@ fn link_inputs<'a>(
         return Err(Error::Reported { errors });
     }
     lap("scan");
+    options.check_cancelled()?;
 
     let commons = narrow.run(|| common::allocate(&refs));
     let merged = merged?;
     lap("merge");
+    options.check_cancelled()?;
     let icf_mode = match options.icf.as_deref() {
         Some("all") => Some(IcfMode::All),
         Some("safe") => Some(IcfMode::Safe),
@@ -556,6 +562,7 @@ fn link_inputs<'a>(
         )?;
         sections.apply_folding(fold_into);
         lap("icf");
+        options.check_cancelled()?;
     }
     let refs = Refs {
         files,
@@ -623,6 +630,7 @@ fn link_inputs<'a>(
     synth.verneed_count = dynamic.verneed_count;
     synth.verdef_count = dynamic.verdef_count;
     lap("dynamic");
+    options.check_cancelled()?;
 
     let plan = narrow.run(|| symtab::plan(&refs, &linker, options));
     let trailers = TrailerSizes {
@@ -703,6 +711,7 @@ fn link_inputs<'a>(
         }
     }
     lap("layout");
+    options.check_cancelled()?;
 
     let mut plan = plan;
     plan.add_section_symbols(layout.section_symbols as usize);
@@ -783,6 +792,7 @@ fn link_inputs<'a>(
             })?;
         }
         lap("compress");
+        options.check_cancelled()?;
     }
 
     let addresses = narrow.run(|| {
@@ -866,6 +876,7 @@ fn link_relocatable<'a>(
             }
         }
         lap("gc");
+        options.check_cancelled()?;
     }
     let refs = Refs {
         files,
