@@ -397,7 +397,7 @@ struct Candidate {
 }
 
 /// The live code sections with relocations, in section ID order.
-fn candidates(input: &LayoutInput<'_, '_>) -> Vec<Candidate> {
+fn candidates<F: crate::elf::read::ElfFormat>(input: &LayoutInput<'_, '_, F>) -> Vec<Candidate> {
     let refs = &input.refs;
     let per_file: Vec<Vec<Candidate>> = refs
         .files
@@ -441,9 +441,9 @@ fn candidates(input: &LayoutInput<'_, '_>) -> Vec<Candidate> {
 ///
 /// Errors from `inner` and from the architecture's decisions (malformed
 /// alignment padding), and [`Error::Internal`] when no fixpoint is reached.
-pub fn layout<'a>(
-    input: &LayoutInput<'_, 'a>,
-    inner: &dyn Fn(&LayoutInput<'_, 'a>) -> Result<Layout<'a>>,
+pub fn layout<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
+    inner: &dyn Fn(&LayoutInput<'_, 'a, F>) -> Result<Layout<'a>>,
 ) -> Result<Layout<'a>> {
     let candidates = candidates(input);
     let mut state = Relaxation::default();
@@ -456,7 +456,7 @@ pub fn layout<'a>(
     }
     // Relocations are read, and their targets resolved, once; each pass
     // only recomputes addresses.
-    let prepared: Vec<Result<Option<SectionInput<'_, 'a>>>> = candidates
+    let prepared: Vec<Result<Option<SectionInput<'_, 'a, F>>>> = candidates
         .par_iter()
         .map(|candidate| prepare(input, *candidate))
         .collect();
@@ -482,11 +482,11 @@ pub fn layout<'a>(
 }
 
 /// What the architecture's decisions can look up in one pass.
-pub struct Pass<'p, 'x, 'a> {
+pub struct Pass<'p, 'x, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Addresses with the layout of this pass (symbol values follow the
     /// edits it was laid out with; global symbols are looked up by
     /// definition, so [`Addresses::globals`] is empty).
-    pub addresses: Addresses<'x, 'a>,
+    pub addresses: Addresses<'x, 'a, F>,
     /// Relocation decision context.
     pub context: Context,
     /// `--relax`: relaxation marks may be acted on. Alignment is honored
@@ -503,7 +503,7 @@ pub struct Pass<'p, 'x, 'a> {
     pub pass: u32,
 }
 
-impl Pass<'_, '_, '_> {
+impl<F: crate::elf::read::ElfFormat> Pass<'_, '_, '_, F> {
     /// Where relocation target `symbol` of `file` (plus `addend`) is, in a
     /// form that stays valid across passes: through its PLT entry or IFUNC
     /// stub when `branch` says the relocation is a call.
@@ -513,7 +513,7 @@ impl Pass<'_, '_, '_> {
         let Some(target) = refs.target(file, symbol as usize) else {
             return Place::Unknown;
         };
-        let owner = Addresses::owner(&target, file, symbol);
+        let owner = Addresses::<F>::owner(&target, file, symbol);
         if branch {
             if target.is_ifunc() && addresses.iplt_address(owner).is_some() {
                 return Place::Iplt { owner, addend };
@@ -635,15 +635,15 @@ impl Pass<'_, '_, '_> {
 }
 
 /// One code section, prepared for the architecture's decisions.
-pub struct SectionInput<'s, 'a> {
+pub struct SectionInput<'s, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// The section.
     pub id: SectionId,
     /// Its file, by index.
     pub file: usize,
     /// The file.
-    pub input: &'s ElfInput<'a>,
+    pub input: &'s ElfInput<'a, F>,
     /// The parsed object.
-    pub object: &'s ObjectInput<'a>,
+    pub object: &'s ObjectInput<'a, F>,
     /// The section header.
     pub section: &'s InputSection<'a>,
     /// Its contents.
@@ -659,12 +659,12 @@ pub struct SectionInput<'s, 'a> {
     targets: Vec<OnceCell<Place>>,
 }
 
-impl SectionInput<'_, '_> {
+impl<F: crate::elf::read::ElfFormat> SectionInput<'_, '_, F> {
     /// `S + A` of the relocation at position `seq` in this pass, through
     /// its PLT entry or IFUNC stub when `branch` says it is a call. `None`
     /// when the address is not known (such relocations are not relaxed).
     #[must_use]
-    pub fn target(&self, pass: &Pass<'_, '_, '_>, seq: u32, branch: bool) -> Option<u64> {
+    pub fn target(&self, pass: &Pass<'_, '_, '_, F>, seq: u32, branch: bool) -> Option<u64> {
         let rel = self.relocs.get(seq as usize)?;
         let place = *self
             .targets
@@ -711,9 +711,9 @@ impl Edits {
     }
 
     /// Records the edit of the relocation at position `seq`.
-    pub fn push(
+    pub fn push<F: crate::elf::read::ElfFormat>(
         &mut self,
-        section: &SectionInput<'_, '_>,
+        section: &SectionInput<'_, '_, F>,
         seq: u32,
         offset: u64,
         remove: u32,
@@ -733,10 +733,10 @@ impl Edits {
 
 /// Decides every candidate's edits against `layout`, whose `relax` holds
 /// the edits it was laid out with.
-fn relax_pass<'a>(
-    input: &LayoutInput<'_, 'a>,
+fn relax_pass<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
     layout: &Layout<'a>,
-    sections: &mut [SectionInput<'_, 'a>],
+    sections: &mut [SectionInput<'_, 'a, F>],
     pass: u32,
 ) -> Result<Relaxation> {
     let commons = Commons::default();
@@ -756,6 +756,7 @@ fn relax_pass<'a>(
             relax: input.options.relax,
             copy_relocs: input.options.copy_relocs,
             arch,
+            weak_zero: Context::weak_zero(arch, input.mode),
         },
         relax: input.options.relax,
         tp: layout.tls.map(|tls| tls.tp(arch)),
@@ -787,10 +788,10 @@ fn relax_pass<'a>(
 
 /// Reads candidate section `candidate` for the passes: its relocations
 /// in processing order and its contents.
-fn prepare<'s, 'a>(
-    input: &'s LayoutInput<'_, 'a>,
+fn prepare<'s, 'a, F: crate::elf::read::ElfFormat>(
+    input: &'s LayoutInput<'_, 'a, F>,
     candidate: Candidate,
-) -> Result<Option<SectionInput<'s, 'a>>> {
+) -> Result<Option<SectionInput<'s, 'a, F>>> {
     let Some(file) = input.refs.files.get(candidate.file) else {
         return Ok(None);
     };
@@ -838,9 +839,9 @@ fn prepare<'s, 'a>(
     }))
 }
 
-fn relax_section(
-    pass: &Pass<'_, '_, '_>,
-    section: &mut SectionInput<'_, '_>,
+fn relax_section<F: crate::elf::read::ElfFormat>(
+    pass: &Pass<'_, '_, '_, F>,
+    section: &mut SectionInput<'_, '_, F>,
 ) -> Result<Option<SectionRelax>> {
     let layout = pass.addresses.layout;
     let index = section.id.index();
@@ -867,7 +868,10 @@ pub fn applies(arch: Arch) -> bool {
 }
 
 /// The architecture's edits of one section.
-fn decide(pass: &Pass<'_, '_, '_>, section: &SectionInput<'_, '_>) -> Result<Edits> {
+fn decide<F: crate::elf::read::ElfFormat>(
+    pass: &Pass<'_, '_, '_, F>,
+    section: &SectionInput<'_, '_, F>,
+) -> Result<Edits> {
     match pass.context.arch {
         Arch::RiscV64 => super::riscv::relax::decide(pass, section),
         _ => Ok(Edits::default()),

@@ -22,7 +22,7 @@ use crate::elf::read::consts::{
     SHN_ABS, SHN_UNDEF, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_NOTYPE, STT_OBJECT,
     STT_SECTION, STT_TLS, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL,
 };
-use crate::elf::read::{RawSymbol, SectionIndex};
+use crate::elf::read::{ElfFormat, ElfKind, RawRecord, RawSymbol, SectionIndex};
 use crate::ids::SymbolId;
 use crate::symbols::{DefinitionKind, SymbolFlags};
 
@@ -32,9 +32,6 @@ use super::dynsym::shndx_of_address;
 use super::export::PREEMPTIBLE;
 use super::refs::{Def, Refs};
 use super::values::Addresses;
-
-/// Size of one symbol table entry.
-pub const SYM_SIZE: usize = 24;
 
 /// Which symbols the output table holds.
 #[derive(Debug, Default)]
@@ -72,6 +69,8 @@ pub struct SymtabPlan {
     pub strtab_size: usize,
     /// Section symbols at the start of the table (`--emit-relocs`).
     pub section_symbols: usize,
+    /// The ELF class and byte order entries are written in.
+    pub kind: ElfKind,
 }
 
 fn keep_local(name: &[u8], raw: &RawSymbol, discard: DiscardMode) -> bool {
@@ -85,7 +84,11 @@ fn keep_local(name: &[u8], raw: &RawSymbol, discard: DiscardMode) -> bool {
     }
 }
 
-fn global_visibility(refs: &Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) -> u8 {
+fn global_visibility<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    linker: &LinkerSymbols,
+    id: SymbolId,
+) -> u8 {
     let target = refs.global_target(id, true);
     if let Def::Linker(_) = target.def {
         return match linker.entries.iter().find(|(i, _)| *i == id) {
@@ -97,7 +100,9 @@ fn global_visibility(refs: &Refs<'_, '_>, linker: &LinkerSymbols, id: SymbolId) 
 }
 
 /// Whether an input has a `STT_FILE` symbol.
-pub(crate) fn has_file_symbol(object: &super::object::ObjectInput<'_>) -> bool {
+pub(crate) fn has_file_symbol<F: crate::elf::read::ElfFormat>(
+    object: &super::object::ObjectInput<'_, F>,
+) -> bool {
     let symbols = object.elf.symbols();
     (1..object.first_global).any(|index| {
         symbols
@@ -109,7 +114,9 @@ pub(crate) fn has_file_symbol(object: &super::object::ObjectInput<'_>) -> bool {
 /// The name GNU ld gives the `STT_FILE` symbol it adds for an input without
 /// one: the file name without directories (for an archive member, the
 /// member's).
-pub(crate) fn file_symbol_name(file: &super::inputs::ElfInput<'_>) -> Option<Vec<u8>> {
+pub(crate) fn file_symbol_name<F: crate::elf::read::ElfFormat>(
+    file: &super::inputs::ElfInput<'_, F>,
+) -> Option<Vec<u8>> {
     let input = file.file?;
     let name: &[u8] = match input.member() {
         Some(member) => member.as_bytes(),
@@ -121,10 +128,10 @@ pub(crate) fn file_symbol_name(file: &super::inputs::ElfInput<'_>) -> Option<Vec
 
 /// Which local symbols of `file` the relocations of its live sections
 /// name, by symbol index.
-fn referenced_locals(
-    refs: &Refs<'_, '_>,
+fn referenced_locals<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     file_index: usize,
-    object: &super::object::ObjectInput<'_>,
+    object: &super::object::ObjectInput<'_, F>,
 ) -> Vec<bool> {
     let mut referenced = vec![false; object.first_global];
     for (index, section) in object.sections.iter().enumerate() {
@@ -165,9 +172,17 @@ fn live_import(flags: SymbolFlags) -> bool {
 
 /// Plans the symbol table. Returns an empty plan for `-s`.
 #[must_use]
-pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) -> SymtabPlan {
+pub fn plan<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    linker: &LinkerSymbols,
+    options: &LinkOptions,
+    kind: ElfKind,
+) -> SymtabPlan {
     if options.strip == StripMode::All {
-        return SymtabPlan::default();
+        return SymtabPlan {
+            kind,
+            ..SymtabPlan::default()
+        };
     }
     let discard = options.discard;
     let shared = options.kind == crate::args::OutputKind::Shared;
@@ -286,7 +301,10 @@ pub fn plan(refs: &Refs<'_, '_>, linker: &LinkerSymbols, options: &LinkOptions) 
         .collect();
     selected.sort_unstable_by_key(|(id, ..)| *id);
 
-    let mut plan = SymtabPlan::default();
+    let mut plan = SymtabPlan {
+        kind,
+        ..SymtabPlan::default()
+    };
     let mut index = 1usize;
     let mut offset = 1usize;
     for (kept, names, file_name) in per_file {
@@ -372,7 +390,9 @@ impl SymtabPlan {
     /// `.symtab` size in bytes.
     #[must_use]
     pub fn symtab_size(&self) -> u64 {
-        u64::try_from(self.count.saturating_mul(SYM_SIZE)).unwrap_or(u64::MAX)
+        u64::try_from(self.count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(self.kind.sym_size())
     }
 
     /// Whether the table is written at all.
@@ -386,7 +406,10 @@ impl SymtabPlan {
 /// versioned symbols.
 /// The version a symbol imported from a shared library is written with
 /// (`name@VERSION`, as GNU ld does), unless its name already has one.
-fn import_suffix<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<&'a [u8]> {
+fn import_suffix<'a, F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, 'a, F>,
+    id: SymbolId,
+) -> Option<&'a [u8]> {
     if refs.symbols.definition_kind(id) != DefinitionKind::Shared
         || refs.symbols.name(id).version().is_some()
     {
@@ -396,7 +419,7 @@ fn import_suffix<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<&'a [u8]> {
 }
 
 /// The length of a global symbol's name in `.strtab`.
-fn global_name_len(refs: &Refs<'_, '_>, id: SymbolId) -> usize {
+fn global_name_len<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SymbolId) -> usize {
     let len = name_len(refs.symbols.name(id));
     match import_suffix(refs, id) {
         Some(version) => len.saturating_add(1).saturating_add(version.len()),
@@ -417,30 +440,49 @@ fn name_len(name: crate::symbols::SymbolName<'_>) -> usize {
 
 /// In executables and shared objects, a TLS symbol's value is its offset in
 /// the TLS template.
-fn tls_relative(addresses: &Addresses<'_, '_>, kind: u8, value: u64, shndx: u16) -> u64 {
+fn tls_relative<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    kind: u8,
+    value: u64,
+    shndx: u16,
+) -> u64 {
     if kind != STT_TLS || shndx == SHN_ABS || shndx == SHN_UNDEF {
         return value;
     }
     value.wrapping_sub(addresses.layout.tls.map_or(0, |t| t.start))
 }
 
-fn put_sym(out: &mut [u8], name: usize, info: u8, other: u8, shndx: u16, value: u64, size: u64) {
-    let Some(entry) = out.first_chunk_mut::<SYM_SIZE>() else {
+fn put_sym<F: ElfFormat>(
+    out: &mut [u8],
+    name: usize,
+    info: u8,
+    other: u8,
+    shndx: u16,
+    value: u64,
+    size: u64,
+) {
+    let Some(entry) = out.get_mut(..<F::Sym as RawRecord>::SIZE) else {
         return;
     };
-    let name = u32::try_from(name).unwrap_or(0);
-    entry[0..4].copy_from_slice(&name.to_le_bytes());
-    entry[4] = info;
-    entry[5] = other;
-    entry[6..8].copy_from_slice(&shndx.to_le_bytes());
-    entry[8..16].copy_from_slice(&value.to_le_bytes());
-    entry[16..24].copy_from_slice(&size.to_le_bytes());
+    let symbol = RawSymbol {
+        st_name: u32::try_from(name).unwrap_or(0),
+        st_info: info,
+        st_other: other,
+        st_shndx: shndx,
+        st_value: value,
+        st_size: size,
+    };
+    entry.copy_from_slice(F::encode_sym(&symbol).as_bytes());
 }
 
 /// The output section header index of input section `section` of `file`
 /// (after ICF folding): `SHN_ABS` when its output section was dropped as
 /// empty, `SHN_UNDEF` when it is not in the output.
-pub(crate) fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32) -> u16 {
+pub(crate) fn shndx_for<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    file: usize,
+    section: u32,
+) -> u16 {
     let Some(id) = addresses
         .refs
         .sections
@@ -462,25 +504,41 @@ pub(crate) fn shndx_for(addresses: &Addresses<'_, '_>, file: usize, section: u32
 }
 
 /// Writes `.symtab` into `out`.
-pub fn write_symtab(
+pub fn write_symtab<F: crate::elf::read::ElfFormat>(
     plan: &SymtabPlan,
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
     out: &mut [u8],
 ) {
+    // The link's input format is its output format.
+    write_symtab_as::<F>(plan, addresses, linker, out);
+}
+
+fn write_symtab_as<F: ElfFormat>(
+    plan: &SymtabPlan,
+    addresses: &Addresses<'_, '_, F>,
+    linker: &LinkerSymbols,
+    out: &mut [u8],
+) {
+    /// Splits `out` after `count` entries, clamped to what it holds.
+    fn split<F: ElfFormat>(out: &mut [u8], count: usize) -> (&mut [u8], &mut [u8]) {
+        let bytes = count
+            .saturating_mul(<F::Sym as RawRecord>::SIZE)
+            .min(out.len());
+        out.split_at_mut(bytes)
+    }
+    let entry_size = <F::Sym as RawRecord>::SIZE;
     let refs = &addresses.refs;
-    let (entries, _) = out.as_chunks_mut::<SYM_SIZE>();
-    let (head, rest) =
-        entries.split_at_mut(plan.section_symbols.saturating_add(1).min(entries.len()));
+    let (head, rest) = split::<F>(out, plan.section_symbols.saturating_add(1));
     for (position, (entry, section)) in head
-        .iter_mut()
+        .chunks_exact_mut(entry_size)
         .skip(1)
         .zip(&addresses.layout.sections)
         .enumerate()
     {
         let shndx = u16::try_from(position.saturating_add(1))
             .unwrap_or(crate::elf::read::consts::SHN_XINDEX);
-        put_sym(
+        put_sym::<F>(
             entry,
             0,
             (STB_LOCAL << 4) | STT_SECTION,
@@ -494,20 +552,20 @@ pub fn write_symtab(
         .hidden_base
         .saturating_sub(1)
         .saturating_sub(plan.section_symbols);
-    let (locals, rest) = rest.split_at_mut(local_count.min(rest.len()));
-    let (hidden_file, rest) = rest.split_at_mut(usize::from(plan.hidden_file).min(rest.len()));
-    for entry in hidden_file {
-        put_sym(entry, 0, (STB_LOCAL << 4) | STT_FILE, 0, SHN_ABS, 0, 0);
+    let (locals, rest) = split::<F>(rest, local_count);
+    let (hidden_file, rest) = split::<F>(rest, usize::from(plan.hidden_file));
+    for entry in hidden_file.chunks_exact_mut(entry_size) {
+        put_sym::<F>(entry, 0, (STB_LOCAL << 4) | STT_FILE, 0, SHN_ABS, 0, 0);
     }
-    let (hidden, globals) = rest.split_at_mut(plan.hidden.len().min(rest.len()));
+    let (hidden, globals) = split::<F>(rest, plan.hidden.len());
 
     // File locals, per file in parallel.
     let mut slices = Vec::with_capacity(plan.locals.len());
     let mut remaining = locals;
     for (file, kept) in plan.locals.iter().enumerate() {
         let file_symbol = usize::from(plan.file_names.get(file).is_some_and(Option::is_some));
-        let n = kept.len().saturating_add(file_symbol).min(remaining.len());
-        let (head, tail) = std::mem::take(&mut remaining).split_at_mut(n);
+        let n = kept.len().saturating_add(file_symbol);
+        let (head, tail) = split::<F>(std::mem::take(&mut remaining), n);
         slices.push(head);
         remaining = tail;
     }
@@ -523,9 +581,10 @@ pub fn write_symtab(
             let kept = plan.locals.get(file_index).map_or(&[][..], Vec::as_slice);
             let mut slice = slice;
             if let Some(Some(name)) = plan.file_names.get(file_index)
-                && let Some((entry, rest)) = std::mem::take(&mut slice).split_first_mut()
+                && slice.len() >= entry_size
             {
-                put_sym(
+                let (entry, rest) = std::mem::take(&mut slice).split_at_mut(entry_size);
+                put_sym::<F>(
                     entry,
                     name_offset,
                     (STB_LOCAL << 4) | STT_FILE,
@@ -537,7 +596,7 @@ pub fn write_symtab(
                 name_offset = name_offset.saturating_add(name.len()).saturating_add(1);
                 slice = rest;
             }
-            for (entry, &index) in slice.iter_mut().zip(kept) {
+            for (entry, &index) in slice.chunks_exact_mut(entry_size).zip(kept) {
                 let index = index as usize;
                 let Some(raw) = symbols.get_raw(index) else {
                     continue;
@@ -554,7 +613,7 @@ pub fn write_symtab(
                     _ => (SHN_ABS, raw.st_value, raw.st_size),
                 };
                 let value = tls_relative(addresses, raw.kind(), value, shndx);
-                put_sym(
+                put_sym::<F>(
                     entry,
                     name_offset,
                     raw.st_info,
@@ -567,115 +626,114 @@ pub fn write_symtab(
             }
         });
 
-    let global_entry =
-        |id: SymbolId, local: bool, name_offset: usize, entry: &mut [u8; SYM_SIZE]| {
-            let target = refs.global_target(id, true);
-            let value = addresses.globals.get(id.index()).copied().unwrap_or(0);
-            let (binding, kind, other, shndx, size) = match target.def {
-                Def::Section {
-                    file,
-                    section,
-                    value,
-                } => {
-                    let raw = target.raw.unwrap_or_default();
-                    (
-                        raw.binding(),
-                        raw.kind(),
-                        raw.st_other,
-                        shndx_for(addresses, file, section),
-                        addresses.symbol_size(file, section, value, raw.st_size),
-                    )
-                }
-                Def::Absolute(_) => {
-                    let raw = target.raw.unwrap_or_default();
-                    (
-                        raw.binding(),
-                        raw.kind(),
-                        raw.st_other,
-                        SHN_ABS,
-                        raw.st_size,
-                    )
-                }
-                Def::Common(_) => {
-                    let def = refs.symbols.definition(id);
+    let global_entry = |id: SymbolId, local: bool, name_offset: usize, entry: &mut [u8]| {
+        let target = refs.global_target(id, true);
+        let value = addresses.globals.get(id.index()).copied().unwrap_or(0);
+        let (binding, kind, other, shndx, size) = match target.def {
+            Def::Section {
+                file,
+                section,
+                value,
+            } => {
+                let raw = target.raw.unwrap_or_default();
+                (
+                    raw.binding(),
+                    raw.kind(),
+                    raw.st_other,
+                    shndx_for(addresses, file, section),
+                    addresses.symbol_size(file, section, value, raw.st_size),
+                )
+            }
+            Def::Absolute(_) => {
+                let raw = target.raw.unwrap_or_default();
+                (
+                    raw.binding(),
+                    raw.kind(),
+                    raw.st_other,
+                    SHN_ABS,
+                    raw.st_size,
+                )
+            }
+            Def::Common(_) => {
+                let def = refs.symbols.definition(id);
+                (
+                    STB_GLOBAL,
+                    STT_OBJECT,
+                    STV_DEFAULT,
+                    shndx_of_address(addresses, value),
+                    def.aux & !super::resolve::AUX_COMDAT,
+                )
+            }
+            Def::Linker(_) => {
+                let visibility = global_visibility(refs, linker, id);
+                let absolute = refs.symbols.flags(id).contains(super::defined::ABSOLUTE);
+                (
+                    STB_GLOBAL,
+                    super::defined::linker_type(refs, linker, id),
+                    visibility,
+                    if absolute {
+                        SHN_ABS
+                    } else {
+                        super::defined::linker_shndx(addresses, linker, id)
+                            .unwrap_or_else(|| shndx_of_address(addresses, value))
+                    },
+                    0,
+                )
+            }
+            Def::Shared(_) => {
+                let raw = target.raw.unwrap_or_default();
+                if addresses.synth.copy_of(id).is_some() {
                     (
                         STB_GLOBAL,
-                        STT_OBJECT,
+                        raw.kind(),
                         STV_DEFAULT,
                         shndx_of_address(addresses, value),
-                        def.aux & !super::resolve::AUX_COMDAT,
+                        raw.st_size,
                     )
-                }
-                Def::Linker(_) => {
-                    let visibility = global_visibility(refs, linker, id);
-                    let absolute = refs.symbols.flags(id).contains(super::defined::ABSOLUTE);
+                } else {
                     (
-                        STB_GLOBAL,
-                        super::defined::linker_type(refs, linker, id),
-                        visibility,
-                        if absolute {
-                            SHN_ABS
-                        } else {
-                            super::defined::linker_shndx(addresses, linker, id)
-                                .unwrap_or_else(|| shndx_of_address(addresses, value))
-                        },
+                        import_binding(refs, id),
+                        raw.kind(),
+                        STV_DEFAULT,
+                        SHN_UNDEF,
                         0,
                     )
                 }
-                Def::Shared(_) => {
-                    let raw = target.raw.unwrap_or_default();
-                    if addresses.synth.copy_of(id).is_some() {
-                        (
-                            STB_GLOBAL,
-                            raw.kind(),
-                            STV_DEFAULT,
-                            shndx_of_address(addresses, value),
-                            raw.st_size,
-                        )
-                    } else {
-                        (
-                            import_binding(refs, id),
-                            raw.kind(),
-                            STV_DEFAULT,
-                            SHN_UNDEF,
-                            0,
-                        )
-                    }
-                }
-                Def::Undefined { .. } => (
-                    import_binding(refs, id),
-                    STT_NOTYPE,
-                    STV_DEFAULT,
-                    SHN_UNDEF,
-                    0,
-                ),
-            };
-            // Globals made local lose their visibility, as in GNU ld.
-            let (binding, other) = if local {
-                (STB_LOCAL, other & !3)
-            } else {
-                (binding, other)
-            };
-            let value = tls_relative(addresses, kind, value, shndx);
-            put_sym(
-                entry,
-                name_offset,
-                (binding << 4) | (kind & 0xf),
-                other,
-                shndx,
-                value,
-                size,
-            );
+            }
+            Def::Undefined { .. } => (
+                import_binding(refs, id),
+                STT_NOTYPE,
+                STV_DEFAULT,
+                SHN_UNDEF,
+                0,
+            ),
         };
+        // Globals made local lose their visibility, as in GNU ld.
+        let (binding, other) = if local {
+            (STB_LOCAL, other & !3)
+        } else {
+            (binding, other)
+        };
+        let value = tls_relative(addresses, kind, value, shndx);
+        put_sym::<F>(
+            entry,
+            name_offset,
+            (binding << 4) | (kind & 0xf),
+            other,
+            shndx,
+            value,
+            size,
+        );
+    };
 
     // Name offsets were computed by the plan, from the same lengths.
     hidden
-        .par_iter_mut()
+        .par_chunks_exact_mut(entry_size)
         .zip(plan.hidden.par_iter())
         .zip(plan.hidden_offsets.par_iter())
         .for_each(|((entry, &id), &name)| global_entry(id, true, name, entry));
     globals
-        .par_iter_mut()
+        .par_chunks_exact_mut(entry_size)
         .zip(plan.globals.par_iter())
         .zip(plan.global_offsets.par_iter())
         .for_each(|((entry, &id), &name)| global_entry(id, false, name, entry));
@@ -683,7 +741,11 @@ pub fn write_symtab(
 
 /// Writes `.strtab` into `out`: each file's local names, then the hidden
 /// and global names, from the offsets the plan computed, in parallel.
-pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
+pub fn write_strtab<F: crate::elf::read::ElfFormat>(
+    plan: &SymtabPlan,
+    refs: &Refs<'_, '_, F>,
+    out: &mut [u8],
+) {
     /// Globals whose names one task writes.
     const NAMES_PER_TASK: usize = 4096;
     enum Task<'p> {
@@ -775,7 +837,7 @@ pub fn write_strtab(plan: &SymtabPlan, refs: &Refs<'_, '_>, out: &mut [u8]) {
 
 /// The binding of an undefined or imported symbol: weak when every
 /// reference from a regular object is weak.
-fn import_binding(refs: &Refs<'_, '_>, id: SymbolId) -> u8 {
+fn import_binding<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SymbolId) -> u8 {
     if refs.symbols.flags(id).contains(REF_REGULAR_STRONG) {
         STB_GLOBAL
     } else {

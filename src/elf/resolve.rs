@@ -147,7 +147,10 @@ enum Offers {
 }
 
 /// The slots of an object's groups (`NO_SLOT` for groups discarded before).
-fn group_slots<'a>(slots: &GroupSlots<'a>, object: &ObjectInput<'a>) -> Result<Vec<u32>> {
+fn group_slots<'a, F: crate::elf::read::ElfFormat>(
+    slots: &GroupSlots<'a>,
+    object: &ObjectInput<'a, F>,
+) -> Result<Vec<u32>> {
     (0..object.groups.len())
         .map(|index| {
             if discarded_before(object, index) {
@@ -170,9 +173,9 @@ impl<'a> ComdatHook<'a> {
     /// offer held the key when it was made. An offer that did not has lost
     /// for good (the claim can only go lower); one that did must look again
     /// once every offer of the round is in.
-    fn offer_groups(
+    fn offer_groups<F: crate::elf::read::ElfFormat>(
         round: &ClaimRound<'_, 'a>,
-        object: &ObjectInput<'a>,
+        object: &ObjectInput<'a, F>,
         file: FileId,
         position: InputPosition,
     ) -> Vec<bool> {
@@ -190,7 +193,10 @@ impl<'a> ComdatHook<'a> {
 /// Whether an earlier resolution (the one before LTO) discarded group
 /// `index`: it stays discarded, as the kept copy may now be in code LTO
 /// generated without a group.
-fn discarded_before(object: &ObjectInput<'_>, index: usize) -> bool {
+fn discarded_before<F: crate::elf::read::ElfFormat>(
+    object: &ObjectInput<'_, F>,
+    index: usize,
+) -> bool {
     object.discarded_groups.get(index).copied().unwrap_or(false)
 }
 
@@ -199,13 +205,13 @@ fn claim_round(round: usize) -> u32 {
     u32::try_from(round).unwrap_or(u32::MAX).saturating_add(1)
 }
 
-impl<'a> LoadHook<ElfInput<'a>> for ComdatHook<'a> {
+impl<'a, F: crate::elf::read::ElfFormat> LoadHook<ElfInput<'a, F>> for ComdatHook<'a> {
     /// Only LTO's claim hook changes names, of the IR files it claims.
-    fn keeps_names(&self, file: &ElfInput<'a>) -> bool {
+    fn keeps_names(&self, file: &ElfInput<'a, F>) -> bool {
         file.lto_mode() != LtoMode::Claim || file.pending_ir().is_none()
     }
 
-    fn prepare(&self, _: FileId, file: &mut ElfInput<'a>) -> Result<()> {
+    fn prepare(&self, _: FileId, file: &mut ElfInput<'a, F>) -> Result<()> {
         // A file LTO may claim offers in `after_load`, once it is known
         // whether its groups are native or IR.
         if file.ir.is_none() && self.keeps_names(file) {
@@ -217,7 +223,13 @@ impl<'a> LoadHook<ElfInput<'a>> for ComdatHook<'a> {
         Ok(())
     }
 
-    fn on_load(&self, round: usize, _: FileId, rank: u32, file: &mut ElfInput<'a>) -> Result<()> {
+    fn on_load(
+        &self,
+        round: usize,
+        _: FileId,
+        rank: u32,
+        file: &mut ElfInput<'a, F>,
+    ) -> Result<()> {
         if let Some(object) = &mut file.object
             && let Some(slots) = &object.group_slots
         {
@@ -233,15 +245,15 @@ impl<'a> LoadHook<ElfInput<'a>> for ComdatHook<'a> {
     }
 }
 
-impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
-    fn load_hook(&self) -> Option<&dyn LoadHook<ElfInput<'a>>> {
+impl<'a, F: crate::elf::read::ElfFormat> RoundHook<ElfInput<'a, F>> for ComdatHook<'a> {
+    fn load_hook(&self) -> Option<&dyn LoadHook<ElfInput<'a, F>>> {
         Some(self)
     }
 
     fn after_load(
         &mut self,
         round: usize,
-        files: &mut [RoundFile<'_, ElfInput<'a>>],
+        files: &mut [RoundFile<'_, ElfInput<'a, F>>],
     ) -> Result<()> {
         let claim_round = claim_round(round);
         let by_key = self.claims.in_round(claim_round);
@@ -364,7 +376,10 @@ impl<'a> RoundHook<ElfInput<'a>> for ComdatHook<'a> {
 
 /// Marks dead the members of the COMDAT group copies [`ComdatHook`]
 /// discarded. Returns the number of discarded groups.
-pub fn deduplicate_comdat(files: &[ElfInput<'_>], sections: &mut Sections) -> usize {
+pub fn deduplicate_comdat<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    sections: &mut Sections,
+) -> usize {
     let mut discarded = 0usize;
     for (file_index, file) in files.iter().enumerate() {
         let Some(object) = &file.object else {
@@ -395,7 +410,11 @@ pub fn deduplicate_comdat(files: &[ElfInput<'_>], sections: &mut Sections) -> us
 }
 
 /// Whether the definition `def` lies in a dead section.
-fn in_dead_section(files: &[ElfInput<'_>], sections: &Sections, def: &Definition) -> bool {
+fn in_dead_section<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    sections: &Sections,
+    def: &Definition,
+) -> bool {
     let file_index = def.file.index();
     let Some(object) = files.get(file_index).and_then(|f| f.object.as_ref()) else {
         return false;
@@ -413,8 +432,8 @@ fn in_dead_section(files: &[ElfInput<'_>], sections: &Sections, def: &Definition
 }
 
 /// Reports duplicate definitions, lld-style. Returns the number of errors.
-pub fn report_duplicates(
-    files: &[ElfInput<'_>],
+pub fn report_duplicates<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
     resolution: &Resolution<'_>,
     sections: &Sections,
     demangle: bool,
@@ -448,7 +467,10 @@ pub fn report_duplicates(
 
 /// `file.o:(.section+0xoffset)` for a definition.
 #[must_use]
-pub fn definition_site(files: &[ElfInput<'_>], def: &Definition) -> String {
+pub fn definition_site<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    def: &Definition,
+) -> String {
     let Some(file) = files.get(def.file.index()) else {
         return "<linker>".to_string();
     };

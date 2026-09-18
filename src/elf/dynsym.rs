@@ -40,6 +40,8 @@ use crate::elf::read::consts::{
     DT_VERNEEDNUM, DT_VERSYM, SHN_ABS, SHN_UNDEF, STB_GLOBAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC,
     STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_PROTECTED, VER_FLG_BASE, VER_NDX_GLOBAL,
 };
+use crate::elf::read::format::with_format;
+use crate::elf::read::{DynEntry, ElfFormat, ElfKind, RawRecord, RawSymbol};
 use crate::error::{Error, Result};
 use crate::ids::SymbolId;
 use crate::symbols::{DefinitionKind, SymbolFlags};
@@ -53,10 +55,23 @@ use super::scan::ScanResult;
 use super::synth::Synth;
 use super::values::Addresses;
 
-/// Size of a `.dynsym` entry.
-pub const DYNSYM_SIZE: u64 = 24;
-/// Size of a `.dynamic` entry.
-pub const DYNAMIC_SIZE: u64 = 16;
+/// Encodes a `u16` in the byte order of `kind`.
+#[inline]
+fn e16(kind: ElfKind, value: u16) -> [u8; 2] {
+    match kind.endianness() {
+        crate::target::Endianness::Little => value.to_le_bytes(),
+        crate::target::Endianness::Big => value.to_be_bytes(),
+    }
+}
+
+/// Encodes a `u32` in the byte order of `kind`.
+#[inline]
+fn e32(kind: ElfKind, value: u32) -> [u8; 4] {
+    match kind.endianness() {
+        crate::target::Endianness::Little => value.to_le_bytes(),
+        crate::target::Endianness::Big => value.to_be_bytes(),
+    }
+}
 
 /// One `.dynsym` entry after the null symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +104,8 @@ pub enum DynValue {
 /// The planned dynamic symbol table and `.dynamic` section.
 #[derive(Debug, Default)]
 pub struct DynamicPlan {
+    /// The ELF class and byte order the tables are written in.
+    pub kind: ElfKind,
     /// Whether the output has dynamic sections at all.
     pub enabled: bool,
     /// The entries after the null symbol; entry `i` has index `i + 1`.
@@ -145,13 +162,17 @@ impl DynamicPlan {
         vec![
             (
                 Synthetic::DynSym,
-                self.count().saturating_mul(DYNSYM_SIZE),
-                8,
+                self.count().saturating_mul(self.kind.sym_size()),
+                self.kind.word_size(),
             ),
             (Synthetic::DynStr, len(&self.dynstr), 1),
-            (Synthetic::GnuHash, len(&self.gnu_hash), 8),
-            // GNU ld aligns the ELF64 `.hash` to 8.
-            (Synthetic::Hash, len(&self.sysv_hash), 8),
+            (
+                Synthetic::GnuHash,
+                len(&self.gnu_hash),
+                self.kind.word_size(),
+            ),
+            // GNU ld aligns the ELF64 `.hash` to 8 (the ELF32 one to 4).
+            (Synthetic::Hash, len(&self.sysv_hash), self.kind.word_size()),
             (
                 Synthetic::VerSym,
                 u64::try_from(self.versym.len())
@@ -159,14 +180,18 @@ impl DynamicPlan {
                     .saturating_mul(2),
                 2,
             ),
-            (Synthetic::VerNeed, len(&self.verneed), 8),
-            (Synthetic::VerDef, len(&self.verdef), 8),
+            (
+                Synthetic::VerNeed,
+                len(&self.verneed),
+                self.kind.word_size(),
+            ),
+            (Synthetic::VerDef, len(&self.verdef), self.kind.word_size()),
             (
                 Synthetic::Dynamic,
                 u64::try_from(self.dynamic.len())
                     .unwrap_or(u64::MAX)
-                    .saturating_mul(DYNAMIC_SIZE),
-                8,
+                    .saturating_mul(self.kind.dyn_size()),
+                self.kind.word_size(),
             ),
         ]
     }
@@ -363,9 +388,9 @@ pub fn sysv_hash(name: &[u8]) -> u32 {
 }
 
 /// What the planner needs from the rest of the link.
-pub struct PlanInput<'p, 'r, 'a> {
+pub struct PlanInput<'p, 'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Relocation targets and the symbol table.
-    pub refs: &'p Refs<'r, 'a>,
+    pub refs: &'p Refs<'r, 'a, F>,
     /// Needed shared objects.
     pub needed: &'p Needed,
     /// The output mode.
@@ -388,7 +413,10 @@ pub struct PlanInput<'p, 'r, 'a> {
 /// For a symbol a shared library defines under a non-base version, the
 /// library's file index and the version name.
 #[must_use]
-pub fn import_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<(usize, &'a [u8])> {
+pub fn import_version<'a, F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, 'a, F>,
+    id: SymbolId,
+) -> Option<(usize, &'a [u8])> {
     let def = refs.symbols.definition(id);
     if def.kind != DefinitionKind::Shared {
         return None;
@@ -406,7 +434,10 @@ pub fn import_version<'a>(refs: &Refs<'_, 'a>, id: SymbolId) -> Option<(usize, &
 pub const GLIBC_ABI_DT_RELR: &[u8] = b"GLIBC_ABI_DT_RELR";
 
 /// The needed shared library that defines the `GLIBC_ABI_DT_RELR` version.
-fn relr_version_provider(refs: &Refs<'_, '_>, needed: &Needed) -> Option<usize> {
+fn relr_version_provider<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    needed: &Needed,
+) -> Option<usize> {
     refs.files.iter().enumerate().find_map(|(index, file)| {
         let shared = file.shared.as_ref()?;
         (needed.is_needed(index)
@@ -421,7 +452,7 @@ fn relr_version_provider(refs: &Refs<'_, '_>, needed: &Needed) -> Option<usize> 
 }
 
 /// Whether a defined symbol's section made it into the output.
-fn present(refs: &Refs<'_, '_>, id: SymbolId) -> bool {
+fn present<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SymbolId) -> bool {
     match refs.global_target(id, true).def {
         Def::Section { file, section, .. } => refs.sections.is_present_in(file, section),
         Def::Undefined { .. } => false,
@@ -434,8 +465,8 @@ fn present(refs: &Refs<'_, '_>, id: SymbolId) -> bool {
 /// `__timezone` for `timezone`), as GNU ld does: it records a weak
 /// definition's "real" alias as dynamic whenever the weak one is. `chosen`
 /// is in symbol ID order and stays so.
-fn with_strong_aliases(
-    refs: &Refs<'_, '_>,
+fn with_strong_aliases<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     synth: &Synth,
     mut chosen: Vec<(SymbolId, bool)>,
 ) -> Vec<(SymbolId, bool)> {
@@ -524,12 +555,18 @@ fn with_strong_aliases(
 ///
 /// Returns [`Error::Limit`] when tables exceed their formats.
 #[allow(clippy::too_many_lines)]
-pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
+pub fn plan<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
+) -> Result<DynamicPlan> {
     let refs = input.refs;
     let symbols = refs.symbols;
     let mode = input.mode;
     let options = input.options;
-    let mut plan = DynamicPlan::default();
+    let kind = input.synth.arch.kind();
+    let mut plan = DynamicPlan {
+        kind,
+        ..DynamicPlan::default()
+    };
     if !mode.dynamic {
         return Ok(plan);
     }
@@ -793,18 +830,18 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
             } else {
                 u32::from(count).saturating_mul(16).saturating_add(16)
             };
-            data.extend_from_slice(&1u16.to_le_bytes());
-            data.extend_from_slice(&count.to_le_bytes());
-            data.extend_from_slice(&dynstr.add(file_name)?.to_le_bytes());
-            data.extend_from_slice(&16u32.to_le_bytes());
-            data.extend_from_slice(&next.to_le_bytes());
+            data.extend_from_slice(&e16(kind, 1));
+            data.extend_from_slice(&e16(kind, count));
+            data.extend_from_slice(&e32(kind, dynstr.add(file_name)?));
+            data.extend_from_slice(&e32(kind, 16));
+            data.extend_from_slice(&e32(kind, next));
             for (position, &name) in versions.iter().enumerate() {
                 let last = position.saturating_add(1) == versions.len();
-                data.extend_from_slice(&sysv_hash(name).to_le_bytes());
-                data.extend_from_slice(&0u16.to_le_bytes());
-                data.extend_from_slice(&need_index(file, name).to_le_bytes());
-                data.extend_from_slice(&dynstr.add(name)?.to_le_bytes());
-                data.extend_from_slice(&(if last { 0u32 } else { 16 }).to_le_bytes());
+                data.extend_from_slice(&e32(kind, sysv_hash(name)));
+                data.extend_from_slice(&e16(kind, 0));
+                data.extend_from_slice(&e16(kind, need_index(file, name)));
+                data.extend_from_slice(&e32(kind, dynstr.add(name)?));
+                data.extend_from_slice(&e32(kind, if last { 0 } else { 16 }));
             }
         }
         plan.verneed = data;
@@ -847,18 +884,18 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
                 .map_err(|_| Error::Limit("too many version parents".into()))?;
             let size = 20u32.saturating_add(u32::from(cnt).saturating_mul(8));
             let last = position.saturating_add(1) == count;
-            data.extend_from_slice(&1u16.to_le_bytes());
-            data.extend_from_slice(&flags.to_le_bytes());
-            data.extend_from_slice(&index.to_le_bytes());
-            data.extend_from_slice(&cnt.to_le_bytes());
-            data.extend_from_slice(&sysv_hash(name).to_le_bytes());
-            data.extend_from_slice(&20u32.to_le_bytes());
-            data.extend_from_slice(&(if last { 0 } else { size }).to_le_bytes());
+            data.extend_from_slice(&e16(kind, 1));
+            data.extend_from_slice(&e16(kind, *flags));
+            data.extend_from_slice(&e16(kind, *index));
+            data.extend_from_slice(&e16(kind, cnt));
+            data.extend_from_slice(&e32(kind, sysv_hash(name)));
+            data.extend_from_slice(&e32(kind, 20));
+            data.extend_from_slice(&e32(kind, if last { 0 } else { size }));
             let names = std::iter::once(*own).chain(parent_offsets.iter().copied());
             for (aux, offset) in names.enumerate() {
                 let last_aux = aux.saturating_add(1) == aux_count;
-                data.extend_from_slice(&offset.to_le_bytes());
-                data.extend_from_slice(&(if last_aux { 0u32 } else { 8 }).to_le_bytes());
+                data.extend_from_slice(&e32(kind, offset));
+                data.extend_from_slice(&e32(kind, if last_aux { 0 } else { 8 }));
             }
         }
         plan.verdef = data;
@@ -870,11 +907,11 @@ pub fn plan(input: &PlanInput<'_, '_, '_>) -> Result<DynamicPlan> {
         .map(|&(hash, entry, _)| (hash, entry_name(entry)))
         .collect();
     if gnu {
-        plan.gnu_hash = build_gnu_hash(&hashed_names, nbuckets, plan.first_hashed)?;
+        plan.gnu_hash = build_gnu_hash(&hashed_names, nbuckets, plan.first_hashed, kind)?;
     }
     if sysv {
         let names: Vec<&[u8]> = plan.entries.iter().map(|&e| entry_name(e)).collect();
-        plan.sysv_hash = build_sysv_hash(&names)?;
+        plan.sysv_hash = build_sysv_hash(&names, kind)?;
     }
     plan.dynstr = dynstr.data;
 
@@ -901,11 +938,25 @@ struct DynamicStrings {
     filters: Vec<u32>,
 }
 
-fn build_gnu_hash(hashed: &[(u32, &[u8])], nbuckets: u32, symoffset: usize) -> Result<Vec<u8>> {
+fn build_gnu_hash(
+    hashed: &[(u32, &[u8])],
+    nbuckets: u32,
+    symoffset: usize,
+    kind: ElfKind,
+) -> Result<Vec<u8>> {
     let too_big = || Error::Limit("GNU hash table too large".into());
     let count = hashed.len();
     let bits = count.saturating_mul(12);
-    let mask_words = (bits / 64).max(1).next_power_of_two();
+    // One bloom word is address-sized: 64 bits in ELF64, 32 in ELF32.
+    let word_bits = u32::try_from(kind.word_size())
+        .unwrap_or(8)
+        .saturating_mul(8)
+        .max(1);
+    let mask_words = bits
+        .checked_div(word_bits as usize)
+        .unwrap_or(1)
+        .max(1)
+        .next_power_of_two();
     let mask_words32 = u32::try_from(mask_words).map_err(|_| too_big())?;
     let shift = 26u32;
     let mut bloom = vec![0u64; mask_words];
@@ -913,9 +964,13 @@ fn build_gnu_hash(hashed: &[(u32, &[u8])], nbuckets: u32, symoffset: usize) -> R
     let mut chains = vec![0u32; count];
     let symoffset32 = u32::try_from(symoffset.saturating_add(1)).map_err(|_| too_big())?;
     for (position, &(hash, _)) in hashed.iter().enumerate() {
-        let word = (hash >> 6).checked_rem(mask_words32).unwrap_or(0);
+        let word = hash
+            .checked_div(word_bits)
+            .and_then(|w| w.checked_rem(mask_words32))
+            .unwrap_or(0);
         if let Some(slot) = bloom.get_mut(word as usize) {
-            *slot |= (1u64 << (hash % 64)) | (1u64 << ((hash >> shift) % 64));
+            let bit = |h: u32| 1u64 << h.checked_rem(word_bits).unwrap_or(0);
+            *slot |= bit(hash) | bit(hash >> shift);
         }
         let bucket = hash.checked_rem(nbuckets).unwrap_or(0);
         let dynsym_index = u32::try_from(position)
@@ -934,24 +989,27 @@ fn build_gnu_hash(hashed: &[(u32, &[u8])], nbuckets: u32, symoffset: usize) -> R
             *slot = if last { hash | 1 } else { hash & !1 };
         }
     }
+    let word_size = usize::try_from(kind.word_size()).unwrap_or(8);
     let mut data = Vec::with_capacity(
         16usize
-            .saturating_add(mask_words.saturating_mul(8))
+            .saturating_add(mask_words.saturating_mul(word_size))
             .saturating_add((nbuckets as usize).saturating_mul(4))
             .saturating_add(count.saturating_mul(4)),
     );
-    data.extend_from_slice(&nbuckets.to_le_bytes());
-    data.extend_from_slice(&symoffset32.to_le_bytes());
-    data.extend_from_slice(&mask_words32.to_le_bytes());
-    data.extend_from_slice(&shift.to_le_bytes());
-    for word in bloom {
-        data.extend_from_slice(&word.to_le_bytes());
-    }
+    data.extend_from_slice(&e32(kind, nbuckets));
+    data.extend_from_slice(&e32(kind, symoffset32));
+    data.extend_from_slice(&e32(kind, mask_words32));
+    data.extend_from_slice(&e32(kind, shift));
+    with_format!(kind, |F| {
+        for word in &bloom {
+            data.extend_from_slice(F::encode_word(*word).as_bytes());
+        }
+    });
     for bucket in buckets {
-        data.extend_from_slice(&bucket.to_le_bytes());
+        data.extend_from_slice(&e32(kind, bucket));
     }
     for chain in chains {
-        data.extend_from_slice(&chain.to_le_bytes());
+        data.extend_from_slice(&e32(kind, chain));
     }
     Ok(data)
 }
@@ -974,7 +1032,7 @@ fn bucket_count(symbols: usize, gnu: bool) -> u32 {
     if gnu { best.max(2) } else { best }
 }
 
-fn build_sysv_hash(names: &[&[u8]]) -> Result<Vec<u8>> {
+fn build_sysv_hash(names: &[&[u8]], kind: ElfKind) -> Result<Vec<u8>> {
     let too_big = || Error::Limit("hash table too large".into());
     let nchain = u32::try_from(names.len().saturating_add(1)).map_err(|_| too_big())?;
     let nbucket = bucket_count(names.len(), false);
@@ -996,17 +1054,20 @@ fn build_sysv_hash(names: &[&[u8]]) -> Result<Vec<u8>> {
                 .saturating_mul(4),
         ),
     );
-    data.extend_from_slice(&nbucket.to_le_bytes());
-    data.extend_from_slice(&nchain.to_le_bytes());
+    data.extend_from_slice(&e32(kind, nbucket));
+    data.extend_from_slice(&e32(kind, nchain));
     for value in buckets.into_iter().chain(chains) {
-        data.extend_from_slice(&value.to_le_bytes());
+        data.extend_from_slice(&e32(kind, value));
     }
     Ok(data)
 }
 
 /// The symbol `name` if a regular object defines it and it is in the
 /// output.
-fn defined_symbol(refs: &Refs<'_, '_>, name: &[u8]) -> Option<SymbolId> {
+fn defined_symbol<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    name: &[u8],
+) -> Option<SymbolId> {
     let id = refs
         .symbols
         .lookup(&crate::symbols::SymbolName::new(name))?;
@@ -1018,8 +1079,8 @@ fn defined_symbol(refs: &Refs<'_, '_>, name: &[u8]) -> Option<SymbolId> {
     .filter(|&id| present(refs, id))
 }
 
-fn dynamic_entries(
-    input: &PlanInput<'_, '_, '_>,
+fn dynamic_entries<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
     plan: &DynamicPlan,
     strings: &DynamicStrings,
 ) -> Vec<(i64, DynValue)> {
@@ -1028,6 +1089,7 @@ fn dynamic_entries(
     let mode = input.mode;
     let synth = input.synth;
     let refs = input.refs;
+    let rel = synth.arch.uses_rel();
     let mut entries = Vec::new();
     for &needed in &strings.needed {
         entries.push((DT_NEEDED, Value(u64::from(needed))));
@@ -1078,16 +1140,25 @@ fn dynamic_entries(
     entries.push((DT_STRTAB, Address(Synthetic::DynStr)));
     entries.push((DT_SYMTAB, Address(Synthetic::DynSym)));
     entries.push((DT_STRSZ, Size(Synthetic::DynStr)));
-    entries.push((DT_SYMENT, Value(DYNSYM_SIZE)));
+    entries.push((DT_SYMENT, Value(plan.kind.sym_size())));
     if mode.executable() {
         entries.push((DT_DEBUG, Value(0)));
     }
-    if synth.got_plt_reserved > 0 {
+    // GNU ld's i386 backend adds `DT_PLTGOT` only with a PLT: `.got.plt`
+    // exists whenever PIC code names `_GLOBAL_OFFSET_TABLE_`.
+    let pltgot =
+        synth.arch != crate::elf::arch::Arch::I386 || synth.size_align(Synthetic::Plt).0 > 0;
+    if synth.got_plt_reserved > 0 && pltgot {
         entries.push((DT_PLTGOT, Address(Synthetic::GotPlt)));
     }
     if synth.size_align(Synthetic::RelaPlt).0 > 0 {
         entries.push((DT_PLTRELSZ, Size(Synthetic::RelaPlt)));
-        entries.push((DT_PLTREL, Value(crate::elf::read::consts::DT_RELA as u64)));
+        let pltrel = if rel {
+            crate::elf::read::consts::DT_REL
+        } else {
+            crate::elf::read::consts::DT_RELA
+        };
+        entries.push((DT_PLTREL, Value(pltrel as u64)));
         entries.push((DT_JMPREL, Address(Synthetic::RelaPlt)));
         if let Some(offset) = synth.arch.glink_offset() {
             entries.push((
@@ -1097,14 +1168,21 @@ fn dynamic_entries(
         }
     }
     if synth.rela_dyn_count() > 0 {
-        entries.push((DT_RELA, Address(Synthetic::RelaDyn)));
-        entries.push((DT_RELASZ, Size(Synthetic::RelaDyn)));
-        entries.push((DT_RELAENT, Value(24)));
+        if rel {
+            use crate::elf::read::consts::{DT_REL, DT_RELENT, DT_RELSZ};
+            entries.push((DT_REL, Address(Synthetic::RelaDyn)));
+            entries.push((DT_RELSZ, Size(Synthetic::RelaDyn)));
+            entries.push((DT_RELENT, Value(plan.kind.rel_size())));
+        } else {
+            entries.push((DT_RELA, Address(Synthetic::RelaDyn)));
+            entries.push((DT_RELASZ, Size(Synthetic::RelaDyn)));
+            entries.push((DT_RELAENT, Value(plan.kind.rela_size())));
+        }
     }
     if synth.relr_count() > 0 {
         entries.push((DT_RELR, Address(Synthetic::RelrDyn)));
         entries.push((DT_RELRSZ, Size(Synthetic::RelrDyn)));
-        entries.push((DT_RELRENT, Value(8)));
+        entries.push((DT_RELRENT, Value(plan.kind.word_size())));
     }
     let text = input.scan.text_relocs();
     if text {
@@ -1175,7 +1253,12 @@ fn dynamic_entries(
     }
     let relative = synth.relative_count();
     if options.combine_relocs && relative > 0 {
-        entries.push((DT_RELACOUNT, Value(relative)));
+        let count = if rel {
+            crate::elf::read::consts::DT_RELCOUNT
+        } else {
+            DT_RELACOUNT
+        };
+        entries.push((count, Value(relative)));
     }
     for _ in 0..options.spare_dynamic_tags.unwrap_or(0).min(64) {
         entries.push((DT_NULL, Value(0)));
@@ -1184,20 +1267,34 @@ fn dynamic_entries(
     entries
 }
 
-fn put_sym(out: &mut [u8], name: u32, info: u8, other: u8, shndx: u16, value: u64, size: u64) {
-    let Some(entry) = out.first_chunk_mut::<24>() else {
+fn put_sym<F: ElfFormat>(
+    out: &mut [u8],
+    name: u32,
+    info: u8,
+    other: u8,
+    shndx: u16,
+    value: u64,
+    size: u64,
+) {
+    let Some(entry) = out.get_mut(..<F::Sym as RawRecord>::SIZE) else {
         return;
     };
-    entry[0..4].copy_from_slice(&name.to_le_bytes());
-    entry[4] = info;
-    entry[5] = other;
-    entry[6..8].copy_from_slice(&shndx.to_le_bytes());
-    entry[8..16].copy_from_slice(&value.to_le_bytes());
-    entry[16..24].copy_from_slice(&size.to_le_bytes());
+    let symbol = RawSymbol {
+        st_name: name,
+        st_info: info,
+        st_other: other,
+        st_shndx: shndx,
+        st_value: value,
+        st_size: size,
+    };
+    entry.copy_from_slice(F::encode_sym(&symbol).as_bytes());
 }
 
 /// The output section header index holding `address`, or `SHN_ABS`.
-pub fn shndx_of_address(addresses: &Addresses<'_, '_>, address: u64) -> u16 {
+pub fn shndx_of_address<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    address: u64,
+) -> u16 {
     let sections = &addresses.layout.sections;
     sections
         .iter()
@@ -1213,21 +1310,26 @@ pub fn shndx_of_address(addresses: &Addresses<'_, '_>, address: u64) -> u16 {
 }
 
 /// Writes `.dynsym`.
-pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut [u8]) {
+pub fn write_dynsym<F: ElfFormat>(
+    plan: &DynamicPlan,
+    addresses: &Addresses<'_, '_, F>,
+    out: &mut [u8],
+) {
     let refs = &addresses.refs;
     let symbols = refs.symbols;
-    let (entries, _) = out.as_chunks_mut::<24>();
-    let Some((null, rest)) = entries.split_first_mut() else {
+    let entry_size = <F::Sym as RawRecord>::SIZE.max(1);
+    if out.len() < entry_size {
         return;
-    };
+    }
+    let (null, rest) = out.split_at_mut(entry_size);
     null.fill(0);
-    rest.par_iter_mut()
+    rest.par_chunks_exact_mut(entry_size)
         .zip(plan.entries.par_iter())
         .zip(plan.names.par_iter())
         .for_each(|((slot, &entry), &name)| {
             let id = match entry {
                 Entry::Version(_) => {
-                    put_sym(
+                    put_sym::<F>(
                         slot,
                         name,
                         (STB_GLOBAL << 4) | STT_OBJECT,
@@ -1267,7 +1369,7 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
                     _ => STT_NOTYPE,
                 };
                 let canonical = flags.contains(SymbolFlags::NEEDS_CANONICAL_PLT);
-                put_sym(
+                put_sym::<F>(
                     slot,
                     name,
                     (binding << 4) | kind,
@@ -1331,7 +1433,7 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
             } else {
                 value
             };
-            put_sym(
+            put_sym::<F>(
                 slot,
                 name,
                 (binding << 4) | kind,
@@ -1344,14 +1446,15 @@ pub fn write_dynsym(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut
 }
 
 /// Writes `.dynamic`.
-pub fn write_dynamic(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mut [u8]) {
+pub fn write_dynamic<F: ElfFormat>(
+    plan: &DynamicPlan,
+    addresses: &Addresses<'_, '_, F>,
+    out: &mut [u8],
+) {
     let layout = addresses.layout;
     let output = |name: &[u8]| layout.by_name(name).map_or((0, 0), |s| (s.addr, s.size));
-    for ((tag, value), slot) in plan
-        .dynamic
-        .iter()
-        .zip(out.as_chunks_mut::<16>().0.iter_mut())
-    {
+    let entry_size = <F::Dyn as RawRecord>::SIZE.max(1);
+    for ((tag, value), slot) in plan.dynamic.iter().zip(out.chunks_exact_mut(entry_size)) {
         let value = match *value {
             DynValue::Value(v) => v,
             DynValue::Address(kind) => layout.synthetic(kind).map_or(0, |(addr, ..)| addr),
@@ -1363,8 +1466,7 @@ pub fn write_dynamic(plan: &DynamicPlan, addresses: &Addresses<'_, '_>, out: &mu
                 .synthetic(kind)
                 .map_or(0, |(addr, ..)| addr.wrapping_add(offset)),
         };
-        slot[0..8].copy_from_slice(&tag.to_le_bytes());
-        slot[8..16].copy_from_slice(&value.to_le_bytes());
+        slot.copy_from_slice(F::encode_dyn(&DynEntry { tag: *tag, value }).as_bytes());
     }
 }
 

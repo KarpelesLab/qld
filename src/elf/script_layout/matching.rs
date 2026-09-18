@@ -342,7 +342,9 @@ impl<'s> DescIndex<'s> {
 
 /// The name a description sees for a file: the member name for archive
 /// members (with the archive path), else the path.
-fn file_names<'a>(file: &ElfInput<'a>) -> (&'a [u8], Option<&'a [u8]>) {
+fn file_names<'a, F: crate::elf::read::ElfFormat>(
+    file: &ElfInput<'a, F>,
+) -> (&'a [u8], Option<&'a [u8]>) {
     match file.file {
         Some(f) => match f.member() {
             Some(member) => (
@@ -928,9 +930,9 @@ fn name_static_or<'a>(original: &'a [u8], chosen: &[u8]) -> &'a [u8] {
 /// Assigns output sections under a script; see the [module
 /// documentation](self).
 #[allow(clippy::too_many_lines)]
-pub fn place<'a>(
+pub fn place<'a, F: crate::elf::read::ElfFormat>(
     script: &'a LayoutScript,
-    files: &[ElfInput<'a>],
+    files: &[ElfInput<'a, F>],
     sections: &Sections,
     options: &crate::args::LinkOptions,
 ) -> Placement<'a> {

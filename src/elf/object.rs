@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use crate::debug::section::{CompressedSection, ZDEBUG_PREFIX};
 use crate::elf::read::consts::SHF_COMPRESSED;
-use crate::elf::read::{Elf64Le, GnuProperties, ObjectFile, SectionHeader, SectionIndex, Source};
+use crate::elf::read::{
+    Elf64Le, ElfFormat, GnuProperties, ObjectFile, SectionHeader, SectionIndex, Source,
+};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
 use crate::passes::merge::{MergeKind, SplitSection, split_section};
@@ -183,8 +185,8 @@ const ZDEBUG_NAMES: &[(&[u8], &[u8])] = &[
 type Decompressed<'a> = (SectionHeader, &'a [u8], &'a [u8]);
 
 /// Decompresses a compressed non-allocated section into the file table.
-fn decompress_section<'a>(
-    elf: &ObjectFile<'a, Elf64Le>,
+fn decompress_section<'a, F: ElfFormat>(
+    elf: &ObjectFile<'a, F>,
     header: &SectionHeader,
     name: &'a [u8],
     config: &ParseConfig<'a>,
@@ -229,9 +231,9 @@ fn decompress_section<'a>(
 
 /// A parsed input object.
 #[derive(Debug)]
-pub struct ObjectInput<'a> {
+pub struct ObjectInput<'a, F: ElfFormat = Elf64Le> {
     /// The underlying ELF reader.
-    pub elf: ObjectFile<'a, Elf64Le>,
+    pub elf: ObjectFile<'a, F>,
     /// Index of the first global symbol.
     pub first_global: usize,
     /// Global symbol names, in symbol table order from `first_global`.
@@ -305,7 +307,7 @@ pub fn is_debug_name(name: &[u8]) -> bool {
         || name.starts_with(b".stab")
 }
 
-impl<'a> ObjectInput<'a> {
+impl<'a, F: ElfFormat> ObjectInput<'a, F> {
     /// Parses an object and prepares its symbols for resolution.
     ///
     /// # Errors
@@ -313,7 +315,7 @@ impl<'a> ObjectInput<'a> {
     /// Returns [`Error::Malformed`] for malformed files, and
     /// [`Error::Unimplemented`] for objects qld cannot link yet.
     pub fn parse(data: &'a [u8], source: Source<'a>, config: &ParseConfig<'a>) -> Result<Self> {
-        let elf = ObjectFile::<Elf64Le>::parse(data, source)?;
+        let elf = ObjectFile::<F>::parse(data, source)?;
         if crate::elf::arch::Arch::from_machine(elf.elf().header().e_machine).is_none() {
             return Err(source.malformed(18, "ELF machine (not an architecture qld links)"));
         }

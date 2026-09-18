@@ -45,7 +45,11 @@ use super::sections::NONE;
 /// Section properties that must match for two sections to fold.
 type Key = (u32, u64, u64, u64, u32, u64);
 
-fn foldable_section(refs: &Refs<'_, '_>, placement: &Placement<'_>, id: SectionId) -> Option<Key> {
+fn foldable_section<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    placement: &Placement<'_>,
+    id: SectionId,
+) -> Option<Key> {
     if !refs.sections.is_live(id) {
         return None;
     }
@@ -108,8 +112,8 @@ fn addrsig_symbols(data: &[u8]) -> Vec<usize> {
 /// # Errors
 ///
 /// Returns [`Error::Internal`] if the pass rejects its input.
-pub fn fold(
-    refs: &Refs<'_, '_>,
+pub fn fold<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     placement: &Placement<'_>,
     merged: &Merged<'_, '_>,
     mode: IcfMode,
@@ -303,13 +307,10 @@ pub fn fold(
         .collect())
 }
 
-fn section_relocs<'a>(
-    refs: &Refs<'_, 'a>,
+fn section_relocs<'a, F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, 'a, F>,
     id: SectionId,
-) -> Option<(
-    usize,
-    crate::elf::read::RelaSlice<'a, crate::elf::read::Elf64Le>,
-)> {
+) -> Option<(usize, crate::elf::read::RelaSlice<'a, F>)> {
     let (file, index) = refs.sections.locate(id)?;
     let object = refs.files.get(file)?.object.as_ref()?;
     let section = object.section(index)?;
@@ -328,8 +329,8 @@ fn section_relocs<'a>(
     }
 }
 
-fn icf_target(
-    refs: &Refs<'_, '_>,
+fn icf_target<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     merged: &Merged<'_, '_>,
     target: &super::refs::Target,
     addend: i64,
@@ -376,7 +377,7 @@ fn icf_target(
     }
 }
 
-fn describe(refs: &Refs<'_, '_>, id: SectionId) -> String {
+fn describe<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SectionId) -> String {
     let Some((file, index)) = refs.sections.locate(id) else {
         return format!("section {}", id.as_u32());
     };

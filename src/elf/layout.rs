@@ -28,6 +28,7 @@
 use rayon::prelude::*;
 
 use crate::args::{ExecStack, LinkOptions, SeparateCode};
+use crate::elf::read::ElfKind;
 use crate::elf::read::consts::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_RELRO, PT_GNU_STACK,
     PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE,
@@ -54,12 +55,6 @@ use super::synth::Synth;
 pub const DEFAULT_BASE: u64 = 0x40_0000;
 /// Default maximum page size on x86-64.
 pub const DEFAULT_PAGE: u64 = 0x1000;
-/// Size of the ELF header.
-pub const EHDR_SIZE: u64 = 64;
-/// Size of one program header.
-pub const PHDR_SIZE: u64 = 56;
-/// Size of one section header.
-pub const SHDR_SIZE: u64 = 64;
 /// [`Layout::section_shndx`] value of a live input section whose output
 /// section was dropped because it is empty: it has an address but no
 /// section header.
@@ -247,6 +242,8 @@ pub struct TrailerSizes {
 /// The finished layout.
 #[derive(Debug)]
 pub struct Layout<'a> {
+    /// The ELF class and byte order the output is written in.
+    pub kind: ElfKind,
     /// Output sections in section header order (index 0 is the null section,
     /// which is not stored: header index = position + 1).
     pub sections: Vec<OutSection<'a>>,
@@ -350,15 +347,15 @@ impl Layout<'_> {
 }
 
 /// Everything layout reads.
-pub struct LayoutInput<'l, 'a> {
+pub struct LayoutInput<'l, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Options.
     pub options: &'l LinkOptions,
     /// Relocation target resolution, for range-extension thunks.
-    pub refs: Refs<'l, 'a>,
+    pub refs: Refs<'l, 'a, F>,
     /// Rules.
     pub rules: &'l RuleSet<'l>,
     /// Inputs.
-    pub files: &'l [ElfInput<'a>],
+    pub files: &'l [ElfInput<'a, F>],
     /// Input sections.
     pub sections: &'l Sections,
     /// Placement.
@@ -366,7 +363,7 @@ pub struct LayoutInput<'l, 'a> {
     /// Merge groups.
     pub merged: &'l Merged<'l, 'a>,
     /// `.eh_frame` sections.
-    pub eh_frames: &'l EhFrames<'a>,
+    pub eh_frames: &'l EhFrames<'a, F>,
     /// Synthetic sections.
     pub synth: &'l Synth,
     /// Trailing table sizes.
@@ -383,6 +380,14 @@ pub struct LayoutInput<'l, 'a> {
     /// The linker relaxation edits to lay out with; set by
     /// [`crate::elf::arch::shrink::layout`] while it iterates.
     pub relax: Option<&'l Relaxation>,
+}
+
+impl<F: crate::elf::read::ElfFormat> LayoutInput<'_, '_, F> {
+    /// The ELF class and byte order of the output.
+    #[must_use]
+    pub fn kind(&self) -> ElfKind {
+        self.synth.arch.kind()
+    }
 }
 
 /// The compressed size of an output section.
@@ -439,7 +444,9 @@ fn synthetic_goes_last(kind: Synthetic) -> bool {
 /// # Errors
 ///
 /// Returns [`Error::Limit`] when the image does not fit the address space.
-pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
+pub fn layout<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
+) -> Result<Layout<'a>> {
     input.synth.arch.check_options(input.options)?;
     if input.relax.is_none() && input.synth.arch.relaxes() {
         return super::arch::shrink::layout(input, &|input| layout(input));
@@ -468,7 +475,11 @@ pub fn layout<'a>(input: &LayoutInput<'_, 'a>) -> Result<Layout<'a>> {
 }
 
 /// One round of layout, reserving space for `thunks`.
-fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layout<'a>> {
+fn layout_once<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
+    thunks: &Thunks,
+) -> Result<Layout<'a>> {
+    let kind = input.kind();
     let placement = input.placement;
     let sections = input.sections;
     let files = input.files;
@@ -916,7 +927,7 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         .or(input.options.image_base)
         .unwrap_or(default_base);
     let base = align_up(base, 1)?;
-    let headers = add(EHDR_SIZE, PHDR_SIZE.saturating_mul(phnum_u64))?;
+    let headers = add(kind.ehdr_size(), kind.phdr_size().saturating_mul(phnum_u64))?;
     let mut dot = add(base, headers)?;
     let mut file_end = headers;
     // Address minus file offset in the current segment.
@@ -1099,7 +1110,7 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         }
         placed_thunks.sort_unstable();
     }
-    let end = align_up(dot, 8)?;
+    let end = align_up(dot, kind.word_size())?;
     place_empty_until(NONE, dot, &mut output_places);
 
     // Non-allocated sections.
@@ -1123,8 +1134,8 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         section.lma = section.addr;
     }
     let shnum = u64::try_from(out_sections.len().saturating_add(1)).unwrap_or(u64::MAX);
-    let shoff = align_up(file_end, 8)?;
-    let file_size = add(shoff, shnum.saturating_mul(SHDR_SIZE))?;
+    let shoff = align_up(file_end, kind.word_size())?;
+    let file_size = add(shoff, shnum.saturating_mul(kind.shdr_size()))?;
 
     // Program headers, in GNU ld's order.
     let mut synthetic_places = Vec::new();
@@ -1157,12 +1168,12 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
     };
     let mut segments: Vec<Segment> = Vec::with_capacity(phnum);
     if has_interp {
-        let size = PHDR_SIZE.saturating_mul(phnum_u64);
+        let size = kind.phdr_size().saturating_mul(phnum_u64);
         segments.push(Segment {
             p_type: PT_PHDR,
             flags: PF_R,
-            offset: EHDR_SIZE,
-            vaddr: base.saturating_add(EHDR_SIZE),
+            offset: kind.ehdr_size(),
+            vaddr: base.saturating_add(kind.ehdr_size()),
             paddr: None,
             filesz: size,
             memsz: size,
@@ -1367,6 +1378,7 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
 
     let bss_start = bss_start.unwrap_or(edata);
     Ok(Layout {
+        kind,
         sections: out_sections,
         thunks: placed_thunks,
         relax: Relaxation::default(),
@@ -1389,7 +1401,7 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
         fill_patterns: Vec::new(),
         script_symbols: Vec::new(),
         warnings: Vec::new(),
-        phoff: EHDR_SIZE,
+        phoff: kind.ehdr_size(),
         headers_reserved: 0,
         nocrossrefs: Vec::new(),
     })
@@ -1399,10 +1411,11 @@ fn layout_once<'a>(input: &LayoutInput<'_, 'a>, thunks: &Thunks) -> Result<Layou
 /// `.symtab`, `.strtab`, `.shstrtab`) to `out_sections`, names every
 /// section, and links the trailers. Returns the number of section symbols
 /// and the `.shstrtab` contents.
-pub(crate) fn add_trailers(
-    input: &LayoutInput<'_, '_>,
+pub(crate) fn add_trailers<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
     out_sections: &mut Vec<OutSection<'_>>,
 ) -> Result<(u32, Vec<u8>)> {
+    let kind = input.kind();
     // Trailers. With `--emit-relocs`, the symbol table starts with a section
     // symbol for every output section (whose header index is its position
     // plus one, as trailers come last), and every output section with input
@@ -1429,12 +1442,12 @@ pub(crate) fn add_trailers(
                 target.name,
                 Trailer::Rela(u32::try_from(position).unwrap_or(NONE)),
                 crate::elf::read::consts::SHT_RELA,
-                count.saturating_mul(24),
-                8,
+                count.saturating_mul(kind.rela_size()),
+                kind.word_size(),
             );
             rela.name_prefix = b".rela";
             rela.flags = crate::elf::read::consts::SHF_INFO_LINK;
-            rela.entsize = 24;
+            rela.entsize = kind.rela_size();
             rela.info = u32::try_from(position.saturating_add(1)).unwrap_or(0);
             out_sections.push(rela);
         }
@@ -1518,7 +1531,7 @@ pub(crate) fn add_trailers(
             Trailer::Symtab => {
                 section.link = strtab_index;
                 section.info = input.trailers.first_global.saturating_add(section_symbols);
-                section.entsize = 24;
+                section.entsize = kind.sym_size();
             }
             Trailer::Rela(_) => section.link = symtab_index,
             _ => {}
@@ -1604,6 +1617,7 @@ fn relro_start<F: Fn(&OutSection<'_>) -> bool>(
 /// Sets `sh_link`, `sh_info` and `sh_entsize` of the dynamic linking
 /// sections, which refer to each other by section header index.
 pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
+    let class = synth.arch.kind();
     let index_of = |sections: &[OutSection<'_>], kind: Synthetic| -> u32 {
         sections
             .iter()
@@ -1629,7 +1643,14 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
             .collect();
         for kind in kinds {
             match kind {
-                Synthetic::GnuHash => section.link = dynsym,
+                Synthetic::GnuHash => {
+                    section.link = dynsym;
+                    // Every word of the ELF32 table is 32 bits; the ELF64
+                    // bloom filter mixes sizes, so it has no entry size.
+                    if class.is_32() {
+                        section.entsize = 4;
+                    }
+                }
                 Synthetic::Hash => {
                     section.link = dynsym;
                     section.entsize = 4;
@@ -1637,7 +1658,7 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
                 Synthetic::DynSym => {
                     section.link = dynstr;
                     section.info = 1;
-                    section.entsize = 24;
+                    section.entsize = class.sym_size();
                 }
                 Synthetic::VerSym => {
                     section.link = dynsym;
@@ -1653,18 +1674,26 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
                 }
                 Synthetic::RelaDyn => {
                     section.link = dynsym;
-                    section.entsize = 24;
+                    section.entsize = synth.arch.dyn_reloc_size();
+                    if synth.arch.uses_rel() {
+                        section.sh_type = crate::elf::read::consts::SHT_REL;
+                    }
                 }
                 Synthetic::RelaPlt => {
                     section.link = dynsym;
                     section.info = got_plt;
-                    section.entsize = 24;
+                    section.entsize = synth.arch.dyn_reloc_size();
+                    if synth.arch.uses_rel() {
+                        section.sh_type = crate::elf::read::consts::SHT_REL;
+                    }
                 }
-                Synthetic::RelrDyn => section.entsize = 8,
+                Synthetic::RelrDyn => section.entsize = class.word_size(),
                 Synthetic::Dynamic => {
                     section.link = dynstr;
-                    section.entsize = 16;
+                    section.entsize = class.dyn_size();
                 }
+                // GNU ld gives the i386 `.plt` an entry size of 4.
+                Synthetic::Plt if synth.arch == super::arch::Arch::I386 => section.entsize = 4,
                 Synthetic::Plt | Synthetic::PltSec => section.entsize = 16,
                 Synthetic::PltGot => section.entsize = if synth.ibt { 16 } else { 8 },
                 _ => {}
@@ -1737,7 +1766,10 @@ pub(crate) fn synthetic_flags(kind: Synthetic) -> (u64, u32) {
     }
 }
 
-pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result<(u64, u64)> {
+pub(crate) fn member_size<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    member: Member,
+) -> Result<(u64, u64)> {
     Ok(match member {
         Member::Input(id) => {
             let (file, index) = input
@@ -1786,8 +1818,8 @@ pub(crate) fn member_size(input: &LayoutInput<'_, '_>, member: Member) -> Result
 /// section (the others are empty).
 #[cold]
 #[inline(never)]
-fn riscv_member_size(
-    input: &LayoutInput<'_, '_>,
+fn riscv_member_size<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
     id: SectionId,
     section: &super::object::InputSection<'_>,
 ) -> (u64, u64) {
@@ -1808,7 +1840,11 @@ fn riscv_member_size(
     )
 }
 
-pub(crate) fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[Placed]) -> u64 {
+pub(crate) fn entsize_of<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    _output: usize,
+    placed: &[Placed],
+) -> u64 {
     let mut entsize: Option<u64> = None;
     for p in placed {
         let size = match p.member {
@@ -1825,9 +1861,15 @@ pub(crate) fn entsize_of(input: &LayoutInput<'_, '_>, _output: usize, placed: &[
                     crate::passes::merge::MergeKind::Strings { char_size } => u64::from(char_size),
                     crate::passes::merge::MergeKind::Fixed { entry_size } => entry_size,
                 }),
-            Member::Synthetic(Synthetic::RelaPlt | Synthetic::RelaDyn | Synthetic::DynSym) => 24,
-            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt | Synthetic::RelrDyn) => 8,
-            Member::Synthetic(Synthetic::Dynamic | Synthetic::Plt | Synthetic::PltSec) => 16,
+            Member::Synthetic(Synthetic::RelaPlt | Synthetic::RelaDyn) => {
+                input.synth.arch.dyn_reloc_size()
+            }
+            Member::Synthetic(Synthetic::DynSym) => input.kind().sym_size(),
+            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt | Synthetic::RelrDyn) => {
+                input.kind().word_size()
+            }
+            Member::Synthetic(Synthetic::Dynamic) => input.kind().dyn_size(),
+            Member::Synthetic(Synthetic::Plt | Synthetic::PltSec) => 16,
             Member::Synthetic(Synthetic::VerSym) => 2,
             Member::Synthetic(Synthetic::Comment) => 1,
             Member::Synthetic(_) => 0,

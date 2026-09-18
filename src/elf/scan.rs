@@ -28,7 +28,6 @@
 use rayon::prelude::*;
 
 use crate::diag::{Diagnostic, Location};
-use crate::elf::read::Relocations;
 use crate::elf::read::consts::SHF_ALLOC;
 use crate::ids::SymbolId;
 use crate::symbols::SymbolFlags;
@@ -163,7 +162,10 @@ impl ScanResult {
 
 /// Scans every live allocated section.
 #[must_use]
-pub fn scan(refs: &Refs<'_, '_>, context: &Context) -> ScanResult {
+pub fn scan<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    context: &Context,
+) -> ScanResult {
     let files = refs
         .files
         .par_iter()
@@ -175,7 +177,12 @@ pub fn scan(refs: &Refs<'_, '_>, context: &Context) -> ScanResult {
 
 /// A diagnostic location for offset `offset` of section `section` of `file`.
 #[must_use]
-pub fn location(refs: &Refs<'_, '_>, file: usize, section: u32, offset: u64) -> Location {
+pub fn location<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    section: u32,
+    offset: u64,
+) -> Location {
     let input = refs.files.get(file);
     let name = input
         .and_then(|f| f.object.as_ref())
@@ -194,7 +201,28 @@ fn type_name(arch: Arch, r_type: u32) -> String {
     arch.reloc_label(r_type)
 }
 
-fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileScan {
+/// GNU ld's i386 backend still gives `___tls_get_addr` its PLT entry in a
+/// dynamic output when a TLS relaxation removed the call.
+#[cold]
+fn i386_removed_call<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    context: &Context,
+    id: crate::ids::SymbolId,
+    r_type: u32,
+) {
+    if context.mode.dynamic
+        && r_type == crate::elf::read::consts::i386::R_386_PLT32
+        && refs.symbols.flags(id).contains(super::export::PREEMPTIBLE)
+    {
+        refs.symbols.set_flags(id, SymbolFlags::NEEDS_PLT);
+    }
+}
+
+fn scan_file<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file_index: usize,
+    context: &Context,
+) -> FileScan {
     let mut result = FileScan::default();
     let Some(file) = refs.files.get(file_index) else {
         return result;
@@ -241,7 +269,7 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             }
             _ => continue,
         };
-        let Relocations::Rela(relas) = relocations else {
+        if !relocations.is_rela() && !context.arch.uses_rel() {
             result.errors.push(
                 Diagnostic::error(format!(
                     "{}: SHT_REL relocations are not supported for {}",
@@ -251,7 +279,7 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
                 .order(order),
             );
             continue;
-        };
+        }
         let eh_frame = section.kind == SectionKind::EhFrame;
         let mut dyn_section = DynSection {
             section: section_index,
@@ -260,13 +288,16 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             packable: 0,
         };
         let mut skip = false;
-        super::arch::for_each_relocation!(context.arch, relas, |rel| {
+        super::arch::for_each_relocation!(context.arch, relocations, data, |rel| {
             if skip {
                 // The call a TLS relaxation removed still counts as a use
                 // (GNU ld keeps `__tls_get_addr` in the dynamic symbols).
                 skip = false;
                 if let Some(id) = refs.global_id(file_index, rel.symbol as usize) {
                     refs.symbols.set_flags(id, REF_LIVE);
+                    if F::WORD_SIZE == 4 && context.arch == Arch::I386 {
+                        i386_removed_call(refs, context, id, rel.r_type);
+                    }
                 }
                 continue;
             }
@@ -289,31 +320,37 @@ fn scan_file(refs: &Refs<'_, '_>, file_index: usize, context: &Context) -> FileS
             {
                 refs.symbols.set_flags(id, REF_LIVE);
             }
-            let decision =
-                match reloc::decide(context, &rel, data, &target, flags, section.header.sh_flags) {
-                    Ok(decision) => decision,
-                    Err(error) => {
-                        let what = match error {
-                            ClassifyError::Unsupported => format!(
-                                "unsupported relocation type {}",
-                                type_name(context.arch, rel.r_type)
-                            ),
-                            ClassifyError::BadTlsInstruction => format!(
-                                "{} is not part of a TLS sequence qld can link",
-                                context
-                                    .arch
-                                    .reloc_name(rel.r_type)
-                                    .unwrap_or("a TLS relocation")
-                            ),
-                        };
-                        result.errors.push(
-                            Diagnostic::error(what)
-                                .at(location(refs, file_index, section_index, rel.offset))
-                                .order(order),
-                        );
-                        continue;
-                    }
-                };
+            let decision = match reloc::decide::<F>(
+                context,
+                &rel,
+                data,
+                &target,
+                flags,
+                section.header.sh_flags,
+            ) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    let what = match error {
+                        ClassifyError::Unsupported => format!(
+                            "unsupported relocation type {}",
+                            type_name(context.arch, rel.r_type)
+                        ),
+                        ClassifyError::BadTlsInstruction => format!(
+                            "{} is not part of a TLS sequence qld can link",
+                            context
+                                .arch
+                                .reloc_name(rel.r_type)
+                                .unwrap_or("a TLS relocation")
+                        ),
+                    };
+                    result.errors.push(
+                        Diagnostic::error(what)
+                            .at(location(refs, file_index, section_index, rel.offset))
+                            .order(order),
+                    );
+                    continue;
+                }
+            };
             let class = decision.class;
             skip = class.skip_next;
             if class.kind == Kind::None {

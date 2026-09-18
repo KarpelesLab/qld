@@ -197,272 +197,281 @@ const fn hold(mut rule: OutputRule, class: OrphanClass) -> OutputRule {
     rule
 }
 
-/// GNU ld's default x86-64 layout, as rules.
-pub static DEFAULT_RULES: &[OutputRule] = &[
-    hold(
-        synth(
-            rule(".note.gnu.build-id", &[plain(&[".note.gnu.build-id"])]),
-            Synthetic::BuildId,
-        ),
-        OrphanClass::Note,
-    ),
-    synthetic_only(".interp", Synthetic::Interp),
-    synthetic_only(".hash", Synthetic::Hash),
-    synthetic_only(".gnu.hash", Synthetic::GnuHash),
-    synthetic_only(".dynsym", Synthetic::DynSym),
-    synthetic_only(".dynstr", Synthetic::DynStr),
-    synthetic_only(".gnu.version", Synthetic::VerSym),
-    synthetic_only(".gnu.version_d", Synthetic::VerDef),
-    synthetic_only(".gnu.version_r", Synthetic::VerNeed),
-    synthetic_only(".rela.dyn", Synthetic::RelaDyn),
-    synth(
-        rule(
-            ".rela.plt",
-            &[plain(&[".rela.plt"]), plain(&[".rela.iplt"])],
-        ),
-        Synthetic::RelaPlt,
-    ),
-    synthetic_only(".relr.dyn", Synthetic::RelrDyn),
-    keep(rule(".init", &[plain(&[".init"])])),
-    synth(rule(".plt", &[plain(&[".plt", ".iplt"])]), Synthetic::Plt),
-    synth(rule(".plt.got", &[plain(&[".plt.got"])]), Synthetic::PltGot),
-    synth(rule(".plt.sec", &[plain(&[".plt.sec"])]), Synthetic::PltSec),
-    hold(
-        rule(
-            ".text",
-            &[
-                plain(&[".text.unlikely", ".text.*_unlikely", ".text.unlikely.*"]),
-                plain(&[".text.exit", ".text.exit.*"]),
-                plain(&[".text.startup", ".text.startup.*"]),
-                plain(&[".text.hot", ".text.hot.*"]),
-                InputRule {
-                    patterns: &[".text.sorted.*"],
-                    sort: SortMode::Name,
-                    files: FileFilter::Any,
-                },
-                plain(&[".text", ".stub", ".text.*", ".gnu.linkonce.t.*"]),
-                plain(&[".gnu.warning"]),
-            ],
-        ),
-        OrphanClass::Text,
-    ),
-    keep(rule(".fini", &[plain(&[".fini"])])),
-    hold(
-        rule(
-            ".rodata",
-            &[plain(&[".rodata", ".rodata.*", ".gnu.linkonce.r.*"])],
-        ),
-        OrphanClass::Rodata,
-    ),
-    rule(".rodata1", &[plain(&[".rodata1"])]),
-    synth(
-        rule(
-            ".eh_frame_hdr",
-            &[
-                plain(&[".eh_frame_hdr"]),
-                plain(&[".eh_frame_entry", ".eh_frame_entry.*"]),
-            ],
-        ),
-        Synthetic::EhFrameHdr,
-    ),
-    synth(
-        keep(rule(
-            ".eh_frame",
-            &[plain(&[".eh_frame"]), plain(&[".eh_frame.*"])],
-        )),
-        Synthetic::EhFrameEnd,
-    ),
-    rule(".sframe", &[plain(&[".sframe"]), plain(&[".sframe.*"])]),
-    rule(
-        ".gcc_except_table",
-        &[plain(&[".gcc_except_table", ".gcc_except_table.*"])],
-    ),
-    rule(".gnu_extab", &[plain(&[".gnu_extab*"])]),
-    rule(".exception_ranges", &[plain(&[".exception_ranges*"])]),
-    rule(".note.build-id", &[plain(&[".note.build-id"])]),
-    synth(
-        rule(".note.gnu.property", &[plain(&[".note.gnu.property"])]),
-        Synthetic::GnuProperty,
-    ),
-    rule(".note.ABI-tag", &[plain(&[".note.ABI-tag"])]),
-    rule(".note.package", &[plain(&[".note.package"])]),
-    rule(".note.dlopen", &[plain(&[".note.dlopen"])]),
-    rule(".note.netbsd.ident", &[plain(&[".note.netbsd.ident"])]),
-    rule(".note.openbsd.ident", &[plain(&[".note.openbsd.ident"])]),
-    relro(hold(
-        rule(
-            ".tdata",
-            &[plain(&[".tdata", ".tdata.*", ".gnu.linkonce.td.*"])],
-        ),
-        OrphanClass::Tdata,
-    )),
-    relro(hold(
-        rule(
-            ".tbss",
-            &[
-                plain(&[".tbss", ".tbss.*", ".gnu.linkonce.tb.*"]),
-                plain(&[".tcommon"]),
-            ],
-        ),
-        OrphanClass::Tbss,
-    )),
-    relro(keep(rule(".preinit_array", &[plain(&[".preinit_array"])]))),
-    relro(keep(rule(
-        ".init_array",
+/// GNU ld's default layout, as rules; `$dyn`, `$plt` and `$iplt` name the
+/// dynamic relocation sections, which are `SHT_RELA` or `SHT_REL`.
+macro_rules! default_rules {
+    ($dyn:literal, $plt:literal, $iplt:literal) => {
         &[
-            InputRule {
-                patterns: &[".init_array.*", ".ctors.*"],
-                sort: SortMode::InitPriority,
-                files: FileFilter::Any,
-            },
-            InputRule {
-                patterns: &[".init_array", ".ctors"],
-                sort: SortMode::None,
-                files: FileFilter::NotCrtBeginEnd,
-            },
-        ],
-    ))),
-    relro(keep(rule(
-        ".fini_array",
-        &[
-            InputRule {
-                patterns: &[".fini_array.*", ".dtors.*"],
-                sort: SortMode::InitPriority,
-                files: FileFilter::Any,
-            },
-            InputRule {
-                patterns: &[".fini_array", ".dtors"],
-                sort: SortMode::None,
-                files: FileFilter::NotCrtBeginEnd,
-            },
-        ],
-    ))),
-    relro(keep(rule(
-        ".ctors",
-        &[
-            InputRule {
-                patterns: &[".ctors"],
-                sort: SortMode::None,
-                files: FileFilter::CrtBegin,
-            },
-            plain(&[".ctors"]),
-        ],
-    ))),
-    relro(keep(rule(
-        ".dtors",
-        &[
-            InputRule {
-                patterns: &[".dtors"],
-                sort: SortMode::None,
-                files: FileFilter::CrtBegin,
-            },
-            plain(&[".dtors"]),
-        ],
-    ))),
-    relro(keep(rule(".jcr", &[plain(&[".jcr"])]))),
-    relro(synth(
-        rule(
-            ".data.rel.ro",
-            &[
-                plain(&[".data.rel.ro.local*", ".gnu.linkonce.d.rel.ro.local.*"]),
-                plain(&[".data.rel.ro", ".data.rel.ro.*", ".gnu.linkonce.d.rel.ro.*"]),
-            ],
-        ),
-        Synthetic::DynRelro,
-    )),
-    relro(synth(
-        rule(".dynamic", &[plain(&[".dynamic"])]),
-        Synthetic::Dynamic,
-    )),
-    relro(synth(
-        rule(".got", &[plain(&[".got"]), plain(&[".igot"])]),
-        Synthetic::Got,
-    )),
-    synth(
-        rule(".got.plt", &[plain(&[".got.plt"]), plain(&[".igot.plt"])]),
-        Synthetic::GotPlt,
-    ),
-    hold(
-        rule(
-            ".data",
-            &[plain(&[".data", ".data.*", ".gnu.linkonce.d.*"])],
-        ),
-        OrphanClass::Data,
-    ),
-    rule(".data1", &[plain(&[".data1"])]),
-    hold(
-        synth(
+            hold(
+                synth(
+                    rule(".note.gnu.build-id", &[plain(&[".note.gnu.build-id"])]),
+                    Synthetic::BuildId,
+                ),
+                OrphanClass::Note,
+            ),
+            synthetic_only(".interp", Synthetic::Interp),
+            synthetic_only(".hash", Synthetic::Hash),
+            synthetic_only(".gnu.hash", Synthetic::GnuHash),
+            synthetic_only(".dynsym", Synthetic::DynSym),
+            synthetic_only(".dynstr", Synthetic::DynStr),
+            synthetic_only(".gnu.version", Synthetic::VerSym),
+            synthetic_only(".gnu.version_d", Synthetic::VerDef),
+            synthetic_only(".gnu.version_r", Synthetic::VerNeed),
+            synthetic_only($dyn, Synthetic::RelaDyn),
+            synth(
+                rule($plt, &[plain(&[$plt]), plain(&[$iplt])]),
+                Synthetic::RelaPlt,
+            ),
+            synthetic_only(".relr.dyn", Synthetic::RelrDyn),
+            keep(rule(".init", &[plain(&[".init"])])),
+            synth(rule(".plt", &[plain(&[".plt", ".iplt"])]), Synthetic::Plt),
+            synth(rule(".plt.got", &[plain(&[".plt.got"])]), Synthetic::PltGot),
+            synth(rule(".plt.sec", &[plain(&[".plt.sec"])]), Synthetic::PltSec),
+            hold(
+                rule(
+                    ".text",
+                    &[
+                        plain(&[".text.unlikely", ".text.*_unlikely", ".text.unlikely.*"]),
+                        plain(&[".text.exit", ".text.exit.*"]),
+                        plain(&[".text.startup", ".text.startup.*"]),
+                        plain(&[".text.hot", ".text.hot.*"]),
+                        InputRule {
+                            patterns: &[".text.sorted.*"],
+                            sort: SortMode::Name,
+                            files: FileFilter::Any,
+                        },
+                        plain(&[".text", ".stub", ".text.*", ".gnu.linkonce.t.*"]),
+                        plain(&[".gnu.warning"]),
+                    ],
+                ),
+                OrphanClass::Text,
+            ),
+            keep(rule(".fini", &[plain(&[".fini"])])),
+            hold(
+                rule(
+                    ".rodata",
+                    &[plain(&[".rodata", ".rodata.*", ".gnu.linkonce.r.*"])],
+                ),
+                OrphanClass::Rodata,
+            ),
+            rule(".rodata1", &[plain(&[".rodata1"])]),
+            synth(
+                rule(
+                    ".eh_frame_hdr",
+                    &[
+                        plain(&[".eh_frame_hdr"]),
+                        plain(&[".eh_frame_entry", ".eh_frame_entry.*"]),
+                    ],
+                ),
+                Synthetic::EhFrameHdr,
+            ),
+            synth(
+                keep(rule(
+                    ".eh_frame",
+                    &[plain(&[".eh_frame"]), plain(&[".eh_frame.*"])],
+                )),
+                Synthetic::EhFrameEnd,
+            ),
+            rule(".sframe", &[plain(&[".sframe"]), plain(&[".sframe.*"])]),
             rule(
-                ".bss",
+                ".gcc_except_table",
+                &[plain(&[".gcc_except_table", ".gcc_except_table.*"])],
+            ),
+            rule(".gnu_extab", &[plain(&[".gnu_extab*"])]),
+            rule(".exception_ranges", &[plain(&[".exception_ranges*"])]),
+            rule(".note.build-id", &[plain(&[".note.build-id"])]),
+            synth(
+                rule(".note.gnu.property", &[plain(&[".note.gnu.property"])]),
+                Synthetic::GnuProperty,
+            ),
+            rule(".note.ABI-tag", &[plain(&[".note.ABI-tag"])]),
+            rule(".note.package", &[plain(&[".note.package"])]),
+            rule(".note.dlopen", &[plain(&[".note.dlopen"])]),
+            rule(".note.netbsd.ident", &[plain(&[".note.netbsd.ident"])]),
+            rule(".note.openbsd.ident", &[plain(&[".note.openbsd.ident"])]),
+            relro(hold(
+                rule(
+                    ".tdata",
+                    &[plain(&[".tdata", ".tdata.*", ".gnu.linkonce.td.*"])],
+                ),
+                OrphanClass::Tdata,
+            )),
+            relro(hold(
+                rule(
+                    ".tbss",
+                    &[
+                        plain(&[".tbss", ".tbss.*", ".gnu.linkonce.tb.*"]),
+                        plain(&[".tcommon"]),
+                    ],
+                ),
+                OrphanClass::Tbss,
+            )),
+            relro(keep(rule(".preinit_array", &[plain(&[".preinit_array"])]))),
+            relro(keep(rule(
+                ".init_array",
                 &[
-                    plain(&[".dynbss"]),
-                    plain(&[".bss", ".bss.*", ".gnu.linkonce.b.*"]),
+                    InputRule {
+                        patterns: &[".init_array.*", ".ctors.*"],
+                        sort: SortMode::InitPriority,
+                        files: FileFilter::Any,
+                    },
+                    InputRule {
+                        patterns: &[".init_array", ".ctors"],
+                        sort: SortMode::None,
+                        files: FileFilter::NotCrtBeginEnd,
+                    },
+                ],
+            ))),
+            relro(keep(rule(
+                ".fini_array",
+                &[
+                    InputRule {
+                        patterns: &[".fini_array.*", ".dtors.*"],
+                        sort: SortMode::InitPriority,
+                        files: FileFilter::Any,
+                    },
+                    InputRule {
+                        patterns: &[".fini_array", ".dtors"],
+                        sort: SortMode::None,
+                        files: FileFilter::NotCrtBeginEnd,
+                    },
+                ],
+            ))),
+            relro(keep(rule(
+                ".ctors",
+                &[
+                    InputRule {
+                        patterns: &[".ctors"],
+                        sort: SortMode::None,
+                        files: FileFilter::CrtBegin,
+                    },
+                    plain(&[".ctors"]),
+                ],
+            ))),
+            relro(keep(rule(
+                ".dtors",
+                &[
+                    InputRule {
+                        patterns: &[".dtors"],
+                        sort: SortMode::None,
+                        files: FileFilter::CrtBegin,
+                    },
+                    plain(&[".dtors"]),
+                ],
+            ))),
+            relro(keep(rule(".jcr", &[plain(&[".jcr"])]))),
+            relro(synth(
+                rule(
+                    ".data.rel.ro",
+                    &[
+                        plain(&[".data.rel.ro.local*", ".gnu.linkonce.d.rel.ro.local.*"]),
+                        plain(&[".data.rel.ro", ".data.rel.ro.*", ".gnu.linkonce.d.rel.ro.*"]),
+                    ],
+                ),
+                Synthetic::DynRelro,
+            )),
+            relro(synth(
+                rule(".dynamic", &[plain(&[".dynamic"])]),
+                Synthetic::Dynamic,
+            )),
+            relro(synth(
+                rule(".got", &[plain(&[".got"]), plain(&[".igot"])]),
+                Synthetic::Got,
+            )),
+            synth(
+                rule(".got.plt", &[plain(&[".got.plt"]), plain(&[".igot.plt"])]),
+                Synthetic::GotPlt,
+            ),
+            hold(
+                rule(
+                    ".data",
+                    &[plain(&[".data", ".data.*", ".gnu.linkonce.d.*"])],
+                ),
+                OrphanClass::Data,
+            ),
+            rule(".data1", &[plain(&[".data1"])]),
+            hold(
+                synth(
+                    rule(
+                        ".bss",
+                        &[
+                            plain(&[".dynbss"]),
+                            plain(&[".bss", ".bss.*", ".gnu.linkonce.b.*"]),
+                        ],
+                    ),
+                    Synthetic::DynBss,
+                ),
+                OrphanClass::Bss,
+            ),
+            rule(
+                ".lbss",
+                &[
+                    plain(&[".dynlbss"]),
+                    plain(&[".lbss", ".lbss.*", ".gnu.linkonce.lb.*"]),
                 ],
             ),
-            Synthetic::DynBss,
-        ),
-        OrphanClass::Bss,
-    ),
-    rule(
-        ".lbss",
-        &[
-            plain(&[".dynlbss"]),
-            plain(&[".lbss", ".lbss.*", ".gnu.linkonce.lb.*"]),
-        ],
-    ),
-    rule(
-        ".lrodata",
-        &[plain(&[".lrodata", ".lrodata.*", ".gnu.linkonce.lr.*"])],
-    ),
-    rule(
-        ".ldata",
-        &[plain(&[".ldata", ".ldata.*", ".gnu.linkonce.l.*"])],
-    ),
-    synth(
-        rule(".comment", &[plain(&[".comment"])]),
-        Synthetic::Comment,
-    ),
-    rule(
-        ".gnu.build.attributes",
-        &[plain(&[".gnu.build.attributes", ".gnu.build.attributes.*"])],
-    ),
-    rule(".debug", &[plain(&[".debug"])]),
-    rule(".line", &[plain(&[".line"])]),
-    rule(".debug_srcinfo", &[plain(&[".debug_srcinfo"])]),
-    rule(".debug_sfnames", &[plain(&[".debug_sfnames"])]),
-    rule(".debug_aranges", &[plain(&[".debug_aranges"])]),
-    rule(".debug_pubnames", &[plain(&[".debug_pubnames"])]),
-    rule(
-        ".debug_info",
-        &[plain(&[".debug_info", ".gnu.linkonce.wi.*"])],
-    ),
-    rule(".debug_abbrev", &[plain(&[".debug_abbrev"])]),
-    rule(
-        ".debug_line",
-        &[plain(&[".debug_line", ".debug_line.*", ".debug_line_end"])],
-    ),
-    rule(".debug_frame", &[plain(&[".debug_frame"])]),
-    rule(".debug_str", &[plain(&[".debug_str"])]),
-    rule(".debug_loc", &[plain(&[".debug_loc"])]),
-    rule(".debug_macinfo", &[plain(&[".debug_macinfo"])]),
-    rule(".debug_weaknames", &[plain(&[".debug_weaknames"])]),
-    rule(".debug_funcnames", &[plain(&[".debug_funcnames"])]),
-    rule(".debug_typenames", &[plain(&[".debug_typenames"])]),
-    rule(".debug_varnames", &[plain(&[".debug_varnames"])]),
-    rule(".debug_pubtypes", &[plain(&[".debug_pubtypes"])]),
-    rule(".debug_ranges", &[plain(&[".debug_ranges"])]),
-    rule(".debug_addr", &[plain(&[".debug_addr"])]),
-    rule(".debug_line_str", &[plain(&[".debug_line_str"])]),
-    rule(".debug_loclists", &[plain(&[".debug_loclists"])]),
-    rule(".debug_macro", &[plain(&[".debug_macro"])]),
-    rule(".debug_names", &[plain(&[".debug_names"])]),
-    rule(".debug_rnglists", &[plain(&[".debug_rnglists"])]),
-    rule(".debug_str_offsets", &[plain(&[".debug_str_offsets"])]),
-    hold(
-        rule(".debug_sup", &[plain(&[".debug_sup"])]),
-        OrphanClass::NonAlloc,
-    ),
-];
+            rule(
+                ".lrodata",
+                &[plain(&[".lrodata", ".lrodata.*", ".gnu.linkonce.lr.*"])],
+            ),
+            rule(
+                ".ldata",
+                &[plain(&[".ldata", ".ldata.*", ".gnu.linkonce.l.*"])],
+            ),
+            synth(
+                rule(".comment", &[plain(&[".comment"])]),
+                Synthetic::Comment,
+            ),
+            rule(
+                ".gnu.build.attributes",
+                &[plain(&[".gnu.build.attributes", ".gnu.build.attributes.*"])],
+            ),
+            rule(".debug", &[plain(&[".debug"])]),
+            rule(".line", &[plain(&[".line"])]),
+            rule(".debug_srcinfo", &[plain(&[".debug_srcinfo"])]),
+            rule(".debug_sfnames", &[plain(&[".debug_sfnames"])]),
+            rule(".debug_aranges", &[plain(&[".debug_aranges"])]),
+            rule(".debug_pubnames", &[plain(&[".debug_pubnames"])]),
+            rule(
+                ".debug_info",
+                &[plain(&[".debug_info", ".gnu.linkonce.wi.*"])],
+            ),
+            rule(".debug_abbrev", &[plain(&[".debug_abbrev"])]),
+            rule(
+                ".debug_line",
+                &[plain(&[".debug_line", ".debug_line.*", ".debug_line_end"])],
+            ),
+            rule(".debug_frame", &[plain(&[".debug_frame"])]),
+            rule(".debug_str", &[plain(&[".debug_str"])]),
+            rule(".debug_loc", &[plain(&[".debug_loc"])]),
+            rule(".debug_macinfo", &[plain(&[".debug_macinfo"])]),
+            rule(".debug_weaknames", &[plain(&[".debug_weaknames"])]),
+            rule(".debug_funcnames", &[plain(&[".debug_funcnames"])]),
+            rule(".debug_typenames", &[plain(&[".debug_typenames"])]),
+            rule(".debug_varnames", &[plain(&[".debug_varnames"])]),
+            rule(".debug_pubtypes", &[plain(&[".debug_pubtypes"])]),
+            rule(".debug_ranges", &[plain(&[".debug_ranges"])]),
+            rule(".debug_addr", &[plain(&[".debug_addr"])]),
+            rule(".debug_line_str", &[plain(&[".debug_line_str"])]),
+            rule(".debug_loclists", &[plain(&[".debug_loclists"])]),
+            rule(".debug_macro", &[plain(&[".debug_macro"])]),
+            rule(".debug_names", &[plain(&[".debug_names"])]),
+            rule(".debug_rnglists", &[plain(&[".debug_rnglists"])]),
+            rule(".debug_str_offsets", &[plain(&[".debug_str_offsets"])]),
+            hold(
+                rule(".debug_sup", &[plain(&[".debug_sup"])]),
+                OrphanClass::NonAlloc,
+            ),
+        ]
+    };
+}
+
+/// GNU ld's default x86-64 layout, as rules.
+pub static DEFAULT_RULES: &[OutputRule] = default_rules!(".rela.dyn", ".rela.plt", ".rela.iplt");
+
+/// The same layout for architectures whose dynamic relocations are
+/// `SHT_REL` (i386).
+pub static REL_RULES: &[OutputRule] = default_rules!(".rel.dyn", ".rel.plt", ".rel.iplt");
 
 /// A compiled rule set: patterns ready for matching.
 ///
@@ -508,14 +517,26 @@ impl<'r> RuleSet<'r> {
         Self::new(DEFAULT_RULES)
     }
 
+    /// The default rules of an architecture: [`REL_RULES`] where dynamic
+    /// relocations are `SHT_REL`, else [`DEFAULT_RULES`].
+    #[must_use]
+    pub fn default_rules_for(arch: crate::elf::arch::Arch) -> Self {
+        Self::new(if arch.uses_rel() {
+            REL_RULES
+        } else {
+            DEFAULT_RULES
+        })
+    }
+
     /// The rules of a link: the script engine's plan when there is one,
     /// else the default rules.
     #[must_use]
     pub fn for_link(
         script: Option<&'r crate::elf::script_layout::LayoutScript>,
         diagnostics: &'r dyn crate::diag::DiagnosticSink,
+        arch: crate::elf::arch::Arch,
     ) -> Self {
-        let mut rules = Self::new(DEFAULT_RULES);
+        let mut rules = Self::default_rules_for(arch);
         rules.script = script;
         rules.diagnostics = Some(diagnostics);
         rules

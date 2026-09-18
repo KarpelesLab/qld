@@ -49,10 +49,10 @@ use super::refs::{Def, Refs};
 /// # Errors
 ///
 /// Returns [`Error::Internal`] if the graph is inconsistent.
-pub fn collect(
-    refs: &Refs<'_, '_>,
+pub fn collect<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     placement: &Placement<'_>,
-    eh_frames: &EhFrames<'_>,
+    eh_frames: &EhFrames<'_, F>,
     linker: &LinkerSymbols,
     internal: &InternalNames,
     want_graph: bool,
@@ -227,8 +227,8 @@ pub fn collect(
 /// Reports `--why-live`: for every defined global symbol matching one of
 /// `patterns` (with `*` and `?` wildcards), the reference chain from a GC
 /// root to its section, or that it was removed.
-pub fn report_why_live(
-    refs: &Refs<'_, '_>,
+pub fn report_why_live<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     graph: &SectionGraph,
     patterns: &[String],
     diagnostics: &dyn DiagnosticSink,
@@ -275,7 +275,7 @@ pub fn report_why_live(
     }
 }
 
-fn describe(refs: &Refs<'_, '_>, id: SectionId) -> String {
+fn describe<F: crate::elf::read::ElfFormat>(refs: &Refs<'_, '_, F>, id: SectionId) -> String {
     let Some((file, index)) = refs.sections.locate(id) else {
         return String::new();
     };
@@ -292,7 +292,10 @@ fn describe(refs: &Refs<'_, '_>, id: SectionId) -> String {
     format!("{}:({name})", input.display())
 }
 
-fn relocation_count(refs: &Refs<'_, '_>, section: SectionId) -> usize {
+fn relocation_count<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    section: SectionId,
+) -> usize {
     let Some((file_index, index)) = refs.sections.locate(section) else {
         return 0;
     };
@@ -327,7 +330,11 @@ fn contributes_edges(flags: u64, sh_type: u32) -> bool {
 }
 
 /// Prints `--print-gc-sections` lines for removed allocated sections.
-pub fn print_removed(refs: &Refs<'_, '_>, removed: &[SectionId], diagnostics: &dyn DiagnosticSink) {
+pub fn print_removed<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    removed: &[SectionId],
+    diagnostics: &dyn DiagnosticSink,
+) {
     for &id in removed {
         let Some((file_index, index)) = refs.sections.locate(id) else {
             continue;

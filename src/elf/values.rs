@@ -23,15 +23,15 @@ use super::rules::Synthetic;
 use super::synth::{GotKind, Owner, Synth};
 
 /// Everything needed to compute addresses.
-pub struct Addresses<'x, 'a> {
+pub struct Addresses<'x, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
     /// Relocation target resolution.
-    pub refs: Refs<'x, 'a>,
+    pub refs: Refs<'x, 'a, F>,
     /// The layout.
     pub layout: &'x Layout<'a>,
     /// Merged sections.
     pub merged: &'x Merged<'x, 'a>,
     /// `.eh_frame` sections.
-    pub eh_frames: &'x EhFrames<'a>,
+    pub eh_frames: &'x EhFrames<'a, F>,
     /// Synthetic sections.
     pub synth: &'x Synth,
     /// Common symbols.
@@ -40,15 +40,15 @@ pub struct Addresses<'x, 'a> {
     pub globals: Vec<u64>,
 }
 
-impl<'x, 'a> Addresses<'x, 'a> {
+impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
     /// Computes global symbol addresses.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
-        refs: Refs<'x, 'a>,
+        refs: Refs<'x, 'a, F>,
         layout: &'x Layout<'a>,
         merged: &'x Merged<'x, 'a>,
-        eh_frames: &'x EhFrames<'a>,
+        eh_frames: &'x EhFrames<'a, F>,
         synth: &'x Synth,
         commons: &'x Commons,
         placement: &Placement<'_>,
@@ -191,6 +191,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
             Value::Dynamic => layout
                 .synthetic(Synthetic::Dynamic)
                 .map_or(0, |(addr, ..)| addr),
+            Value::TlsModuleBase => layout.tls.map_or(0, |tls| tls.start),
             Value::GlobalPointer => placement
                 .outputs
                 .iter()
@@ -399,7 +400,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
     pub fn got_entry_address(&self, owner: Owner, kind: GotKind) -> Option<u64> {
         let word = self.synth.got_word(owner, kind)?;
         let (base, ..) = self.layout.synthetic(Synthetic::Got)?;
-        base.checked_add(word.checked_mul(8)?)
+        base.checked_add(word.checked_mul(self.synth.arch.kind().word_size())?)
     }
 
     /// The address of the `.got.plt` slot of PLT entry `index` (for a
@@ -410,7 +411,7 @@ impl<'x, 'a> Addresses<'x, 'a> {
         let slot = u64::try_from(index)
             .ok()?
             .checked_add(self.synth.got_plt_reserved)?;
-        base.checked_add(slot.checked_mul(8)?)
+        base.checked_add(slot.checked_mul(self.synth.arch.kind().word_size())?)
     }
 
     /// The GOT base (`_GLOBAL_OFFSET_TABLE_`; on PowerPC64 the TOC pointer
@@ -485,7 +486,11 @@ pub fn plt_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u
 pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
     if synth.plt_got.index(owner).is_some() {
         let (base, ..) = layout.synthetic(Synthetic::Got)?;
-        return base.checked_add(synth.got_word(owner, GotKind::Address)?.checked_mul(8)?);
+        return base.checked_add(
+            synth
+                .got_word(owner, GotKind::Address)?
+                .checked_mul(synth.arch.kind().word_size())?,
+        );
     }
     let index = if synth.dynamic() {
         synth.plt_index(owner)?
@@ -493,7 +498,11 @@ pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Opt
         u64::try_from(synth.iplt.index(owner)?).ok()?
     };
     let (base, ..) = layout.synthetic(Synthetic::GotPlt)?;
-    base.checked_add(index.checked_add(synth.got_plt_reserved)?.checked_mul(8)?)
+    base.checked_add(
+        index
+            .checked_add(synth.got_plt_reserved)?
+            .checked_mul(synth.arch.kind().word_size())?,
+    )
 }
 
 /// The address of lazy `.plt` entry `index`, after the header.

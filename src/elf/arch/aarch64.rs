@@ -1175,6 +1175,7 @@ mod tests {
                 landing_pad: true,
                 entry_landing_pad: true,
                 authenticate: false,
+                pic: false,
             },
         )
         .unwrap();
@@ -1224,6 +1225,7 @@ mod tests {
                 landing_pad: landing,
                 entry_landing_pad: landing,
                 authenticate: true,
+                pic: false,
             };
             assert_eq!(plt_entry_size(flags), 24);
             let mut entry = [0u8; 24];

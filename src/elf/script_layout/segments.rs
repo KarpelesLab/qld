@@ -20,7 +20,8 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::args::{ExecStack, LinkOptions, MagicMode, SeparateCode};
-use crate::elf::layout::{EHDR_SIZE, OutSection, PHDR_SIZE, Segment, Trailer, align_up};
+use crate::elf::layout::{OutSection, Segment, Trailer, align_up};
+use crate::elf::read::ElfKind;
 use crate::elf::read::consts::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_RELRO, PT_GNU_STACK,
     PT_INTERP, PT_LOAD, PT_NOTE, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE,
@@ -49,6 +50,8 @@ pub struct PhdrSpec {
 pub struct SegmentInput<'s> {
     /// Options.
     pub options: &'s LinkOptions,
+    /// The ELF class and byte order of the output.
+    pub kind: ElfKind,
     /// `PHDRS`, evaluated, when the script has them.
     pub phdrs: Option<&'s [PhdrSpec]>,
     /// For each section (by position), its `:phdr` names after
@@ -473,14 +476,16 @@ fn user_maps(
 pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Result<SegmentResult> {
     let options = input.options;
     let paged = options.magic == MagicMode::Normal;
-    let estimate = input.reserved_headers.saturating_sub(EHDR_SIZE);
+    let estimate = input
+        .reserved_headers
+        .saturating_sub(input.kind.ehdr_size());
     let mut maps = match input.phdrs {
         Some(specs) => user_maps(input, specs, sections)?,
         None => default_maps(input, sections, input.reserved_headers),
     };
     // The table holds at least as many entries as the layout assumed.
     let count = u64::try_from(maps.len()).map_err(|_| too_large())?;
-    let table = PHDR_SIZE.saturating_mul(count).max(estimate);
+    let table = input.kind.phdr_size().saturating_mul(count).max(estimate);
     let max_page = if paged {
         options
             .max_page_size
@@ -524,7 +529,7 @@ pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Resu
     });
 
     let mut segments = vec![Segment::default(); maps.len()];
-    let mut off = EHDR_SIZE;
+    let mut off = input.kind.ehdr_size();
     let phdr_load = order
         .iter()
         .take_while(|&&i| maps.get(i).is_some_and(|m| m.p_type == PT_LOAD))
@@ -533,7 +538,7 @@ pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Resu
     if phdr_load.is_none() {
         off = off.checked_add(table).ok_or_else(too_large)?;
     }
-    let mut phoff = EHDR_SIZE;
+    let mut phoff = input.kind.ehdr_size();
     let mut placed = vec![false; sections.len()];
     for &m_index in &order {
         let Some(map) = maps.get(m_index) else {
@@ -608,8 +613,8 @@ pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Resu
             if map.flags.is_none() {
                 p.flags |= PF_R;
             }
-            p.filesz = EHDR_SIZE;
-            p.memsz = EHDR_SIZE;
+            p.filesz = input.kind.ehdr_size();
+            p.memsz = input.kind.ehdr_size();
             if map.p_type == PT_LOAD && first.is_some() {
                 let short = p.vaddr < off || (map.paddr.is_none() && paddr < off);
                 if short && input.defer_room_error && table > estimate {
@@ -644,7 +649,7 @@ pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Resu
                     }
                 } else if let Some(load) = phdr_load.and_then(|l| segments.get(l)) {
                     let base = if maps.get(phdr_load.unwrap_or(0)).is_some_and(|m| m.filehdr) {
-                        EHDR_SIZE
+                        input.kind.ehdr_size()
                     } else {
                         0
                     };
@@ -654,7 +659,7 @@ pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Resu
                     }
                     p.offset = load.offset.wrapping_add(base);
                 } else {
-                    p.offset = EHDR_SIZE;
+                    p.offset = input.kind.ehdr_size();
                 }
             }
         }
@@ -901,7 +906,7 @@ pub fn assign(input: &SegmentInput<'_>, sections: &mut [OutSection<'_>]) -> Resu
         .map(|s| s.offset.saturating_add(s.size))
         .max()
         .unwrap_or(0)
-        .max(EHDR_SIZE.saturating_add(table))
+        .max(input.kind.ehdr_size().saturating_add(table))
         .max(off);
     Ok(SegmentResult {
         segments,

@@ -119,9 +119,9 @@ impl UnitHeader {
 
 /// Reads the unit header at `offset` of `section`; `types` is set for a
 /// `.debug_types` section (DWARF 4 type units).
-pub(crate) fn unit_header(
-    obj: &DebugObject<'_, '_>,
-    section: &Section<'_>,
+pub(crate) fn unit_header<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
+    section: &Section<'_, F>,
     offset: usize,
     types: bool,
 ) -> Parsed<UnitHeader> {
@@ -188,9 +188,9 @@ pub(crate) fn unit_header(
 
 /// Every unit header of `section`; a malformed unit ends the list (with
 /// the error).
-pub(crate) fn unit_headers(
-    obj: &DebugObject<'_, '_>,
-    section: &Section<'_>,
+pub(crate) fn unit_headers<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
+    section: &Section<'_, F>,
     types: bool,
 ) -> (Vec<UnitHeader>, Option<Malformed>) {
     let mut units = Vec::new();
@@ -292,9 +292,9 @@ pub(crate) struct Abbrevs {
 
 impl Abbrevs {
     /// The table unit `unit` uses, parsed on first use.
-    pub(crate) fn get(
+    pub(crate) fn get<F: crate::elf::read::ElfFormat>(
         &mut self,
-        obj: &DebugObject<'_, '_>,
+        obj: &DebugObject<'_, '_, F>,
         unit: &UnitHeader,
     ) -> core::result::Result<&AbbrevTable, Malformed> {
         let key = unit.abbrev;
@@ -363,9 +363,9 @@ impl Value<'_> {
 
 /// Reads one attribute value of `form` at the reader's position in
 /// `section` (a `.debug_info`).
-pub(crate) fn read_value<'a>(
-    obj: &DebugObject<'_, '_>,
-    section: &Section<'_>,
+pub(crate) fn read_value<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
+    section: &Section<'_, F>,
     r: &mut Reader<'a>,
     form: u64,
     implicit: i64,
@@ -566,8 +566,8 @@ pub(crate) struct Bases {
 }
 
 /// Resolves a string attribute value to its bytes.
-pub(crate) fn string<'a>(
-    obj: &DebugObject<'_, 'a>,
+pub(crate) fn string<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
     value: Value<'a>,
     unit: &UnitHeader,
     bases: &Bases,
@@ -601,8 +601,8 @@ pub(crate) fn string<'a>(
 }
 
 /// The `.debug_str` offset (and relocation target) of string index `index`.
-pub(crate) fn str_offset(
-    obj: &DebugObject<'_, '_>,
+pub(crate) fn str_offset<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
     index: u64,
     unit: &UnitHeader,
     bases: &Bases,
@@ -622,8 +622,8 @@ pub(crate) fn str_offset(
 }
 
 /// Entry `index` of `.debug_addr`: (address, section).
-fn addrx(
-    obj: &DebugObject<'_, '_>,
+fn addrx<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
     index: u64,
     unit: &UnitHeader,
     bases: &Bases,
@@ -655,9 +655,9 @@ struct UnitDie<'a> {
 
 /// Reads the attributes of the DIE at the reader's position whose
 /// abbreviation is `abbrev`, calling `each` with every attribute and value.
-pub(crate) fn read_attrs<'a>(
-    obj: &DebugObject<'_, '_>,
-    section: &Section<'_>,
+pub(crate) fn read_attrs<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
+    section: &Section<'_, F>,
     r: &mut Reader<'a>,
     abbrev: &Abbrev,
     unit: &UnitHeader,
@@ -687,9 +687,9 @@ pub(crate) struct UnitInfo {
 
 /// Reads the unit DIE of `unit`: its address ranges (lld's
 /// `collectAddressRanges`) and what the name scanner needs.
-pub(crate) fn unit_info<'a>(
-    obj: &DebugObject<'_, 'a>,
-    section: &Section<'a>,
+pub(crate) fn unit_info<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
+    section: &Section<'a, F>,
     unit: &UnitHeader,
     abbrevs: &AbbrevTable,
 ) -> Parsed<Option<UnitInfo>> {
@@ -740,8 +740,8 @@ pub(crate) fn unit_info<'a>(
 }
 
 /// An address attribute as (address, section).
-fn address(
-    obj: &DebugObject<'_, '_>,
+fn address<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
     value: Value<'_>,
     unit: &UnitHeader,
     bases: &Bases,
@@ -756,8 +756,8 @@ fn address(
 /// The unit's address ranges, as LLVM's `DWARFDie::getAddressRanges`
 /// computes them for the unit DIE. Ranges whose section is unknown are
 /// dropped, as lld drops them.
-fn address_ranges(
-    obj: &DebugObject<'_, '_>,
+fn address_ranges<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
     unit: &UnitHeader,
     die: &UnitDie<'_>,
 ) -> Vec<AddressRange> {
@@ -802,8 +802,8 @@ fn address_ranges(
 
 /// A `.debug_ranges` list (DWARF 4 and older), LLVM's
 /// `DWARFDebugRangeList::getAbsoluteRanges`.
-fn debug_ranges(
-    obj: &DebugObject<'_, '_>,
+fn debug_ranges<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
     unit: &UnitHeader,
     offset: u64,
     mut base: Option<(u64, Option<u32>)>,
@@ -864,8 +864,8 @@ fn max_address(size: usize) -> u64 {
 }
 
 /// The offset of range list `index` (`DW_FORM_rnglistx`).
-fn rnglist_offset(
-    obj: &DebugObject<'_, '_>,
+fn rnglist_offset<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
     index: u64,
     unit: &UnitHeader,
     bases: &Bases,
@@ -881,8 +881,8 @@ fn rnglist_offset(
 }
 
 /// A `.debug_rnglists` list, LLVM's `DWARFDebugRnglist::getAbsoluteRanges`.
-fn rnglist(
-    obj: &DebugObject<'_, '_>,
+fn rnglist<F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, '_, F>,
     unit: &UnitHeader,
     bases: &Bases,
     offset: u64,

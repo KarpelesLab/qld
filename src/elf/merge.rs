@@ -75,8 +75,8 @@ const WIDE_MERGE_PIECES: usize = 4 << 20;
 /// # Errors
 ///
 /// Returns [`crate::Error::Internal`] if the merge pass rejects its input.
-pub fn merge<'s, 'a>(
-    files: &'s [ElfInput<'a>],
+pub fn merge<'s, 'a, F: crate::elf::read::ElfFormat>(
+    files: &'s [ElfInput<'a, F>],
     sections: &Sections,
     placement: &Placement<'_>,
     tail_merge: bool,

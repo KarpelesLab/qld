@@ -103,6 +103,19 @@ pub struct Context {
     pub copy_relocs: bool,
     /// The architecture, chosen once per link.
     pub arch: Arch,
+    /// Undefined weak symbols are 0 in position-dependent i386 output (GNU
+    /// ld's backend): absolute references to them need no dynamic
+    /// relocation, and in a static executable GOT loads of them relax.
+    pub weak_zero: bool,
+}
+
+impl Context {
+    /// Whether GOT loads of undefined weak symbols relax to 0 in a link of
+    /// `arch` in `mode`.
+    #[must_use]
+    pub fn weak_zero(arch: Arch, mode: Mode) -> bool {
+        arch == Arch::I386 && !mode.pic
+    }
 }
 
 /// Whether a relative relocation at `offset` of a section aligned to
@@ -177,6 +190,20 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
     }
 }
 
+/// Lets GOT loads of an undefined weak symbol relax to the constant 0
+/// ([`Context::weak_zero`]). Out of line and cold, so the relocation loops
+/// of the other architectures do not carry it.
+#[cold]
+#[inline(never)]
+fn relax_weak_zero(context: &Context, target: &Target, classify: &mut ClassifyContext) {
+    // Only without a dynamic linker: a dynamic executable keeps the GOT
+    // entry, which it may still bind.
+    if context.relax && !context.mode.dynamic && matches!(target.def, Def::Undefined { weak: true })
+    {
+        classify.relax_got = true;
+    }
+}
+
 /// Decides how relocation `rel` of a section with flags `section_flags`
 /// (contents `data`) against `target` is linked. `flags` are the global
 /// symbol's flags (empty for locals).
@@ -185,7 +212,7 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
 ///
 /// [`ClassifyError`] for unsupported relocations and unrecognized TLS code.
 #[inline(always)]
-pub fn decide(
+pub fn decide<F: crate::elf::read::ElfFormat>(
     context: &Context,
     rel: &Relocation,
     data: &[u8],
@@ -195,6 +222,11 @@ pub fn decide(
 ) -> Result<Decision, ClassifyError> {
     let mut classify = classify_context(context, target, flags);
     classify.code = section_flags & crate::elf::read::consts::SHF_EXECINSTR != 0;
+    // Only ELF32 links can be i386 ones: for the other formats this is
+    // gone at compile time, and costs their relocation loops nothing.
+    if F::WORD_SIZE == 4 && context.weak_zero {
+        relax_weak_zero(context, target, &mut classify);
+    }
     let class = context
         .arch
         .classify(rel.r_type, rel.addend, data, rel.offset, classify)?;
@@ -283,11 +315,15 @@ pub fn decide(
                 return Ok(decision);
             }
             let writable = section_flags & SHF_WRITE != 0;
-            if matches!(class.width, Width::W64) {
+            if context.arch.is_word(class.width) {
                 if !p.preemptible {
                     if mode.pic && (p.defined || !p.global) && !p.absolute {
                         decision.dynamic = Dynamic::Relative;
                     }
+                } else if context.weak_zero && p.undefined_weak && mode.executable() {
+                    // GNU ld's i386 backend resolves an undefined weak
+                    // symbol to 0 in a position-dependent executable, with
+                    // no dynamic relocation (crtbegin.o's `_ITM_*`).
                 } else if mode.shared || writable || !p.shared {
                     decision.dynamic = Dynamic::Symbolic(DynKind::Abs64);
                     decision.flags |= SymbolFlags::NEEDS_DYNSYM;

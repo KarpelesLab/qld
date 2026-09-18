@@ -226,11 +226,17 @@ impl Synth {
             landing_pad: self.ibt,
             entry_landing_pad: self.ibt && (self.arch == Arch::X86_64 || executable),
             authenticate: self.pac_plt && self.arch == Arch::AArch64,
+            pic: self.mode.is_some_and(|m| m.pic),
         }
     }
 
     /// Plans GOT, PLT and copy relocation entries from the scan.
-    pub fn plan_entries(&mut self, refs: &Refs<'_, '_>, scan: &ScanResult, mode: Mode) {
+    pub fn plan_entries<F: crate::elf::read::ElfFormat>(
+        &mut self,
+        refs: &Refs<'_, '_, F>,
+        scan: &ScanResult,
+        mode: Mode,
+    ) {
         let symbols = refs.symbols;
         self.arch = Arch::of_files(refs.files).unwrap_or(self.arch);
         self.mode = Some(mode);
@@ -309,8 +315,9 @@ impl Synth {
             || self.tlsld
             || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
-        // `.got.plt` words.
-        self.got_plt_reserved = if dynamic && has_got_plt {
+        // `.got.plt` words; GNU ld's i386 backend still reserves them, and
+        // `_GLOBAL_OFFSET_TABLE_` points at them.
+        self.got_plt_reserved = if (dynamic || self.arch == Arch::I386) && has_got_plt {
             self.arch.got_plt_reserved()
         } else {
             0
@@ -330,7 +337,11 @@ impl Synth {
     /// one copy: every alias the library defines becomes an alias of the
     /// copy and is exported, so the library binds all of them to it, as lld
     /// does.
-    fn plan_copies(&mut self, refs: &Refs<'_, '_>, symbols: Vec<SymbolId>) {
+    fn plan_copies<F: crate::elf::read::ElfFormat>(
+        &mut self,
+        refs: &Refs<'_, '_, F>,
+        symbols: Vec<SymbolId>,
+    ) {
         // (file, shndx, value) of each symbol's definition.
         let key = |id: SymbolId| -> Option<(usize, u16, u64)> {
             let def = refs.symbols.definition(id);
@@ -425,7 +436,10 @@ impl Synth {
 
     /// Counts the `.rela.dyn` relocations of GOT entries and copies:
     /// `(relative, other)`.
-    fn count_got_relocs(&self, refs: &Refs<'_, '_>) -> (u64, u64) {
+    fn count_got_relocs<F: crate::elf::read::ElfFormat>(
+        &self,
+        refs: &Refs<'_, '_, F>,
+    ) -> (u64, u64) {
         let Some(mode) = self.mode.filter(|m| m.dynamic) else {
             return (0, 0);
         };
@@ -561,6 +575,7 @@ impl Synth {
     pub fn size_align(&self, kind: Synthetic) -> (u64, u64) {
         let count = |list: &EntryList| u64_len(list.len());
         let dynamic = self.dynamic();
+        let word = self.arch.kind();
         match kind {
             Synthetic::None => (0, 1),
             Synthetic::BuildId => match self.build_id {
@@ -580,12 +595,16 @@ impl Synth {
                 .iter()
                 .find(|(k, ..)| *k == kind)
                 .map_or((0, 1), |&(_, size, align)| (size, align)),
-            Synthetic::RelaDyn => (self.rela_dyn_count().saturating_mul(24), 8),
+            Synthetic::RelaDyn => (
+                self.rela_dyn_count()
+                    .saturating_mul(self.arch.dyn_reloc_size()),
+                word.word_size(),
+            ),
             Synthetic::RelrDyn => {
                 if self.relr_count() > 0 {
-                    (self.relr_size, 8)
+                    (self.relr_size, word.word_size())
                 } else {
-                    (0, 8)
+                    (0, word.word_size())
                 }
             }
             Synthetic::RelaPlt => {
@@ -596,7 +615,10 @@ impl Synth {
                 } else {
                     count(&self.iplt)
                 };
-                (entries.saturating_mul(24), 8)
+                (
+                    entries.saturating_mul(self.arch.dyn_reloc_size()),
+                    word.word_size(),
+                )
             }
             Synthetic::Plt => {
                 let flags = self.plt_flags();
@@ -618,7 +640,7 @@ impl Synth {
                 } else {
                     (
                         count(&self.iplt).saturating_mul(self.arch.iplt_entry_size(flags)),
-                        align,
+                        self.arch.iplt_align(),
                     )
                 }
             }
@@ -652,9 +674,12 @@ impl Synth {
                 self.property_note
                     .as_ref()
                     .map_or(0, |n| u64::try_from(n.len()).unwrap_or(0)),
-                8,
+                word.word_size(),
             ),
-            Synthetic::Got => (self.got_words().saturating_mul(8), 8),
+            Synthetic::Got => (
+                self.got_words().saturating_mul(word.word_size()),
+                word.word_size(),
+            ),
             Synthetic::GotPlt => {
                 let slots = if dynamic {
                     self.plt_entries()
@@ -664,8 +689,8 @@ impl Synth {
                 (
                     slots
                         .saturating_add(self.got_plt_reserved)
-                        .saturating_mul(8),
-                    8,
+                        .saturating_mul(word.word_size()),
+                    word.word_size(),
                 )
             }
             Synthetic::DynBss => self.dynbss,
@@ -678,7 +703,10 @@ impl Synth {
 
 /// Size, alignment and read-only-ness of the space a copy relocation of
 /// `id` needs, from the shared library's definition.
-fn copy_shape(refs: &Refs<'_, '_>, id: SymbolId) -> (u64, u64, bool) {
+fn copy_shape<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    id: SymbolId,
+) -> (u64, u64, bool) {
     use crate::elf::read::consts::SHF_WRITE;
     let def = refs.symbols.definition(id);
     let Some(shared) = refs
@@ -731,8 +759,8 @@ pub enum SlotReloc {
 /// The dynamic relocations of the (one or two) GOT words of `owner`'s
 /// entry of `kind`.
 #[must_use]
-pub fn got_slot_relocs(
-    refs: &Refs<'_, '_>,
+pub fn got_slot_relocs<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
     mode: Mode,
     owner: Owner,
     kind: GotKind,
@@ -816,7 +844,7 @@ pub fn plan_build_id(options: &LinkOptions) -> Option<u64> {
 /// objects): x86 `FEATURE_1_AND` or AArch64 `FEATURE_1_AND`, whichever the
 /// link targets.
 #[must_use]
-pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
+pub fn input_features<F: crate::elf::read::ElfFormat>(files: &[ElfInput<'_, F>]) -> u32 {
     let aarch64 = Arch::of_files(files) == Some(Arch::AArch64);
     let mut feature_and: Option<u32> = None;
     for file in files {
@@ -838,7 +866,10 @@ pub fn input_features(files: &[ElfInput<'_>]) -> u32 {
 /// `-z ibt`, or every object marked) or AArch64 BTI (every object marked,
 /// or `-z force-bti`).
 #[must_use]
-pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+pub fn plan_ibt<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> bool {
     if Arch::of_files(files) == Some(Arch::AArch64) {
         return options.aarch64.force_bti
             || input_features(files) & GNU_PROPERTY_AARCH64_FEATURE_1_BTI != 0;
@@ -851,14 +882,20 @@ pub fn plan_ibt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
 /// Whether PLT entries authenticate the addresses they load: AArch64
 /// `-z pac-plt`.
 #[must_use]
-pub fn plan_pac_plt(files: &[ElfInput<'_>], options: &LinkOptions) -> bool {
+pub fn plan_pac_plt<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> bool {
     options.aarch64.pac_plt && Arch::of_files(files) == Some(Arch::AArch64)
 }
 
 /// The warnings `-z force-bti` gives, as GNU ld does: one for each input
 /// object without the BTI property.
 #[must_use]
-pub fn force_bti_warnings(files: &[ElfInput<'_>], options: &LinkOptions) -> Vec<Diagnostic> {
+pub fn force_bti_warnings<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> Vec<Diagnostic> {
     if !options.aarch64.force_bti || Arch::of_files(files) != Some(Arch::AArch64) {
         return Vec::new();
     }
@@ -896,7 +933,10 @@ pub fn force_bti_warnings(files: &[ElfInput<'_>], options: &LinkOptions) -> Vec<
 /// Properties are written in type order; zero values are left out. Shared
 /// libraries do not take part.
 #[must_use]
-pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Option<Vec<u8>> {
+pub fn plan_property_note<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    options: &LinkOptions,
+) -> Option<Vec<u8>> {
     let aarch64 = Arch::of_files(files) == Some(Arch::AArch64);
     let mut needed_1 = 0u32;
     let mut isa_needed = 0u32;
@@ -942,7 +982,7 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
         .into_iter()
         .filter(|&(_, value)| value != 0)
         .collect();
-        return encode_property_note(&properties);
+        return encode_property_note(&properties, F::WORD_SIZE);
     }
     let mut features = features;
     if options.x86.ibt {
@@ -969,15 +1009,18 @@ pub fn plan_property_note(files: &[ElfInput<'_>], options: &LinkOptions) -> Opti
     .into_iter()
     .filter(|&(_, value)| value != 0)
     .collect();
-    encode_property_note(&properties)
+    encode_property_note(&properties, F::WORD_SIZE)
 }
 
 /// Encodes `.note.gnu.property` from `(type, value)` pairs, in type order.
-fn encode_property_note(properties: &[(u32, u32)]) -> Option<Vec<u8>> {
+/// Each property's data is padded to the class's word size (`word`): 16
+/// bytes a property in ELF64, 12 in ELF32.
+fn encode_property_note(properties: &[(u32, u32)], word: usize) -> Option<Vec<u8>> {
     if properties.is_empty() {
         return None;
     }
-    let descsz = u32::try_from(properties.len().saturating_mul(16)).ok()?;
+    let entry = 8usize.saturating_add(4usize.next_multiple_of(word.max(1)));
+    let descsz = u32::try_from(properties.len().saturating_mul(entry)).ok()?;
     let mut note = Vec::with_capacity(16usize.saturating_add(descsz as usize));
     note.extend_from_slice(&4u32.to_le_bytes());
     note.extend_from_slice(&descsz.to_le_bytes());
@@ -987,7 +1030,7 @@ fn encode_property_note(properties: &[(u32, u32)]) -> Option<Vec<u8>> {
         note.extend_from_slice(&kind.to_le_bytes());
         note.extend_from_slice(&4u32.to_le_bytes());
         note.extend_from_slice(&value.to_le_bytes());
-        note.extend_from_slice(&[0; 4]);
+        note.resize(note.len().next_multiple_of(word.max(1)), 0);
     }
     Some(note)
 }

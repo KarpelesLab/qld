@@ -240,21 +240,29 @@ pub fn patches_in(
 }
 
 /// The address of the PLT entry `owner` is called through, if it has one.
-fn plt_address(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, owner: Owner) -> Option<u64> {
+fn plt_address<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    layout: &Layout<'_>,
+    owner: Owner,
+) -> Option<u64> {
     crate::elf::values::plt_address(input.synth, layout, owner)
 }
 
 /// The GOT word `owner`'s stub jumps through (0 when there is none, which
 /// the writer reports).
-fn slot_of(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, owner: Owner) -> u64 {
+fn slot_of<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    layout: &Layout<'_>,
+    owner: Owner,
+) -> u64 {
     crate::elf::values::plt_slot_address(input.synth, layout, owner).unwrap_or(0)
 }
 
 /// The address a `bl`/`b` against `symbol` of `file` ends up branching to,
 /// as the writer will compute it, whether that is a stub (and the GOT word
 /// it jumps through), and the callee's `st_other`.
-fn branch_target(
-    input: &LayoutInput<'_, '_>,
+fn branch_target<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
     layout: &Layout<'_>,
     file: usize,
     symbol: u32,
@@ -314,7 +322,11 @@ fn branch_target(
 /// Plans the thunks the layout in `layout` needs, given the ones `previous`
 /// round planned (whose space `layout` already reserves).
 #[must_use]
-pub fn plan(input: &LayoutInput<'_, '_>, layout: &Layout<'_>, previous: &Thunks) -> Thunks {
+pub fn plan<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    layout: &Layout<'_>,
+    previous: &Thunks,
+) -> Thunks {
     let arch = input.synth.arch;
     if !arch.needs_thunks() {
         return Thunks::default();

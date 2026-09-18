@@ -38,8 +38,8 @@ pub(crate) fn gdb_hash(name: &[u8]) -> u32 {
 ///
 /// A malformed set keeps the entries read before the problem and ends the
 /// section, which is reported.
-pub(crate) fn pub_sections<'a>(
-    obj: &DebugObject<'_, 'a>,
+pub(crate) fn pub_sections<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
     cu_offsets: &[u64],
     out: &mut Vec<NameEntry<'a>>,
     problems: &mut Vec<(u32, Malformed)>,
@@ -51,9 +51,9 @@ pub(crate) fn pub_sections<'a>(
     }
 }
 
-fn pub_section<'a>(
-    obj: &DebugObject<'_, 'a>,
-    section: &Section<'a>,
+fn pub_section<'a, F: crate::elf::read::ElfFormat>(
+    obj: &DebugObject<'_, 'a, F>,
+    section: &Section<'a, F>,
     cu_offsets: &[u64],
     out: &mut Vec<NameEntry<'a>>,
 ) -> Result<(), Malformed> {

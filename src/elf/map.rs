@@ -26,7 +26,10 @@ use super::values::Addresses;
 
 /// Renders the link map.
 #[must_use]
-pub fn render(addresses: &Addresses<'_, '_>, plan: &SymtabPlan) -> String {
+pub fn render<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    plan: &SymtabPlan,
+) -> String {
     let refs = &addresses.refs;
     let layout = addresses.layout;
 
@@ -96,7 +99,10 @@ pub fn render(addresses: &Addresses<'_, '_>, plan: &SymtabPlan) -> String {
     text
 }
 
-fn describe(addresses: &Addresses<'_, '_>, id: SectionId) -> String {
+fn describe<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    id: SectionId,
+) -> String {
     let refs = &addresses.refs;
     let Some((file, index)) = refs.sections.locate(id) else {
         return String::new();
@@ -121,9 +127,9 @@ fn describe(addresses: &Addresses<'_, '_>, id: SectionId) -> String {
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the map file cannot be written.
-pub fn write(
+pub fn write<F: crate::elf::read::ElfFormat>(
     options: &LinkOptions,
-    addresses: &Addresses<'_, '_>,
+    addresses: &Addresses<'_, '_, F>,
     plan: &SymtabPlan,
     cref: Option<&str>,
 ) -> Result<()> {

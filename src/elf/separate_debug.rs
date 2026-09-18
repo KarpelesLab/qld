@@ -128,10 +128,12 @@ pub fn stripped_sections(sections: &Sections, placement: &Placement<'_>) -> Sect
 /// cover only the bytes left in the file, as `objcopy --only-keep-debug`
 /// makes them.
 pub fn to_debug_file(layout: &mut Layout<'_>) -> Result<()> {
-    let headers = layout
-        .phoff
-        .max(layout::EHDR_SIZE)
-        .saturating_add(layout::PHDR_SIZE.saturating_mul(layout.segments.len() as u64));
+    let headers = layout.phoff.max(layout.kind.ehdr_size()).saturating_add(
+        layout
+            .kind
+            .phdr_size()
+            .saturating_mul(layout.segments.len() as u64),
+    );
     let page = layout
         .segments
         .iter()
@@ -190,10 +192,13 @@ pub fn to_debug_file(layout: &mut Layout<'_>) -> Result<()> {
         section.offset = offset;
         offset = layout::add(offset, section.size)?;
     }
-    layout.shoff = layout::align_up(offset, 8)?;
+    layout.shoff = layout::align_up(offset, layout.kind.word_size())?;
     layout.file_size = layout::add(
         layout.shoff,
-        layout::SHDR_SIZE.saturating_mul((layout.sections.len() as u64).saturating_add(1)),
+        layout
+            .kind
+            .shdr_size()
+            .saturating_mul((layout.sections.len() as u64).saturating_add(1)),
     )?;
     // Synthetic parts (the build-id note) move with their sections.
     for (kind, _, file_offset, _) in &mut layout.synthetic {
