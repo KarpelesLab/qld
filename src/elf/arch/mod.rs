@@ -872,7 +872,8 @@ impl Arch {
 
     /// Replaces a branch to an undefined weak symbol, which has no address
     /// to branch to, with the instruction GNU ld writes there (AArch64: a
-    /// `nop`). Returns `false` when the architecture keeps the branch.
+    /// `nop`; LoongArch: a branch to itself, since address 0 is out of
+    /// reach). Returns `false` when the architecture keeps the branch.
     ///
     /// # Errors
     ///
@@ -884,7 +885,8 @@ impl Arch {
         r_type: u32,
     ) -> Result<bool, ApplyError> {
         match self {
-            Self::X86_64 | Self::LoongArch64 => Ok(false),
+            Self::X86_64 => Ok(false),
+            Self::LoongArch64 => loongarch::undefined_weak_branch(out, offset, r_type),
             Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
         }
     }

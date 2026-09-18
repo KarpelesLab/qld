@@ -773,6 +773,26 @@ pub fn relax_tls(
     }
 }
 
+/// Makes a `b`/`bl` or conditional branch to an undefined weak symbol, which
+/// has no address, branch to itself, as lld does on RISC-V: address 0 is out
+/// of reach of an executable at GNU ld's base, and the call is guarded
+/// anyway (`if (f) f();`). A `pcaddu18i` + `jirl` pair reaches 0 and keeps
+/// its target.
+///
+/// # Errors
+///
+/// [`ApplyError::OutOfBounds`] when the instruction is outside the section.
+pub fn undefined_weak_branch(out: &mut [u8], offset: u64, r_type: u32) -> Result<bool, ApplyError> {
+    let field = match base_type(r_type) {
+        R_LARCH_B16 => Field::B16,
+        R_LARCH_B21 => Field::B21,
+        R_LARCH_B26 => Field::B26,
+        _ => return Ok(false),
+    };
+    patch(out, offset, field, 0)?;
+    Ok(true)
+}
+
 /// Fills `out` with `nop` instructions; a partial word is zeroed.
 pub fn write_nops(out: &mut [u8]) {
     let (words, rest) = out.as_chunks_mut::<4>();

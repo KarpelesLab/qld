@@ -1549,3 +1549,46 @@ fn relocatable_output_links_like_lld() {
         assert_same_code(&dir, "out", variant == "relax");
     }
 }
+
+/// A `bl` to an undefined weak function (GCC's calls in the normal code
+/// model) in a static executable: address 0 is out of its reach from GNU
+/// ld's base, so it becomes a branch to itself rather than an error. A
+/// `pcaddu18i` + `jirl` still reaches 0.
+#[test]
+fn branches_to_undefined_weak_symbols_link() {
+    let tools = require!();
+    let dir = scratch("undefined-weak");
+    let source = "
+	.text
+	.weak	missing_qld
+	.globl	_start
+	.type	_start, @function
+_start:
+	bl	missing_qld
+	beqz	$a0, missing_qld
+	pcaddu18i	$ra, %call36(missing_qld)
+	jirl	$ra, $ra, 0
+	.size	_start, . - _start
+";
+    compile(&tools, &dir, "weak", source, &["-mno-relax"]);
+    let output = qld(&dir, &["-static", "weak.o", "-o", "out.qld"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let elf = Elf::read(&dir.join("out.qld"));
+    let start = elf.symbols.iter().find(|s| s.name == "_start").unwrap();
+    let words: Vec<u32> = elf
+        .bytes(start.value, 16)
+        .unwrap()
+        .chunks(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    assert_eq!(words[0], 0x5400_0000, "bl .");
+    assert_eq!(words[1], 0x4000_0080, "beqz $a0, .");
+    assert_eq!(
+        tokens(&elf, start.value + 8, start.value + 16, false),
+        ["pcaddu18i r1", "jirl r1, &0x0"]
+    );
+}
