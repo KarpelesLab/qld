@@ -1271,6 +1271,9 @@ pub struct LinkOptions {
     pub magic: MagicMode,
     /// `--relax` (default) / `--no-relax`.
     pub relax: bool,
+    /// Arm `--merge-exidx-entries` (default) / `--no-merge-exidx-entries`:
+    /// drop `.ARM.exidx` entries that repeat the one before.
+    pub merge_exidx_entries: bool,
     /// RISC-V `--relax-gp`: relax absolute accesses within 2 KiB of
     /// `__global_pointer$` to `gp`-relative ones (off by default, as in
     /// lld).
@@ -1459,6 +1462,7 @@ impl LinkOptions {
             extern_protected_data: true,
             section_header: true,
             relax: true,
+            merge_exidx_entries: true,
             relax_gp: false,
             dependent_libraries: true,
             fork: true,
@@ -1568,6 +1572,7 @@ impl LinkOptions {
             define_common: Default::default(),
             magic: Default::default(),
             relax: Default::default(),
+            merge_exidx_entries: Default::default(),
             relax_gp: Default::default(),
             image_base: Default::default(),
             section_starts: Default::default(),

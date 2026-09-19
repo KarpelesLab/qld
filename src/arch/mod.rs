@@ -8,6 +8,7 @@
 //! Anything that names a relocation constant belongs in a backend instead.
 
 pub mod aarch64;
+pub mod arm;
 pub mod loongarch;
 pub mod ppc64;
 pub mod riscv;

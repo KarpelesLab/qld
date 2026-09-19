@@ -198,9 +198,14 @@ const fn hold(mut rule: OutputRule, class: OrphanClass) -> OutputRule {
 }
 
 /// GNU ld's default layout, as rules; `$dyn`, `$plt` and `$iplt` name the
-/// dynamic relocation sections, which are `SHT_RELA` or `SHT_REL`.
+/// dynamic relocation sections, which are `SHT_RELA` or `SHT_REL`, and
+/// `$unwind` holds the output sections an architecture puts after
+/// `.rodata1` (Arm's exception index).
 macro_rules! default_rules {
     ($dyn:literal, $plt:literal, $iplt:literal) => {
+        default_rules!($dyn, $plt, $iplt, [])
+    };
+    ($dyn:literal, $plt:literal, $iplt:literal, [$($unwind:expr),* $(,)?]) => {
         &[
             hold(
                 synth(
@@ -255,6 +260,7 @@ macro_rules! default_rules {
                 OrphanClass::Rodata,
             ),
             rule(".rodata1", &[plain(&[".rodata1"])]),
+            $($unwind,)*
             synth(
                 rule(
                     ".eh_frame_hdr",
@@ -473,6 +479,25 @@ pub static DEFAULT_RULES: &[OutputRule] = default_rules!(".rela.dyn", ".rela.plt
 /// `SHT_REL` (i386).
 pub static REL_RULES: &[OutputRule] = default_rules!(".rel.dyn", ".rel.plt", ".rel.iplt");
 
+/// GNU ld's Arm layout: `SHT_REL` dynamic relocations, and the exception
+/// index and its tables after the read-only data, where
+/// `PROVIDE_HIDDEN (__exidx_start = .)` and `__exidx_end` surround them.
+pub static ARM_RULES: &[OutputRule] = default_rules!(
+    ".rel.dyn",
+    ".rel.plt",
+    ".rel.iplt",
+    [
+        rule(
+            ".ARM.extab",
+            &[plain(&[".ARM.extab*", ".gnu.linkonce.armextab.*"])],
+        ),
+        rule(
+            ".ARM.exidx",
+            &[plain(&[".ARM.exidx*", ".gnu.linkonce.armexidx.*"])],
+        ),
+    ]
+);
+
 /// A compiled rule set: patterns ready for matching.
 ///
 /// With a linker script, [`RuleSet::script`] holds the layout plan and the
@@ -521,10 +546,10 @@ impl<'r> RuleSet<'r> {
     /// relocations are `SHT_REL`, else [`DEFAULT_RULES`].
     #[must_use]
     pub fn default_rules_for(arch: crate::elf::arch::Arch) -> Self {
-        Self::new(if arch.uses_rel() {
-            REL_RULES
-        } else {
-            DEFAULT_RULES
+        Self::new(match arch {
+            crate::elf::arch::Arch::Arm => ARM_RULES,
+            arch if arch.uses_rel() => REL_RULES,
+            _ => DEFAULT_RULES,
         })
     }
 
@@ -692,6 +717,22 @@ mod tests {
             .place(name.as_bytes(), file.as_bytes())
             .and_then(|p| rules.outputs.get(usize::from(p.output)))
             .map(|o| o.name)
+    }
+
+    #[test]
+    fn places_the_arm_exception_index() {
+        let rules = RuleSet::new(ARM_RULES);
+        assert_eq!(
+            output_of(&rules, ".ARM.exidx.text.f", "a.o"),
+            Some(".ARM.exidx")
+        );
+        assert_eq!(output_of(&rules, ".ARM.extab", "a.o"), Some(".ARM.extab"));
+        assert_eq!(output_of(&rules, ".text", "a.o"), Some(".text"));
+        // The index follows the read-only data and precedes `.tdata`.
+        let position = |name: &str| ARM_RULES.iter().position(|r| r.name == name);
+        assert!(position(".rodata") < position(".ARM.exidx"));
+        assert!(position(".ARM.extab") < position(".ARM.exidx"));
+        assert!(position(".ARM.exidx") < position(".tdata"));
     }
 
     #[test]

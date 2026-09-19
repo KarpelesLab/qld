@@ -1,0 +1,17 @@
+# M4: an IFUNC in a static 32-bit Arm executable. The stub in `.iplt`
+# jumps through a `.igot.plt` slot that an `R_ARM_IRELATIVE` relocation
+# fills at startup, and the function pointer must be the stub's address,
+# so the two calls agree.
+description = "IFUNC resolved at startup in a static executable, for 32-bit Arm"
+compile = ["cc -O2 -c ifunc.c"]
+driver = "cc"
+link = "-static -o out ifunc.o"
+run = "./out"
+expect.stdout = "pick 1 1 same\n"
+expect.readelf = [
+  "ARM",
+  "R_ARM_IRELATIVE",
+  "!R_ARM_JUMP_SLOT",
+]
+targets = ["arm-linux-gnueabihf"]
+determinism = true

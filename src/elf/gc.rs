@@ -164,16 +164,29 @@ pub fn collect<F: crate::elf::read::ElfFormat>(
             && let Some(Ok(Some(relocations))) = object
                 .section(input.relocs)
                 .map(|r| object.elf.relocation_section(input.relocs, &r.header))
-            && let Relocations::Rela(relas) = relocations.relocations
         {
-            for rel in relas.iter() {
-                let Some(target) = refs.target(file_index, rel.symbol as usize) else {
-                    continue;
+            let mut edge = |symbol: u32| {
+                let Some(target) = refs.target(file_index, symbol as usize) else {
+                    return;
                 };
                 if let Def::Section { .. } = target.def
                     && let Some(to) = refs.target_section(&target)
                 {
                     push(to);
+                }
+            };
+            // The addends are not needed here, so `SHT_REL` relocations
+            // (i386, Arm) are read as they are.
+            match relocations.relocations {
+                Relocations::Rela(relas) => {
+                    for rel in relas.iter() {
+                        edge(rel.symbol);
+                    }
+                }
+                Relocations::Rel(rels) => {
+                    for rel in rels.iter() {
+                        edge(rel.symbol);
+                    }
                 }
             }
         }

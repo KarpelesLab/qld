@@ -199,6 +199,9 @@ pub struct Synth {
     pub verdef_count: u64,
     /// RISC-V: the merged `.riscv.attributes`.
     pub riscv_attributes: Option<super::arch::riscv::attributes::Output>,
+    /// 32-bit Arm: the merged `.ARM.attributes` and the exception index,
+    /// which take the place of their first input section.
+    pub arm: Option<Box<super::arch::arm::Prepared>>,
 }
 
 /// The string the linker adds to `.comment`.
@@ -835,6 +838,11 @@ pub fn got_slot_relocs<F: crate::elf::read::ElfFormat>(
         return [SlotReloc::None; 2];
     }
     if kind == GotKind::TlsLd {
+        // In an executable the module ID is known (1), so the pair is a
+        // link-time constant; only a shared object needs the relocation.
+        if !mode.shared {
+            return [SlotReloc::None; 2];
+        }
         return [SlotReloc::Module(DynKind::DtpMod), SlotReloc::None];
     }
     let target = match owner {

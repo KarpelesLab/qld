@@ -1,0 +1,34 @@
+# M4: the four TLS models in a 32-bit Arm executable. The ABI has no
+# relaxation for the traditional sequences, so the general-dynamic and
+# local-dynamic accesses keep their `__tls_get_addr` calls through GOT
+# pairs and the initial-exec one keeps its GOT entry; everything is in the
+# executable, so the pairs and entries are link-time constants (module 1
+# and the offsets from the start of the block, or from the thread
+# pointer) and no TLS dynamic relocation is left. Local-exec accesses use
+# the thread pointer directly, eight bytes below the block (variant I).
+description = "Arm TLS: general-dynamic, local-dynamic, initial-exec and local-exec in an executable"
+compile = ["cc -O2 -fPIC -c tls.c"]
+driver = "cc"
+link = [
+  "-pie -o out-pie tls.o",
+  "-static -o out-static tls.o",
+]
+output = "out-pie"
+run = "./out-pie && ./out-static"
+expect.stdout = "tls 31\ntls 31\n"
+expect.readelf = [
+  "ARM",
+  "TLS",
+  "__tls_get_addr",
+  "!R_ARM_TLS_DTPMOD32",
+  "!R_ARM_TLS_DTPOFF32",
+  "!R_ARM_TLS_TPOFF32",
+]
+expect.readelf_files."out-static" = [
+  "EXEC (Executable file)",
+  "TLS",
+  "!INTERP",
+  "!R_ARM_TLS_DTPMOD32",
+]
+targets = ["arm-linux-gnueabihf"]
+determinism = true
