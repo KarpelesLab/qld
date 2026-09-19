@@ -160,6 +160,7 @@ const SETS_DEFAULT: &[&str] = &[
     "no-omagic",
     "no-nmagic",
     "relax",
+    "merge-exidx-entries",
     "no-apply-dynamic-relocs",
     "Bno-symbolic",
     "no-export-dynamic",

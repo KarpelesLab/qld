@@ -331,6 +331,11 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
     if !arch.needs_thunks() {
         return Thunks::default();
     }
+    // Arm thunks also interwork, so their planning knows the instruction
+    // set of both ends.
+    if arch == Arch::Arm {
+        return super::arm::thunks::plan(input, layout, previous);
+    }
     let refs = &input.refs;
     let mut needed: Vec<(u32, u64)> = Vec::new();
     for (file_index, file) in refs.files.iter().enumerate() {

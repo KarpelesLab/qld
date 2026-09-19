@@ -132,6 +132,10 @@ const FIXED: &[(&str, Value)] = &[
     ("__rel_iplt_start", Value::RelaIpltStart),
     ("__rel_iplt_end", Value::RelaIpltEnd),
     ("_DYNAMIC", Value::Dynamic),
+    // Arm: the exception index, which unwinders read in static
+    // executables.
+    ("__exidx_start", Value::SectionStart(".ARM.exidx")),
+    ("__exidx_end", Value::SectionEnd(".ARM.exidx")),
     ("_TLS_MODULE_BASE_", Value::TlsModuleBase),
 ];
 
@@ -139,10 +143,10 @@ const FIXED: &[(&str, Value)] = &[
 /// assigns them unconditionally; they are exported with `--export-dynamic`.
 pub const ALWAYS_DEFINED: &[&str] = &["_edata", "__bss_start", "_end"];
 
-/// Boundary symbols GNU ld's AArch64 default script assigns besides the
-/// common ones (`__bss_start__ = .;` before `.bss`, `_bss_end__` and
-/// `__bss_end__` after it, `__end__` with `_end`). qld's `.bss` ends at
-/// `_end`, so the last three take its value.
+/// Boundary symbols GNU ld's AArch64 and Arm default scripts assign
+/// besides the common ones (`__bss_start__ = .;` before `.bss`,
+/// `_bss_end__` and `__bss_end__` after it, `__end__` with `_end`). qld's
+/// `.bss` ends at `_end`, so the last three take its value.
 const AARCH64_EXTRA: &[(&str, Value)] = &[
     ("__bss_start__", Value::BssStart),
     ("_bss_end__", Value::End),
@@ -165,7 +169,10 @@ pub fn always_defined<F: crate::elf::read::ElfFormat>(
     let mut names = Vec::new();
     if mode.executable() && !script {
         names.extend_from_slice(ALWAYS_DEFINED);
-        if super::arch::Arch::of_files(files) == Some(super::arch::Arch::AArch64) {
+        if matches!(
+            super::arch::Arch::of_files(files),
+            Some(super::arch::Arch::AArch64 | super::arch::Arch::Arm)
+        ) {
             names.extend(AARCH64_EXTRA.iter().map(|&(name, _)| name));
         }
     }
@@ -243,9 +250,12 @@ pub fn register<F: crate::elf::read::ElfFormat>(
         result.entries.push((id, value));
     };
     let script = placement.script.as_deref();
-    let aarch64 =
-        script.is_none() && super::arch::Arch::of_files(files) == Some(super::arch::Arch::AArch64);
-    let extra: &[(&str, Value)] = if aarch64 { AARCH64_EXTRA } else { &[] };
+    let boundaries = script.is_none()
+        && matches!(
+            super::arch::Arch::of_files(files),
+            Some(super::arch::Arch::AArch64 | super::arch::Arch::Arm)
+        );
+    let extra: &[(&str, Value)] = if boundaries { AARCH64_EXTRA } else { &[] };
     for &(name, value) in FIXED.iter().chain(extra) {
         if dynamic && matches!(value, Value::RelaIpltStart | Value::RelaIpltEnd) {
             continue;

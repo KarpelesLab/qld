@@ -893,7 +893,11 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
                     put(address.wrapping_add(size64), argument);
                 }
                 GotKind::TlsLd => {
-                    put(address, 0);
+                    // The executable's module ID is 1 where the pair is
+                    // not relocated (Arm, which does not relax
+                    // local-dynamic accesses).
+                    let module = u64::from(relocs[0] == SlotReloc::None);
+                    put(address, module);
                     put(address.wrapping_add(size64), 0);
                 }
             }
@@ -1623,6 +1627,19 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             return Ok(());
         };
         return write_eh_frame(input, eh, base, out);
+    }
+    // Arm branches interwork and go through thunks, and its exception
+    // index and attributes are rebuilt.
+    if input.context.arch == Arch::Arm {
+        let section = super::arch::arm::apply::SectionWrite {
+            id,
+            file: file_index,
+            index: section_index,
+            section,
+            data,
+            base,
+        };
+        return super::arch::arm::apply::write_section(input, section, out);
     }
     // RISC-V relocations depend on each other and on linker relaxation.
     if input.context.arch == Arch::RiscV64 {

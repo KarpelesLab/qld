@@ -889,11 +889,16 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
     let has_property = input.synth.property_note.is_some();
     let has_eh_hdr = input.synth.eh_frame_hdr && input.synth.fde_count > 0;
     let gnu_stack = input.options.gnu_stack;
-    // RISC-V: `PT_RISCV_ATTRIBUTES` covers `.riscv.attributes`.
+    // RISC-V: `PT_RISCV_ATTRIBUTES` covers `.riscv.attributes`; Arm:
+    // `PT_ARM_EXIDX` covers `.ARM.exidx`.
     let has_attributes = input.synth.arch == Arch::RiscV64
         && out_sections
             .iter()
             .any(|s| s.sh_type == SHT_RISCV_ATTRIBUTES);
+    let has_exidx = input.synth.arch == Arch::Arm
+        && out_sections
+            .iter()
+            .any(|s| s.sh_type == super::arch::arm::SHT_ARM_EXIDX);
     let phnum = load_count
         .saturating_add(usize::from(has_interp).saturating_mul(2))
         .saturating_add(usize::from(has_dynamic))
@@ -903,7 +908,8 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         .saturating_add(usize::from(has_eh_hdr))
         .saturating_add(usize::from(gnu_stack))
         .saturating_add(usize::from(has_relro))
-        .saturating_add(usize::from(has_attributes));
+        .saturating_add(usize::from(has_attributes))
+        .saturating_add(usize::from(has_exidx));
     let phnum_u64 = u64::try_from(phnum).unwrap_or(u64::MAX);
 
     // 4. Addresses. Each new PT_LOAD starts on a page boundary; a writable
@@ -1298,6 +1304,22 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
             filesz: stop.saturating_sub(start),
             memsz: stop.saturating_sub(start),
             align: 1,
+        });
+    }
+    if has_exidx
+        && let Some(section) = out_sections
+            .iter()
+            .find(|s| s.sh_type == super::arch::arm::SHT_ARM_EXIDX)
+    {
+        segments.push(Segment {
+            p_type: super::arch::arm::PT_ARM_EXIDX,
+            flags: PF_R,
+            offset: section.offset,
+            vaddr: section.addr,
+            paddr: None,
+            filesz: section.size,
+            memsz: section.size,
+            align: 4,
         });
     }
     if has_attributes
@@ -1797,6 +1819,15 @@ pub(crate) fn member_size<F: crate::elf::read::ElfFormat>(
             // `.riscv.attributes` takes the place of the input sections.
             if input.synth.arch == Arch::RiscV64 {
                 return Ok(riscv_member_size(input, id, section));
+            }
+            if input.synth.arch == Arch::Arm {
+                return Ok(super::arch::arm::apply::member_size(
+                    input.synth.arm.as_deref(),
+                    id,
+                    section.header.sh_type,
+                    section.header.sh_size,
+                    section.header.sh_addralign,
+                ));
             }
             let size = section.header.sh_size;
             (size, section.header.sh_addralign)

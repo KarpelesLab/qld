@@ -679,6 +679,7 @@ impl GnuParser {
             Action::Magic(mode) => o.magic = mode,
             Action::Relax(on) => o.relax = on,
             Action::RelaxGp(on) => o.relax_gp = on,
+            Action::MergeExidx(on) => o.merge_exidx_entries = on,
             Action::ImageBase => o.image_base = Some(integer(m)?),
             Action::SectionStart => {
                 let spec = text(m)?;

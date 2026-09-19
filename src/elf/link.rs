@@ -723,6 +723,17 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         ..Synth::default()
     };
     narrow.run(|| synth.plan_entries(&refs, &scan, mode));
+    if context.arch == super::arch::Arch::Arm {
+        // Entries that repeat the one before are dropped only when the
+        // order the exception index is planned in is the one layout will
+        // place the code in.
+        let default_order = script.is_none() && order.as_ref().is_none_or(|o| o.is_empty());
+        synth.arm = Some(Box::new(super::arch::arm::prepare(
+            &refs,
+            &placement,
+            default_order && options.merge_exidx_entries,
+        )));
+    }
     // DT_RELR is for position-independent output; GNU ld ignores the
     // option otherwise.
     synth.relr = options.pack_relative_relocs && mode.pic;
