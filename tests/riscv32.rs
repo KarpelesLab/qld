@@ -1000,6 +1000,65 @@ void _start(void) {
 }
 "#;
 
+/// Pointers in `.data` and `.data.rel.ro`: to local and hidden data (which
+/// become `R_RISCV_RELATIVE`), to a preemptible variable and to an
+/// undefined function (which become symbolic `R_RISCV_32`).
+const POINTERS_C: &str = r#"
+static int table[4] = {1, 2, 3, 4};
+__attribute__((visibility("hidden"))) int hidden_data = 7;
+static int *const local_pointers[3] = {&table[0], &table[2], &hidden_data};
+int *data_pointers[2] = {&table[1], &hidden_data};
+int global_data = 9;
+int *global_pointer = &global_data;
+extern int outside(int);
+int (*function_pointer)(int) = outside;
+int sum(void) {
+  return *local_pointers[0] + *local_pointers[1] + *local_pointers[2]
+       + *data_pointers[0] + *global_pointer + function_pointer(1) + outside(2);
+}
+"#;
+
+/// `R_RISCV_32` is the word-size absolute relocation on RV32, so a pointer
+/// in the data of a shared object or a PIE is a dynamic relocation, not a
+/// "recompile with -fPIC" error (which is what it is on RV64, where the
+/// word is `R_RISCV_64`).
+#[test]
+fn data_pointers_take_dynamic_relocations() {
+    let tools = require!();
+    let dir = scratch("pointers");
+    compile(tools, &dir, "pointers.c", POINTERS_C, "pic.o", &["-fPIC"]);
+    compile(tools, &dir, "pointers.c", POINTERS_C, "pie.o", &["-fPIE"]);
+    compile(
+        tools,
+        &dir,
+        "start.c",
+        "extern int sum(void);\nint outside(int x) { return x; }\nvoid _start(void) { int r = sum(); for (;;) __asm__ volatile(\"\" :: \"r\"(r)); }\n",
+        "start.o",
+        &["-fPIE"],
+    );
+    // In the shared object the pointed-to variable is preemptible, so its
+    // pointer keeps a symbolic `R_RISCV_32`; in the PIE it is not, so
+    // every pointer is relative.
+    for (name, args, symbolic) in [
+        ("libptr.so", &["-shared", "pic.o"][..], true),
+        ("ptr-pie", &["-pie", "pie.o", "start.o"], false),
+    ] {
+        let (lld, ours) = link_both(tools, &dir, name, args);
+        assert_same(tools, &dir, &lld, &ours);
+        let relocs = run_ok(&dir, &tools.readelf, &["-rW", &ours]);
+        assert!(relocs.contains("R_RISCV_RELATIVE"), "{name}:\n{relocs}");
+        assert_eq!(
+            relocs.contains("R_RISCV_32") && relocs.contains("global_data"),
+            symbolic,
+            "{name}:\n{relocs}"
+        );
+        let wide = relocs
+            .split_whitespace()
+            .any(|w| w.starts_with("R_RISCV_") && w.ends_with("64"));
+        assert!(!wide, "{name}:\n{relocs}");
+    }
+}
+
 #[test]
 fn dynamic_links_match_lld() {
     let tools = require!();

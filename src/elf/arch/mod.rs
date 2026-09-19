@@ -50,8 +50,6 @@ pub enum Arch {
     AArch64,
     /// RISC-V 64 (LP64, little-endian).
     RiscV64,
-    /// RISC-V 32 (ILP32, little-endian): the RV64 code with 4-byte words.
-    RiscV32,
     /// LoongArch64 (LP64D, little-endian).
     LoongArch64,
     /// PowerPC64, little-endian, ELFv2 ABI.
@@ -60,8 +58,15 @@ pub enum Arch {
     I386,
     /// x32: x86-64 with 32-bit pointers (ILP32), in ELF32 objects.
     X32,
+<<<<<<< HEAD
     /// s390x (z/Architecture, 64-bit, big-endian).
     S390x,
+=======
+    /// RISC-V 32 (ILP32, little-endian): the RV64 code with 4-byte words.
+    /// The ELF32 architectures are last, so that the checks for them are
+    /// one comparison ([`Arch::is_word`]).
+    RiscV32,
+>>>>>>> worktree-agent-afe6b0f8b0ff1ca7a
 }
 
 /// What a relocation computes.
@@ -595,7 +600,7 @@ impl Arch {
     #[inline]
     pub fn is_word(self, width: Width) -> bool {
         // The 64-bit architectures first, so that they pay for no other.
-        if self != Self::I386 && self != Self::X32 {
+        if !matches!(self, Self::I386 | Self::X32 | Self::RiscV32) {
             return width == Width::W64;
         }
         match self {
