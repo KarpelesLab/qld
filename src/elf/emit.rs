@@ -15,10 +15,11 @@
 //!   known before layout.
 //!
 //! `.eh_frame` relocations follow their records to their output offsets;
-//! those of dropped records become `R_X86_64_NONE`. Relocation types are the
-//! input's, except that `GOTPCRELX` relocations the link relaxed become
-//! `R_X86_64_PC32` (or `R_X86_64_32S`/`R_X86_64_32` for immediates), as in
-//! GNU ld; TLS relaxations are not reflected.
+//! those of dropped records become `R_X86_64_NONE`. Entries are the output
+//! class's `Elf_Rela` (`SHT_REL` inputs are not supported). Relocation
+//! types are the input's, except that `GOTPCRELX` relocations the link
+//! relaxed become `R_X86_64_PC32` (or `R_X86_64_32S`/`R_X86_64_32` for
+//! immediates), as in GNU ld; TLS relaxations are not reflected.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -42,11 +43,6 @@ use super::symtab::SymtabPlan;
 use super::values::Addresses;
 use super::write::WriteInput;
 use crate::symbols::SymbolFlags;
-
-/// Size of one output relocation, `Elf32_Rela` or `Elf64_Rela`.
-fn rela_size<F: crate::elf::read::ElfFormat>() -> usize {
-    <F::Rela as crate::elf::read::RawRecord>::SIZE.max(1)
-}
 
 fn relocations<'a, F: crate::elf::read::ElfFormat>(
     object: &ObjectInput<'a, F>,
@@ -136,8 +132,7 @@ pub fn count<F: crate::elf::read::ElfFormat>(
         .reduce(|| 0, u64::saturating_add))
 }
 
-/// Writes one output relocation, in the class and byte order of the
-/// output.
+/// Writes one output relocation, an `Elf_Rela` of the output's class.
 fn put<F: crate::elf::read::ElfFormat>(
     out: &mut [u8],
     offset: u64,
@@ -145,16 +140,15 @@ fn put<F: crate::elf::read::ElfFormat>(
     r_type: u32,
     addend: i64,
 ) {
+    use crate::elf::read::RawRecord;
     let rel = Relocation {
         offset,
         symbol: u32::try_from(symbol).unwrap_or(0),
         r_type,
         addend,
     };
-    let bytes = F::encode_rela(&rel);
-    let bytes = crate::elf::read::RawRecord::as_bytes(&bytes);
-    if let Some(entry) = out.get_mut(..bytes.len()) {
-        entry.copy_from_slice(bytes);
+    if let Some(entry) = out.get_mut(..<F::Rela as RawRecord>::SIZE) {
+        entry.copy_from_slice(F::encode_rela(&rel).as_bytes());
     }
 }
 
@@ -231,10 +225,10 @@ fn output_type<F: crate::elf::read::ElfFormat>(
     match decision.class.kind {
         Kind::RelaxGotPc => R_X86_64_PC32,
         Kind::RelaxGotPcNoPic => {
-            let byte = |back: u64| {
+            let byte = |back: usize| {
                 usize::try_from(rel.offset)
                     .ok()
-                    .and_then(|o| o.checked_sub(back as usize))
+                    .and_then(|o| o.checked_sub(back))
                     .and_then(|o| data.get(o))
                     .copied()
                     .unwrap_or(0)
@@ -284,7 +278,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
         );
         let len = usize::try_from(count)
             .unwrap_or(usize::MAX)
-            .saturating_mul(rela_size::<F>())
+            .saturating_mul(<F::Rela as crate::elf::read::RawRecord>::SIZE)
             .min(rest.len());
         let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
         slices.push((placed.member, head));
@@ -309,7 +303,8 @@ pub fn write<F: crate::elf::read::ElfFormat>(
             return;
         };
         let base = addresses.section_address(id).unwrap_or(0);
-        let mut entries = out.chunks_exact_mut(rela_size::<F>());
+        // Whole entries: the slice was sized above from the same count.
+        let mut entries = out.chunks_mut(<F::Rela as crate::elf::read::RawRecord>::SIZE);
         if section.kind == SectionKind::EhFrame {
             let Some(eh) = addresses
                 .eh_frames

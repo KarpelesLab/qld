@@ -480,6 +480,18 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   - `-r` does not synthesize `R_RISCV_ALIGN` as lld does.
 - **Endianness:** big-endian RISC-V (`elf64briscv`) is rejected.
 
+## RISC-V 32
+
+- The backend is shared with RV64; only the width-dependent parts (GOT and
+  TLS entry size, the PLT's `lw` and slot shift, the dynamic relocation
+  types, `c.jal` relaxation) differ.
+- IFUNC stubs go in `.plt` before `.text`, as in GNU ld, where lld uses
+  `.iplt` after it; an address-taken IFUNC symbol keeps its resolver's
+  address, where lld redirects it to the canonical PLT entry.
+- `-r` is not implemented for ELF32 output yet, so a partial link of RV32 or
+  i386 objects reports "not implemented yet".
+- `--emit-relocs` rejects `SHT_REL` inputs.
+
 ## i386 ELF
 
 - Relaxing TLS general-dynamic or descriptor code to initial-exec uses a

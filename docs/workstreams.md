@@ -82,7 +82,7 @@ can work at the same time without colliding.
 | W41 | Library API decisions for 1.0 (M9) | `src/args/options.rs`, `examples/**`, `tests/api*`, `tests/projects/api-review.md`; proposals for `lib.rs` | W36 | merged |
 | W42 | Performance round 3 (M5) | performance changes in `src/elf/{inputs,object,resolve,dynsym,layout,place}*`, `src/symbols/**`, `src/input/**`, `benches/**`, `tests/projects/bench*` | W28, W40 | in progress |
 | W43 | x32 (M4) | `src/elf/arch/x86_64*` (x32 parts), `tests/x32*`, `tests/fixtures/x32-*` | W40 | in progress |
-| W44 | RV32 (M4) | `src/elf/arch/riscv*` (word-size parameter), `tests/riscv32*`, `tests/fixtures/riscv32-*` | W30, W40 | in progress |
+| W44 | RV32 (M4) | `src/elf/arch/riscv*` (word-size parameter), `tests/riscv32*`, `tests/fixtures/riscv32-*` | W30, W40 | merged |
 | W45 | s390x, the first big-endian target (M4) | `src/elf/arch/s390x*`, `src/arch/s390x*`, big-endian enablement in the ELF format layer, `tests/s390x*`, `tests/fixtures/s390x-*` | W40 | in progress |
 | W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
@@ -610,6 +610,12 @@ their base, with identical output.
 ---
 
 ## Integration follow-ups
+
+- **W44 (RV32):** `-r` for ELF32 output (`relocatable.rs` writes 64-bit
+  records) blocks partial links for RV32, i386 and x32;
+  `target.rs::default_target()` has no riscv32 host case;
+  `__rela_iplt_end` takes the following section's index at a boundary;
+  `tests/riscv32.rs` duplicates ~600 lines of the RV64 symbolizer.
 
 - **W32 (LoongArch64):** shrinking relaxation on W30's framework;
   `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis

@@ -526,7 +526,8 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     let arch = crate::elf::arch::Arch::of(input.options, files);
     let machine = arch.machine();
     let flags = arch.output_flags(files);
-    let riscv_attributes = (arch == crate::elf::arch::Arch::RiscV64)
+    let riscv_attributes = arch
+        .is_riscv()
         .then(|| crate::elf::arch::riscv::attributes::collect(refs))
         .flatten();
     let mut kept: KeptGroups<'a> =
