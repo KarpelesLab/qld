@@ -317,7 +317,15 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
                 return Ok(decision);
             }
             let writable = section_flags & SHF_WRITE != 0;
-            if context.arch.is_word(class.width) {
+            // An ELF64 output's pointer is always `Width::W64`, so the
+            // architecture is asked only in ELF32 links, where the answer
+            // differs (`R_386_32`, `R_X86_64_32`, `R_ARM_ABS32`, …).
+            let word = if F::WORD_SIZE == 8 {
+                class.width == Width::W64
+            } else {
+                context.arch.is_word(class.width)
+            };
+            if word {
                 if !p.preemptible {
                     if mode.pic && (p.defined || !p.global) && !p.absolute {
                         decision.dynamic = Dynamic::Relative;

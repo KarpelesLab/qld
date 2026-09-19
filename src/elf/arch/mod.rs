@@ -587,10 +587,6 @@ impl Arch {
     #[must_use]
     #[inline]
     pub fn is_word(self, width: Width) -> bool {
-        // The 64-bit architectures first, so that they pay for no other.
-        if !matches!(self, Self::I386 | Self::X32 | Self::RiscV32 | Self::Arm) {
-            return width == Width::W64;
-        }
         match self {
             Self::I386 | Self::Arm => matches!(width, Width::Any32 | Width::U32 | Width::I32),
             // `R_X86_64_32`, GNU ld's pointer relocation for x32.
