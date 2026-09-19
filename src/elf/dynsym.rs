@@ -413,7 +413,7 @@ pub struct PlanInput<'p, 'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::re
     /// The relocation scan.
     pub scan: &'p ScanResult,
     /// Whether each named output section has contents.
-    pub has_output: &'p dyn Fn(&[u8]) -> bool,
+    pub has_output: &'p (dyn Fn(&[u8]) -> bool + Sync),
     /// The `DT_SONAME` of a shared object output, or its file name.
     pub soname: Option<Vec<u8>>,
 }
@@ -563,23 +563,31 @@ fn with_strong_aliases<F: crate::elf::read::ElfFormat>(
 /// # Errors
 ///
 /// Returns [`Error::Limit`] when tables exceed their formats.
-#[allow(clippy::too_many_lines)]
 pub fn plan<F: crate::elf::read::ElfFormat>(
     input: &PlanInput<'_, '_, '_, F>,
 ) -> Result<DynamicPlan> {
+    let chosen = choose(input);
+    plan_chosen(input, chosen)
+}
+
+/// The symbols the dynamic symbol table holds, in symbol ID order, each
+/// with whether the output defines it.
+///
+/// This is the first step of [`plan`]. It is separate because it sets
+/// reference flags on strong aliases of weak imports, which the symbol
+/// table plan reads: the rest of the plan does not, and can run beside it
+/// (see `elf::link`).
+#[must_use]
+pub fn choose<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
+) -> Vec<(SymbolId, bool)> {
     let refs = input.refs;
     let symbols = refs.symbols;
     let mode = input.mode;
     let options = input.options;
-    let kind = input.synth.arch.kind();
-    let mut plan = DynamicPlan {
-        kind,
-        ..DynamicPlan::default()
-    };
     if !mode.dynamic {
-        return Ok(plan);
+        return Vec::new();
     }
-    plan.enabled = true;
     let needs = SymbolFlags::NEEDS_GOT
         | SymbolFlags::NEEDS_PLT
         | SymbolFlags::NEEDS_TLSGD
@@ -621,7 +629,32 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
             }
         })
         .collect();
-    let chosen = with_strong_aliases(refs, input.synth, chosen);
+    with_strong_aliases(refs, input.synth, chosen)
+}
+
+/// The rest of [`plan`], from the symbols [`choose`] picked.
+///
+/// # Errors
+///
+/// Returns [`Error::Limit`] when tables exceed their formats.
+#[allow(clippy::too_many_lines)]
+pub fn plan_chosen<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
+    chosen: Vec<(SymbolId, bool)>,
+) -> Result<DynamicPlan> {
+    let refs = input.refs;
+    let symbols = refs.symbols;
+    let mode = input.mode;
+    let options = input.options;
+    let kind = input.synth.arch.kind();
+    let mut plan = DynamicPlan {
+        kind,
+        ..DynamicPlan::default()
+    };
+    if !mode.dynamic {
+        return Ok(plan);
+    }
+    plan.enabled = true;
 
     let mut imports: Vec<SymbolId> = Vec::new();
     let mut exports: Vec<Entry> = Vec::new();
@@ -779,7 +812,31 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
         .par_iter()
         .map(|&entry| entry_name(entry))
         .collect();
-    plan.names = dynstr.add_all(&texts)?;
+    // The hash tables need no string offset and the string table no hash:
+    // they are built side by side (clang exports 150,000 symbols, and each
+    // takes about the same time).
+    let (names, hashes) = rayon::join(
+        || dynstr.add_all(&texts),
+        || -> Result<(Vec<u8>, Vec<u8>)> {
+            let hashed_names: Vec<(u32, &[u8])> = hashed
+                .iter()
+                .map(|&(hash, entry, _)| (hash, entry_name(entry)))
+                .collect();
+            let gnu_hash = if gnu {
+                build_gnu_hash(&hashed_names, nbuckets, plan.first_hashed, kind)?
+            } else {
+                Vec::new()
+            };
+            let sysv_hash = if sysv {
+                build_sysv_hash(&texts, kind, input.synth.arch.wide_sysv_hash())?
+            } else {
+                Vec::new()
+            };
+            Ok((gnu_hash, sysv_hash))
+        },
+    );
+    plan.names = names?;
+    (plan.gnu_hash, plan.sysv_hash) = hashes?;
 
     // `.gnu.version`.
     if versioned {
@@ -910,18 +967,6 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
         plan.verdef = data;
     }
 
-    // Hash tables.
-    let hashed_names: Vec<(u32, &[u8])> = hashed
-        .iter()
-        .map(|&(hash, entry, _)| (hash, entry_name(entry)))
-        .collect();
-    if gnu {
-        plan.gnu_hash = build_gnu_hash(&hashed_names, nbuckets, plan.first_hashed, kind)?;
-    }
-    if sysv {
-        let names: Vec<&[u8]> = plan.entries.iter().map(|&e| entry_name(e)).collect();
-        plan.sysv_hash = build_sysv_hash(&names, kind, input.synth.arch.wide_sysv_hash())?;
-    }
     plan.dynstr = dynstr.data;
 
     plan.dynamic = dynamic_entries(

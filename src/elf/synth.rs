@@ -248,13 +248,6 @@ impl Synth {
         let symbols = refs.symbols;
         self.arch = Arch::of_files(refs.files).unwrap_or(self.arch);
         self.mode = Some(mode);
-        let all: Vec<SymbolId> = symbols.ids().collect();
-        let flagged = |test: &(dyn Fn(SymbolFlags) -> bool + Sync)| -> Vec<SymbolId> {
-            all.par_iter()
-                .copied()
-                .filter(|&id| test(symbols.flags(id)))
-                .collect()
-        };
         let locals = |pick: fn(&super::scan::FileScan) -> &Vec<u32>| -> Vec<(u32, u32)> {
             scan.files
                 .iter()
@@ -275,44 +268,64 @@ impl Synth {
                 && f.contains(SymbolFlags::NEEDS_PLT | SymbolFlags::NEEDS_GOT)
                 && !f.contains(SymbolFlags::NEEDS_CANONICAL_PLT)
         };
+        // One pass over the symbol flags for all eight lists: they are
+        // sparse (clang: 1.5 million symbols, a few thousand entries), and
+        // a symbol with none of the flags costs one test.
+        let flagged = Self::flagged_lists(symbols, &|f| {
+            [
+                f.contains(SymbolFlags::NEEDS_GOT),
+                f.contains(SymbolFlags::NEEDS_TLSGD),
+                f.contains(SymbolFlags::NEEDS_GOTTPOFF),
+                f.contains(SymbolFlags::NEEDS_TLSDESC),
+                f.contains(NEEDS_IPLT),
+                dynamic
+                    && f.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
+                    && !f.contains(NEEDS_IPLT)
+                    && !plt_got(f),
+                plt_got(f) && !f.contains(NEEDS_IPLT),
+                f.contains(SymbolFlags::NEEDS_COPY_RELOC),
+            ]
+        });
+        let [
+            got,
+            tlsgd,
+            gottpoff,
+            tlsdesc,
+            iplt,
+            plt,
+            plt_got_list,
+            copies,
+        ] = flagged;
         self.got = EntryList {
-            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_GOT)),
+            globals: got,
             locals: locals(|f| &f.got_locals),
         };
         self.tlsgd = EntryList {
-            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_TLSGD)),
+            globals: tlsgd,
             locals: locals(|f| &f.tlsgd_locals),
         };
         self.gottpoff = EntryList {
-            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_GOTTPOFF)),
+            globals: gottpoff,
             locals: locals(|f| &f.gottpoff_locals),
         };
         self.tlsdesc = EntryList {
-            globals: flagged(&|f| f.contains(SymbolFlags::NEEDS_TLSDESC)),
+            globals: tlsdesc,
             locals: locals(|f| &f.tlsdesc_locals),
         };
         self.tlsld = scan.tls_ld();
         self.iplt = EntryList {
-            globals: flagged(&|f| f.contains(NEEDS_IPLT)),
+            globals: iplt,
             locals: locals(|f| &f.iplt_locals),
         };
         self.plt = EntryList {
-            globals: flagged(&|f| {
-                dynamic
-                    && f.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
-                    && !f.contains(NEEDS_IPLT)
-                    && !plt_got(f)
-            }),
+            globals: plt,
             locals: Vec::new(),
         };
         self.plt_got = EntryList {
-            globals: flagged(&|f| plt_got(f) && !f.contains(NEEDS_IPLT)),
+            globals: plt_got_list,
             locals: Vec::new(),
         };
-        self.plan_copies(
-            refs,
-            flagged(&|f| f.contains(SymbolFlags::NEEDS_COPY_RELOC)),
-        );
+        self.plan_copies(refs, copies);
         let has_got_plt = !self.got.is_empty()
             || !self.plt.is_empty()
             || !self.iplt.is_empty()
@@ -345,6 +358,43 @@ impl Synth {
         self.section_dyn_relocs = scan.section_dyn_relocs();
         self.section_packable = scan.section_packable();
         self.got_dyn_relocs = self.count_got_relocs(refs);
+    }
+
+    /// The symbols each of `tests`' predicates holds for, in symbol ID
+    /// order, from one parallel pass over the flags. A chunk builds its own
+    /// lists, and the chunks are joined in order, so the result does not
+    /// depend on scheduling.
+    fn flagged_lists<const N: usize>(
+        symbols: &crate::symbols::SymbolTable<'_>,
+        tests: &(dyn Fn(SymbolFlags) -> [bool; N] + Sync),
+    ) -> [Vec<SymbolId>; N] {
+        /// Symbols per task.
+        const CHUNK: usize = 16 << 10;
+        let count = symbols.len();
+        let parts: Vec<[Vec<SymbolId>; N]> = (0..count.div_ceil(CHUNK))
+            .into_par_iter()
+            .map(|chunk| {
+                let lo = chunk.saturating_mul(CHUNK);
+                let hi = lo.saturating_add(CHUNK).min(count);
+                let mut lists: [Vec<SymbolId>; N] = std::array::from_fn(|_| Vec::new());
+                for index in lo..hi {
+                    let id = SymbolId::new(index);
+                    for (list, hit) in lists.iter_mut().zip(tests(symbols.flags(id))) {
+                        if hit {
+                            list.push(id);
+                        }
+                    }
+                }
+                lists
+            })
+            .collect();
+        let mut lists: [Vec<SymbolId>; N] = std::array::from_fn(|_| Vec::new());
+        for part in parts {
+            for (list, mut chunk) in lists.iter_mut().zip(part) {
+                list.append(&mut chunk);
+            }
+        }
+        lists
     }
 
     /// Allocates space for copy relocations, in symbol order.

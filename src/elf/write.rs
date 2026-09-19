@@ -1690,6 +1690,10 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
     // PowerPC64: `.toc` entries this section takes the address of, whose
     // accesses keep going through the entry; found on first use.
     let pinned_toc: std::cell::OnceCell<Vec<(u32, u64)>> = std::cell::OnceCell::new();
+    // Only a `NOCROSSREFS` list in a script prohibits references, so the
+    // check is hoisted out of the loop: the call alone cost 0.7% of the
+    // link's instructions on every relocation of every link.
+    let nocrossrefs = !addresses.layout.nocrossrefs.is_empty();
     let mut skip = false;
     arch::for_each_relocation!(arch, relocations, data, |rel| {
         if skip {
@@ -1706,7 +1710,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         let Some(target) = refs.target(file_index, rel.symbol as usize) else {
             continue;
         };
-        if let Some((from, to)) = prohibited_cross_reference(input, id, &target) {
+        if nocrossrefs && let Some((from, to)) = prohibited_cross_reference(input, id, &target) {
             let name = cross_reference_name(refs, file_index, rel.symbol, &target);
             report(format!(
                 "prohibited cross reference from {from} to `{name}' in {to}"

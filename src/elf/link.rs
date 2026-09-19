@@ -529,8 +529,16 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         return Ok(());
     }
 
-    let needed = narrow.run(|| dso::plan_needed(files, &symbols, &rules, &resolution));
     let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
+    let rule_set = RuleSet::for_link(script, diagnostics, super::arch::Arch::of(options, files));
+    // Which shared objects the output needs and where input sections go are
+    // independent passes; neither keeps every thread busy.
+    let (needed, mut placement) = narrow.run(|| {
+        rayon::join(
+            || dso::plan_needed(files, &symbols, &rules, &resolution),
+            || place::place(&rule_set, files, &sections, options),
+        )
+    });
     if mode.dynamic && !mode.shared {
         narrow.run(|| dso::mark_dependency_symbols(files, &symbols, &needed, options));
     }
@@ -540,8 +548,6 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     }
     let always = always.as_slice();
 
-    let rule_set = RuleSet::for_link(script, diagnostics, super::arch::Arch::of(options, files));
-    let mut placement = narrow.run(|| place::place(&rule_set, files, &sections, options));
     for id in &placement.discarded {
         if let Some(slot) = sections.live.get_mut(id.index()) {
             *slot = false;
@@ -571,8 +577,15 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     lap("placement");
     options.check_cancelled()?;
 
-    let mut eh_frames = narrow.run(|| ehframe::split(files, &sections))?;
-    if options.gc_sections {
+    // `--gc-sections` needs the `.eh_frame` records to follow the graph, so
+    // they are split here; without it the split runs beside the relocation
+    // scan (below), which needs nothing from it.
+    let mut eh_frames = if options.gc_sections {
+        Some(narrow.run(|| ehframe::split(files, &sections))?)
+    } else {
+        None
+    };
+    if let Some(eh_frames) = eh_frames.as_mut() {
         let refs = Refs {
             files,
             symbols: &symbols,
@@ -581,7 +594,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         };
         let why_live = !options.why_live.is_empty();
         let (removed, graph) = narrow
-            .run(|| gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live))?;
+            .run(|| gc::collect(&refs, &placement, eh_frames, &linker, internal, why_live))?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
@@ -629,8 +642,16 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     // its own: they run side by side. A merge error counts only if the scan
     // reports none, as when the merge ran after it.
     // The debug indexes only read the inputs: they are built alongside.
-    let (scan, (merged, debug_indexes)) = rayon::join(
-        || scan::scan(&refs, &context),
+    let ((scan, split), (merged, debug_indexes)) = rayon::join(
+        || {
+            rayon::join(
+                || scan::scan(&refs, &context),
+                || match eh_frames {
+                    Some(eh_frames) => Ok(eh_frames),
+                    None => ehframe::split(files, &sections),
+                },
+            )
+        },
         || {
             rayon::join(
                 || {
@@ -653,6 +674,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
             )
         },
     );
+    let mut eh_frames = split?;
     for file in &scan.files {
         for error in &file.errors {
             diagnostics.emit(error.clone());
@@ -724,7 +746,6 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         resolution: &resolution,
         sections: &sections,
     };
-    narrow.run(|| eh_frames.finalize(&refs));
     let order = super::ordering::for_link(&refs, &placement, options, diagnostics)?;
 
     let mut synth = Synth {
@@ -732,7 +753,20 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         bind_now: options.bind_now,
         ..Synth::default()
     };
-    narrow.run(|| synth.plan_entries(&refs, &scan, mode));
+    // The live `.eh_frame` records, the GOT/PLT entries and the non-empty
+    // output sections are three independent passes over the inputs, and
+    // none of them keeps every thread busy on its own: they run side by
+    // side.
+    let nonempty_outputs = narrow.run(|| {
+        let (nonempty, ()) = rayon::join(
+            || {
+                synth.plan_entries(&refs, &scan, mode);
+                nonempty_outputs(files, &sections, &placement)
+            },
+            || eh_frames.finalize(&refs),
+        );
+        nonempty
+    });
     // DT_RELR is for position-independent output; GNU ld ignores the
     // option otherwise.
     synth.relr = options.pack_relative_relocs && mode.pic;
@@ -754,7 +788,6 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     synth.eh_frame_end = eh_frames.sections.iter().any(|s| s.size > 0);
     synth.common = (commons.size, commons.align);
 
-    let nonempty_outputs = narrow.run(|| nonempty_outputs(files, &sections, &placement));
     let has_output = |name: &[u8]| {
         placement
             .outputs
@@ -772,26 +805,35 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
                 .file_name()
                 .map(|n| n.as_encoded_bytes().to_vec())
         });
-    let dynamic = narrow.run(|| {
-        dynsym::plan(&dynsym::PlanInput {
-            refs: &refs,
-            needed: &needed,
-            mode,
-            options,
-            synth: &synth,
-            exports: &exports,
-            scan: &scan,
-            has_output: &has_output,
-            soname,
-        })
-    })?;
+    let input = dynsym::PlanInput {
+        refs: &refs,
+        needed: &needed,
+        mode,
+        options,
+        synth: &synth,
+        exports: &exports,
+        scan: &scan,
+        has_output: &has_output,
+        soname,
+    };
+    // Choosing the dynamic symbols sets reference flags on strong aliases
+    // of weak imports (`environ`), which the symbol table plan reads, so it
+    // comes first; the rest of the dynamic plan changes nothing the symbol
+    // table plan reads, and the two run side by side.
+    let chosen = narrow.run(|| dynsym::choose(&input));
+    let (dynamic, plan) = narrow.run(|| {
+        rayon::join(
+            || dynsym::plan_chosen(&input, chosen),
+            || symtab::plan(&refs, &linker, options, context.arch.kind()),
+        )
+    });
+    let dynamic = dynamic?;
     synth.dynamic_sizes = dynamic.sizes();
     synth.verneed_count = dynamic.verneed_count;
     synth.verdef_count = dynamic.verdef_count;
     lap("dynamic");
     options.check_cancelled()?;
 
-    let plan = narrow.run(|| symtab::plan(&refs, &linker, options, context.arch.kind()));
     let mut trailers = TrailerSizes {
         symtab: plan.symtab_size(),
         strtab: if plan.is_empty() {

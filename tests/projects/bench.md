@@ -1,10 +1,237 @@
-# Benchmarks (W24, W26, W28; roadmap M5)
+# Benchmarks (W24, W26, W28, W42; roadmap M5)
 
 qld against GNU ld, lld, mold and wild on real links, replayed from build
 trees that already exist. The drivers are in `benches/`; this file records
-the method, the corpus and the results. W28's results (symbol resolution)
-come first, then W26's from [Standing after W26](#standing-after-w26-stated-plainly);
+the method, the corpus and the results. W42's results (pipeline overlap)
+come first, then W28's (symbol resolution) from
+[Standing after W28](#standing-after-w28-symbol-resolution-stated-plainly),
+then W26's from [Standing after W26](#standing-after-w26-stated-plainly);
 W24's (the first round, with GNU ld) follow from [Standing after W24](#standing-after-w24-stated-plainly).
+
+## Standing after W42 (pipeline overlap), stated plainly
+
+W42 made independent planning steps run side by side. Every output is
+byte-identical to its base, at 1, 2, 8 and 64 threads. Measured on
+2026-09-20 on the same machine, but **on a much busier one than the
+earlier rounds** (load average 24–27 against 4–13 for W28) and with the
+outputs written to a tmpfs (`/run/user/1000`) rather than to the shared
+btrfs, which the machine's owner asked us to spare. Both facts move the
+absolute numbers: read the columns against each other, not against W28's
+table. "qld before" is the branch point (master 0337503, W28 plus the
+other workstreams), "qld after" this branch. Minimum wall times of 3
+interleaved runs:
+
+| benchmark | threads | lld | mold | wild | qld before | qld after |
+| --- | --- | --- | --- | --- | --- | --- |
+| clang | default | 255 ms | 266 ms | 86 ms | 150 ms | 131 ms |
+| clang | 1 | 440 ms | 565 ms | 511 ms | 606 ms | 578 ms |
+| clang | 8 | 296 ms | 139 ms | 92 ms | 152 ms | 161 ms |
+| clang | 64 | 308 ms | 255 ms | 76 ms | 145 ms | 127 ms |
+| libclang-cpp | default | 194 ms | 73 ms | 59 ms | 92 ms | 85 ms |
+| libclang-cpp | 1 | 276 ms | 365 ms | 266 ms | 355 ms | 351 ms |
+| libclang-cpp | 8 | 177 ms | 87 ms | 59 ms | 104 ms | 91 ms |
+| libclang-cpp | 64 | 184 ms | 252 ms | 53 ms | 91 ms | 83 ms |
+| small-count | default | 8 ms | 14 ms | 8 ms | 7 ms | 8 ms |
+| small-count | 1 | 7 ms | 10 ms | 5 ms | 8 ms | 7 ms |
+| small-count | 8 | 8 ms | 8 ms | 4 ms | 6 ms | 7 ms |
+| small-count | 64 | 7 ms | 19 ms | 8 ms | 9 ms | 10 ms |
+
+(clang-debug and vmlinux were not run at all: their 1.2 GiB and 99 MiB
+outputs, written back to back, are what stalled the shared machine's disk
+in W28. The 8-thread clang row is noise around the median — 190 ms before
+against 191 after — not a regression; every stage lap below is lower.)
+
+Stage laps (`QLD_TIMING=1`, `--no-fork`, `benches/run.py --laps`), clang
+at 16 threads, min of 5 interleaved runs at load 42:
+
+| stage | before | after |
+| --- | --- | --- |
+| inputs | 6.3 ms | 6.6 |
+| resolution | 25.0 | 26.5 |
+| placement | 10.7 | 9.7 |
+| scan | 9.1 | 8.8 |
+| merge | 0.2 | 0.1 |
+| dynamic | 14.9 | 12.2 |
+| layout | 10.5 | 9.0 |
+| write | 39.0 | 35.1 |
+| all stages | 115.7 | 108.0 |
+
+The symbol table plan moved from `layout` into `dynamic`, so the two must
+be read together: 25.4 ms before, 21.2 after. Resolution has no W42 change
+in it; its 1.5 ms is the run-to-run spread at this load.
+
+### W42 changes
+
+| Commit | Change | Effect (clang, 16 threads) |
+| --- | --- | --- |
+| d5b5e5e | `synth::plan_entries`, `nonempty_outputs` and `ehframe::finalize` in one `rayon::join`; `symtab::plan` beside the dynamic plan, which W26 could not do because choosing the dynamic symbols sets reference flags the symbol table plan reads — `dynsym::choose` is now that step alone and `dynsym::plan_chosen` the rest | layout 9.6 → 7.5 ms, whole link 136 → 131 |
+| 084cbbe | `dso::plan_needed` beside `place::place`; `.gnu.hash`/`.hash` beside the `.dynstr` batch insertion | placement 11.5 → 10.3 ms, dynamic 15.1 → 13.3 |
+| 20b919c | `ehframe::split` inside the scan's join when there is no `--gc-sections` (with it, the collection needs the records first) | scan 10.9 → 9.9 ms |
+| 4851578 | One pass over the symbol flags for the eight GOT/PLT/copy lists, instead of collecting 1.5 million IDs and filtering them eight times | 0.34% fewer instructions (callgrind) |
+| 1a1506c | The `NOCROSSREFS` check hoisted out of the write's relocation loop: the call returned at once for every link without a script list, but not for free | 1.06% fewer instructions |
+
+### Tried in W42 and not kept
+
+- **Collecting `.rela.dyn`'s relocations before the chunks are written**
+  (they are one chunk of 180,000 entries, and the region that holds them
+  is the longest one): write 38.6 → 40.5 ms. The other chunks keep the
+  machine busy anyway, so taking the work out of the overlap only made
+  the write longer.
+- **A per-worker pool of region buffers** in the write backing (the
+  buffers account for about 35,000 of a clang link's 80,000 page faults):
+  no change. glibc already hands the same arena chunks back to the same
+  worker; the faults are the first touch of memory the allocator has not
+  yet returned to the kernel.
+- **Joining `symtab::plan` with the whole of `dynsym::plan`**: the output
+  changed at 8 threads and above (W26 had found why: `with_strong_aliases`
+  sets `REF_REGULAR` on strong aliases of weak imports, and the symbol
+  table plan reads it). Splitting the plan in two fixed it; the hash check
+  at 1, 2, 8 and 64 threads is what caught it.
+
+### Where clang's 131 ms go now, and what is left
+
+At 16 threads: write 35 ms, resolution 26 (of which 15 is the parallel
+pass that loads the members that may be extracted), dynamic 12, placement
+10, layout 9, scan 9, inputs 7.
+
+- **The write is at its floor for this backing.** Its chunks cost 166 ms
+  of work on one thread and the `pwrite`s 18 ms, and the kernel serializes
+  writes to one inode: 131 MiB of copying that cannot overlap with itself.
+  `QLD_OUTPUT_BACKING=memory` (one 131 MiB buffer) takes 90 ms, `mmap` 41,
+  `write` 38.
+- **Kernel time is the largest single overhead left**: 0.34–0.40 s of a
+  clang link at 16 threads, against 0.10 on one thread, for the same
+  70,000–80,000 page faults, plus 12,000 `mprotect` calls from glibc's
+  per-thread arenas growing 128 KiB at a time. With
+  `GLIBC_TUNABLES=glibc.malloc.top_pad=67108864:glibc.malloc.trim_threshold=134217728`
+  the same binary linked clang in 180 ms against 224 (min of 4 interleaved
+  runs at load 26; 148 against 151 on a quieter machine). `mallopt` can
+  set both at startup, but it needs an `unsafe extern` call in
+  `src/main.rs`, a frozen file: the diff is in the W42 report.
+  `glibc.malloc.hugetlb=1` is *not* a safe addition: it took 140 ms
+  instead of 151 with memory free, and 1,021 ms when the machine had 1 GiB
+  free and had to compact.
+- Still open from W28: slimming `ObjectInput`/`InputSection` (112 bytes ×
+  640,000 sections), COMDAT slots keyed by symbol ID (6.5% of the load
+  pass's instructions), and single-thread relocation processing
+  (`relocate_input` 6.6% of the link's instructions, `scan_file` 5.4%,
+  `x86_64::classify` 3.6%).
+
+### Full results (W42)
+
+Wall time (min and median of 3), CPU (user+system, from a `--no-fork` run
+for the forking linkers), peak RSS, output size and the load average, from
+the run of the table above (`benches/run.py SPECS clang libclang-cpp
+small-count --linker qld-base=... --only lld,mold,wild,qld-base,qld
+--threads default,1,8,64 --runs 3 --no-sync --outdir <tmpfs>`). mold's
+medians at default and 64 threads are wild outliers at this load, not a
+change in mold.
+
+#### clang
+
+| linker | threads | wall min | wall median | CPU (median) | peak RSS | output | load avg |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 255 ms | 320 ms | 1.29s | 738 MiB | 131.3 MiB | 24–27 |
+| lld | 1 | 440 ms | 487 ms | 0.49s | 733 MiB | 131.3 MiB | 24–27 |
+| lld | 8 | 296 ms | 317 ms | 0.79s | 744 MiB | 131.3 MiB | 24–27 |
+| lld | 64 | 308 ms | 344 ms | 1.81s | 736 MiB | 131.3 MiB | 24–27 |
+| mold | default | 266 ms | 762 ms | 18.03s | 747 MiB | 131.8 MiB | 24–27 |
+| mold | 1 | 565 ms | 621 ms | 0.89s | 667 MiB | 131.8 MiB | 24–27 |
+| mold | 8 | 139 ms | 165 ms | 4.32s | 648 MiB | 131.8 MiB | 24–27 |
+| mold | 64 | 255 ms | 354 ms | 55.15s | 827 MiB | 131.8 MiB | 24–27 |
+| wild | default | 86 ms | 90 ms | 1.68s | 500 MiB | 131.0 MiB | 24–27 |
+| wild | 1 | 511 ms | 566 ms | 0.49s | 507 MiB | 131.0 MiB | 24–27 |
+| wild | 8 | 92 ms | 106 ms | 0.58s | 504 MiB | 131.0 MiB | 24–27 |
+| wild | 64 | 76 ms | 84 ms | 2.12s | 490 MiB | 131.0 MiB | 24–27 |
+| qld-base | default | 150 ms | 166 ms | 1.54s | 559 MiB | 131.4 MiB | 24–27 |
+| qld-base | 1 | 606 ms | 656 ms | 0.59s | 508 MiB | 131.4 MiB | 24–27 |
+| qld-base | 8 | 152 ms | 190 ms | 0.98s | 521 MiB | 131.4 MiB | 24–27 |
+| qld-base | 64 | 145 ms | 163 ms | 1.57s | 563 MiB | 131.4 MiB | 24–27 |
+| qld | default | 131 ms | 148 ms | 1.26s | 563 MiB | 131.4 MiB | 24–27 |
+| qld | 1 | 578 ms | 639 ms | 0.62s | 509 MiB | 131.4 MiB | 24–27 |
+| qld | 8 | 161 ms | 191 ms | 1.09s | 540 MiB | 131.4 MiB | 25–27 |
+| qld | 64 | 127 ms | 169 ms | 1.61s | 565 MiB | 131.4 MiB | 25–27 |
+
+#### libclang-cpp
+
+| linker | threads | wall min | wall median | CPU (median) | peak RSS | output | load avg |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 194 ms | 227 ms | 0.81s | 395 MiB | 77.4 MiB | 26–27 |
+| lld | 1 | 276 ms | 337 ms | 0.33s | 400 MiB | 77.4 MiB | 26–27 |
+| lld | 8 | 177 ms | 217 ms | 0.57s | 401 MiB | 77.4 MiB | 26–27 |
+| lld | 64 | 184 ms | 199 ms | 1.13s | 395 MiB | 77.4 MiB | 26–27 |
+| mold | default | 73 ms | 152 ms | 1.91s | 562 MiB | 78.0 MiB | 26–27 |
+| mold | 1 | 365 ms | 400 ms | 0.31s | 362 MiB | 78.0 MiB | 26–27 |
+| mold | 8 | 87 ms | 92 ms | 0.54s | 407 MiB | 78.0 MiB | 26–27 |
+| mold | 64 | 252 ms | 371 ms | 8.11s | 710 MiB | 78.0 MiB | 26–27 |
+| wild | default | 59 ms | 66 ms | 1.37s | 290 MiB | 77.3 MiB | 26–27 |
+| wild | 1 | 266 ms | 306 ms | 0.30s | 309 MiB | 77.3 MiB | 26–27 |
+| wild | 8 | 59 ms | 67 ms | 0.34s | 305 MiB | 77.3 MiB | 26–27 |
+| wild | 64 | 53 ms | 56 ms | 1.39s | 290 MiB | 77.3 MiB | 26–27 |
+| qld-base | default | 92 ms | 112 ms | 1.00s | 340 MiB | 77.6 MiB | 26–27 |
+| qld-base | 1 | 355 ms | 410 ms | 0.38s | 304 MiB | 77.6 MiB | 26–27 |
+| qld-base | 8 | 104 ms | 105 ms | 0.55s | 330 MiB | 77.6 MiB | 26–27 |
+| qld-base | 64 | 91 ms | 94 ms | 0.90s | 346 MiB | 77.6 MiB | 26–27 |
+| qld | default | 85 ms | 91 ms | 0.89s | 324 MiB | 77.6 MiB | 26–27 |
+| qld | 1 | 351 ms | 450 ms | 0.35s | 303 MiB | 77.6 MiB | 26–27 |
+| qld | 8 | 91 ms | 103 ms | 0.59s | 326 MiB | 77.6 MiB | 26–27 |
+| qld | 64 | 83 ms | 89 ms | 0.94s | 336 MiB | 77.6 MiB | 26–27 |
+
+#### small-count
+
+| linker | threads | wall min | wall median | CPU (median) | peak RSS | output | load avg |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| lld | default | 8 ms | 9 ms | 0.01s | 37 MiB | 0.0 MiB | 26–26 |
+| lld | 1 | 7 ms | 8 ms | 0.01s | 39 MiB | 0.0 MiB | 26–26 |
+| lld | 8 | 8 ms | 8 ms | 0.01s | 37 MiB | 0.0 MiB | 26–26 |
+| lld | 64 | 7 ms | 8 ms | 0.02s | 37 MiB | 0.0 MiB | 26–26 |
+| mold | default | 14 ms | 14 ms | 0.22s | 108 MiB | 0.0 MiB | 26–26 |
+| mold | 1 | 10 ms | 10 ms | 0.01s | 37 MiB | 0.0 MiB | 26–26 |
+| mold | 8 | 8 ms | 10 ms | 0.04s | 54 MiB | 0.0 MiB | 26–26 |
+| mold | 64 | 19 ms | 26 ms | 0.55s | 144 MiB | 0.0 MiB | 26–26 |
+| wild | default | 8 ms | 9 ms | 0.11s | 20 MiB | 0.0 MiB | 26–26 |
+| wild | 1 | 5 ms | 5 ms | 0.00s | 20 MiB | 0.0 MiB | 26–26 |
+| wild | 8 | 4 ms | 4 ms | 0.01s | 20 MiB | 0.0 MiB | 26–26 |
+| wild | 64 | 8 ms | 9 ms | 0.14s | 20 MiB | 0.0 MiB | 26–26 |
+| qld-base | default | 7 ms | 8 ms | 0.03s | 20 MiB | 0.0 MiB | 26–26 |
+| qld-base | 1 | 8 ms | 8 ms | 0.01s | 24 MiB | 0.0 MiB | 26–26 |
+| qld-base | 8 | 6 ms | 8 ms | 0.02s | 23 MiB | 0.0 MiB | 26–26 |
+| qld-base | 64 | 9 ms | 10 ms | 0.09s | 22 MiB | 0.0 MiB | 26–26 |
+| qld | default | 8 ms | 8 ms | 0.03s | 20 MiB | 0.0 MiB | 26–26 |
+| qld | 1 | 7 ms | 8 ms | 0.01s | 24 MiB | 0.0 MiB | 26–26 |
+| qld | 8 | 7 ms | 8 ms | 0.02s | 22 MiB | 0.0 MiB | 26–26 |
+| qld | 64 | 10 ms | 10 ms | 0.08s | 21 MiB | 0.0 MiB | 26–26 |
+
+### Determinism and the performance guard (W42)
+
+`benches/run.py SPECS clang libclang-cpp small-count --determinism QLD
+--det-threads 1,2,8,64 --hashes FILE`: identical at 1, 2, 8 and 64 threads
+for all three, and identical to the branch point's hashes
+(clang `ffad1ac52df901c0`, libclang-cpp `7fe47ce7696d1316`, small-count
+`0f201fabe6ad3ee8`). Callgrind on the clang link at one thread:
+5,012,809,706 instructions at the branch point, 4,946,494,826 on this
+branch (1.32% fewer), same output.
+
+The wall-clock tables above were taken before the last commit, 1a1506c.
+A run of the finished branch against the branch point alone (same driver,
+`--only qld-base,qld`, 3 interleaved runs, load 31, min wall):
+
+| benchmark | threads | before | after |
+| --- | --- | --- | --- |
+| clang | default | 112 ms | 101 ms |
+| clang | 8 | 139 ms | 129 ms |
+| clang | 64 | 123 ms | 111 ms |
+| libclang-cpp | default | 88 ms | 77 ms |
+| libclang-cpp | 8 | 91 ms | 85 ms |
+| libclang-cpp | 64 | 84 ms | 78 ms |
+| small-count | default | 11 ms | 11 ms |
+| small-count | 8 | 10 ms | 8 ms |
+| small-count | 64 | 12 ms | 15 ms |
+
+(small-count links 1 object and 2 archives: its numbers are process
+startup and are the same either way, the 64-thread row included — that one
+is the cost of starting 64 rayon workers, and it moves by 3-4 ms between
+runs.)
 
 ## Standing after W28 (symbol resolution), stated plainly
 
