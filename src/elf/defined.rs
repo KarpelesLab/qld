@@ -274,7 +274,7 @@ pub fn register<F: crate::elf::read::ElfFormat>(
     // RISC-V executables: `__global_pointer$`, which the C runtime loads
     // into `gp`.
     if options.kind != crate::args::OutputKind::Shared
-        && super::arch::Arch::of_files(files) == Some(super::arch::Arch::RiscV64)
+        && super::arch::Arch::of_files(files).is_some_and(super::arch::Arch::is_riscv)
         && let Some(id) = symbols.lookup(&SymbolName::new(b"__global_pointer$"))
         && wanted(symbols, id)
     {
