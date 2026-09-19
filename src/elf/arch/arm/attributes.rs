@@ -59,15 +59,22 @@ const ALSO_COMPATIBLE_WITH: u64 = 65;
 const CONFORMANCE: u64 = 67;
 
 /// Tags whose merged value is the highest of the objects': the
-/// architecture and the extensions it may use.
+/// architecture, the extensions it may use, and the floating-point
+/// properties GNU ld also takes the largest of.
 const HIGHEST: &[u64] = &[
     CPU_ARCH, 8,  // Tag_ARM_ISA_use
     9,  // Tag_THUMB_ISA_use
     10, // Tag_FP_arch
     11, // Tag_WMMX_arch
     12, // Tag_Advanced_SIMD_arch
+    19, // Tag_ABI_FP_rounding
+    20, // Tag_ABI_FP_denormal
+    21, // Tag_ABI_FP_exceptions
+    22, // Tag_ABI_FP_user_exceptions
+    23, // Tag_ABI_FP_number_model
     24, // Tag_ABI_align_needed
     25, // Tag_ABI_align_preserved
+    27, // Tag_ABI_HardFP_use
     34, // Tag_CPU_unaligned_access
     36, // Tag_FP_HP_extension
     42, // Tag_MPextension_use
