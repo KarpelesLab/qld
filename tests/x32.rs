@@ -25,8 +25,8 @@
 //! `objdump` and `readelf`; `ld.lld` from `QLD_LLD` or `PATH`. A test prints
 //! `SKIPPED:` and passes when one is missing, unless
 //! `QLD_REQUIRE_X32_TOOLS=1` (compiler and GNU ld), `QLD_REQUIRE_X32_LIBC=1`
-//! (the x32 C library), `QLD_REQUIRE_X32_LLD=1`, or, for running,
-//! `QLD_REQUIRE_X32_RUN=1`.
+//! (the x32 C library), `QLD_REQUIRE_X32_CXX=1` (the C++ one),
+//! `QLD_REQUIRE_X32_LLD=1`, or, for running, `QLD_REQUIRE_X32_RUN=1`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -420,6 +420,9 @@ struct Image {
     /// The addends of the relative relocations, by place: what the word
     /// holds once the dynamic linker has added the load address.
     relative: BTreeMap<u64, u64>,
+    /// The index in `.rela.plt` of each PLT relocation, by place: which
+    /// PLT entry the slot belongs to.
+    plt_index: BTreeMap<u64, u64>,
 }
 
 impl Image {
@@ -475,7 +478,12 @@ impl Image {
         symbols.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
         let mut dynrel = BTreeMap::new();
         let mut relative = BTreeMap::new();
+        let mut plt_index = BTreeMap::new();
+        let mut in_rela_plt = false;
         for line in run_ok(dir, &tools.readelf, &["-rW", file]).lines() {
+            if line.starts_with("Relocation section") {
+                in_rela_plt = line.contains(".rela.plt");
+            }
             let fields: Vec<&str> = line.split_whitespace().collect();
             let [place, _, kind, rest @ ..] = fields.as_slice() else {
                 continue;
@@ -491,6 +499,10 @@ impl Image {
             {
                 relative.insert(place, addend);
             }
+            if in_rela_plt {
+                let index = plt_index.len() as u64;
+                plt_index.insert(place, index);
+            }
             dynrel.insert(place, format!("{kind}({symbol})"));
         }
         Self {
@@ -499,6 +511,7 @@ impl Image {
             symbols,
             dynrel,
             relative,
+            plt_index,
         }
     }
 
@@ -754,6 +767,19 @@ fn compare_with(tools: &Tools, dir: &Path, other: &str, file: &str, functions: &
             "{file}: {plt} differs from GNU ld's (left: {other}, right: GNU ld)"
         );
     }
+    for got in [".got", ".got.plt"] {
+        let (Some(a), Some(b)) = (gnu.section(got), ours.section(got)) else {
+            continue;
+        };
+        if a.size != b.size {
+            continue;
+        }
+        assert_eq!(
+            got_words(&ours, b),
+            got_words(&gnu, a),
+            "{file}: {got} differs from GNU ld's (left: {other}, right: GNU ld)"
+        );
+    }
     // GNU ld keeps the PLT entry of a `__tls_get_addr` call a relaxation
     // removed even when nothing defines the symbol — here only the dynamic
     // linker would, and these programs have none. qld keeps it when the
@@ -779,6 +805,58 @@ fn compare_with(tools: &Tools, dir: &Path, other: &str, file: &str, functions: &
         "{file}: .dynamic tags (left: {other}, right: GNU ld)"
     );
     check_header(tools, dir, &other_file);
+}
+
+/// The words of a GOT section, each as the dynamic relocation that fills
+/// it and the 64-bit value the linker left there — a lazy `.got.plt` slot
+/// holds the address of its PLT entry's `push`, and the reserved words the
+/// address of `_DYNAMIC` and two zeros. Sorted, because the two linkers
+/// give the entries different indexes.
+fn got_words(image: &Image, section: &Section) -> Vec<String> {
+    // The three reserved words of `.got.plt` come first, then one word per
+    // PLT entry, in the order the linker chose.
+    let plt = image.section(".plt");
+    let lazy_target = |at: u64, value: u64| -> Option<String> {
+        let plt = plt?;
+        let entry = plt.entsize.max(1);
+        let offset = value.checked_sub(plt.addr)?;
+        if offset >= plt.size {
+            return None;
+        }
+        // The slot of the PLT relocation with index `n` points at PLT
+        // entry `n`: at its `push` without IBT, at its start with it.
+        let own = *image.plt_index.get(&at)? == offset.checked_div(entry)?.checked_sub(1)?;
+        let within = offset % entry;
+        own.then(|| format!("its own PLT entry+{within:#x}"))
+    };
+    let mut words: Vec<String> = Vec::new();
+    let mut at = section.addr;
+    while at < section.addr + section.size {
+        let value = image.quad(at).unwrap_or(0);
+        let (low, high) = (value & 0xffff_ffff, value >> 32);
+        let target = if low == 0 {
+            "0".to_string()
+        } else if let Some(own) = lazy_target(at, low) {
+            own
+        } else {
+            image.name(low)
+        };
+        let reloc = image
+            .dynrel
+            .get(&at)
+            .cloned()
+            .or_else(|| {
+                image
+                    .relative
+                    .get(&at)
+                    .map(|a| format!("RELATIVE({})", image.name(*a)))
+            })
+            .unwrap_or_else(|| "-".to_string());
+        words.push(format!("{reloc} = {target} high {high:#x}"));
+        at += 8;
+    }
+    words.sort();
+    words
 }
 
 /// The entries of a PLT section, symbolized, sorted: the two linkers give
@@ -1164,10 +1242,10 @@ fn cxx_exceptions() {
     };
     if tools.cxx.is_none() {
         assert!(
-            !required("QLD_REQUIRE_X32_LIBC"),
-            "QLD_REQUIRE_X32_LIBC is set but g++ -mx32 does not link"
+            !required("QLD_REQUIRE_X32_CXX"),
+            "QLD_REQUIRE_X32_CXX is set but g++ -mx32 does not link"
         );
-        println!("SKIPPED: no g++ -mx32");
+        println!("SKIPPED: no g++ -mx32 (the x32 C++ library)");
         return;
     }
     let expected = "derived:0=1\nderived:1=1\nderived:2=1\n\
