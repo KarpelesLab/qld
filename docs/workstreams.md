@@ -80,6 +80,11 @@ can work at the same time without colliding.
 | W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | merged |
 | W40 | ELF32 and big-endian ELF (M4) | the ELF reader/writer generics in `src/elf/**`, `src/elf/arch/{i386,arm}*`, `src/arch/{i386,arm}*`, `tests/elf32*`, `tests/fixtures/{i386,arm,s390x,ppc64be}-*` | W30, W31, W32, W37 | merged |
 | W41 | Library API decisions for 1.0 (M9) | `src/args/options.rs`, `examples/**`, `tests/api*`, `tests/projects/api-review.md`; proposals for `lib.rs` | W36 | merged |
+| W42 | Performance round 3 (M5) | performance changes in `src/elf/{inputs,object,resolve,dynsym,layout,place}*`, `src/symbols/**`, `src/input/**`, `benches/**`, `tests/projects/bench*` | W28, W40 | in progress |
+| W43 | x32 (M4) | `src/elf/arch/x86_64*` (x32 parts), `tests/x32*`, `tests/fixtures/x32-*` | W40 | in progress |
+| W44 | RV32 (M4) | `src/elf/arch/riscv*` (word-size parameter), `tests/riscv32*`, `tests/fixtures/riscv32-*` | W30, W40 | in progress |
+| W45 | s390x, the first big-endian target (M4) | `src/elf/arch/s390x*`, `src/arch/s390x*`, big-endian enablement in the ELF format layer, `tests/s390x*`, `tests/fixtures/s390x-*` | W40 | in progress |
+| W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -585,6 +590,22 @@ PowerPC64 BE (ELFv1) and s390x.
 [api-review.md](../tests/projects/api-review.md): `Default` versus `new()`,
 string-typed options, `darwin.inputs`, printing and environment reads inside
 the library, and nested thread pools.
+
+---
+
+## W42–W46: round 5
+
+- **W42, performance:** close the gap to wild. Member loading stops scaling
+  past ~8 threads (kernel page-fault cost; slimmer `ObjectInput` /
+  `InputSection`), the dynamic and layout stages do not scale at 8 threads,
+  and single-threaded relocation processing and parsing lag lld.
+- **W43–W46, architectures on the generic ELF32 / big-endian layer:** x32,
+  RV32, s390x (which enables big-endian output end to end) and 32-bit ARM.
+  PowerPC64 big-endian (ELFv1) follows once s390x has exercised big-endian
+  output.
+
+All of them keep the x86-64 clang link's instruction count within 0.5% of
+their base, with identical output.
 
 ---
 
