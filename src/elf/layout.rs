@@ -890,7 +890,7 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
     let has_eh_hdr = input.synth.eh_frame_hdr && input.synth.fde_count > 0;
     let gnu_stack = input.options.gnu_stack;
     // RISC-V: `PT_RISCV_ATTRIBUTES` covers `.riscv.attributes`.
-    let has_attributes = input.synth.arch == Arch::RiscV64
+    let has_attributes = input.synth.arch.is_riscv()
         && out_sections
             .iter()
             .any(|s| s.sh_type == SHT_RISCV_ATTRIBUTES);
@@ -1508,8 +1508,8 @@ pub(crate) fn add_trailers<F: crate::elf::read::ElfFormat>(
             input
                 .trailers
                 .symtab
-                .saturating_add(u64::from(section_symbols).saturating_mul(24)),
-            8,
+                .saturating_add(u64::from(section_symbols).saturating_mul(kind.sym_size())),
+            kind.word_size(),
         ));
         out_sections.push(trailer(
             b".strtab",
@@ -1814,7 +1814,7 @@ pub(crate) fn member_size<F: crate::elf::read::ElfFormat>(
             }
             // RISC-V: relaxation shrinks code, and the merged
             // `.riscv.attributes` takes the place of the input sections.
-            if input.synth.arch == Arch::RiscV64 {
+            if input.synth.arch.is_riscv() {
                 return Ok(riscv_member_size(input, id, section));
             }
             let size = section.header.sh_size;
@@ -1884,9 +1884,10 @@ pub(crate) fn entsize_of<F: crate::elf::read::ElfFormat>(
                 input.synth.arch.dyn_reloc_size()
             }
             Member::Synthetic(Synthetic::DynSym) => input.kind().sym_size(),
-            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt | Synthetic::RelrDyn) => {
-                input.kind().word_size()
+            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt) => {
+                input.synth.arch.got_entry_size()
             }
+            Member::Synthetic(Synthetic::RelrDyn) => input.kind().word_size(),
             Member::Synthetic(Synthetic::Dynamic) => input.kind().dyn_size(),
             Member::Synthetic(Synthetic::Plt | Synthetic::PltSec) => {
                 if input.synth.arch == super::arch::Arch::S390x {

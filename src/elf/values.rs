@@ -402,7 +402,7 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
     pub fn got_entry_address(&self, owner: Owner, kind: GotKind) -> Option<u64> {
         let word = self.synth.got_word(owner, kind)?;
         let (base, ..) = self.layout.synthetic(Synthetic::Got)?;
-        base.checked_add(word.checked_mul(self.synth.arch.kind().word_size())?)
+        base.checked_add(word.checked_mul(self.synth.arch.got_entry_size())?)
     }
 
     /// The address of the `.got.plt` slot of PLT entry `index` (for a
@@ -413,7 +413,7 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
         let slot = u64::try_from(index)
             .ok()?
             .checked_add(self.synth.got_plt_reserved)?;
-        base.checked_add(slot.checked_mul(self.synth.arch.kind().word_size())?)
+        base.checked_add(slot.checked_mul(self.synth.arch.got_entry_size())?)
     }
 
     /// The GOT base (`_GLOBAL_OFFSET_TABLE_`; on PowerPC64 the TOC pointer
@@ -499,7 +499,7 @@ pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Opt
         return base.checked_add(
             synth
                 .got_word(owner, GotKind::Address)?
-                .checked_mul(synth.arch.kind().word_size())?,
+                .checked_mul(synth.arch.got_entry_size())?,
         );
     }
     let index = if synth.dynamic() {
@@ -511,7 +511,7 @@ pub fn plt_slot_address(synth: &Synth, layout: &Layout<'_>, owner: Owner) -> Opt
     base.checked_add(
         index
             .checked_add(synth.got_plt_reserved)?
-            .checked_mul(synth.arch.kind().word_size())?,
+            .checked_mul(synth.arch.got_entry_size())?,
     )
 }
 

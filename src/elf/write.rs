@@ -812,6 +812,17 @@ fn symbol_value<F: crate::elf::read::ElfFormat>(
     }
 }
 
+/// Encodes GOT entry `value` into `slot`, which is
+/// [`Arch::got_entry_size`] bytes: the class's word, or 64 bits in an
+/// ELF32 output (x32), where a thread pointer offset is sign-extended.
+fn put_got_word<F: ElfFormat>(slot: &mut [u8], value: u64) {
+    if F::WORD_SIZE == 4 && slot.len() == 8 {
+        slot.copy_from_slice(&<F::Endian as crate::elf::read::Endian>::put_u64(value));
+    } else {
+        slot.copy_from_slice(F::encode_word(value).as_bytes());
+    }
+}
+
 fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
@@ -821,15 +832,15 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     let tls = addresses.layout.tls.unwrap_or_default();
     let mode = synth.mode;
     let rel = synth.arch.uses_rel();
-    let size = <F::Word as RawRecord>::SIZE;
-    let size64 = u64::try_from(size).unwrap_or(8).max(1);
+    let size64 = synth.arch.got_entry_size().max(1);
+    let size = usize::try_from(size64).unwrap_or(8);
     let mut put = |address: u64, value: u64| {
         let start = address.wrapping_sub(base);
         if let Some(word) = usize::try_from(start)
             .ok()
             .and_then(|s| out.get_mut(s..s.checked_add(size)?))
         {
-            word.copy_from_slice(F::encode_word(value).as_bytes());
+            put_got_word::<F>(word, value);
         }
     };
     let refs = &addresses.refs;
@@ -914,7 +925,9 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
 fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
     let addresses = input.addresses;
     let synth = addresses.synth;
-    let size = <F::Word as RawRecord>::SIZE.max(1);
+    let size = usize::try_from(synth.arch.got_entry_size())
+        .unwrap_or(8)
+        .max(1);
     let reserved = usize::try_from(synth.got_plt_reserved).unwrap_or(0);
     if synth.dynamic() {
         if synth.arch.got_plt_holds_dynamic()
@@ -924,7 +937,7 @@ fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]
                 .layout
                 .synthetic(Synthetic::Dynamic)
                 .map_or(0, |(addr, ..)| addr);
-            first.copy_from_slice(F::encode_word(dynamic).as_bytes());
+            put_got_word::<F>(first, dynamic);
         }
         let slots = out.chunks_exact_mut(size).skip(reserved);
         for (index, (owner, slot)) in synth
@@ -945,7 +958,7 @@ fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]
                     .map_or(0, |(addr, ..)| addr);
                 synth.arch.lazy_slot_value(plt, lazy, synth.plt_flags())
             };
-            slot.copy_from_slice(F::encode_word(value).as_bytes());
+            put_got_word::<F>(slot, value);
         }
         return;
     }
@@ -954,7 +967,7 @@ fn write_got_plt<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]
         // Filled by IRELATIVE at startup; hold the resolver address
         // meanwhile, as GNU ld does.
         let value = symbol_value(addresses, owner);
-        entry.copy_from_slice(F::encode_word(value).as_bytes());
+        put_got_word::<F>(entry, value);
     }
 }
 
@@ -1149,11 +1162,7 @@ fn collect_dyn_relocs<F: crate::elf::read::ElfFormat>(
                 .into_iter()
                 .enumerate()
             {
-                let at = address.wrapping_add(if word == 0 {
-                    0
-                } else {
-                    arch.kind().word_size()
-                });
+                let at = address.wrapping_add(if word == 0 { 0 } else { arch.got_entry_size() });
                 match reloc {
                     SlotReloc::None => {}
                     SlotReloc::Relative => {
@@ -1641,7 +1650,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         return write_eh_frame(input, eh, base, out);
     }
     // RISC-V relocations depend on each other and on linker relaxation.
-    if input.context.arch == Arch::RiscV64 {
+    if input.context.arch.is_riscv() {
         let section = super::arch::riscv::apply::SectionWrite {
             id,
             file: file_index,

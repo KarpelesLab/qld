@@ -7,7 +7,8 @@
 //!   aligned (always, even with `--no-relax`);
 //! - a call (`auipc` + `jalr`, `CALL`/`CALL_PLT` with `R_RISCV_RELAX`)
 //!   becomes `jal` within ±1 MiB, or `c.j` within ±2 KiB for a tail call
-//!   in an object with compressed instructions;
+//!   in an object with compressed instructions (on RV32 also `c.jal` for a
+//!   call that links `ra`);
 //! - a local-exec access whose offset fits 12 bits loses its `lui` and
 //!   `add` and addresses `tp` directly;
 //! - a `lui` of an absolute address that fits 12 bits goes away and the
@@ -22,7 +23,7 @@
 
 #![deny(clippy::arithmetic_side_effects)]
 
-use crate::arch::riscv::{self as insn, C_J, JAL, TP, fits_signed, hi20};
+use crate::arch::riscv::{self as insn, C_J, C_JAL, JAL, TP, fits_signed, hi20};
 use crate::elf::layout::{Layout, LayoutInput};
 use crate::elf::read::consts::riscv::*;
 use crate::elf::refs::Def;
@@ -175,10 +176,20 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
                     .map(insn::rd);
                 if let (Some(dest), Some(rd)) = (target(true), rd) {
                     let displace = dest.wrapping_sub(loc) as i64;
-                    if limit >= 6 && rvc && fits_signed(displace, 12) && rd == insn::X0 {
+                    // `c.jal` exists on RV32 only (lld's rule too).
+                    let compressed = match rd {
+                        insn::X0 => Some(C_J),
+                        insn::RA if F::WORD_SIZE == 4 => Some(C_JAL),
+                        _ => None,
+                    };
+                    if let Some(compressed) = compressed
+                        && limit >= 6
+                        && rvc
+                        && fits_signed(displace, 12)
+                    {
                         remove = 6;
                         rewrite = Some(Rewrite::Replace {
-                            word: u32::from(C_J),
+                            word: u32::from(compressed),
                             len: 2,
                             r_type: R_RISCV_RVC_JUMP,
                         });
