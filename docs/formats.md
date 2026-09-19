@@ -125,7 +125,10 @@ every output format:
 
 ## ELF32 output
 
-32-bit targets (i386) write REL relocations: `.rel.dyn` and `.rel.plt` with
+Emulations: `elf_i386`, `elf32lriscv` (and the `_ilp32`, `_ilp32f`,
+`_ilp32d` spellings) and `elf32_x86_64` (x32: ILP32 on x86-64, with 12-byte
+`Elf32_Rela` records, 8-byte GOT and `.got.plt` entries, and `R_X86_64_32`
+as the pointer relocation). i386 writes REL relocations: `.rel.dyn` and `.rel.plt` with
 `DT_REL`, `DT_RELSZ`, `DT_RELENT` and `DT_PLTREL = DT_REL`, with addends
 stored in the patched words. The class and byte order are a type parameter
 of the whole ELF pipeline (`ElfFormat`), chosen once per link, so the 64-bit

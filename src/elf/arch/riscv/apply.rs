@@ -20,7 +20,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::arch::riscv::{
-    self as insn, A0, ADDI, AUIPC, FieldError, LD, LUI, NOP, fits_signed, hi20, itype, lo12, utype,
+    self as insn, A0, ADDI, AUIPC, FieldError, LUI, NOP, fits_signed, hi20, itype, lo12, utype,
 };
 use crate::debug::tombstone::DeadTarget;
 use crate::diag::Diagnostic;
@@ -200,6 +200,7 @@ impl<'w, 'x, 'a, F: crate::elf::read::ElfFormat> Writer<'_, 'w, 'x, 'a, F> {
     }
 
     fn put(&self, out: &mut [u8], rel: &Relocation, at: u64, width: Width, value: u64) {
+        let value = wrap_value::<F>(width, value);
         if let Err(error) = super::super::write_value(out, at, width, value) {
             self.report_apply(rel, error);
         }
@@ -211,7 +212,9 @@ impl<'w, 'x, 'a, F: crate::elf::read::ElfFormat> Writer<'_, 'w, 'x, 'a, F> {
         let result = match class.kind {
             Kind::Add => super::super::add_value(out, at, class.width, value),
             Kind::Sub => super::super::add_value(out, at, class.width, value.wrapping_neg()),
-            _ => super::super::write_value(out, at, class.width, value),
+            _ => {
+                super::super::write_value(out, at, class.width, wrap_value::<F>(class.width, value))
+            }
         };
         if let Err(error) = result {
             self.report_apply(rel, error);
@@ -526,7 +529,7 @@ impl<'w, 'x, 'a, F: crate::elf::read::ElfFormat> Writer<'_, 'w, 'x, 'a, F> {
                             itype(ADDI, A0, insn::X0, value as u32)
                         }
                         (_, true) => itype(ADDI, A0, A0, lo12(value)),
-                        (_, false) => itype(LD, A0, A0, lo12(value)),
+                        (_, false) => itype(super::load(F::WORD_SIZE as u64), A0, A0, lo12(value)),
                     };
                     self.put_word(out, rel, at, word);
                     continue;
@@ -628,6 +631,18 @@ impl<'w, 'x, 'a, F: crate::elf::read::ElfFormat> Writer<'_, 'w, 'x, 'a, F> {
                 self.store(out, rel, at, class, value);
             }
         }
+    }
+}
+
+/// `value` as field `width` receives it: on RV32 (4-byte words), the upper
+/// part of an address pair wraps at 32 bits ([`insn::wrap32_hi`]). Gone at
+/// compile time on RV64.
+fn wrap_value<F: crate::elf::read::ElfFormat>(width: Width, value: u64) -> u64 {
+    match width {
+        Width::RiscV(insn::Field::Hi20 | insn::Field::Call) if F::WORD_SIZE == 4 => {
+            insn::wrap32_hi(value)
+        }
+        _ => value,
     }
 }
 

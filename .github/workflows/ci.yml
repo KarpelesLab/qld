@@ -84,6 +84,57 @@ jobs:
           echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
       - run: cargo test --all-features --test ordering --test debug_index -- --test-threads=2
 
+  x32:
+    name: x32 links compared with GNU ld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_X32_TOOLS: "1"
+      QLD_REQUIRE_X32_LIBC: "1"
+      QLD_REQUIRE_X32_CXX: "1"
+      QLD_REQUIRE_X32_LLD: "1"
+      QLD_LLD: ld.lld-22
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # gcc-multilib brings libc6-dev-x32 and libx32gcc-13-dev; g++-multilib
+      # brings libx32stdc++-13-dev
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
+      - run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y lld-22
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+      # x32 programs run only on a kernel built with CONFIG_X86_X32_ABI
+      - name: Can this kernel run x32 binaries?
+        run: |
+          printf 'void _start(void){__asm__ volatile("syscall"::"a"(0x4000003c),"D"(0));}\n' > /tmp/x32.c
+          gcc -mx32 -O2 -ffreestanding -nostdlib -static /tmp/x32.c -o /tmp/x32
+          if /tmp/x32; then
+            echo "QLD_REQUIRE_X32_RUN=1" >> "$GITHUB_ENV"
+          else
+            echo "x32 binaries do not run on this kernel; links are compared, not run"
+          fi
+      - run: cargo test --all-features --test x32 -- --nocapture
+
+  riscv32:
+    name: RISC-V 32 links compared with lld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_RISCV_TOOLS: "1"
+      QLD_REQUIRE_RISCV32_QEMU: "1"
+      QLD_LLD: ld.lld-22
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y lld-22 qemu-user-static
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+      - run: cargo test --all-features --test riscv32 -- --nocapture
+
   riscv64:
     name: RISC-V 64 links compared with lld
     runs-on: ubuntu-24.04

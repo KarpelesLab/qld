@@ -480,6 +480,35 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   - `-r` does not synthesize `R_RISCV_ALIGN` as lld does.
 - **Endianness:** big-endian RISC-V (`elf64briscv`) is rejected.
 
+## x32
+
+- The interpreter is `/libx32/ld-linux-x32.so.2`; GNU ld's built-in default
+  is `/lib/ldx32.so.1`.
+- TLS descriptors are resolved eagerly, so there is no `DT_TLSDESC_PLT` or
+  `DT_TLSDESC_GOT`, as on x86-64 and AArch64.
+- A `GOTPCRELX` load with no REX prefix whose preceding byte could be one
+  relaxes to a `lea` rather than an immediate.
+- A `__tls_get_addr` call removed by a relaxation keeps its PLT entry only
+  when the symbol is preemptible.
+- **GNU ld 2.46 corrupts the x32 local-dynamic sequence** when the
+  `__tls_get_addr` call is indirect: it writes the 12-byte form over 13
+  bytes, leaving a stray byte. qld writes the intended 13-byte sequence.
+- lld rejects x32's `GOTTPOFF` and TLSDESC instruction forms, so it is only
+  compared on position-independent output.
+- `-r` and `-b binary` are not implemented for ELF32 output.
+
+## RISC-V 32
+
+- The backend is shared with RV64; only the width-dependent parts (GOT and
+  TLS entry size, the PLT's `lw` and slot shift, the dynamic relocation
+  types, `c.jal` relaxation) differ.
+- IFUNC stubs go in `.plt` before `.text`, as in GNU ld, where lld uses
+  `.iplt` after it; an address-taken IFUNC symbol keeps its resolver's
+  address, where lld redirects it to the canonical PLT entry.
+- `-r` is not implemented for ELF32 output yet, so a partial link of RV32 or
+  i386 objects reports "not implemented yet".
+- `--emit-relocs` rejects `SHT_REL` inputs.
+
 ## i386 ELF
 
 - Relaxing TLS general-dynamic or descriptor code to initial-exec uses a
