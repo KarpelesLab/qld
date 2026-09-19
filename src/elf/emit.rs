@@ -43,8 +43,10 @@ use super::values::Addresses;
 use super::write::WriteInput;
 use crate::symbols::SymbolFlags;
 
-/// Size of an `Elf64_Rela`.
-const RELA_SIZE: usize = 24;
+/// Size of one output relocation, `Elf32_Rela` or `Elf64_Rela`.
+fn rela_size<F: crate::elf::read::ElfFormat>() -> usize {
+    <F::Rela as crate::elf::read::RawRecord>::SIZE.max(1)
+}
 
 fn relocations<'a, F: crate::elf::read::ElfFormat>(
     object: &ObjectInput<'a, F>,
@@ -134,15 +136,26 @@ pub fn count<F: crate::elf::read::ElfFormat>(
         .reduce(|| 0, u64::saturating_add))
 }
 
-/// Writes one output relocation.
-fn put(out: &mut [u8], offset: u64, symbol: usize, r_type: u32, addend: i64) {
-    let Some(entry) = out.first_chunk_mut::<RELA_SIZE>() else {
-        return;
+/// Writes one output relocation, in the class and byte order of the
+/// output.
+fn put<F: crate::elf::read::ElfFormat>(
+    out: &mut [u8],
+    offset: u64,
+    symbol: usize,
+    r_type: u32,
+    addend: i64,
+) {
+    let rel = Relocation {
+        offset,
+        symbol: u32::try_from(symbol).unwrap_or(0),
+        r_type,
+        addend,
     };
-    let symbol = u64::try_from(symbol).unwrap_or(0) & 0xffff_ffff;
-    entry[0..8].copy_from_slice(&offset.to_le_bytes());
-    entry[8..16].copy_from_slice(&((symbol << 32) | u64::from(r_type)).to_le_bytes());
-    entry[16..24].copy_from_slice(&addend.to_le_bytes());
+    let bytes = F::encode_rela(&rel);
+    let bytes = crate::elf::read::RawRecord::as_bytes(&bytes);
+    if let Some(entry) = out.get_mut(..bytes.len()) {
+        entry.copy_from_slice(bytes);
+    }
 }
 
 /// The output symbol and addend of relocation `rel` of `file`.
@@ -218,17 +231,24 @@ fn output_type<F: crate::elf::read::ElfFormat>(
     match decision.class.kind {
         Kind::RelaxGotPc => R_X86_64_PC32,
         Kind::RelaxGotPcNoPic => {
-            let rex = usize::try_from(rel.offset)
-                .ok()
-                .and_then(|o| o.checked_sub(3))
-                .and_then(|o| data.get(o))
-                .copied()
-                .unwrap_or(0);
-            if rex & 0x08 != 0 {
-                R_X86_64_32S
+            let byte = |back: u64| {
+                usize::try_from(rel.offset)
+                    .ok()
+                    .and_then(|o| o.checked_sub(back as usize))
+                    .and_then(|o| data.get(o))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let rex = byte(3);
+            // x32 clears REX.W of a load, whose immediate is an unsigned
+            // 32-bit address; `test` and the binary operators keep their
+            // operand size, and may have no REX prefix at all.
+            let wide = if input.context.arch == super::arch::Arch::X32 {
+                byte(2) != 0x8b && rex & 0xf0 == 0x40 && rex & 0x08 != 0
             } else {
-                R_X86_64_32
-            }
+                rex & 0x08 != 0
+            };
+            if wide { R_X86_64_32S } else { R_X86_64_32 }
         }
         _ => rel.r_type,
     }
@@ -264,7 +284,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
         );
         let len = usize::try_from(count)
             .unwrap_or(usize::MAX)
-            .saturating_mul(RELA_SIZE)
+            .saturating_mul(rela_size::<F>())
             .min(rest.len());
         let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
         slices.push((placed.member, head));
@@ -289,7 +309,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
             return;
         };
         let base = addresses.section_address(id).unwrap_or(0);
-        let mut entries = out.as_chunks_mut::<RELA_SIZE>().0.iter_mut();
+        let mut entries = out.chunks_exact_mut(rela_size::<F>());
         if section.kind == SectionKind::EhFrame {
             let Some(eh) = addresses
                 .eh_frames
@@ -306,7 +326,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         continue;
                     };
                     if !record.live {
-                        put(entry, 0, 0, R_X86_64_NONE, 0);
+                        put::<F>(entry, 0, 0, R_X86_64_NONE, 0);
                         continue;
                     }
                     let local = rel
@@ -315,8 +335,10 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         .wrapping_add(u64::from(record.out_offset));
                     let place = base.wrapping_add(local);
                     match output_symbol(addresses, plan, section_symbols, file, &rel) {
-                        Some((symbol, addend)) => put(entry, place, symbol, rel.r_type, addend),
-                        None => put(entry, place, 0, R_X86_64_NONE, 0),
+                        Some((symbol, addend)) => {
+                            put::<F>(entry, place, symbol, rel.r_type, addend)
+                        }
+                        None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
                     }
                 }
             }
@@ -333,7 +355,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                 let relax = &addresses.layout.relax;
                 let place = base.wrapping_add(relax.map(id, rel.offset));
                 match output_symbol(addresses, plan, section_symbols, file, &rel) {
-                    Some((symbol, addend)) => put(
+                    Some((symbol, addend)) => put::<F>(
                         entry,
                         place,
                         symbol,
@@ -344,7 +366,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         ),
                         addend,
                     ),
-                    None => put(entry, place, 0, R_X86_64_NONE, 0),
+                    None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
                 }
             }
         }

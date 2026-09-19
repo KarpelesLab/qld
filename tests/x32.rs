@@ -1182,6 +1182,48 @@ fn cxx_exceptions() {
     }
 }
 
+/// `--emit-relocs` keeps the input relocations, with the `GOTPCRELX`
+/// conversions GNU ld records: `R_X86_64_PC32` for a `lea`, and
+/// `R_X86_64_32` (never `32S`, x32 having cleared REX.W) for a load turned
+/// into an immediate.
+#[test]
+fn emit_relocs() {
+    let tools = require!();
+    let dir = scratch("emit-relocs");
+    assemble(tools, &dir, "relax.s", "relax.o", &[]);
+    ld_both(
+        tools,
+        &dir,
+        "static",
+        &["-static", "--emit-relocs", "relax.o"],
+    );
+    let kinds = |linker: &str| -> Vec<String> {
+        let mut all: Vec<String> =
+            run_ok(&dir, &tools.readelf, &["-rW", &format!("{linker}/static")])
+                .lines()
+                .filter_map(|l| {
+                    let fields: Vec<&str> = l.split_whitespace().collect();
+                    let [place, _, kind, rest @ ..] = fields.as_slice() else {
+                        return None;
+                    };
+                    if place.len() != 8 || !kind.starts_with("R_X86_64_") {
+                        return None;
+                    }
+                    let symbol = rest.get(1).map_or("", |s| s.split('@').next().unwrap_or(s));
+                    Some(format!("{kind}({symbol})"))
+                })
+                .collect();
+        all.sort();
+        all
+    };
+    assert_eq!(
+        kinds("qld"),
+        kinds("gnu"),
+        "--emit-relocs types (left: qld, right: GNU ld)"
+    );
+    assert!(kinds("qld").iter().any(|k| k.starts_with("R_X86_64_32(")));
+}
+
 /// Objects for another x86 ABI are rejected, not linked as x32: i386
 /// objects have the same class, x86-64 ones the same machine.
 #[test]
