@@ -521,6 +521,8 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - `--emit-relocs` rejects `SHT_REL` inputs.
 - A dynamic output with no PLT entries still reserves `.got.plt` and emits
   `DT_PLTGOT`, as GNU ld does; lld emits neither.
+- A dynamic output with no PLT entries still reserves `.got.plt` and emits
+  `DT_PLTGOT`, as GNU ld does; lld emits neither.
 
 ## i386 ELF
 
