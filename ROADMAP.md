@@ -180,13 +180,16 @@ and TLS models.
       as in lld: glibc and musl need no lazy TLSDESC PLT. Outstanding: erratum
       fixes under linker-script layout (the kernel uses them), a patch pool
       per 128 MiB of code
-- [~] **RISC-V 64** done: the full relocation set, PLT/GOT, TLS GD/IE/LE and
+- [x] **RISC-V 64**: the full relocation set, PLT/GOT, TLS GD/IE/LE and
       TLSDESC with relaxation, linker relaxation with section shrinking (an
       architecture-neutral fixpoint in `src/elf/arch/shrink.rs`), `--relax-gp`,
       `__global_pointer$`, `.riscv.attributes` merging, `-r`, `--emit-relocs`;
-      compared with lld symbolically, fixtures run under qemu in CI. RV32
-      waits for ELF32; `DT_RISCV_VARIANT_CC` and `PT_RISCV_ATTRIBUTES` under
-      linker scripts are open
+      compared with lld symbolically, fixtures run under qemu in CI.
+- [x] **RISC-V 32** (`elf32lriscv`, ILP32/ILP32F/ILP32D) on the same backend,
+      with the word size as a parameter: 4-byte GOT and TLS entries, the `lw`
+      PLT, `c.jal` relaxation, RV32 attribute merging; compared with lld and
+      run under qemu-riscv32. Open for RISC-V: `DT_RISCV_VARIANT_CC`, and
+      `PT_RISCV_ATTRIBUTES` under linker scripts
 - [x] **i386**: GOT-relative relocations with GNU ld's GOT32X relaxations, `-z ibtplt`, the GNU TLS models and TLS descriptors with their relaxations, PLT and IFUNC; compared with GNU ld 2.46 and run natively
 - [ ] **ARM (32-bit)**: Thumb/ARM interworking, veneers, `.ARM.exidx`
       ordering and synthesis, BE8, `R_ARM_V4BX`

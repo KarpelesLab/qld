@@ -281,6 +281,10 @@ dispatch on the format in readers cost 5.8% on the clang link, and
 target-only checks inside the hottest relocation code cost up to 8%, so
 both are kept out of the per-relocation paths.
 
+i386 and RV32 are the architectures on the ELF32 path so far. The RISC-V
+backend serves both widths: the word size is a parameter of the few
+functions whose output depends on it, not a second copy of the backend.
+
 ## Module layout
 
 qld is a **single crate**. It builds as one library plus one binary, and the
