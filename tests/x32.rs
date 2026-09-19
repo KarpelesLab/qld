@@ -1260,6 +1260,74 @@ fn cxx_exceptions() {
     }
 }
 
+/// `-z pack-relative-relocs`: an x32 static PIE's relative relocations
+/// are `SHT_RELR` words of 4 bytes, and relocate the same places as GNU
+/// ld's.
+#[test]
+fn packed_relative_relocations() {
+    let tools = require!();
+    let dir = scratch("relr");
+    for source in ["start.c", "main.c"] {
+        let object = source.replace(".c", ".o");
+        compile_freestanding(tools, &dir, source, &object, &["-fPIE", "-DSELF_RELOC"]);
+    }
+    compile_freestanding(tools, &dir, "tls_gd.c", "gd.o", &["-fPIC"]);
+    compile_freestanding(
+        tools,
+        &dir,
+        "tls_gd.c",
+        "desc.o",
+        &["-fPIC", "-mtls-dialect=gnu2", "-DDESC"],
+    );
+    ld_both(
+        tools,
+        &dir,
+        "static-pie",
+        &[
+            "-static",
+            "-pie",
+            "--no-dynamic-linker",
+            "-z",
+            "pack-relative-relocs",
+            "start.o",
+            "main.o",
+            "gd.o",
+            "desc.o",
+        ],
+    );
+    let places = |linker: &str| -> Vec<String> {
+        let file = format!("{linker}/static-pie");
+        let image = Image::load(tools, &dir, &file);
+        let listing = run_ok(&dir, &tools.readelf, &["-rW", &file]);
+        let mut all: Vec<String> = listing
+            .lines()
+            .skip_while(|l| !l.contains("'.relr.dyn'"))
+            .filter_map(|l| {
+                let fields: Vec<&str> = l.split_whitespace().collect();
+                let [index, _, address, ..] = fields.as_slice() else {
+                    return None;
+                };
+                if !index.ends_with(':') || index.len() != 5 {
+                    return None;
+                }
+                Some(image.name(hex(address)?))
+            })
+            .collect();
+        all.sort();
+        assert!(!all.is_empty(), "{file} has no packed relocations");
+        all
+    };
+    assert_eq!(
+        places("qld"),
+        places("gnu"),
+        ".relr.dyn places (left: qld, right: GNU ld)"
+    );
+    let entsize = Image::load(tools, &dir, "qld/static-pie")
+        .section(".relr.dyn")
+        .map(|s| s.entsize);
+    assert_eq!(entsize, Some(4), "x32 `.relr.dyn` holds 32-bit words");
+}
+
 /// `--emit-relocs` keeps the input relocations, with the `GOTPCRELX`
 /// conversions GNU ld records: `R_X86_64_PC32` for a `lea`, and
 /// `R_X86_64_32` (never `32S`, x32 having cleared REX.W) for a load turned
