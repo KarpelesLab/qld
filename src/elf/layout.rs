@@ -1865,9 +1865,10 @@ pub(crate) fn entsize_of<F: crate::elf::read::ElfFormat>(
                 input.synth.arch.dyn_reloc_size()
             }
             Member::Synthetic(Synthetic::DynSym) => input.kind().sym_size(),
-            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt | Synthetic::RelrDyn) => {
-                input.kind().word_size()
+            Member::Synthetic(Synthetic::Got | Synthetic::GotPlt) => {
+                input.synth.arch.got_entry_size()
             }
+            Member::Synthetic(Synthetic::RelrDyn) => input.kind().word_size(),
             Member::Synthetic(Synthetic::Dynamic) => input.kind().dyn_size(),
             Member::Synthetic(Synthetic::Plt | Synthetic::PltSec) => 16,
             Member::Synthetic(Synthetic::VerSym) => 2,

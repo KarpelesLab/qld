@@ -1144,10 +1144,13 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
     if mode.executable() {
         entries.push((DT_DEBUG, Value(0)));
     }
-    // GNU ld's i386 backend adds `DT_PLTGOT` only with a PLT: `.got.plt`
-    // exists whenever PIC code names `_GLOBAL_OFFSET_TABLE_`.
-    let pltgot =
-        synth.arch != crate::elf::arch::Arch::I386 || synth.size_align(Synthetic::Plt).0 > 0;
+    // GNU ld's x86 backends add `DT_PLTGOT` only with a PLT: `.got.plt`
+    // exists whenever PIC code names `_GLOBAL_OFFSET_TABLE_` (i386) or
+    // anything needs a GOT (x32).
+    let pltgot = !matches!(
+        synth.arch,
+        crate::elf::arch::Arch::I386 | crate::elf::arch::Arch::X32
+    ) || synth.size_align(Synthetic::Plt).0 > 0;
     if synth.got_plt_reserved > 0 && pltgot {
         entries.push((DT_PLTGOT, Address(Synthetic::GotPlt)));
     }

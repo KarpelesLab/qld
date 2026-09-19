@@ -201,19 +201,21 @@ fn type_name(arch: Arch, r_type: u32) -> String {
     arch.reloc_label(r_type)
 }
 
-/// GNU ld's i386 backend still gives `___tls_get_addr` its PLT entry in a
-/// dynamic output when a TLS relaxation removed the call.
+/// GNU ld's x86 backends still give `___tls_get_addr` (i386) or
+/// `__tls_get_addr` (x32) its PLT entry in a dynamic output when a TLS
+/// relaxation removed the call.
 #[cold]
-fn i386_removed_call<F: crate::elf::read::ElfFormat>(
+fn removed_tls_call<F: crate::elf::read::ElfFormat>(
     refs: &Refs<'_, '_, F>,
     context: &Context,
     id: crate::ids::SymbolId,
     r_type: u32,
 ) {
-    if context.mode.dynamic
-        && r_type == crate::elf::read::consts::i386::R_386_PLT32
-        && refs.symbols.flags(id).contains(super::export::PREEMPTIBLE)
-    {
+    let call = match context.arch {
+        Arch::I386 => r_type == crate::elf::read::consts::i386::R_386_PLT32,
+        _ => r_type == crate::elf::read::consts::x86_64::R_X86_64_PLT32,
+    };
+    if context.mode.dynamic && call && refs.symbols.flags(id).contains(super::export::PREEMPTIBLE) {
         refs.symbols.set_flags(id, SymbolFlags::NEEDS_PLT);
     }
 }
@@ -295,8 +297,8 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                 skip = false;
                 if let Some(id) = refs.global_id(file_index, rel.symbol as usize) {
                     refs.symbols.set_flags(id, REF_LIVE);
-                    if F::WORD_SIZE == 4 && context.arch == Arch::I386 {
-                        i386_removed_call(refs, context, id, rel.r_type);
+                    if F::WORD_SIZE == 4 && matches!(context.arch, Arch::I386 | Arch::X32) {
+                        removed_tls_call(refs, context, id, rel.r_type);
                     }
                 }
                 continue;

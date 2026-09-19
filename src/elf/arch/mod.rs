@@ -4,7 +4,8 @@
 //! instruction sequences and writes linker-generated stubs. The rest of the
 //! ELF backend never names a relocation constant: it asks [`Arch`], which is
 //! chosen once per link ([`Arch::of`]) and dispatches to the module for
-//! x86-64, AArch64, RISC-V (RV64 and RV32), LoongArch64, PowerPC64 or i386.
+//! x86-64 (and x32), AArch64, RISC-V (RV64 and RV32), LoongArch64,
+//! PowerPC64 or i386.
 //!
 //! The vocabulary is shared, so the relocation scan and the writer run one
 //! loop for every architecture:
@@ -54,6 +55,8 @@ pub enum Arch {
     Ppc64,
     /// i386 (32-bit x86).
     I386,
+    /// x32: x86-64 with 32-bit pointers (ILP32), in ELF32 objects.
+    X32,
 }
 
 /// What a relocation computes.
@@ -443,6 +446,7 @@ impl Arch {
             }
             Architecture::LoongArch64 => Some(Self::LoongArch64),
             Architecture::X86 => Some(Self::I386),
+            Architecture::X86_64X32 => Some(Self::X32),
             Architecture::PowerPc64 if target.endian == crate::target::Endianness::Little => {
                 Some(Self::Ppc64)
             }
@@ -479,11 +483,14 @@ impl Arch {
     }
 
     /// The variant of `self` for an ELF class whose words are `word_size`
-    /// bytes: RISC-V is one machine in both classes.
+    /// bytes: RISC-V is one machine in both classes, and so are x86-64
+    /// and x32.
     #[must_use]
     pub fn for_word_size(self, word_size: usize) -> Self {
         match self {
             Self::RiscV64 if word_size == 4 => Self::RiscV32,
+            // An ELF32 x86-64 object is x32.
+            Self::X86_64 if word_size == 4 => Self::X32,
             _ => self,
         }
     }
@@ -536,7 +543,7 @@ impl Arch {
     #[must_use]
     pub fn kind(self) -> crate::elf::read::ElfKind {
         match self {
-            Self::I386 | Self::RiscV32 => crate::elf::read::ElfKind::Elf32Le,
+            Self::I386 | Self::X32 | Self::RiscV32 => crate::elf::read::ElfKind::Elf32Le,
             Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
                 crate::elf::read::ElfKind::Elf64Le
             }
@@ -567,10 +574,29 @@ impl Arch {
     #[must_use]
     #[inline]
     pub fn is_word(self, width: Width) -> bool {
+        // The 64-bit architectures first, so that they pay for no other.
+        if self != Self::I386 && self != Self::X32 {
+            return width == Width::W64;
+        }
         match self {
             Self::I386 => matches!(width, Width::Any32 | Width::U32 | Width::I32),
+            // `R_X86_64_32`, GNU ld's pointer relocation for x32.
+            Self::X32 => width == Width::U32,
             Self::RiscV32 => width == Width::RiscV(crate::arch::riscv::Field::Word32),
             _ => width == Width::W64,
+        }
+    }
+
+    /// Size of one GOT or `.got.plt` entry: the class's word, except on
+    /// x32, whose GOT entries are 8 bytes as on x86-64 (indirect calls and
+    /// jumps read 64 bits, and TLS entries hold 64-bit offsets).
+    #[must_use]
+    #[inline]
+    pub fn got_entry_size(self) -> u64 {
+        if self == Self::X32 {
+            8
+        } else {
+            self.kind().word_size()
         }
     }
 
@@ -589,7 +615,7 @@ impl Arch {
     pub fn machine(self) -> u16 {
         match self {
             Self::I386 => crate::elf::read::consts::EM_386,
-            Self::X86_64 => EM_X86_64,
+            Self::X86_64 | Self::X32 => EM_X86_64,
             Self::AArch64 => EM_AARCH64,
             Self::RiscV64 | Self::RiscV32 => EM_RISCV,
             Self::LoongArch64 => EM_LOONGARCH,
@@ -603,6 +629,7 @@ impl Arch {
         match self {
             Self::I386 => "elf_i386",
             Self::X86_64 => "elf_x86_64",
+            Self::X32 => "elf32_x86_64",
             Self::AArch64 => "aarch64linux",
             Self::RiscV64 => "elf64lriscv",
             Self::RiscV32 => "elf32lriscv",
@@ -638,7 +665,7 @@ impl Arch {
     pub fn default_max_page(self) -> u64 {
         match self {
             Self::I386 => 0x1000,
-            Self::X86_64 | Self::RiscV64 | Self::RiscV32 => 0x1000,
+            Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 => 0x1000,
             Self::AArch64 | Self::Ppc64 => 0x1_0000,
             // GNU ld's; lld assumes 64 KiB.
             Self::LoongArch64 => 0x4000,
@@ -651,7 +678,7 @@ impl Arch {
     pub fn default_base(self) -> u64 {
         match self {
             Self::I386 => 0x0804_8000,
-            Self::X86_64 | Self::AArch64 => super::layout::DEFAULT_BASE,
+            Self::X86_64 | Self::X32 | Self::AArch64 => super::layout::DEFAULT_BASE,
             Self::RiscV64 | Self::RiscV32 => 0x1_0000,
             Self::LoongArch64 => 0x1_2000_0000,
             // The first 256 MiB segment boundary.
@@ -666,7 +693,7 @@ impl Arch {
     pub fn got_plt_reserved(self) -> u64 {
         match self {
             Self::I386 => 3,
-            Self::X86_64 | Self::AArch64 => 3,
+            Self::X86_64 | Self::X32 | Self::AArch64 => 3,
             Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 | Self::Ppc64 => 2,
         }
     }
@@ -749,7 +776,12 @@ impl Arch {
                 crate::arch::aarch64::page(target).wrapping_sub(crate::arch::aarch64::page(place))
             }
             Self::LoongArch64 => loongarch::page_delta(target, place, r_type),
-            Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::RiscV32 | Self::Ppc64 => {
+            Self::X86_64
+            | Self::X32
+            | Self::AArch64
+            | Self::RiscV64
+            | Self::RiscV32
+            | Self::Ppc64 => {
                 let page = crate::arch::aarch64::page;
                 page(target).wrapping_sub(page(place))
             }
@@ -773,9 +805,12 @@ impl Arch {
         match self {
             Self::I386 => Err(ApplyError::BadInstruction),
             Self::LoongArch64 => loongarch::relax(out, offset, r_type, target, place),
-            Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::RiscV32 | Self::Ppc64 => {
-                Err(ApplyError::BadInstruction)
-            }
+            Self::X86_64
+            | Self::X32
+            | Self::AArch64
+            | Self::RiscV64
+            | Self::RiscV32
+            | Self::Ppc64 => Err(ApplyError::BadInstruction),
         }
     }
 
@@ -864,7 +899,7 @@ impl Arch {
         use crate::elf::read::consts::aarch64 as a64;
         match self {
             Self::I386 => false,
-            Self::X86_64 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => false,
+            Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => false,
             Self::AArch64 => matches!(r_type, a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26),
             Self::Ppc64 => ppc64::is_thunk_branch(r_type),
         }
@@ -887,7 +922,7 @@ impl Arch {
     pub fn branch_thunk(self, branch: Branch) -> Option<u64> {
         match self {
             Self::I386 => None,
-            Self::X86_64 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => None,
+            Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => None,
             Self::AArch64 => (self.is_thunk_branch(branch.r_type)
                 && !crate::arch::aarch64::branch_in_range(branch.place, branch.target))
             .then_some(branch.target),
@@ -919,7 +954,7 @@ impl Arch {
     /// x86 targets but not for AArch64.
     #[must_use]
     pub fn separate_code_by_default(self) -> bool {
-        matches!(self, Self::X86_64 | Self::I386)
+        matches!(self, Self::X86_64 | Self::X32 | Self::I386)
     }
 
     /// The default program interpreter on Linux.
@@ -928,6 +963,7 @@ impl Arch {
         match self {
             Self::I386 => "/lib/ld-linux.so.2",
             Self::X86_64 => "/lib64/ld-linux-x86-64.so.2",
+            Self::X32 => "/libx32/ld-linux-x32.so.2",
             Self::AArch64 => "/lib/ld-linux-aarch64.so.1",
             Self::RiscV64 | Self::RiscV32 => {
                 riscv::interpreter(riscv::EF_RISCV_FLOAT_ABI, self.kind().word_size())
@@ -953,7 +989,12 @@ impl Arch {
     pub fn tcb_size(self) -> u64 {
         match self {
             Self::I386 => 0,
-            Self::X86_64 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 | Self::Ppc64 => 0,
+            Self::X86_64
+            | Self::X32
+            | Self::RiscV64
+            | Self::RiscV32
+            | Self::LoongArch64
+            | Self::Ppc64 => 0,
             Self::AArch64 => 16,
         }
     }
@@ -1019,7 +1060,7 @@ impl Arch {
     pub fn has_plt_sec(self, ibt: bool) -> bool {
         match self {
             Self::I386 => ibt,
-            Self::X86_64 => ibt,
+            Self::X86_64 | Self::X32 => ibt,
             Self::AArch64 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => false,
             Self::Ppc64 => true,
         }
@@ -1072,12 +1113,14 @@ impl Arch {
                     DynKind::TlsDesc => x86::R_386_TLS_DESC,
                 }
             }
-            Self::X86_64 => match kind {
+            Self::X86_64 | Self::X32 => match kind {
                 DynKind::Relative => x64::R_X86_64_RELATIVE,
                 DynKind::Irelative => x64::R_X86_64_IRELATIVE,
                 DynKind::JumpSlot => x64::R_X86_64_JUMP_SLOT,
                 DynKind::GlobDat => x64::R_X86_64_GLOB_DAT,
                 DynKind::Copy => x64::R_X86_64_COPY,
+                // x32 pointers are 32 bits: `R_X86_64_32`, as GNU ld writes.
+                DynKind::Abs64 if self == Self::X32 => x64::R_X86_64_32,
                 DynKind::Abs64 => x64::R_X86_64_64,
                 DynKind::DtpMod => x64::R_X86_64_DTPMOD64,
                 DynKind::DtpOff => x64::R_X86_64_DTPOFF64,
@@ -1162,6 +1205,7 @@ impl Arch {
         match self {
             Self::I386 => r_type == crate::elf::read::consts::i386::R_386_PLT32,
             Self::X86_64 => false, // answered above
+            Self::X32 => matches!(r_type, x64::R_X86_64_PLT32 | x64::R_X86_64_PLT32_BND),
             Self::Ppc64 => matches!(r_type, p64::R_PPC64_REL24 | p64::R_PPC64_REL24_NOTOC),
             Self::AArch64 => matches!(
                 r_type,
@@ -1190,6 +1234,7 @@ impl Arch {
         match self {
             Self::I386 => i386::classify(r_type, addend, data, offset, context),
             Self::X86_64 => x86_64::classify(r_type, addend, data, offset, context),
+            Self::X32 => x86_64::classify_x32(r_type, addend, data, offset, context),
             Self::AArch64 => aarch64::classify(r_type, context),
             Self::RiscV64 | Self::RiscV32 => riscv::classify(r_type, context),
             Self::LoongArch64 => loongarch::classify(r_type, addend, data, offset, context),
@@ -1213,6 +1258,7 @@ impl Arch {
         match self {
             Self::I386 => i386::relax_got(out, offset, kind, value),
             Self::X86_64 => x86_64::relax_got(out, offset, kind, value),
+            Self::X32 => x86_64::relax_got_x32(out, offset, kind, value),
             Self::AArch64 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 | Self::Ppc64 => {
                 Err(ApplyError::BadInstruction)
             }
@@ -1235,6 +1281,7 @@ impl Arch {
         match self {
             Self::I386 => i386::relax_tls(out, offset, kind, r_type, values),
             Self::X86_64 => x86_64::relax_tls(out, offset, kind, values),
+            Self::X32 => x86_64::relax_tls_x32(out, offset, kind, values),
             Self::AArch64 => aarch64::relax_tls(out, offset, kind, r_type, values),
             // RISC-V sections are written by `riscv::apply`.
             Self::RiscV64 | Self::RiscV32 => Err(ApplyError::BadInstruction),
@@ -1248,7 +1295,7 @@ impl Arch {
     pub fn plt_header_size(self, flags: PltFlags) -> u64 {
         match self {
             Self::I386 => 16,
-            Self::X86_64 => 16,
+            Self::X86_64 | Self::X32 => 16,
             Self::AArch64 => {
                 let _ = flags;
                 32
@@ -1264,7 +1311,7 @@ impl Arch {
     pub fn plt_entry_size(self, flags: PltFlags) -> u64 {
         match self {
             Self::I386 => i386::PLT_ENTRY_SIZE,
-            Self::X86_64 => 16,
+            Self::X86_64 | Self::X32 => 16,
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
@@ -1283,8 +1330,8 @@ impl Arch {
                     i386::PLT_GOT_ENTRY_SIZE
                 }
             }
-            Self::X86_64 if flags.landing_pad => 16,
-            Self::X86_64 => 8,
+            Self::X86_64 | Self::X32 if flags.landing_pad => 16,
+            Self::X86_64 | Self::X32 => 8,
             Self::AArch64 => aarch64::plt_entry_size(aarch64::plt_got_flags(flags)),
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
@@ -1310,7 +1357,7 @@ impl Arch {
     pub fn iplt_entry_size(self, flags: PltFlags) -> u64 {
         match self {
             Self::I386 => i386::IPLT_ENTRY_SIZE,
-            Self::X86_64 => 16,
+            Self::X86_64 | Self::X32 => 16,
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
@@ -1333,8 +1380,8 @@ impl Arch {
                 }
             }
             // The `push` after the jump, or the whole entry with IBT.
-            Self::X86_64 if flags.landing_pad => entry,
-            Self::X86_64 => entry.wrapping_add(6),
+            Self::X86_64 | Self::X32 if flags.landing_pad => entry,
+            Self::X86_64 | Self::X32 => entry.wrapping_add(6),
             // The header pushes and jumps; entries do not. On LoongArch the
             // header finds the index from the entry's return address.
             Self::AArch64 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => plt,
@@ -1358,7 +1405,7 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::I386 => i386::write_plt_header(out, got_plt, flags.pic),
-            Self::X86_64 => x86_64::write_plt_header(out, plt, got_plt),
+            Self::X86_64 | Self::X32 => x86_64::write_plt_header(out, plt, got_plt),
             Self::AArch64 => aarch64::write_plt_header(out, plt, got_plt, flags),
             Self::RiscV64 | Self::RiscV32 => {
                 riscv::write_plt_header(out, plt, got_plt, self.kind().word_size())
@@ -1399,7 +1446,7 @@ impl Arch {
                     flags.landing_pad,
                 )
             }
-            Self::X86_64 => {
+            Self::X86_64 | Self::X32 => {
                 x86_64::write_plt_entry(out, entry, slot, index, plt, flags.landing_pad)
             }
             Self::AArch64 => aarch64::write_plt_entry(out, entry, slot, flags),
@@ -1429,7 +1476,7 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::I386 => i386::write_plt_jump(out, slot, got_base, flags.pic, flags.landing_pad),
-            Self::X86_64 => x86_64::write_plt_jump(out, entry, slot, flags.landing_pad),
+            Self::X86_64 | Self::X32 => x86_64::write_plt_jump(out, entry, slot, flags.landing_pad),
             Self::AArch64 => {
                 aarch64::write_plt_entry(out, entry, slot, aarch64::plt_got_flags(flags))
             }
@@ -1457,7 +1504,7 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::I386 => i386::write_iplt(out, slot_address, got_base, flags.pic),
-            Self::X86_64 => x86_64::write_iplt(out, stub, slot_address),
+            Self::X86_64 | Self::X32 => x86_64::write_iplt(out, stub, slot_address),
             // GNU ld writes IFUNC stubs as ordinary PLT entries, landing
             // pad and authentication included.
             Self::AArch64 => aarch64::write_plt_entry(out, stub, slot_address, flags),
@@ -1485,7 +1532,7 @@ impl Arch {
     ) -> Result<bool, ApplyError> {
         match self {
             Self::I386 => Ok(false),
-            Self::X86_64 | Self::RiscV64 | Self::RiscV32 => Ok(false),
+            Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 => Ok(false),
             Self::LoongArch64 => loongarch::undefined_weak_branch(out, offset, r_type),
             Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
             Self::Ppc64 => ppc64::nop_undefined_branch(out, offset, r_type),
@@ -1497,7 +1544,7 @@ impl Arch {
     pub fn write_nops(self, out: &mut [u8]) {
         match self {
             Self::I386 => x86_64::write_nops(out),
-            Self::X86_64 => x86_64::write_nops(out),
+            Self::X86_64 | Self::X32 => x86_64::write_nops(out),
             Self::AArch64 => aarch64::write_nops(out),
             Self::RiscV64 | Self::RiscV32 => riscv::write_nops(out),
             Self::LoongArch64 => loongarch::write_nops(out),

@@ -224,7 +224,8 @@ impl Synth {
         let executable = self.mode.is_none_or(|m| m.executable());
         PltFlags {
             landing_pad: self.ibt,
-            entry_landing_pad: self.ibt && (self.arch == Arch::X86_64 || executable),
+            entry_landing_pad: self.ibt
+                && (matches!(self.arch, Arch::X86_64 | Arch::X32) || executable),
             authenticate: self.pac_plt && self.arch == Arch::AArch64,
             pic: self.mode.is_some_and(|m| m.pic),
         }
@@ -677,8 +678,8 @@ impl Synth {
                 word.word_size(),
             ),
             Synthetic::Got => (
-                self.got_words().saturating_mul(word.word_size()),
-                word.word_size(),
+                self.got_words().saturating_mul(self.arch.got_entry_size()),
+                self.arch.got_entry_size(),
             ),
             Synthetic::GotPlt => {
                 let slots = if dynamic {
@@ -689,8 +690,8 @@ impl Synth {
                 (
                     slots
                         .saturating_add(self.got_plt_reserved)
-                        .saturating_mul(word.word_size()),
-                    word.word_size(),
+                        .saturating_mul(self.arch.got_entry_size()),
+                    self.arch.got_entry_size(),
                 )
             }
             Synthetic::DynBss => self.dynbss,

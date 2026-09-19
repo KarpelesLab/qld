@@ -225,17 +225,24 @@ fn output_type<F: crate::elf::read::ElfFormat>(
     match decision.class.kind {
         Kind::RelaxGotPc => R_X86_64_PC32,
         Kind::RelaxGotPcNoPic => {
-            let rex = usize::try_from(rel.offset)
-                .ok()
-                .and_then(|o| o.checked_sub(3))
-                .and_then(|o| data.get(o))
-                .copied()
-                .unwrap_or(0);
-            if rex & 0x08 != 0 {
-                R_X86_64_32S
+            let byte = |back: usize| {
+                usize::try_from(rel.offset)
+                    .ok()
+                    .and_then(|o| o.checked_sub(back))
+                    .and_then(|o| data.get(o))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let rex = byte(3);
+            // x32 clears REX.W of a load, whose immediate is an unsigned
+            // 32-bit address; `test` and the binary operators keep their
+            // operand size, and may have no REX prefix at all.
+            let wide = if input.context.arch == super::arch::Arch::X32 {
+                byte(2) != 0x8b && rex & 0xf0 == 0x40 && rex & 0x08 != 0
             } else {
-                R_X86_64_32
-            }
+                rex & 0x08 != 0
+            };
+            if wide { R_X86_64_32S } else { R_X86_64_32 }
         }
         _ => rel.r_type,
     }
