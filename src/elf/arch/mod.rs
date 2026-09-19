@@ -702,10 +702,16 @@ impl Arch {
     #[must_use]
     pub fn default_max_page(self) -> u64 {
         match self {
-            Self::I386 | Self::S390x | Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 => {
-                0x1000
-            }
-            Self::AArch64 | Self::Ppc64 | Self::Arm => 0x1_0000,
+            // Arm Linux has 4 KiB pages and GNU ld's Arm backend assumes
+            // them; lld assumes 64 KiB there, which pads every segment.
+            Self::I386
+            | Self::S390x
+            | Self::X86_64
+            | Self::X32
+            | Self::RiscV64
+            | Self::RiscV32
+            | Self::Arm => 0x1000,
+            Self::AArch64 | Self::Ppc64 => 0x1_0000,
             // GNU ld's; lld assumes 64 KiB.
             Self::LoongArch64 => 0x4000,
         }

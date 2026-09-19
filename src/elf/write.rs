@@ -913,16 +913,25 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
                     put(address, 0);
                     put(address.wrapping_add(size64), argument);
                 }
-                GotKind::TlsLd => {
-                    // The executable's module ID is 1 where the pair is
-                    // not relocated (Arm, which does not relax
-                    // local-dynamic accesses).
-                    let module = u64::from(relocs[0] == SlotReloc::None);
-                    put(address, module);
-                    put(address.wrapping_add(size64), 0);
-                }
+                // The module-local pair is not in any of these lists; it
+                // is written below.
+                GotKind::TlsLd => {}
             }
         }
+    }
+    // The module-local TLS pair (`R_ARM_TLS_LDM32` and the other
+    // architectures' local-dynamic accesses): the module ID and a zero
+    // offset. An executable is module 1, so only a shared object needs a
+    // relocation to fill the first word, as in GNU ld and lld; qld does
+    // not relax local-dynamic accesses on Arm, so an executable really
+    // reaches this.
+    if synth.tlsld
+        && let Some(address) =
+            addresses.got_entry_address(Owner::Local { file: 0, symbol: 0 }, GotKind::TlsLd)
+    {
+        let module = u64::from(!mode.is_some_and(|mode| mode.shared));
+        put(address, module);
+        put(address.wrapping_add(size64), 0);
     }
 }
 
@@ -1189,7 +1198,11 @@ fn collect_dyn_relocs<F: crate::elf::read::ElfFormat>(
             }
         }
     }
+    // The module-local TLS pair needs a relocation only in a shared
+    // object: an executable is module 1, which the writer puts there
+    // (GNU ld and lld do the same).
     if synth.tlsld
+        && synth.mode.is_some_and(|mode| mode.shared)
         && let Some(address) =
             addresses.got_entry_address(Owner::Local { file: 0, symbol: 0 }, GotKind::TlsLd)
     {
