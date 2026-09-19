@@ -84,7 +84,7 @@ can work at the same time without colliding.
 | W43 | x32 (M4) | `src/elf/arch/x86_64*` (x32 parts), `tests/x32*`, `tests/fixtures/x32-*` | W40 | merged |
 | W44 | RV32 (M4) | `src/elf/arch/riscv*` (word-size parameter), `tests/riscv32*`, `tests/fixtures/riscv32-*` | W30, W40 | merged |
 | W45 | s390x, the first big-endian target (M4) | `src/elf/arch/s390x*`, `src/arch/s390x*`, big-endian enablement in the ELF format layer, `tests/s390x*`, `tests/fixtures/s390x-*` | W40 | in progress |
-| W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | in progress |
+| W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.

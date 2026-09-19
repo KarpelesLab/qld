@@ -43,6 +43,7 @@ jobs:
             binutils-powerpc64le-linux-gnu \
             gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu \
             gcc-s390x-linux-gnu g++-s390x-linux-gnu binutils-s390x-linux-gnu \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
             gcc-i686-linux-gnu g++-i686-linux-gnu binutils-i686-linux-gnu \
             qemu-user-static
           # noble ships only the versioned LoongArch compiler names
@@ -117,6 +118,44 @@ jobs:
             echo "x32 binaries do not run on this kernel; links are compared, not run"
           fi
       - run: cargo test --all-features --test x32 -- --nocapture
+
+  arm32:
+    name: 32-bit Arm links compared with lld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_ARM_TOOLS: "1"
+      QLD_LLD: ld.lld-22
+      QLD_ARM_CC: clang-22
+      QLD_LLVM_OBJDUMP: llvm-objdump-22
+      QLD_LLVM_READELF: llvm-readelf-22
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # noble's LLVM 18 predates the lld thunk and .ARM.exidx behavior the
+      # comparisons were made against
+      - run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y lld-22 llvm-22
+      - run: cargo test --all-features --test arm32 -- --nocapture
+
+  arm32-fixtures:
+    name: 32-bit Arm fixtures run under qemu
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+      QLD_FIXTURE: arm-
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf qemu-user-static
+      # linked by qld, run under qemu-arm
+      - run: cargo test --all-features --test fixtures -- --nocapture
 
   s390x:
     name: s390x links compared with GNU ld

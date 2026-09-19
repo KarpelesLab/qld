@@ -191,8 +191,15 @@ and TLS models.
       run under qemu-riscv32. Open for RISC-V: `DT_RISCV_VARIANT_CC`, and
       `PT_RISCV_ATTRIBUTES` under linker scripts
 - [x] **i386**: GOT-relative relocations with GNU ld's GOT32X relaxations, `-z ibtplt`, the GNU TLS models and TLS descriptors with their relaxations, PLT and IFUNC; compared with GNU ld 2.46 and run natively
-- [ ] **ARM (32-bit)**: Thumb/ARM interworking, veneers, `.ARM.exidx`
-      ordering and synthesis, BE8, `R_ARM_V4BX`
+- [x] **ARM (32-bit)** (`armelf_linux_eabi`, ARMv7-A hard-float): the REL
+      relocation set, ARM/Thumb interworking with `bl`↔`blx` rewriting,
+      range-extension and interworking thunks, `.ARM.exidx` merging and
+      `EXIDX_CANTUNWIND` synthesis with `PT_ARM_EXIDX`, build-attribute and
+      float-ABI merging, PLT/GOT, all TLS models, IFUNC, `R_ARM_V4BX`;
+      compared with lld symbolically, fixtures run under qemu. Outstanding:
+      BE8 (needs big-endian ELF32), `-r` and `--emit-relocs`, mapping symbols
+      for linker-generated code, GNU TLS descriptors, group relocations past
+      G0
 - [x] **x32** (`elf32_x86_64`): the x86-64 relocations and PLT in ELF32 with
       8-byte GOT entries, x32's TLS forms and `GOTPCRELX` relaxations, IFUNCs,
       copy relocations, IBT, `--emit-relocs`, `-z pack-relative-relocs`;

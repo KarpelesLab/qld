@@ -125,7 +125,9 @@ every output format:
 
 ## ELF32 output
 
-Emulations: `elf_i386`, `elf32lriscv` (and the `_ilp32`, `_ilp32f`,
+Emulations: `elf_i386`, `armelf_linux_eabi` (32-bit Arm: `SHT_REL`, a
+20 + 12-byte PLT, variant-I TLS with an 8-byte TCB, 64 KiB max page, base
+`0x10000`, interpreter `/lib/ld-linux-armhf.so.3`), `elf32lriscv` (and the `_ilp32`, `_ilp32f`,
 `_ilp32d` spellings) and `elf32_x86_64` (x32: ILP32 on x86-64, with 12-byte
 `Elf32_Rela` records, 8-byte GOT and `.got.plt` entries, and `R_X86_64_32`
 as the pointer relocation). i386 writes REL relocations: `.rel.dyn` and `.rel.plt` with

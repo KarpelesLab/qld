@@ -281,7 +281,10 @@ dispatch on the format in readers cost 5.8% on the clang link, and
 target-only checks inside the hottest relocation code cost up to 8%, so
 both are kept out of the per-relocation paths.
 
-i386, RV32 and x32 are the architectures on the ELF32 path so far. An
+i386, RV32, x32 and 32-bit Arm are the architectures on the ELF32 path so
+far; Arm and i386 are the `SHT_REL` ones, with the addend stored in the
+field being patched. Arm, like RISC-V, has its own section writer, and its
+thunk keys carry the caller's instruction state. An
 architecture's GOT entry size is `Arch::got_entry_size`, not the class word:
 x32 is ELF32 with 8-byte GOT entries. The RISC-V
 backend serves both widths: the word size is a parameter of the few

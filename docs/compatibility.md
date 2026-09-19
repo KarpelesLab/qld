@@ -508,6 +508,24 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   or PLT relocation and no other reference in code; qld does not track that
   distinction and resolves to zero there too.
 
+## 32-bit Arm
+
+- Exception-index entries are merged per input section, as lld does, rather
+  than per entry as GNU ld does (`--no-merge-exidx-entries` turns it off).
+- Thunks carry the caller's instruction state, so a Thumb `bl` gets a Thumb
+  thunk where lld reuses an A32 thunk through `blx`.
+- No `$a`, `$t` or `$d` mapping symbols are written for qld's own PLT and
+  thunks, so a disassembler decodes those in whatever state the previous
+  function left. Input mapping symbols are preserved.
+- One thunk pool per output section: a `.text` larger than a Thumb branch's
+  ±16 MiB still reports "relocation out of range", as on AArch64 at ±128 MiB.
+- `--emit-relocs`, `-r` and BE8 are refused. `--target1-rel`, `--target2=`,
+  `--be8`, `--fix-cortex-a8`, `--long-plt` and `--pic-veneer` are not
+  supported.
+- GNU TLS descriptors (`R_ARM_TLS_GOTDESC` and friends, GCC's
+  `-mtls-dialect=gnu2`) and group relocations past G0 are reported as
+  unsupported relocations.
+
 ## RISC-V 32
 
 - The backend is shared with RV64; only the width-dependent parts (GOT and
