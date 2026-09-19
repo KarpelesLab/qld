@@ -117,6 +117,7 @@ pub fn fold<F: crate::elf::read::ElfFormat>(
     placement: &Placement<'_>,
     merged: &Merged<'_, '_>,
     mode: IcfMode,
+    arch: crate::elf::arch::Arch,
     print: bool,
     diagnostics: &dyn DiagnosticSink,
 ) -> Result<Vec<u32>> {
@@ -177,10 +178,10 @@ pub fn fold<F: crate::elf::read::ElfFormat>(
                 else {
                     continue;
                 };
-                let Relocations::Rela(relas) = relocations.relocations else {
-                    continue;
-                };
-                for rel in relas.iter() {
+                for index in 0..relocations.relocations.len() {
+                    let Some(rel) = relocations.relocations.get(index) else {
+                        continue;
+                    };
                     if rel.r_type == R_X86_64_PLT32 {
                         continue;
                     }
@@ -246,19 +247,19 @@ pub fn fold<F: crate::elf::read::ElfFormat>(
             if sections.get(row).is_none_or(|s| !s.foldable) {
                 return 0;
             }
-            section_relocs(refs, SectionId::new(row)).map_or(0, |(_, relas)| relas.len())
+            section_relocs(refs, SectionId::new(row)).map_or(0, |(_, _, relocs)| relocs.len())
         },
         |row, slot| {
             if sections.get(row).is_none_or(|s| !s.foldable) {
                 return 0;
             }
-            let Some((file, relas)) = section_relocs(refs, SectionId::new(row)) else {
+            let Some((file, data, relocations)) = section_relocs(refs, SectionId::new(row)) else {
                 return 0;
             };
             let mut written = 0usize;
-            for (rel, out) in relas.iter().zip(slot.iter_mut()) {
+            let mut fill = |rel: crate::elf::read::Relocation, out: &mut IcfReloc| {
                 let Some(target) = refs.target(file, rel.symbol as usize) else {
-                    continue;
+                    return;
                 };
                 let (target, addend) = icf_target(refs, merged, &target, rel.addend);
                 *out = IcfReloc {
@@ -268,6 +269,19 @@ pub fn fold<F: crate::elf::read::ElfFormat>(
                     target,
                 };
                 written = written.saturating_add(1);
+            };
+            match relocations {
+                Relocations::Rela(relas) => {
+                    for (rel, out) in relas.iter().zip(slot.iter_mut()) {
+                        fill(rel, out);
+                    }
+                }
+                Relocations::Rel(rels) => {
+                    for (rel, out) in rels.iter().zip(slot.iter_mut()) {
+                        let addend = arch.implicit_addend(rel.r_type, data, rel.offset);
+                        fill(crate::elf::read::Relocation { addend, ..rel }, out);
+                    }
+                }
             }
             written
         },
@@ -307,10 +321,12 @@ pub fn fold<F: crate::elf::read::ElfFormat>(
         .collect())
 }
 
+/// The relocations of section `id`: its file, its contents (empty where
+/// the addends are explicit) and the relocations themselves.
 fn section_relocs<'a, F: crate::elf::read::ElfFormat>(
     refs: &Refs<'_, 'a, F>,
     id: SectionId,
-) -> Option<(usize, crate::elf::read::RelaSlice<'a, F>)> {
+) -> Option<(usize, &'a [u8], Relocations<'a, F>)> {
     let (file, index) = refs.sections.locate(id)?;
     let object = refs.files.get(file)?.object.as_ref()?;
     let section = object.section(index)?;
@@ -318,15 +334,18 @@ fn section_relocs<'a, F: crate::elf::read::ElfFormat>(
         return None;
     }
     let header = object.section(section.relocs)?.header;
-    match object
+    let relocations = object
         .elf
         .relocation_section(section.relocs, &header)
         .ok()??
-        .relocations
-    {
-        Relocations::Rela(relas) => Some((file, relas)),
-        Relocations::Rel(_) => None,
-    }
+        .relocations;
+    // `SHT_REL`: the addends are in the fields the relocations patch, so
+    // folding compares them from the section's contents.
+    let data = match relocations {
+        Relocations::Rela(_) => &[][..],
+        Relocations::Rel(_) => object.section_data(section).ok()?,
+    };
+    Some((file, data, relocations))
 }
 
 fn icf_target<F: crate::elf::read::ElfFormat>(

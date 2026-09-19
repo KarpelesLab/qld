@@ -147,11 +147,12 @@ fn referenced_locals<F: crate::elf::read::ElfFormat>(
         else {
             continue;
         };
-        if let crate::elf::read::Relocations::Rela(relas) = relocations.relocations {
-            for rel in relas.iter() {
-                if let Some(slot) = referenced.get_mut(rel.symbol as usize) {
-                    *slot = true;
-                }
+        for index in 0..relocations.relocations.len() {
+            let Some(rel) = relocations.relocations.get(index) else {
+                continue;
+            };
+            if let Some(slot) = referenced.get_mut(rel.symbol as usize) {
+                *slot = true;
             }
         }
     }

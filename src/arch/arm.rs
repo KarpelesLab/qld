@@ -171,11 +171,19 @@ impl Field {
             Self::Prel31 => sign_extend(insn & 0x7fff_ffff, 31),
             Self::ThumbAdr => {
                 let imm = i64::from(((hi & 0x400) << 1) | ((lo & 0x7000) >> 4) | (lo & 0xff));
-                if hi & 0xf0 != 0 { imm.wrapping_neg() } else { imm }
+                if hi & 0xf0 != 0 {
+                    imm.wrapping_neg()
+                } else {
+                    imm
+                }
             }
             Self::ThumbLdrLiteral => {
                 let imm = i64::from(lo & 0xfff);
-                if hi & 0x80 != 0 { imm } else { imm.wrapping_neg() }
+                if hi & 0x80 != 0 {
+                    imm
+                } else {
+                    imm.wrapping_neg()
+                }
             }
             Self::LdrLiteral => {
                 let imm = i64::from(insn & 0xfff);

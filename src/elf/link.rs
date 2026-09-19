@@ -700,6 +700,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
             &placement,
             &merged,
             icf_mode,
+            context.arch,
             options.print_icf_sections,
             diagnostics,
         )?;
