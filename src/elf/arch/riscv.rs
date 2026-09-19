@@ -1,4 +1,13 @@
-//! RISC-V 64 (RV64, LP64/LP64D, little-endian) relocations.
+//! RISC-V relocations: RV64 (LP64, LP64F, LP64D) and RV32 (ILP32,
+//! ILP32F, ILP32D), little-endian.
+//!
+//! Both widths share this backend. RV32 differs only where the word size
+//! shows: 4-byte GOT, `.got.plt` and TLS entries, 32-bit dynamic
+//! relocations (no `R_RISCV_64`), a PLT that loads with `lw`, `lui`/`auipc`
+//! pairs whose arithmetic wraps at 32 bits ([`insn::wrap32_hi`]), and the
+//! `ilp32*` dynamic linkers. The ELF class, and so the word size, is fixed
+//! per link ([`crate::elf::read::ElfFormat`]); the functions here that
+//! depend on it take the word size in bytes.
 //!
 //! RISC-V relocations are not independent the way x86-64 and AArch64 ones
 //! are, so besides the shared [`classify`] this backend has its own
@@ -26,7 +35,7 @@
 //!
 //! The PLT is the psABI's (and GNU ld's and lld's): a 32-byte header that
 //! computes the `.got.plt` index from `t1` and jumps to the resolver, then
-//! 16-byte entries `auipc t3; ld t3; jalr t1, t3; nop`.
+//! 16-byte entries `auipc t3; ld t3; jalr t1, t3; nop` (`lw` on RV32).
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -35,8 +44,8 @@ pub mod attributes;
 pub mod relax;
 
 use crate::arch::riscv::{
-    self as insn, AUIPC, Field, JALR, LD, NOP, SRLI, SUB, T0, T1, T2, T3, hi20, itype, lo12, rtype,
-    utype,
+    self as insn, AUIPC, Field, JALR, LD, LW, NOP, SRLI, SUB, T0, T1, T2, T3, hi20, itype, lo12,
+    rtype, utype,
 };
 use crate::elf::read::consts::riscv::*;
 
@@ -181,12 +190,31 @@ pub fn write_field(
     })
 }
 
+/// The load of one word (`ld`, or `lw` on RV32) for words of `word`
+/// bytes.
+#[must_use]
+pub const fn load(word: u64) -> u32 {
+    if word == 4 { LW } else { LD }
+}
+
+/// The PC-relative offset from `from` to `to` as an `auipc` pair computes
+/// it with words of `word` bytes (wrapping at 32 bits on RV32).
+fn pc_offset(from: u64, to: u64, word: u64) -> u64 {
+    let offset = to.wrapping_sub(from);
+    if word == 4 {
+        insn::wrap32_hi(offset)
+    } else {
+        offset
+    }
+}
+
 /// Size of the PLT header.
 pub const PLT_HEADER_SIZE: u64 = 32;
 /// Size of one PLT entry (and of a static IFUNC stub).
 pub const PLT_ENTRY_SIZE: u64 = 16;
 
-/// Writes the PLT header at address `plt`:
+/// Writes the PLT header at address `plt`, for `.got.plt` words of `word`
+/// bytes:
 ///
 /// ```text
 /// 1: auipc t2, %pcrel_hi(.got.plt)
@@ -194,26 +222,33 @@ pub const PLT_ENTRY_SIZE: u64 = 16;
 ///    ld    t3, %pcrel_lo(1b)(t2)    # _dl_runtime_resolve
 ///    addi  t1, t1, -(32 + 12)       # ... scaled below to the slot index
 ///    addi  t0, t2, %pcrel_lo(1b)    # &.got.plt
-///    srli  t1, t1, 1                # .got.plt slot offset
-///    ld    t0, 8(t0)                # link_map
+///    srli  t1, t1, 1                # .got.plt slot offset (2 on RV32)
+///    ld    t0, 8(t0)                # link_map (lw 4(t0) on RV32)
 ///    jr    t3
 /// ```
 ///
 /// # Errors
 ///
 /// [`ApplyError::Overflow`] when `.got.plt` is out of `auipc` range.
-pub fn write_plt_header(out: &mut [u8], plt: u64, got_plt: u64) -> Result<(), ApplyError> {
-    let offset = got_plt.wrapping_sub(plt);
+pub fn write_plt_header(
+    out: &mut [u8],
+    plt: u64,
+    got_plt: u64,
+    word: u64,
+) -> Result<(), ApplyError> {
+    let offset = pc_offset(plt, got_plt, word);
     insn::check_hi(offset).map_err(|_| ApplyError::Overflow)?;
     let header_adjust = 0u32.wrapping_sub(PLT_HEADER_SIZE as u32).wrapping_sub(12);
+    // Entries are 16 bytes and slots `word`: shift by log2(16 / word).
+    let shift = if word == 4 { 2 } else { 1 };
     let words = [
         utype(AUIPC, T2, hi20(offset)),
         rtype(SUB, T1, T1, T3),
-        itype(LD, T3, T2, lo12(offset)),
+        itype(load(word), T3, T2, lo12(offset)),
         itype(insn::ADDI, T1, T1, header_adjust),
         itype(insn::ADDI, T0, T2, lo12(offset)),
-        itype(SRLI, T1, T1, 1),
-        itype(LD, T0, T0, 8),
+        itype(SRLI, T1, T1, shift),
+        itype(load(word), T0, T0, word as u32),
         itype(JALR, 0, T3, 0),
     ];
     for (index, word) in (0u64..).zip(words) {
@@ -223,17 +258,17 @@ pub fn write_plt_header(out: &mut [u8], plt: u64, got_plt: u64) -> Result<(), Ap
 }
 
 /// Writes a PLT entry (or IFUNC stub) at address `entry` that jumps through
-/// the GOT word at `slot`: `auipc t3, %pcrel_hi(slot); ld t3,
-/// %pcrel_lo(slot)(t3); jalr t1, t3; nop`.
+/// the GOT word of `word` bytes at `slot`: `auipc t3, %pcrel_hi(slot); ld
+/// t3, %pcrel_lo(slot)(t3); jalr t1, t3; nop` (`lw` on RV32).
 ///
 /// # Errors
 ///
 /// [`ApplyError::Overflow`] when the slot is out of `auipc` range.
-pub fn write_plt_entry(out: &mut [u8], entry: u64, slot: u64) -> Result<(), ApplyError> {
-    let offset = slot.wrapping_sub(entry);
+pub fn write_plt_entry(out: &mut [u8], entry: u64, slot: u64, word: u64) -> Result<(), ApplyError> {
+    let offset = pc_offset(entry, slot, word);
     insn::check_hi(offset).map_err(|_| ApplyError::Overflow)?;
     put(out, 0, utype(AUIPC, T3, hi20(offset)))?;
-    put(out, 4, itype(LD, T3, T3, lo12(offset)))?;
+    put(out, 4, itype(load(word), T3, T3, lo12(offset)))?;
     put(out, 8, itype(JALR, T1, T3, 0))?;
     put(out, 12, NOP)
 }
@@ -256,7 +291,7 @@ pub fn output_flags(flags: impl IntoIterator<Item = u32>) -> u32 {
 }
 
 /// Why an object cannot be linked with the first one, if it cannot: a
-/// different floating-point ABI or base (RV64E).
+/// different floating-point ABI or base (RV32E/RV64E).
 #[must_use]
 pub fn incompatible_flags(first: u32, flags: u32) -> Option<&'static str> {
     if flags & EF_RISCV_FLOAT_ABI != first & EF_RISCV_FLOAT_ABI {
@@ -268,12 +303,16 @@ pub fn incompatible_flags(first: u32, flags: u32) -> Option<&'static str> {
     None
 }
 
-/// The program interpreter for the floating-point ABI in `e_flags`.
+/// The program interpreter for the floating-point ABI in `e_flags`, with
+/// words of `word` bytes (glibc's names).
 #[must_use]
-pub fn interpreter(flags: u32) -> &'static str {
-    match flags & EF_RISCV_FLOAT_ABI {
-        0 => "/lib/ld-linux-riscv64-lp64.so.1",
-        2 => "/lib/ld-linux-riscv64-lp64f.so.1",
+pub fn interpreter(flags: u32, word: u64) -> &'static str {
+    match (word, flags & EF_RISCV_FLOAT_ABI) {
+        (4, 0) => "/lib/ld-linux-riscv32-ilp32.so.1",
+        (4, 2) => "/lib/ld-linux-riscv32-ilp32f.so.1",
+        (4, _) => "/lib/ld-linux-riscv32-ilp32d.so.1",
+        (_, 0) => "/lib/ld-linux-riscv64-lp64.so.1",
+        (_, 2) => "/lib/ld-linux-riscv64-lp64f.so.1",
         _ => "/lib/ld-linux-riscv64-lp64d.so.1",
     }
 }
@@ -331,7 +370,7 @@ mod tests {
     #[test]
     fn plt_matches_lld() {
         let mut header = [0u8; 32];
-        write_plt_header(&mut header, 0x1310, 0x3400).unwrap();
+        write_plt_header(&mut header, 0x1310, 0x3400, 8).unwrap();
         assert_eq!(
             words(&header),
             [
@@ -346,8 +385,33 @@ mod tests {
             ]
         );
         let mut entry = [0u8; 16];
-        write_plt_entry(&mut entry, 0x1330, 0x3410).unwrap();
+        write_plt_entry(&mut entry, 0x1330, 0x3410, 8).unwrap();
         assert_eq!(words(&entry), [0x0000_2e17, 0x0e0e_3e03, 0x000e_0367, NOP]);
+    }
+
+    /// The PLT lld 23 writes for an RV32 shared object whose `.plt` is at
+    /// 0x1480 and `.got.plt` at 0x356c: `lw` loads, slots four bytes
+    /// apart, so the index shifts by two.
+    #[test]
+    fn rv32_plt_matches_lld() {
+        let mut header = [0u8; 32];
+        write_plt_header(&mut header, 0x1480, 0x356c, 4).unwrap();
+        assert_eq!(
+            words(&header),
+            [
+                0x0000_2397, // auipc t2, 0x2
+                0x41c3_0333, // sub t1, t1, t3
+                0x0ec3_ae03, // lw t3, 0xec(t2)
+                0xfd43_0313, // addi t1, t1, -0x2c
+                0x0ec3_8293, // addi t0, t2, 0xec
+                0x0023_5313, // srli t1, t1, 0x2
+                0x0042_a283, // lw t0, 0x4(t0)
+                0x000e_0067, // jr t3
+            ]
+        );
+        let mut entry = [0u8; 16];
+        write_plt_entry(&mut entry, 0x14a0, 0x3574, 4).unwrap();
+        assert_eq!(words(&entry), [0x0000_2e17, 0x0d4e_2e03, 0x000e_0367, NOP]);
     }
 
     #[test]
@@ -356,6 +420,8 @@ mod tests {
         assert_eq!(output_flags([]), 0);
         assert_eq!(incompatible_flags(0x5, 0x1), Some("floating-point ABI"));
         assert_eq!(incompatible_flags(0x5, 0x4), None);
-        assert_eq!(interpreter(0x5), "/lib/ld-linux-riscv64-lp64d.so.1");
+        assert_eq!(interpreter(0x5, 8), "/lib/ld-linux-riscv64-lp64d.so.1");
+        assert_eq!(interpreter(0x1, 4), "/lib/ld-linux-riscv32-ilp32.so.1");
+        assert_eq!(interpreter(0x3, 4), "/lib/ld-linux-riscv32-ilp32f.so.1");
     }
 }
