@@ -532,8 +532,15 @@ impl Synth {
                 add(second);
             }
         }
+        // The module-local pair: only a shared object does not know its
+        // module ID (an executable is module 1).
         if self.tlsld {
-            add(SlotReloc::Module(DynKind::DtpMod));
+            add(got_slot_relocs(
+                refs,
+                mode,
+                Owner::Local { file: 0, symbol: 0 },
+                GotKind::TlsLd,
+            )[0]);
         }
         other = other.saturating_add(u64_len(self.copies.len()));
         // IFUNC slots whose IRELATIVE relocations go to `.rela.dyn`.

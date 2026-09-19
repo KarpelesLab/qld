@@ -1123,6 +1123,18 @@ fn interworking_and_thunks_match_lld() {
         let (lld, ours) = link_both(tools, &dir, name, args);
         assert_same(tools, &dir, &lld, &ours);
     }
+    // Segments are aligned to the 4 KiB maximum page size GNU ld's Arm
+    // backend uses (lld assumes 64 KiB, which pads every segment).
+    let headers = run_ok(&dir, &tools.readelf, &["-lW", "static.qld"]);
+    let loads: Vec<&str> = headers
+        .lines()
+        .filter(|line| line.trim_start().starts_with("LOAD "))
+        .collect();
+    assert!(!loads.is_empty(), "{headers}");
+    assert!(
+        loads.iter().all(|line| line.trim_end().ends_with("0x1000")),
+        "{headers}"
+    );
     // The far calls went through thunks (the destinations are absolute
     // addresses, which have no symbol), and the near ones interwork.
     let code = listing(tools, &dir, "static.qld");

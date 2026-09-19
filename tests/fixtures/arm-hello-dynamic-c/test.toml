@@ -2,7 +2,9 @@
 # and its 12-byte entries, `.got.plt` slots that point back at the header
 # for lazy binding, `SHT_REL` dynamic relocations (`DT_REL`, `DT_RELSZ`,
 # `DT_PLTREL = DT_REL`), Thumb code calling the A32 PLT with `blx`, and the
-# 64 KiB maximum page size.
+# exception index of the C runtime. (The 4 KiB maximum page size GNU ld's
+# Arm backend uses is checked in `tests/arm32.rs`: a PIE's addresses are
+# all relative, so `readelf` prints nothing that pins it down here.)
 description = "dynamic PIE hello world in C, for 32-bit Arm"
 compile = ["cc -O2 -fPIE -c hello.c"]
 driver = "cc"
@@ -18,7 +20,6 @@ expect.readelf = [
   "EXIDX",
   "R_ARM_JUMP_SLOT",
   "R_ARM_RELATIVE",
-  "0x10000",
 ]
 targets = ["arm-linux-gnueabihf"]
 determinism = true
