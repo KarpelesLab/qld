@@ -388,6 +388,22 @@ fn default_maps(input: &SegmentInput<'_>, sections: &[OutSection<'_>], phdr_size
             ..Map::default()
         });
     }
+    // Arm: `PT_ARM_EXIDX` covers the exception index, which unwinders
+    // find through `dl_iterate_phdr`. (The section type alone would not
+    // do: it is `SHT_X86_64_UNWIND` elsewhere.)
+    if let Some(exidx) = sections.iter().position(|s| {
+        s.name == b".ARM.exidx"
+            && s.sh_type == crate::elf::arch::arm::SHT_ARM_EXIDX
+            && is_load(s)
+            && s.size != 0
+    }) {
+        maps.push(Map {
+            p_type: crate::elf::arch::arm::PT_ARM_EXIDX,
+            flags: Some(PF_R),
+            sections: vec![exidx],
+            ..Map::default()
+        });
+    }
     if options.gnu_stack
         && (input.stack_note
             || options.exec_stack != ExecStack::FromInputs

@@ -261,11 +261,11 @@ pub fn usage() -> String {
     // qld links today; later milestones extend these lines.
     text.push_str(
         "qld: supported targets: elf64-x86-64 elf64-littleaarch64 elf64-loongarch \
-         pei-x86-64 pei-i386 pei-aarch64-little\n",
+         elf32-littlearm pei-x86-64 pei-i386 pei-aarch64-little\n",
     );
     text.push_str(
         "qld: supported emulations: elf_x86_64 aarch64linux elf64loongarch \
-         i386pep i386pe arm64pe\n",
+         armelf_linux_eabi i386pep i386pe arm64pe\n",
     );
     text
 }

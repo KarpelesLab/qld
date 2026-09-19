@@ -1534,6 +1534,89 @@ fn every_relocation_kind_matches_lld() {
     assert_same(tools, &dir, &lld, &ours);
 }
 
+/// Compiles `source` for `target` with `extra`, for the attribute tests,
+/// which need objects built for other architecture versions and float
+/// ABIs than the rest.
+fn compile_for(tools: &Tools, dir: &Path, target: &str, name: &str, object: &str, extra: &[&str]) {
+    let mut args = vec![target, "-O1", "-ffreestanding", "-c", name, "-o", object];
+    args.extend_from_slice(extra);
+    run_ok(dir, &tools.cc, &args);
+}
+
+/// Floating point without libgcc: the attributes say the code uses it
+/// (`Tag_ABI_FP_number_model`), which is what the float ABI check looks
+/// at, but no helper is called.
+const FLOAT_C: &str = "float scale_qld(float x) { return x; }\n";
+const FLOAT_MAIN_C: &str = "extern float scale_qld(float);\nfloat value_qld;\nvoid _start(void) { value_qld = scale_qld(value_qld); }\n";
+
+#[test]
+fn build_attributes_are_merged() {
+    let tools = require!();
+    let dir = scratch("attributes");
+    fs::write(dir.join("float.c"), FLOAT_C).unwrap();
+    fs::write(dir.join("main.c"), FLOAT_MAIN_C).unwrap();
+    compile_for(
+        tools,
+        &dir,
+        "--target=armv6-linux-gnueabi",
+        "float.c",
+        "soft-v6.o",
+        &["-mfloat-abi=soft"],
+    );
+    compile_for(
+        tools,
+        &dir,
+        "--target=armv7a-linux-gnueabi",
+        "main.c",
+        "soft-v7.o",
+        &["-mfloat-abi=soft"],
+    );
+    compile_for(
+        tools,
+        &dir,
+        "--target=armv7a-linux-gnueabihf",
+        "main.c",
+        "hard-v7.o",
+        &[],
+    );
+    compile_for(
+        tools,
+        &dir,
+        "--target=armv7a-linux-gnueabihf",
+        "float.c",
+        "hard-float.o",
+        &[],
+    );
+    // The merged architecture is the highest of the inputs', and the
+    // float ABI decides the `EF_ARM_ABI_FLOAT_*` bit of `e_flags`.
+    let qld = Path::new(env!("CARGO_BIN_EXE_qld"));
+    let link = |output: &str, objects: &[&str]| {
+        let mut args = vec!["--threads=2", "-static", "-e", "_start"];
+        args.extend_from_slice(objects);
+        args.extend_from_slice(&["-o", output]);
+        run(&dir, qld, &args)
+    };
+    assert!(link("soft", &["soft-v7.o", "soft-v6.o"]).status.success());
+    let attributes = run_ok(&dir, &tools.readelf, &["-A", "soft"]);
+    assert!(attributes.contains("ARM v7"), "{attributes}");
+    let header = run_ok(&dir, &tools.readelf, &["-h", "soft"]);
+    assert!(header.contains("0x5000200"), "{header}");
+    // Objects that pass floating-point arguments differently cannot be
+    // linked together, as in GNU ld.
+    let output = link("mixed", &["hard-v7.o", "soft-v6.o"]);
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{errors}");
+    assert!(errors.contains("VFP register arguments"), "{errors}");
+    // Hard float on its own gives the hard-float flag.
+    assert!(
+        link("hard", &["hard-v7.o", "hard-float.o"])
+            .status
+            .success()
+    );
+    let header = run_ok(&dir, &tools.readelf, &["-h", "hard"]);
+    assert!(header.contains("0x5000400"), "{header}");
+}
+
 #[test]
 fn gc_sections_matches_lld() {
     let tools = require!();
