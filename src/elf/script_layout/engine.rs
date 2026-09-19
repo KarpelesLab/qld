@@ -741,9 +741,8 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
                                 0
                             }
                         };
-                        let bytes = value.to_le_bytes();
                         let width = usize::try_from(size.bytes()).unwrap_or(8).min(8);
-                        let data = bytes.get(..width).unwrap_or(&bytes).to_vec();
+                        let data = super::data_bytes::<F>(value, width);
                         if let Some(out) = self.outs.get_mut(index as usize) {
                             out.has_data = true;
                             if self.final_pass {

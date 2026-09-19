@@ -287,7 +287,7 @@ fn build_id_size(kind: &BuildId) -> usize {
 /// # Errors
 ///
 /// Returns I/O errors.
-pub fn finish_output(
+pub fn finish_output<F: crate::elf::read::ElfFormat>(
     path: &Path,
     layout: &Layout<'_>,
     options: &LinkOptions,
@@ -323,7 +323,9 @@ pub fn finish_output(
         .and_then(|end| end.checked_sub(4))
         .ok_or_else(|| Error::Internal(".gnu_debuglink too small".into()))?;
     file.seek(SeekFrom::Start(at)).map_err(io)?;
-    file.write_all(&crc.to_le_bytes()).map_err(io)?;
+    // The CRC is a word of the output, in its byte order.
+    file.write_all(&<F::Endian as crate::elf::read::Endian>::put_u32(crc))
+        .map_err(io)?;
     Ok((crc, build_id))
 }
 

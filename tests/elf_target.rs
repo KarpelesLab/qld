@@ -278,9 +278,9 @@ fn bitcode_names_the_target() {
     assert_incompatible(&output, "Aarch64");
 }
 
-/// `-b binary` inputs are machine-neutral: they link into any 64-bit
-/// little-endian target, and the output's machine is the target's (`-m`),
-/// not x86-64. Needs no tools.
+/// `-b binary` inputs are machine-neutral: they link into any target, in
+/// its class and byte order, and the output's machine is the target's
+/// (`-m`), not x86-64. Needs no tools.
 #[test]
 fn binary_inputs_take_the_target() {
     let dir = scratch("binary");
@@ -297,14 +297,25 @@ fn binary_inputs_take_the_target() {
         );
         assert_eq!(class_and_machine(&dir.join("blob.o")), (2, machine));
     }
-    // ELF32 targets are refused cleanly: the objects are 64-bit.
-    let output = qld(
-        &dir,
-        &["-m", "elf_i386", "-b", "binary", "blob.bin", "-o", "out"],
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success() && stderr.contains("-b binary inputs for Elf32Le"),
-        "{stderr}"
-    );
+    // A 32-bit or big-endian target gets an object of its own format
+    // (no `-r`: relocatable output is x86-64 only so far).
+    for (emulation, class, machine, data) in
+        [("elf_i386", 1u8, 3u16, 1u8), ("elf64_s390", 2, 22, 2)]
+    {
+        let args = ["-m", emulation, "-b", "binary", "blob.bin", "-o", "out"];
+        let output = qld(&dir, &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(dir.join("out")).unwrap();
+        assert_eq!((bytes[4], bytes[5]), (class, data), "{emulation}");
+        let e_machine = if data == 2 {
+            u16::from_be_bytes([bytes[18], bytes[19]])
+        } else {
+            u16::from_le_bytes([bytes[18], bytes[19]])
+        };
+        assert_eq!(e_machine, machine, "{emulation}");
+    }
 }

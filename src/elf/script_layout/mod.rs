@@ -39,3 +39,23 @@ pub use engine::{ScriptSymbol, layout};
 pub use load::{Prepared, prepare};
 pub use matching::{ResolvedSymbols, ScriptPlacement, SymbolDef, place};
 pub use plan::LayoutScript;
+
+/// The bytes a linker-script data statement (`BYTE`, `SHORT`, `LONG`,
+/// `QUAD`) of `width` bytes writes for `value`, in the output's byte
+/// order: its low bytes, first in a little-endian output and last in a
+/// big-endian one.
+#[must_use]
+pub fn data_bytes<F: crate::elf::read::ElfFormat>(value: u64, width: usize) -> Vec<u8> {
+    use crate::elf::read::Endian;
+    let width = width.min(8);
+    if <F::Endian as Endian>::ENDIANNESS == crate::target::Endianness::Big {
+        let bytes = value.to_be_bytes();
+        bytes
+            .get(8usize.saturating_sub(width)..)
+            .unwrap_or(&bytes)
+            .to_vec()
+    } else {
+        let bytes = value.to_le_bytes();
+        bytes.get(..width).unwrap_or(&bytes).to_vec()
+    }
+}

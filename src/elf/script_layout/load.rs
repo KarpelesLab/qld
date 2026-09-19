@@ -399,19 +399,14 @@ pub fn prepare(options: &LinkOptions) -> Result<Prepared> {
                 loader.scripts.push((script, true));
             }
             InputKind::File(path) if spec.attrs.format == InputFormat::Binary => {
-                let kind = options
-                    .target
-                    .and_then(crate::elf::arch::Arch::from_target)
-                    .map(crate::elf::arch::Arch::kind);
-                if let Some(kind) = kind.filter(|&k| k != crate::elf::read::ElfKind::Elf64Le) {
-                    // `binary_input` writes 64-bit little-endian objects.
-                    return Err(Error::Unimplemented(format!(
-                        "-b binary inputs for {kind:?} (roadmap M4: more ELF architectures)"
-                    )));
-                }
                 let data = read_file(&provider, path)?;
                 let name = path.as_os_str().as_encoded_bytes().to_vec();
-                let object = crate::elf::binary_input::convert(&name, &data)?;
+                // The class and byte order are the link's, which is
+                // decided from the same inputs (`elf::link::input_kind`).
+                let object = crate::elf::read::format::with_format!(
+                    crate::elf::link::input_kind(options),
+                    |F| { crate::elf::binary_input::convert::<F>(&name, &data)? }
+                );
                 loader.out.inputs.push(InputSpec {
                     kind: InputKind::Bytes {
                         name: path.to_string_lossy().into_owned(),

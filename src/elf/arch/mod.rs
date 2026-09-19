@@ -85,6 +85,11 @@ pub enum Kind {
     GotPageOff,
     /// `G + A - GOT`.
     GotSlotRel,
+    /// A load through a GOT entry that is kept, which the architecture
+    /// turns into a direct address computation once it knows the symbol's
+    /// address ([`Arch::relax_got_load`]; s390x: `lgrl` and `lg` through
+    /// `%r12` become `larl`). Otherwise `G + A - P` or `G + A - GOT`.
+    GotRelax,
     /// `S + A - GOT`.
     GotRel,
     /// `GOT + A - P`.
@@ -133,11 +138,6 @@ pub enum Kind {
     /// `S + A` and the place ([`Arch::relax`]; LoongArch: a GOT load turned
     /// into an address computation, or linker relaxation to `pcaddi`).
     Relax,
-    /// A load through a GOT entry that is kept, which the architecture
-    /// turns into a direct address computation once it knows the symbol's
-    /// address ([`Arch::relax_got_load`]; s390x: `lgrl` and `lg` through
-    /// `%r12` become `larl`). Otherwise `G + A - P` or `G + A - GOT`.
-    GotRelax,
     /// `A` alone: a hint whose addend locates a related instruction
     /// (PowerPC64 `R_PPC64_PCREL_OPT`).
     Addend,

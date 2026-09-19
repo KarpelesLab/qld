@@ -121,7 +121,7 @@ pub fn from_objects<F: crate::elf::read::ElfFormat>(
                 .as_chunks::<8>()
                 .0
                 .iter()
-                .map(|w| u64::from_le_bytes(*w))
+                .map(|w| <F::Endian as crate::elf::read::Endian>::u64(*w))
                 .collect();
             let mut symbols: Vec<u32> = Vec::new();
             if section.relocs != 0 {

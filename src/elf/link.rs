@@ -101,7 +101,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
 /// was given, else the first input's named on the command line that names
 /// one (an object, a GCC LTO object, LLVM bitcode, or the first such member
 /// of an archive), else the default target's ([`super::target`]).
-fn input_kind(options: &LinkOptions) -> ElfKind {
+pub(crate) fn input_kind(options: &LinkOptions) -> ElfKind {
     if let Some(arch) = options.target.and_then(super::arch::Arch::from_target) {
         return arch.kind();
     }
@@ -1043,8 +1043,11 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
                 diagnostics,
             })
         })?;
-        let (crc, build_id) =
-            super::separate_debug::finish_output(&options.output_path(), &main_layout, options)?;
+        let (crc, build_id) = super::separate_debug::finish_output::<F>(
+            &options.output_path(),
+            &main_layout,
+            options,
+        )?;
         drop(main_addresses);
         super::separate_debug::to_debug_file(&mut layout)?;
         let mut debug_options = options.clone();

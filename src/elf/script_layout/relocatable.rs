@@ -978,11 +978,10 @@ fn lay_out_output<F: crate::elf::read::ElfFormat>(
             }
             Item::Data { size, expr, .. } => {
                 let value = abs(ctx, expr).unwrap_or(0);
-                let bytes = value.to_le_bytes();
                 let width = usize::try_from(size.bytes()).unwrap_or(8).min(8);
                 laid.data.push((
                     ctx.dot.wrapping_sub(vma),
-                    bytes.get(..width).unwrap_or(&bytes).to_vec(),
+                    super::data_bytes::<F>(value, width),
                 ));
                 ctx.dot = ctx.dot.wrapping_add(size.bytes());
             }

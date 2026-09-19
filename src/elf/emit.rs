@@ -134,15 +134,28 @@ pub fn count<F: crate::elf::read::ElfFormat>(
         .reduce(|| 0, u64::saturating_add))
 }
 
-/// Writes one output relocation.
-fn put(out: &mut [u8], offset: u64, symbol: usize, r_type: u32, addend: i64) {
+/// Writes one output relocation, in the output's byte order.
+fn put<F: crate::elf::read::ElfFormat>(
+    out: &mut [u8],
+    offset: u64,
+    symbol: usize,
+    r_type: u32,
+    addend: i64,
+) {
     let Some(entry) = out.first_chunk_mut::<RELA_SIZE>() else {
         return;
     };
-    let symbol = u64::try_from(symbol).unwrap_or(0) & 0xffff_ffff;
-    entry[0..8].copy_from_slice(&offset.to_le_bytes());
-    entry[8..16].copy_from_slice(&((symbol << 32) | u64::from(r_type)).to_le_bytes());
-    entry[16..24].copy_from_slice(&addend.to_le_bytes());
+    let rel = crate::elf::read::Relocation {
+        offset,
+        symbol: u32::try_from(symbol).unwrap_or(0),
+        r_type,
+        addend,
+    };
+    entry.copy_from_slice(
+        crate::elf::read::RawRecord::as_bytes(&F::encode_rela(&rel))
+            .first_chunk::<RELA_SIZE>()
+            .unwrap_or(&[0; RELA_SIZE]),
+    );
 }
 
 /// The output symbol and addend of relocation `rel` of `file`.
@@ -306,7 +319,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         continue;
                     };
                     if !record.live {
-                        put(entry, 0, 0, R_X86_64_NONE, 0);
+                        put::<F>(entry, 0, 0, R_X86_64_NONE, 0);
                         continue;
                     }
                     let local = rel
@@ -315,8 +328,10 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         .wrapping_add(u64::from(record.out_offset));
                     let place = base.wrapping_add(local);
                     match output_symbol(addresses, plan, section_symbols, file, &rel) {
-                        Some((symbol, addend)) => put(entry, place, symbol, rel.r_type, addend),
-                        None => put(entry, place, 0, R_X86_64_NONE, 0),
+                        Some((symbol, addend)) => {
+                            put::<F>(entry, place, symbol, rel.r_type, addend)
+                        }
+                        None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
                     }
                 }
             }
@@ -333,7 +348,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                 let relax = &addresses.layout.relax;
                 let place = base.wrapping_add(relax.map(id, rel.offset));
                 match output_symbol(addresses, plan, section_symbols, file, &rel) {
-                    Some((symbol, addend)) => put(
+                    Some((symbol, addend)) => put::<F>(
                         entry,
                         place,
                         symbol,
@@ -344,7 +359,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         ),
                         addend,
                     ),
-                    None => put(entry, place, 0, R_X86_64_NONE, 0),
+                    None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
                 }
             }
         }
