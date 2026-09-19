@@ -404,7 +404,7 @@ pub struct PlanInput<'p, 'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::re
     /// The relocation scan.
     pub scan: &'p ScanResult,
     /// Whether each named output section has contents.
-    pub has_output: &'p dyn Fn(&[u8]) -> bool,
+    pub has_output: &'p (dyn Fn(&[u8]) -> bool + Sync),
     /// The `DT_SONAME` of a shared object output, or its file name.
     pub soname: Option<Vec<u8>>,
 }
@@ -554,23 +554,31 @@ fn with_strong_aliases<F: crate::elf::read::ElfFormat>(
 /// # Errors
 ///
 /// Returns [`Error::Limit`] when tables exceed their formats.
-#[allow(clippy::too_many_lines)]
 pub fn plan<F: crate::elf::read::ElfFormat>(
     input: &PlanInput<'_, '_, '_, F>,
 ) -> Result<DynamicPlan> {
+    let chosen = choose(input);
+    plan_chosen(input, chosen)
+}
+
+/// The symbols the dynamic symbol table holds, in symbol ID order, each
+/// with whether the output defines it.
+///
+/// This is the first step of [`plan`]. It is separate because it sets
+/// reference flags on strong aliases of weak imports, which the symbol
+/// table plan reads: the rest of the plan does not, and can run beside it
+/// (see `elf::link`).
+#[must_use]
+pub fn choose<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
+) -> Vec<(SymbolId, bool)> {
     let refs = input.refs;
     let symbols = refs.symbols;
     let mode = input.mode;
     let options = input.options;
-    let kind = input.synth.arch.kind();
-    let mut plan = DynamicPlan {
-        kind,
-        ..DynamicPlan::default()
-    };
     if !mode.dynamic {
-        return Ok(plan);
+        return Vec::new();
     }
-    plan.enabled = true;
     let needs = SymbolFlags::NEEDS_GOT
         | SymbolFlags::NEEDS_PLT
         | SymbolFlags::NEEDS_TLSGD
@@ -612,7 +620,32 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
             }
         })
         .collect();
-    let chosen = with_strong_aliases(refs, input.synth, chosen);
+    with_strong_aliases(refs, input.synth, chosen)
+}
+
+/// The rest of [`plan`], from the symbols [`choose`] picked.
+///
+/// # Errors
+///
+/// Returns [`Error::Limit`] when tables exceed their formats.
+#[allow(clippy::too_many_lines)]
+pub fn plan_chosen<F: crate::elf::read::ElfFormat>(
+    input: &PlanInput<'_, '_, '_, F>,
+    chosen: Vec<(SymbolId, bool)>,
+) -> Result<DynamicPlan> {
+    let refs = input.refs;
+    let symbols = refs.symbols;
+    let mode = input.mode;
+    let options = input.options;
+    let kind = input.synth.arch.kind();
+    let mut plan = DynamicPlan {
+        kind,
+        ..DynamicPlan::default()
+    };
+    if !mode.dynamic {
+        return Ok(plan);
+    }
+    plan.enabled = true;
 
     let mut imports: Vec<SymbolId> = Vec::new();
     let mut exports: Vec<Entry> = Vec::new();

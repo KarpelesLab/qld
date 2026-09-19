@@ -715,14 +715,26 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         resolution: &resolution,
         sections: &sections,
     };
-    narrow.run(|| eh_frames.finalize(&refs));
     let order = super::ordering::for_link(&refs, &placement, options, diagnostics)?;
 
     let mut synth = Synth {
         arch: context.arch,
         ..Synth::default()
     };
-    narrow.run(|| synth.plan_entries(&refs, &scan, mode));
+    // The live `.eh_frame` records, the GOT/PLT entries and the non-empty
+    // output sections are three independent passes over the inputs, and
+    // none of them keeps every thread busy on its own: they run side by
+    // side.
+    let nonempty_outputs = narrow.run(|| {
+        let (nonempty, ()) = rayon::join(
+            || {
+                synth.plan_entries(&refs, &scan, mode);
+                nonempty_outputs(files, &sections, &placement)
+            },
+            || eh_frames.finalize(&refs),
+        );
+        nonempty
+    });
     // DT_RELR is for position-independent output; GNU ld ignores the
     // option otherwise.
     synth.relr = options.pack_relative_relocs && mode.pic;
@@ -744,7 +756,6 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     synth.eh_frame_end = eh_frames.sections.iter().any(|s| s.size > 0);
     synth.common = (commons.size, commons.align);
 
-    let nonempty_outputs = narrow.run(|| nonempty_outputs(files, &sections, &placement));
     let has_output = |name: &[u8]| {
         placement
             .outputs
@@ -762,26 +773,35 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
                 .file_name()
                 .map(|n| n.as_encoded_bytes().to_vec())
         });
-    let dynamic = narrow.run(|| {
-        dynsym::plan(&dynsym::PlanInput {
-            refs: &refs,
-            needed: &needed,
-            mode,
-            options,
-            synth: &synth,
-            exports: &exports,
-            scan: &scan,
-            has_output: &has_output,
-            soname,
-        })
-    })?;
+    let input = dynsym::PlanInput {
+        refs: &refs,
+        needed: &needed,
+        mode,
+        options,
+        synth: &synth,
+        exports: &exports,
+        scan: &scan,
+        has_output: &has_output,
+        soname,
+    };
+    // Choosing the dynamic symbols sets reference flags on strong aliases
+    // of weak imports (`environ`), which the symbol table plan reads, so it
+    // comes first; the rest of the dynamic plan changes nothing the symbol
+    // table plan reads, and the two run side by side.
+    let chosen = narrow.run(|| dynsym::choose(&input));
+    let (dynamic, plan) = narrow.run(|| {
+        rayon::join(
+            || dynsym::plan_chosen(&input, chosen),
+            || symtab::plan(&refs, &linker, options, context.arch.kind()),
+        )
+    });
+    let dynamic = dynamic?;
     synth.dynamic_sizes = dynamic.sizes();
     synth.verneed_count = dynamic.verneed_count;
     synth.verdef_count = dynamic.verdef_count;
     lap("dynamic");
     options.check_cancelled()?;
 
-    let plan = narrow.run(|| symtab::plan(&refs, &linker, options, context.arch.kind()));
     let mut trailers = TrailerSizes {
         symtab: plan.symtab_size(),
         strtab: if plan.is_empty() {
