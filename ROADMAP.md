@@ -193,7 +193,11 @@ and TLS models.
 - [x] **i386**: GOT-relative relocations with GNU ld's GOT32X relaxations, `-z ibtplt`, the GNU TLS models and TLS descriptors with their relaxations, PLT and IFUNC; compared with GNU ld 2.46 and run natively
 - [ ] **ARM (32-bit)**: Thumb/ARM interworking, veneers, `.ARM.exidx`
       ordering and synthesis, BE8, `R_ARM_V4BX`
-- [ ] **x32** (`elf32_x86_64`)
+- [x] **x32** (`elf32_x86_64`): the x86-64 relocations and PLT in ELF32 with
+      8-byte GOT entries, x32's TLS forms and `GOTPCRELX` relaxations, IFUNCs,
+      copy relocations, IBT, `--emit-relocs`, `-z pack-relative-relocs`;
+      compared with GNU ld 2.46 instruction for instruction, and with lld
+      where lld can link x32
 - [~] **PowerPC64 LE** (ELFv2): relocations including the Power10 prefixed
       forms, TOC and `.toc` relaxation, local entry points, `.plt.sec` call
       stubs that save r2, thunks (including TOC-saving and PC-relative
