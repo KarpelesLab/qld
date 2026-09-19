@@ -68,6 +68,7 @@ in it; its 1.5 ms is the run-to-run spread at this load.
 | 084cbbe | `dso::plan_needed` beside `place::place`; `.gnu.hash`/`.hash` beside the `.dynstr` batch insertion | placement 11.5 → 10.3 ms, dynamic 15.1 → 13.3 |
 | 20b919c | `ehframe::split` inside the scan's join when there is no `--gc-sections` (with it, the collection needs the records first) | scan 10.9 → 9.9 ms |
 | 4851578 | One pass over the symbol flags for the eight GOT/PLT/copy lists, instead of collecting 1.5 million IDs and filtering them eight times | 0.34% fewer instructions (callgrind) |
+| 1a1506c | The `NOCROSSREFS` check hoisted out of the write's relocation loop: the call returned at once for every link without a script list, but not for free | 1.06% fewer instructions |
 
 ### Tried in W42 and not kept
 
@@ -208,8 +209,12 @@ change in mold.
 for all three, and identical to the branch point's hashes
 (clang `ffad1ac52df901c0`, libclang-cpp `7fe47ce7696d1316`, small-count
 `0f201fabe6ad3ee8`). Callgrind on the clang link at one thread:
-5,012,809,706 instructions at the branch point, 4,999,431,056 on this
-branch (0.27% fewer), same output.
+5,012,809,706 instructions at the branch point, 4,946,494,826 on this
+branch (1.32% fewer), same output.
+
+(The wall-clock table above was taken before the last commit, 1a1506c,
+which only removes instructions; the laps and the whole-link times would
+move a little further down with it.)
 
 ## Standing after W28 (symbol resolution), stated plainly
 
