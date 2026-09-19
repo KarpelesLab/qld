@@ -1312,6 +1312,10 @@ pub struct LinkOptions {
     pub print_symbol_order: Option<PathBuf>,
     /// `--gdb-index`: write a `.gdb_index` section.
     pub gdb_index: bool,
+    /// `--s390-pgste`: add an empty `PT_S390_PGSTE` segment, which tells
+    /// the Linux kernel to allocate page tables with the guest storage
+    /// extension (s390x only).
+    pub s390_pgste: bool,
     /// `--debug-names`: write a merged `.debug_names` section.
     pub debug_names: bool,
     /// `--separate-debug-file[=FILE]`: write the debug sections to FILE
@@ -1580,6 +1584,7 @@ impl LinkOptions {
             call_graph_ordering_file: Default::default(),
             print_symbol_order: Default::default(),
             gdb_index: Default::default(),
+            s390_pgste: Default::default(),
             debug_names: Default::default(),
             separate_debug_file: Default::default(),
             dependency_file: Default::default(),

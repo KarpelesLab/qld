@@ -687,7 +687,7 @@ fn write_synthetic_as<F: ElfFormat>(
         Synthetic::None | Synthetic::EhFrameEnd | Synthetic::Common | Synthetic::DynBss => {}
         Synthetic::DynRelro => out.fill(0),
         Synthetic::BuildId => {
-            write_build_id_header(out, synth.build_id.unwrap_or(0));
+            write_build_id_header::<F::Endian>(out, synth.build_id.unwrap_or(0));
         }
         Synthetic::GnuProperty => {
             if let Some(note) = &synth.property_note {
@@ -844,9 +844,19 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
         }
     };
     let refs = &addresses.refs;
-    // PowerPC64 keeps the TOC pointer's link-time value in the first word.
-    if synth.arch.got_header_words() > 0 {
-        put(base, addresses.got_base());
+    // PowerPC64 keeps the TOC pointer's link-time value in the first
+    // reserved word; s390x's three hold `_DYNAMIC` and the dynamic
+    // linker's own words, which it fills in itself.
+    if synth.got_header > 0 {
+        let first = if synth.arch == Arch::S390x {
+            addresses
+                .layout
+                .synthetic(Synthetic::Dynamic)
+                .map_or(0, |(addr, ..)| addr)
+        } else {
+            addresses.got_base()
+        };
+        put(base, first);
     }
     let dtv_offset = synth.arch.dtv_offset();
     for (list, kind) in [
@@ -989,10 +999,16 @@ fn write_plt<F: crate::elf::read::ElfFormat>(
         }
         return Ok(());
     }
-    let got_plt = addresses
-        .layout
-        .synthetic(Synthetic::GotPlt)
-        .map_or(0, |(addr, ..)| addr);
+    // s390x's header reaches the dynamic linker's words from the GOT
+    // pointer, which is not `.got.plt` when `.got` comes first.
+    let got_plt = if arch == Arch::S390x {
+        addresses.got_base()
+    } else {
+        addresses
+            .layout
+            .synthetic(Synthetic::GotPlt)
+            .map_or(0, |(addr, ..)| addr)
+    };
     let header_size = usize::try_from(arch.plt_header_size(flags)).unwrap_or(16);
     let Some((header, rest)) = out.split_at_mut_checked(header_size) else {
         return Ok(());
@@ -1722,7 +1738,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             && let Some(value) = tombstone.get(dead)
         {
             let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-            let _ = arch::write_value(out, rel.offset, class.width, value);
+            let _ = arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value);
             continue;
         }
         let resolved = addresses.symbol_address(&target, rel.addend);
@@ -1739,12 +1755,12 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 // Both labels of a difference in a discarded section count
                 // from zero, which keeps the difference (lld does the same).
                 if let Some(delta) = add_delta(class.kind, rel.addend as u64) {
-                    let _ = arch::add_value(out, rel.offset, class.width, delta);
+                    let _ = arch::add_value_as::<F::Endian>(out, rel.offset, class.width, delta);
                     continue;
                 }
                 let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
                 let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-                let _ = arch::write_value(out, rel.offset, class.width, value);
+                let _ = arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value);
                 continue;
             }
         };
@@ -1768,8 +1784,9 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 .got_entry_address(owner, class.slot)
                 .ok_or(ApplyError::BadInstruction)
         };
-        let put =
-            |out: &mut [u8], value: u64| arch::write_value(out, rel.offset, class.width, value);
+        let put = |out: &mut [u8], value: u64| {
+            arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value)
+        };
         let page = crate::arch::aarch64::page;
         let page_delta = |target: u64| arch.page_delta(target, place, rel.r_type);
         let result = match class.kind {
@@ -1838,9 +1855,23 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             Kind::PageOff => put(out, sa),
             Kind::Add | Kind::Sub => {
                 let delta = add_delta(class.kind, sa).unwrap_or_default();
-                arch::add_value(out, rel.offset, class.width, delta)
+                arch::add_value_as::<F::Endian>(out, rel.offset, class.width, delta)
             }
             Kind::Relax => arch.relax(out, rel.offset, rel.r_type, sa, place),
+            Kind::GotRelax => slot_address().and_then(|g| {
+                arch.relax_got_load(
+                    out,
+                    rel.offset,
+                    rel.r_type,
+                    s,
+                    RelaxValues {
+                        got: g.wrapping_add_signed(a),
+                        place,
+                        got_base: addresses.got_base(),
+                        ..RelaxValues::default()
+                    },
+                )
+            }),
             Kind::GotAbs => slot_address().and_then(|g| put(out, g.wrapping_add_signed(a))),
             Kind::GotPageOff => slot_address().and_then(|g| {
                 put(
@@ -2241,7 +2272,7 @@ fn write_eh_frame<F: crate::elf::read::ElfFormat>(
                 let pointer = u32::try_from(field.wrapping_sub(cie_address)).unwrap_or(0);
                 let at = out_start.saturating_add(length_size as usize);
                 if let Some(slot) = out.get_mut(at..at.saturating_add(4)) {
-                    slot.copy_from_slice(&pointer.to_le_bytes());
+                    slot.copy_from_slice(&<F::Endian as Endian>::put_u32(pointer));
                 }
             }
         }
@@ -2273,14 +2304,14 @@ fn write_eh_frame<F: crate::elf::read::ElfFormat>(
             // LoongArch assembles the advances of the call frame
             // instructions as label differences when the code may relax.
             let written = if let Some(delta) = add_delta(class.kind, sa) {
-                arch::add_value(out, local, class.width, delta)
+                arch::add_value_as::<F::Endian>(out, local, class.width, delta)
             } else {
                 let value = match class.kind {
                     Kind::Abs => sa,
                     Kind::Pc => sa.wrapping_sub(place),
                     _ => continue,
                 };
-                arch::write_value(out, local, class.width, value)
+                arch::write_value_as::<F::Endian>(out, local, class.width, value)
             };
             if written.is_err() {
                 input.diagnostics.emit(

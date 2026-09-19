@@ -10,7 +10,8 @@
 //! - `_binary_<name>_size`, an absolute symbol whose value is the size.
 //!
 //! [`convert`] wraps the bytes in an ELF relocatable object with exactly
-//! that content, so the rest of the link treats it like any other object.
+//! that content, in the link's class and byte order, so the rest of the
+//! link treats it like any other object.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -18,6 +19,7 @@ use crate::elf::read::consts::{
     EM_NONE, SHF_ALLOC, SHF_WRITE, SHN_ABS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL,
     STT_NOTYPE,
 };
+use crate::elf::read::{ElfFormat, FileHeader, RawRecord, RawSymbol, SectionHeader};
 use crate::error::{Error, Result};
 
 /// The symbol name GNU ld derives from `path` and `suffix`: `_binary_`, the
@@ -45,33 +47,22 @@ fn u64_of(n: usize) -> Result<u64> {
     u64::try_from(n).map_err(|_| too_large())
 }
 
-fn push_u16(out: &mut Vec<u8>, v: u16) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-fn push_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-fn push_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
 fn pad_to(out: &mut Vec<u8>, align: usize) {
-    while !out.len().is_multiple_of(align) {
+    while !out.len().is_multiple_of(align.max(1)) {
         out.push(0);
     }
 }
 
 /// Wraps `data` in an ELF relocatable object as GNU ld's binary input
-/// format would present it. The object is 64-bit little-endian and
+/// format would present it, in the link's class and byte order (`F`) and
 /// machine-neutral (`EM_NONE`): it has no code and no relocations, so it
-/// links into any 64-bit little-endian target, and names none. `name` is the input path as given on the
-/// command line.
+/// links into any target, and names none. `name` is the input path as
+/// given on the command line.
 ///
 /// # Errors
 ///
 /// [`Error::Limit`] when the file or its name does not fit the format.
-#[allow(clippy::too_many_lines)]
-pub fn convert(name: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+pub fn convert<F: ElfFormat>(name: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let size = u64_of(data.len())?;
     let symbols = [
         (mangle(name, "start"), 0u64, 1u16),
@@ -95,119 +86,96 @@ pub fn convert(name: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         shstrtab.push(0);
     }
 
-    let mut out = vec![0u8; 64];
+    let ehdr_size = <F::Ehdr as RawRecord>::SIZE;
+    let sym_size = <F::Sym as RawRecord>::SIZE;
+    let align = F::WORD_SIZE;
+    let mut out = vec![0u8; ehdr_size];
     // .data
     let data_offset = out.len();
     out.extend_from_slice(data);
-    pad_to(&mut out, 8);
+    pad_to(&mut out, align);
     // .symtab: null, then the three globals.
     let symtab_offset = out.len();
-    out.extend_from_slice(&[0u8; 24]);
+    out.extend_from_slice(F::encode_sym(&RawSymbol::default()).as_bytes());
     for ((_, value, shndx), name_offset) in symbols.iter().zip(&name_offsets) {
-        push_u32(&mut out, *name_offset);
-        out.push((STB_GLOBAL << 4) | STT_NOTYPE);
-        out.push(0);
-        push_u16(&mut out, *shndx);
-        push_u64(&mut out, *value);
-        push_u64(&mut out, 0);
+        let symbol = RawSymbol {
+            st_name: *name_offset,
+            st_info: (STB_GLOBAL << 4) | STT_NOTYPE,
+            st_other: 0,
+            st_shndx: *shndx,
+            st_value: *value,
+            st_size: 0,
+        };
+        out.extend_from_slice(F::encode_sym(&symbol).as_bytes());
     }
     let symtab_size = out.len().checked_sub(symtab_offset).ok_or_else(too_large)?;
     let strtab_offset = out.len();
     out.extend_from_slice(&strtab);
     let shstrtab_offset = out.len();
     out.extend_from_slice(&shstrtab);
-    pad_to(&mut out, 8);
+    pad_to(&mut out, align);
     let shoff = out.len();
 
     // Section headers: null, .data, .symtab, .strtab, .shstrtab.
-    out.extend_from_slice(&[0u8; 64]);
-    let header = |out: &mut Vec<u8>,
-                  name: u32,
-                  sh_type: u32,
-                  flags: u64,
-                  offset: usize,
-                  size: usize,
-                  link: u32,
-                  info: u32,
-                  align: u64,
-                  entsize: u64|
-     -> Result<()> {
-        push_u32(out, name);
-        push_u32(out, sh_type);
-        push_u64(out, flags);
-        push_u64(out, 0);
-        push_u64(out, u64_of(offset)?);
-        push_u64(out, u64_of(size)?);
-        push_u32(out, link);
-        push_u32(out, info);
-        push_u64(out, align);
-        push_u64(out, entsize);
-        Ok(())
-    };
     let section_name = |i: usize| shname.get(i).copied().unwrap_or(0);
-    header(
-        &mut out,
-        section_name(0),
-        SHT_PROGBITS,
-        SHF_ALLOC | SHF_WRITE,
-        data_offset,
-        data.len(),
-        0,
-        0,
-        1,
-        0,
-    )?;
-    header(
-        &mut out,
-        section_name(1),
-        SHT_SYMTAB,
-        0,
-        symtab_offset,
-        symtab_size,
-        3,
-        1,
-        8,
-        24,
-    )?;
-    header(
-        &mut out,
-        section_name(2),
-        SHT_STRTAB,
-        0,
-        strtab_offset,
-        strtab.len(),
-        0,
-        0,
-        1,
-        0,
-    )?;
-    header(
-        &mut out,
-        section_name(3),
-        SHT_STRTAB,
-        0,
-        shstrtab_offset,
-        shstrtab.len(),
-        0,
-        0,
-        1,
-        0,
-    )?;
+    let headers = [
+        SectionHeader::default(),
+        SectionHeader {
+            sh_name: section_name(0),
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC | SHF_WRITE,
+            sh_offset: u64_of(data_offset)?,
+            sh_size: size,
+            sh_addralign: 1,
+            ..SectionHeader::default()
+        },
+        SectionHeader {
+            sh_name: section_name(1),
+            sh_type: SHT_SYMTAB,
+            sh_offset: u64_of(symtab_offset)?,
+            sh_size: u64_of(symtab_size)?,
+            sh_link: 3,
+            sh_info: 1,
+            sh_addralign: u64_of(align)?,
+            sh_entsize: u64_of(sym_size)?,
+            ..SectionHeader::default()
+        },
+        SectionHeader {
+            sh_name: section_name(2),
+            sh_type: SHT_STRTAB,
+            sh_offset: u64_of(strtab_offset)?,
+            sh_size: u64_of(strtab.len())?,
+            sh_addralign: 1,
+            ..SectionHeader::default()
+        },
+        SectionHeader {
+            sh_name: section_name(3),
+            sh_type: SHT_STRTAB,
+            sh_offset: u64_of(shstrtab_offset)?,
+            sh_size: u64_of(shstrtab.len())?,
+            sh_addralign: 1,
+            ..SectionHeader::default()
+        },
+    ];
+    for header in &headers {
+        out.extend_from_slice(F::encode_shdr(header).as_bytes());
+    }
 
     // ELF header.
-    let ehdr = out.get_mut(..64).ok_or_else(too_large)?;
-    ehdr[..4].copy_from_slice(b"\x7fELF");
-    ehdr[4] = 2; // ELFCLASS64
-    ehdr[5] = 1; // ELFDATA2LSB
-    ehdr[6] = 1; // EV_CURRENT
-    ehdr[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
-    ehdr[18..20].copy_from_slice(&EM_NONE.to_le_bytes());
-    ehdr[20..24].copy_from_slice(&1u32.to_le_bytes());
-    ehdr[40..48].copy_from_slice(&u64_of(shoff)?.to_le_bytes());
-    ehdr[52..54].copy_from_slice(&64u16.to_le_bytes());
-    ehdr[58..60].copy_from_slice(&64u16.to_le_bytes());
-    ehdr[60..62].copy_from_slice(&5u16.to_le_bytes());
-    ehdr[62..64].copy_from_slice(&4u16.to_le_bytes());
+    let file_header = FileHeader {
+        ident_version: 1, // EV_CURRENT
+        e_type: 1,        // ET_REL
+        e_machine: EM_NONE,
+        e_version: 1,
+        e_shoff: u64_of(shoff)?,
+        e_shnum: u16::try_from(headers.len()).map_err(|_| too_large())?,
+        e_shstrndx: 4,
+        ..FileHeader::default()
+    };
+    let encoded = F::encode_ehdr(&file_header);
+    out.get_mut(..ehdr_size)
+        .ok_or_else(too_large)?
+        .copy_from_slice(encoded.as_bytes());
     Ok(out)
 }
 
@@ -228,7 +196,7 @@ mod tests {
 
     #[test]
     fn object_parses_with_three_symbols() {
-        let bytes = convert(b"blob.bin", b"hello").unwrap();
+        let bytes = convert::<Elf64Le>(b"blob.bin", b"hello").unwrap();
         let object = ObjectFile::<Elf64Le>::parse(&bytes, Source::new(Path::new("blob.bin")))
             .expect("valid object");
         let names: Vec<Vec<u8>> = object
@@ -244,7 +212,21 @@ mod tests {
                 b"_binary_blob_bin_size".to_vec()
             ]
         );
-        let empty = convert(b"empty", b"").unwrap();
+        let empty = convert::<Elf64Le>(b"empty", b"").unwrap();
         assert!(ObjectFile::<Elf64Le>::parse(&empty, Source::new(Path::new("empty"))).is_ok());
+        // Big-endian and 32-bit links get objects of their own format.
+        let be = convert::<crate::elf::read::Elf64Be>(b"blob.bin", b"hello").unwrap();
+        let object =
+            ObjectFile::<crate::elf::read::Elf64Be>::parse(&be, Source::new(Path::new("blob.bin")))
+                .expect("valid big-endian object");
+        assert_eq!(object.symbols().globals().count(), 3);
+        let small = convert::<crate::elf::read::Elf32Le>(b"blob.bin", b"hello").unwrap();
+        assert!(
+            ObjectFile::<crate::elf::read::Elf32Le>::parse(
+                &small,
+                Source::new(Path::new("blob.bin"))
+            )
+            .is_ok()
+        );
     }
 }

@@ -894,6 +894,8 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         && out_sections
             .iter()
             .any(|s| s.sh_type == SHT_RISCV_ATTRIBUTES);
+    // s390x `--s390-pgste`: an empty `PT_S390_PGSTE` segment.
+    let has_pgste = input.synth.arch == Arch::S390x && input.options.s390_pgste;
     let phnum = load_count
         .saturating_add(usize::from(has_interp).saturating_mul(2))
         .saturating_add(usize::from(has_dynamic))
@@ -903,7 +905,8 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         .saturating_add(usize::from(has_eh_hdr))
         .saturating_add(usize::from(gnu_stack))
         .saturating_add(usize::from(has_relro))
-        .saturating_add(usize::from(has_attributes));
+        .saturating_add(usize::from(has_attributes))
+        .saturating_add(usize::from(has_pgste));
     let phnum_u64 = u64::try_from(phnum).unwrap_or(u64::MAX);
 
     // 4. Addresses. Each new PT_LOAD starts on a page boundary; a writable
@@ -1316,6 +1319,18 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
             align: 1,
         });
     }
+    if has_pgste {
+        segments.push(Segment {
+            p_type: super::arch::s390x::PT_S390_PGSTE,
+            flags: 0,
+            offset: 0,
+            vaddr: 0,
+            paddr: None,
+            filesz: 0,
+            memsz: 0,
+            align: 8,
+        });
+    }
     if segments.len() != phnum {
         return Err(Error::Internal(format!(
             "program header count changed during layout ({phnum} planned, {} made)",
@@ -1653,7 +1668,7 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
                 }
                 Synthetic::Hash => {
                     section.link = dynsym;
-                    section.entsize = 4;
+                    section.entsize = if synth.arch.wide_sysv_hash() { 8 } else { 4 };
                 }
                 Synthetic::DynSym => {
                     section.link = dynstr;
@@ -1692,8 +1707,12 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
                     section.link = dynstr;
                     section.entsize = class.dyn_size();
                 }
-                // GNU ld gives the i386 `.plt` an entry size of 4.
+                // GNU ld gives the i386 `.plt` an entry size of 4, and
+                // the s390x one its 32-byte entries.
                 Synthetic::Plt if synth.arch == super::arch::Arch::I386 => section.entsize = 4,
+                Synthetic::Plt | Synthetic::PltSec if synth.arch == super::arch::Arch::S390x => {
+                    section.entsize = super::arch::s390x::PLT_ENTRY_SIZE;
+                }
                 Synthetic::Plt | Synthetic::PltSec => section.entsize = 16,
                 Synthetic::PltGot => section.entsize = if synth.ibt { 16 } else { 8 },
                 _ => {}
@@ -1870,7 +1889,13 @@ pub(crate) fn entsize_of<F: crate::elf::read::ElfFormat>(
             }
             Member::Synthetic(Synthetic::RelrDyn) => input.kind().word_size(),
             Member::Synthetic(Synthetic::Dynamic) => input.kind().dyn_size(),
-            Member::Synthetic(Synthetic::Plt | Synthetic::PltSec) => 16,
+            Member::Synthetic(Synthetic::Plt | Synthetic::PltSec) => {
+                if input.synth.arch == super::arch::Arch::S390x {
+                    super::arch::s390x::PLT_ENTRY_SIZE
+                } else {
+                    16
+                }
+            }
             Member::Synthetic(Synthetic::VerSym) => 2,
             Member::Synthetic(Synthetic::Comment) => 1,
             Member::Synthetic(_) => 0,

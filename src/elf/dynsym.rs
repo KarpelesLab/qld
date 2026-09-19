@@ -73,6 +73,15 @@ fn e32(kind: ElfKind, value: u32) -> [u8; 4] {
     }
 }
 
+/// Encodes a `u64` in the byte order of `kind`.
+#[inline]
+fn e64(kind: ElfKind, value: u64) -> [u8; 8] {
+    match kind.endianness() {
+        crate::target::Endianness::Little => value.to_le_bytes(),
+        crate::target::Endianness::Big => value.to_be_bytes(),
+    }
+}
+
 /// One `.dynsym` entry after the null symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
@@ -911,7 +920,7 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
     }
     if sysv {
         let names: Vec<&[u8]> = plan.entries.iter().map(|&e| entry_name(e)).collect();
-        plan.sysv_hash = build_sysv_hash(&names, kind)?;
+        plan.sysv_hash = build_sysv_hash(&names, kind, input.synth.arch.wide_sysv_hash())?;
     }
     plan.dynstr = dynstr.data;
 
@@ -1032,7 +1041,10 @@ fn bucket_count(symbols: usize, gnu: bool) -> u32 {
     if gnu { best.max(2) } else { best }
 }
 
-fn build_sysv_hash(names: &[&[u8]], kind: ElfKind) -> Result<Vec<u8>> {
+/// Builds `.hash`. Its entries are four bytes wide, except on s390x,
+/// where the ABI (and GNU ld's `s390_elf64_size_info`) makes them eight
+/// (`wide`).
+fn build_sysv_hash(names: &[&[u8]], kind: ElfKind, wide: bool) -> Result<Vec<u8>> {
     let too_big = || Error::Limit("hash table too large".into());
     let nchain = u32::try_from(names.len().saturating_add(1)).map_err(|_| too_big())?;
     let nbucket = bucket_count(names.len(), false);
@@ -1047,17 +1059,25 @@ fn build_sysv_hash(names: &[&[u8]], kind: ElfKind) -> Result<Vec<u8>> {
             *head = index;
         }
     }
+    let entry = if wide { 8usize } else { 4 };
     let mut data = Vec::with_capacity(
-        8usize.saturating_add(
+        entry.saturating_mul(2).saturating_add(
             (nbucket as usize)
                 .saturating_add(nchain as usize)
-                .saturating_mul(4),
+                .saturating_mul(entry),
         ),
     );
-    data.extend_from_slice(&e32(kind, nbucket));
-    data.extend_from_slice(&e32(kind, nchain));
+    let push = |data: &mut Vec<u8>, value: u32| {
+        if wide {
+            data.extend_from_slice(&e64(kind, u64::from(value)));
+        } else {
+            data.extend_from_slice(&e32(kind, value));
+        }
+    };
+    push(&mut data, nbucket);
+    push(&mut data, nchain);
     for value in buckets.into_iter().chain(chains) {
-        data.extend_from_slice(&e32(kind, value));
+        push(&mut data, value);
     }
     Ok(data)
 }
@@ -1151,8 +1171,20 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
         synth.arch,
         crate::elf::arch::Arch::I386 | crate::elf::arch::Arch::X32
     ) || synth.size_align(Synthetic::Plt).0 > 0;
-    if synth.got_plt_reserved > 0 && pltgot {
-        entries.push((DT_PLTGOT, Address(Synthetic::GotPlt)));
+    // `DT_PLTGOT` names the dynamic linker's reserved words, which on
+    // s390x are at the start of `.got` when `.got.plt` does not come
+    // first (see `crate::elf::arch::s390x`).
+    let reserved = if synth.got_plt_reserved > 0 {
+        Some(Synthetic::GotPlt)
+    } else if synth.got_header > 0 && synth.arch == crate::elf::arch::Arch::S390x {
+        Some(Synthetic::Got)
+    } else {
+        None
+    };
+    if let Some(part) = reserved
+        && pltgot
+    {
+        entries.push((DT_PLTGOT, Address(part)));
     }
     if synth.size_align(Synthetic::RelaPlt).0 > 0 {
         entries.push((DT_PLTRELSZ, Size(Synthetic::RelaPlt)));

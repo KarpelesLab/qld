@@ -1,0 +1,22 @@
+# M4: the TLS models in an s390x executable. Everything is in the
+# executable, so general-dynamic and local-dynamic relax to local-exec:
+# the literal pool entries become thread pointer offsets, the
+# `brasl %r14,__tls_get_offset` calls marked by `R_390_TLS_GDCALL` and
+# `R_390_TLS_LDCALL` become `brcl 0,.`, and no TLS dynamic relocation may
+# be left. GNU ld still gives the (now uncalled) `__tls_get_offset` a PLT
+# slot, and so does qld.
+description = "s390x TLS: general-dynamic, local-dynamic, initial-exec and local-exec relaxed to local-exec"
+compile = ["cc -O2 -fPIC -c tls.c"]
+driver = "cc"
+link = "-pie -o out tls.o"
+run = "./out"
+expect.stdout = "tls 63\n"
+expect.readelf = [
+  "IBM S/390",
+  "TLS",
+  "!R_390_TLS_DTPMOD",
+  "!R_390_TLS_DTPOFF",
+  "!R_390_TLS_TPOFF",
+]
+targets = ["s390x-linux-gnu"]
+determinism = true

@@ -1,0 +1,21 @@
+# M4: the s390x counterpart of `hello-static-c`, and the first big-endian
+# output run end to end. Static glibc: initial-exec TLS through GOT entries
+# the linker fills, IFUNCs resolved by `IRELATIVE` relocations at startup,
+# and the three reserved words at the start of `.got`.
+description = "static hello world in C, for s390x"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "IBM S/390",
+  "big endian",
+  "EXEC (Executable file)",
+  "R_390_IRELATIVE",
+  "!INTERP",
+  "!.dynamic",
+  "!R_390_JMP_SLOT",
+]
+targets = ["s390x-linux-gnu"]
+determinism = true

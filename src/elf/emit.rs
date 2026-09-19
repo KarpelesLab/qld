@@ -132,7 +132,8 @@ pub fn count<F: crate::elf::read::ElfFormat>(
         .reduce(|| 0, u64::saturating_add))
 }
 
-/// Writes one output relocation, an `Elf_Rela` of the output's class.
+/// Writes one output relocation, an `Elf_Rela` of the output's class and
+/// byte order.
 fn put<F: crate::elf::read::ElfFormat>(
     out: &mut [u8],
     offset: u64,

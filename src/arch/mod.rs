@@ -11,6 +11,7 @@ pub mod aarch64;
 pub mod loongarch;
 pub mod ppc64;
 pub mod riscv;
+pub mod s390x;
 
 /// A value does not fit the instruction field it is being packed into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
