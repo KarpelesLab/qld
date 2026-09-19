@@ -42,6 +42,7 @@ jobs:
             gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu \
             binutils-powerpc64le-linux-gnu \
             gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+            gcc-s390x-linux-gnu g++-s390x-linux-gnu binutils-s390x-linux-gnu \
             gcc-i686-linux-gnu g++-i686-linux-gnu binutils-i686-linux-gnu \
             qemu-user-static
           # noble ships only the versioned LoongArch compiler names
@@ -116,6 +117,27 @@ jobs:
             echo "x32 binaries do not run on this kernel; links are compared, not run"
           fi
       - run: cargo test --all-features --test x32 -- --nocapture
+
+  s390x:
+    name: s390x links compared with GNU ld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_S390X_TOOLS: "1"
+      QLD_REQUIRE_S390X_RUN: "1"
+      QLD_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-s390x-linux-gnu g++-s390x-linux-gnu \
+            binutils-s390x-linux-gnu qemu-user-static
+      - run: cargo test --all-features --test s390x -- --nocapture
+      # the s390x fixtures, linked with qld and run under qemu-s390x
+      - run: cargo test --all-features --test fixtures -- --nocapture
+        env:
+          QLD_FIXTURE: s390x
 
   riscv32:
     name: RISC-V 32 links compared with lld
