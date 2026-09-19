@@ -568,8 +568,15 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     lap("placement");
     options.check_cancelled()?;
 
-    let mut eh_frames = narrow.run(|| ehframe::split(files, &sections))?;
-    if options.gc_sections {
+    // `--gc-sections` needs the `.eh_frame` records to follow the graph, so
+    // they are split here; without it the split runs beside the relocation
+    // scan (below), which needs nothing from it.
+    let mut eh_frames = if options.gc_sections {
+        Some(narrow.run(|| ehframe::split(files, &sections))?)
+    } else {
+        None
+    };
+    if let Some(eh_frames) = eh_frames.as_mut() {
         let refs = Refs {
             files,
             symbols: &symbols,
@@ -578,7 +585,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         };
         let why_live = !options.why_live.is_empty();
         let (removed, graph) = narrow
-            .run(|| gc::collect(&refs, &placement, &eh_frames, &linker, internal, why_live))?;
+            .run(|| gc::collect(&refs, &placement, eh_frames, &linker, internal, why_live))?;
         if options.print_gc_sections {
             gc::print_removed(&refs, &removed, diagnostics);
         }
@@ -626,8 +633,16 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     // its own: they run side by side. A merge error counts only if the scan
     // reports none, as when the merge ran after it.
     // The debug indexes only read the inputs: they are built alongside.
-    let (scan, (merged, debug_indexes)) = rayon::join(
-        || scan::scan(&refs, &context),
+    let ((scan, split), (merged, debug_indexes)) = rayon::join(
+        || {
+            rayon::join(
+                || scan::scan(&refs, &context),
+                || match eh_frames {
+                    Some(eh_frames) => Ok(eh_frames),
+                    None => ehframe::split(files, &sections),
+                },
+            )
+        },
         || {
             rayon::join(
                 || {
@@ -650,6 +665,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
             )
         },
     );
+    let mut eh_frames = split?;
     for file in &scan.files {
         for error in &file.errors {
             diagnostics.emit(error.clone());
