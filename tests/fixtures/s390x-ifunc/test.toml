@@ -1,0 +1,17 @@
+# M4: an IFUNC in a static s390x executable. The stub is a PLT entry that
+# jumps through a `.got.plt` slot an `R_390_IRELATIVE` relocation fills at
+# startup, and the function pointer must be the stub's address, so the two
+# calls agree.
+description = "IFUNC resolved at startup in a static executable, for s390x"
+compile = ["cc -O2 -c ifunc.c"]
+driver = "cc"
+link = "-static -o out ifunc.o"
+run = "./out"
+expect.stdout = "pick 2 2 same\n"
+expect.readelf = [
+  "IBM S/390",
+  "R_390_IRELATIVE",
+  "!R_390_JMP_SLOT",
+]
+targets = ["s390x-linux-gnu"]
+determinism = true

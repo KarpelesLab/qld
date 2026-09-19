@@ -1,0 +1,23 @@
+# M4: a dynamic PIE against glibc, for s390x. Covers the 32-byte PLT
+# entries and their `.got.plt` slots, `R_390_GLOB_DAT` and
+# `R_390_RELATIVE`, and `DT_PLTGOT` pointing at the dynamic linker's three
+# reserved words, which `-z now` (the compiler's default for a PIE) puts
+# at the start of `.got`.
+description = "dynamic PIE hello world in C, for s390x"
+compile = ["cc -O2 -fPIE -c hello.c"]
+driver = "cc"
+link = "-pie -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, dynamic world (20)\n"
+expect.readelf = [
+  "IBM S/390",
+  "big endian",
+  "DYN (",
+  "INTERP",
+  "ld64.so.1",
+  "(RELA)",
+  "R_390_JMP_SLOT",
+  "R_390_RELATIVE",
+]
+targets = ["s390x-linux-gnu"]
+determinism = true

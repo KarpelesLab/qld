@@ -1,0 +1,17 @@
+# M4: C++ exceptions on s390x. The unwinder reads `.eh_frame` and
+# `.eh_frame_hdr` written big-endian, including the CIE pointers the
+# linker rewrites where it drops records and the binary search table.
+description = "C++ exceptions across two frames, for s390x"
+compile = ["c++ -O2 -fPIE -c throw.cpp"]
+driver = "c++"
+link = "-pie -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "IBM S/390",
+  "GNU_EH_FRAME",
+  ".gcc_except_table",
+  "R_390_JMP_SLOT",
+]
+targets = ["s390x-linux-gnu"]
+determinism = true
