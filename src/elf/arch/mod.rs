@@ -575,7 +575,7 @@ impl Arch {
     #[inline]
     pub fn is_word(self, width: Width) -> bool {
         // The 64-bit architectures first, so that they pay for no other.
-        if self != Self::I386 && self != Self::X32 {
+        if !matches!(self, Self::I386 | Self::X32 | Self::RiscV32) {
             return width == Width::W64;
         }
         match self {

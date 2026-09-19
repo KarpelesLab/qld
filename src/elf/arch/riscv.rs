@@ -365,6 +365,22 @@ mod tests {
         }
     }
 
+    /// The word-size absolute relocation, which a dynamic relocation can
+    /// fill, is `R_RISCV_32` on RV32 and `R_RISCV_64` on RV64: a pointer
+    /// in the data of a shared object or a PIE takes one
+    /// ([`super::Arch::is_word`]), and the other width is a
+    /// "recompile with -fPIC" error there.
+    #[test]
+    fn the_word_relocation_differs_by_width() {
+        use super::super::Arch;
+        let word32 = classify(R_RISCV_32, exec()).unwrap().width;
+        let word64 = classify(R_RISCV_64, exec()).unwrap().width;
+        assert!(Arch::RiscV32.is_word(word32));
+        assert!(!Arch::RiscV32.is_word(word64));
+        assert!(Arch::RiscV64.is_word(word64));
+        assert!(!Arch::RiscV64.is_word(word32));
+    }
+
     /// The PLT lld 23 writes for a shared object whose `.plt` is at 0x1310
     /// and `.got.plt` at 0x3400.
     #[test]
