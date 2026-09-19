@@ -341,6 +341,16 @@ Who works where, and which files each task owns, is in
 - **Teardown**: the CLI exits without dropping the link state, as mold and
   lld do. The library API frees everything in the normal way.
 
+### Stages that run side by side
+
+Measured overlaps (W42): the GOT/PLT entry plan, the scan for non-empty
+outputs and `ehframe::finalize` are one join; `symtab::plan` runs beside
+`dynsym::plan_chosen`, while `dynsym::choose` stays sequential because it
+writes the symbol flags the symbol-table plan reads; `place::place` runs
+beside `dso::plan_needed`; the hash tables are built beside the `.dynstr`
+batch insertion; and `ehframe::split` joins the relocation scan unless
+`--gc-sections` needs the records first.
+
 ## In-memory inputs and outputs
 
 The file table (`src/input/table.rs`) asks `LinkOptions::input_provider` for

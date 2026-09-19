@@ -266,17 +266,18 @@ mold's and wild's on x86-64, on both 8-core and 64-core machines, with peak
 RSS no higher than lld's. Output is identical across 1, 2 and N threads for
 every benchmark.
 
-**Status (W28–W31, 2026-09-18, 32-core Threadripper):** met against mold at
-default and 64 threads on every benchmark, not at 8 threads or on one thread;
-wild still leads on whole links (clang: wild 94 ms, qld 128–149 ms).
-Resolution is 30–57% faster after W28 (clang 37–45 → 23–26 ms at 16 threads)
-and output is unchanged. Peak RSS stays below lld's, mold's and wild's, and
-output is identical at 1, 2, 8 and 64 threads. Remaining: member loading stops
-scaling past ~8 threads (kernel page-fault cost), the dynamic and layout
-stages at 8 threads, and single-threaded relocation processing and parsing.
-Adding four architectures cost x86-64 about 1.6% in instructions
-(4.939G → 5.018G on the clang link). Full tables:
-[tests/projects/bench.md](tests/projects/bench.md).
+**Status (W42, 2026-09-20, 32-core Threadripper, machine loaded):** met
+against mold at default and 64 threads, not at 8 threads or on one thread;
+wild still leads on every large link. Overlapping the dynamic, symbol-table
+and `.eh_frame` stages and cheaper GOT/PLT planning took clang from 150 to
+131 ms and libclang-cpp from 92 to 85 ms at default threads (a quiet-machine
+A/B of the same branch: clang 112 → 101 ms), with 1.3% fewer instructions and
+identical output at 1, 2, 8 and 64 threads. What is left, in order: kernel
+time (0.34–0.40 s of a clang link at 16 threads against 0.10 s at 1, from
+page faults and 12k `mprotect` calls — a `mallopt` call in `main.rs` is worth
+~20 ms but needs `unsafe` in a frozen file), the write at its backing's floor
+(~35 ms), slimmer `ObjectInput`/`InputSection`, and single-threaded
+relocation work. Full tables: [tests/projects/bench.md](tests/projects/bench.md).
 
 ---
 

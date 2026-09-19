@@ -80,7 +80,7 @@ can work at the same time without colliding.
 | W39 | Packaging and releases (M9) | `packaging/**`, `.github/workflows/release.yml`, `tests/projects/packaging*` | — | merged |
 | W40 | ELF32 and big-endian ELF (M4) | the ELF reader/writer generics in `src/elf/**`, `src/elf/arch/{i386,arm}*`, `src/arch/{i386,arm}*`, `tests/elf32*`, `tests/fixtures/{i386,arm,s390x,ppc64be}-*` | W30, W31, W32, W37 | merged |
 | W41 | Library API decisions for 1.0 (M9) | `src/args/options.rs`, `examples/**`, `tests/api*`, `tests/projects/api-review.md`; proposals for `lib.rs` | W36 | merged |
-| W42 | Performance round 3 (M5) | performance changes in `src/elf/{inputs,object,resolve,dynsym,layout,place}*`, `src/symbols/**`, `src/input/**`, `benches/**`, `tests/projects/bench*` | W28, W40 | in progress |
+| W42 | Performance round 3 (M5) | performance changes in `src/elf/{inputs,object,resolve,dynsym,layout,place}*`, `src/symbols/**`, `src/input/**`, `benches/**`, `tests/projects/bench*` | W28, W40 | merged |
 | W43 | x32 (M4) | `src/elf/arch/x86_64*` (x32 parts), `tests/x32*`, `tests/fixtures/x32-*` | W40 | merged |
 | W44 | RV32 (M4) | `src/elf/arch/riscv*` (word-size parameter), `tests/riscv32*`, `tests/fixtures/riscv32-*` | W30, W40 | merged |
 | W45 | s390x, the first big-endian target (M4) | `src/elf/arch/s390x*`, `src/arch/s390x*`, big-endian enablement in the ELF format layer, `tests/s390x*`, `tests/fixtures/s390x-*` | W40 | in progress |

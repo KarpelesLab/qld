@@ -490,12 +490,23 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   relaxes to a `lea` rather than an immediate.
 - A `__tls_get_addr` call removed by a relaxation keeps its PLT entry only
   when the symbol is preemptible.
+- Binutils before 2.46 puts TLS descriptor relocations in `.rela.plt`; 2.46
+  and qld put them in `.rela.dyn`.
 - **GNU ld 2.46 corrupts the x32 local-dynamic sequence** when the
   `__tls_get_addr` call is indirect: it writes the 12-byte form over 13
   bytes, leaving a stray byte. qld writes the intended 13-byte sequence.
 - lld rejects x32's `GOTTPOFF` and TLSDESC instruction forms, so it is only
   compared on position-independent output.
 - `-r` and `-b binary` are not implemented for ELF32 output.
+
+## x86 family (i386, x32, x86-64)
+
+- An undefined weak symbol is zero in **every** executable, position
+  independent ones included: no dynamic relocation and no `.dynsym` entry, as
+  GNU ld's `UNDEFINED_WEAK_RESOLVED_TO_ZERO` does. Shared objects keep the
+  relocation. GNU additionally keeps a relocation when the symbol has a GOT
+  or PLT relocation and no other reference in code; qld does not track that
+  distinction and resolves to zero there too.
 
 ## RISC-V 32
 
