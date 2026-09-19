@@ -512,6 +512,9 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 
 - Exception-index entries are merged per input section, as lld does, rather
   than per entry as GNU ld does (`--no-merge-exidx-entries` turns it off).
+  qld always writes the trailing sentinel and aligns `.ARM.exidx` to 4, as
+  lld does; GNU ld drops a sentinel that repeats the last
+  `EXIDX_CANTUNWIND` and aligns to 1.
 - Thunks carry the caller's instruction state, so a Thumb `bl` gets a Thumb
   thunk where lld reuses an A32 thunk through `blx`.
 - No `$a`, `$t` or `$d` mapping symbols are written for qld's own PLT and
