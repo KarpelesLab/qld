@@ -4,7 +4,7 @@
 //! instruction sequences and writes linker-generated stubs. The rest of the
 //! ELF backend never names a relocation constant: it asks [`Arch`], which is
 //! chosen once per link ([`Arch::of`]) and dispatches to the module for
-//! x86-64, AArch64, RISC-V 64, LoongArch64 or PowerPC64.
+//! x86-64, AArch64, RISC-V 64, LoongArch64, PowerPC64, i386 or s390x.
 //!
 //! The vocabulary is shared, so the relocation scan and the writer run one
 //! loop for every architecture:
@@ -12,10 +12,12 @@
 //! - [`Kind`] says what a relocation computes (`S + A`, `Page(S + A) -
 //!   Page(P)`, a GOT slot's address, a thread pointer offset, …) and
 //!   [`GotKind`] which GOT entry it goes through;
-//! - [`Width`] says how the result is stored: a data field, or an AArch64
-//!   RISC-V, LoongArch or PowerPC64 instruction field
+//! - [`Width`] says how the result is stored: a data field (in the
+//!   output's byte order, [`write_value_as`]), or an AArch64, RISC-V,
+//!   LoongArch, PowerPC64 or s390x instruction field
 //!   ([`crate::arch::aarch64::Field`], [`crate::arch::riscv::Field`],
-//!   [`crate::arch::loongarch::Field`], [`crate::arch::ppc64::Field`]);
+//!   [`crate::arch::loongarch::Field`], [`crate::arch::ppc64::Field`],
+//!   [`crate::arch::s390x::Field`]);
 //! - [`DynKind`] names the dynamic relocation a GOT slot, a PLT slot or a
 //!   copy needs, without naming its number.
 
@@ -25,6 +27,7 @@ pub mod i386;
 pub mod loongarch;
 pub mod ppc64;
 pub mod riscv;
+pub mod s390x;
 pub mod shrink;
 pub mod thunk;
 pub mod x86_64;
@@ -52,6 +55,8 @@ pub enum Arch {
     Ppc64,
     /// i386 (32-bit x86).
     I386,
+    /// s390x (z/Architecture, 64-bit, big-endian).
+    S390x,
 }
 
 /// What a relocation computes.
@@ -128,6 +133,11 @@ pub enum Kind {
     /// `S + A` and the place ([`Arch::relax`]; LoongArch: a GOT load turned
     /// into an address computation, or linker relaxation to `pcaddi`).
     Relax,
+    /// A load through a GOT entry that is kept, which the architecture
+    /// turns into a direct address computation once it knows the symbol's
+    /// address ([`Arch::relax_got_load`]; s390x: `lgrl` and `lg` through
+    /// `%r12` become `larl`). Otherwise `G + A - P` or `G + A - GOT`.
+    GotRelax,
     /// `A` alone: a hint whose addend locates a related instruction
     /// (PowerPC64 `R_PPC64_PCREL_OPT`).
     Addend,
@@ -179,6 +189,8 @@ pub enum Width {
     LoongArch(crate::arch::loongarch::Field),
     /// A PowerPC64 instruction (or data) field.
     Ppc(crate::arch::ppc64::Field),
+    /// An s390x instruction field.
+    S390(crate::arch::s390x::Field),
 }
 
 /// A classified relocation.
@@ -226,7 +238,12 @@ impl Class {
     pub fn needs_got(self) -> bool {
         matches!(
             self.kind,
-            Kind::Got | Kind::GotPage | Kind::GotAbs | Kind::GotPageOff | Kind::GotSlotRel
+            Kind::Got
+                | Kind::GotPage
+                | Kind::GotAbs
+                | Kind::GotPageOff
+                | Kind::GotSlotRel
+                | Kind::GotRelax
         )
     }
 
@@ -236,7 +253,7 @@ impl Class {
     pub fn uses_got_base(self) -> bool {
         matches!(
             self.kind,
-            Kind::GotSlotRel | Kind::GotRel | Kind::GotBasePc | Kind::GotPageOff
+            Kind::GotSlotRel | Kind::GotRel | Kind::GotBasePc | Kind::GotPageOff | Kind::GotRelax
         )
     }
 
@@ -422,6 +439,7 @@ impl Arch {
             EM_LOONGARCH => Some(Self::LoongArch64),
             EM_PPC64 => Some(Self::Ppc64),
             crate::elf::read::consts::EM_386 => Some(Self::I386),
+            crate::elf::read::consts::EM_S390 => Some(Self::S390x),
             _ => None,
         }
     }
@@ -441,6 +459,7 @@ impl Arch {
             Architecture::PowerPc64 if target.endian == crate::target::Endianness::Little => {
                 Some(Self::Ppc64)
             }
+            Architecture::S390x => Some(Self::S390x),
             _ => None,
         }
     }
@@ -513,6 +532,7 @@ impl Arch {
     pub fn kind(self) -> crate::elf::read::ElfKind {
         match self {
             Self::I386 => crate::elf::read::ElfKind::Elf32Le,
+            Self::S390x => crate::elf::read::ElfKind::Elf64Be,
             Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
                 crate::elf::read::ElfKind::Elf64Le
             }
@@ -569,6 +589,7 @@ impl Arch {
             Self::RiscV64 => EM_RISCV,
             Self::LoongArch64 => EM_LOONGARCH,
             Self::Ppc64 => EM_PPC64,
+            Self::S390x => crate::elf::read::consts::EM_S390,
         }
     }
 
@@ -582,6 +603,7 @@ impl Arch {
             Self::RiscV64 => "elf64lriscv",
             Self::LoongArch64 => "elf64loongarch",
             Self::Ppc64 => "elf64lppc",
+            Self::S390x => "elf64_s390",
         }
     }
 
@@ -590,6 +612,7 @@ impl Arch {
     pub fn reloc_name(self, r_type: u32) -> Option<&'static str> {
         match self {
             Self::LoongArch64 => loongarch::reloc_name(r_type),
+            Self::S390x => s390x::reloc_name(r_type),
             _ => reloc_name(self.machine(), r_type),
         }
     }
@@ -611,7 +634,7 @@ impl Arch {
     #[must_use]
     pub fn default_max_page(self) -> u64 {
         match self {
-            Self::I386 => 0x1000,
+            Self::I386 | Self::S390x => 0x1000,
             Self::X86_64 | Self::RiscV64 => 0x1000,
             Self::AArch64 | Self::Ppc64 => 0x1_0000,
             // GNU ld's; lld assumes 64 KiB.
@@ -630,6 +653,7 @@ impl Arch {
             Self::LoongArch64 => 0x1_2000_0000,
             // The first 256 MiB segment boundary.
             Self::Ppc64 => 0x1000_0000,
+            Self::S390x => 0x100_0000,
         }
     }
 
@@ -639,7 +663,7 @@ impl Arch {
     #[must_use]
     pub fn got_plt_reserved(self) -> u64 {
         match self {
-            Self::I386 => 3,
+            Self::I386 | Self::S390x => 3,
             Self::X86_64 | Self::AArch64 => 3,
             Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => 2,
         }
@@ -719,7 +743,7 @@ impl Arch {
     #[must_use]
     pub fn page_delta(self, target: u64, place: u64, r_type: u32) -> u64 {
         match self {
-            Self::I386 => {
+            Self::I386 | Self::S390x => {
                 crate::arch::aarch64::page(target).wrapping_sub(crate::arch::aarch64::page(place))
             }
             Self::LoongArch64 => loongarch::page_delta(target, place, r_type),
@@ -745,7 +769,7 @@ impl Arch {
         place: u64,
     ) -> Result<(), ApplyError> {
         match self {
-            Self::I386 => Err(ApplyError::BadInstruction),
+            Self::I386 | Self::S390x => Err(ApplyError::BadInstruction),
             Self::LoongArch64 => loongarch::relax(out, offset, r_type, target, place),
             Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::Ppc64 => {
                 Err(ApplyError::BadInstruction)
@@ -758,6 +782,14 @@ impl Arch {
     #[must_use]
     pub fn relaxes(self) -> bool {
         shrink::applies(self)
+    }
+
+    /// Whether the entries of `.hash` are eight bytes wide rather than
+    /// four: the s390x ABI's odd choice, which GNU ld implements in
+    /// `s390_elf64_size_info`.
+    #[must_use]
+    pub fn wide_sysv_hash(self) -> bool {
+        self == Self::S390x
     }
 
     /// Whether `.got.plt[0]` holds the address of `_DYNAMIC`.
@@ -837,7 +869,7 @@ impl Arch {
     pub fn is_thunk_branch(self, r_type: u32) -> bool {
         use crate::elf::read::consts::aarch64 as a64;
         match self {
-            Self::I386 => false,
+            Self::I386 | Self::S390x => false,
             Self::X86_64 | Self::RiscV64 | Self::LoongArch64 => false,
             Self::AArch64 => matches!(r_type, a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26),
             Self::Ppc64 => ppc64::is_thunk_branch(r_type),
@@ -860,7 +892,7 @@ impl Arch {
     #[must_use]
     pub fn branch_thunk(self, branch: Branch) -> Option<u64> {
         match self {
-            Self::I386 => None,
+            Self::I386 | Self::S390x => None,
             Self::X86_64 | Self::RiscV64 | Self::LoongArch64 => None,
             Self::AArch64 => (self.is_thunk_branch(branch.r_type)
                 && !crate::arch::aarch64::branch_in_range(branch.place, branch.target))
@@ -906,6 +938,7 @@ impl Arch {
             Self::RiscV64 => riscv::interpreter(riscv::EF_RISCV_FLOAT_ABI),
             Self::LoongArch64 => "/lib64/ld-linux-loongarch-lp64d.so.1",
             Self::Ppc64 => "/lib64/ld64.so.2",
+            Self::S390x => "/lib/ld64.so.1",
         }
     }
 
@@ -924,7 +957,7 @@ impl Arch {
     #[must_use]
     pub fn tcb_size(self) -> u64 {
         match self {
-            Self::I386 => 0,
+            Self::I386 | Self::S390x => 0,
             Self::X86_64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => 0,
             Self::AArch64 => 16,
         }
@@ -992,7 +1025,7 @@ impl Arch {
         match self {
             Self::I386 => ibt,
             Self::X86_64 => ibt,
-            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 => false,
+            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::S390x => false,
             Self::Ppc64 => true,
         }
     }
@@ -1009,10 +1042,10 @@ impl Arch {
     /// Whether a preemptible function that also has a GOT entry is called
     /// through `.plt.got` (jumping through that entry) rather than getting
     /// a PLT slot. PowerPC64 linkers give every called function a slot, and
-    /// so does GNU ld's AArch64 backend, which has no `.plt.got`.
+    /// so do GNU ld's AArch64 and s390x backends, which have no `.plt.got`.
     #[must_use]
     pub fn uses_plt_got(self) -> bool {
-        !matches!(self, Self::Ppc64 | Self::AArch64)
+        !matches!(self, Self::Ppc64 | Self::AArch64 | Self::S390x)
     }
 
     /// Whether a dynamic output's `IRELATIVE` relocations go to
@@ -1105,6 +1138,19 @@ impl Arch {
                 // PowerPC64 has no TLS descriptors.
                 DynKind::TlsDesc => p64::R_PPC64_NONE,
             },
+            Self::S390x => match kind {
+                DynKind::Relative => s390x::R_390_RELATIVE,
+                DynKind::Irelative => s390x::R_390_IRELATIVE,
+                DynKind::JumpSlot => s390x::R_390_JMP_SLOT,
+                DynKind::GlobDat => s390x::R_390_GLOB_DAT,
+                DynKind::Copy => s390x::R_390_COPY,
+                DynKind::Abs64 => s390x::R_390_64,
+                DynKind::DtpMod => s390x::R_390_TLS_DTPMOD,
+                DynKind::DtpOff => s390x::R_390_TLS_DTPOFF,
+                DynKind::TpOff => s390x::R_390_TLS_TPOFF,
+                // s390x has no TLS descriptors.
+                DynKind::TlsDesc => s390x::R_390_NONE,
+            },
         }
     }
 
@@ -1129,6 +1175,7 @@ impl Arch {
             ),
             Self::RiscV64 => riscv::is_branch(r_type),
             Self::LoongArch64 => loongarch::is_branch(r_type),
+            Self::S390x => s390x::is_branch(r_type),
         }
     }
 
@@ -1154,6 +1201,7 @@ impl Arch {
             Self::RiscV64 => riscv::classify(r_type, context),
             Self::LoongArch64 => loongarch::classify(r_type, addend, data, offset, context),
             Self::Ppc64 => ppc64::classify(r_type, data, offset, context),
+            Self::S390x => s390x::classify(r_type, data, offset, context),
         }
     }
 
@@ -1173,9 +1221,31 @@ impl Arch {
         match self {
             Self::I386 => i386::relax_got(out, offset, kind, value),
             Self::X86_64 => x86_64::relax_got(out, offset, kind, value),
-            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
+            Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 | Self::S390x => {
                 Err(ApplyError::BadInstruction)
             }
+        }
+    }
+
+    /// Writes a GOT load classified [`Kind::GotRelax`], given the symbol's
+    /// address and, in `values`, the GOT entry's address plus the addend
+    /// ([`RelaxValues::got`]), the place and the GOT base.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplyError`] when a field does not fit.
+    #[inline(never)]
+    pub fn relax_got_load(
+        self,
+        out: &mut [u8],
+        offset: u64,
+        r_type: u32,
+        symbol: u64,
+        values: RelaxValues,
+    ) -> Result<(), ApplyError> {
+        match self {
+            Self::S390x => s390x::relax_got(out, offset, r_type, symbol, values),
+            _ => Err(ApplyError::BadInstruction),
         }
     }
 
@@ -1200,6 +1270,7 @@ impl Arch {
             Self::RiscV64 => Err(ApplyError::BadInstruction),
             Self::LoongArch64 => loongarch::relax_tls(out, offset, kind, r_type, values),
             Self::Ppc64 => ppc64::relax_tls(out, offset, kind, r_type, values),
+            Self::S390x => s390x::relax_tls(out, offset, kind, r_type, values),
         }
     }
 
@@ -1216,6 +1287,7 @@ impl Arch {
             Self::RiscV64 => riscv::PLT_HEADER_SIZE,
             Self::LoongArch64 => loongarch::PLT_HEADER_SIZE,
             Self::Ppc64 => crate::arch::ppc64::GLINK_HEADER_SIZE,
+            Self::S390x => s390x::PLT_HEADER_SIZE,
         }
     }
 
@@ -1229,6 +1301,7 @@ impl Arch {
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
             Self::Ppc64 => 4,
+            Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
     }
 
@@ -1249,20 +1322,27 @@ impl Arch {
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
             Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            // No `.plt.got` (see `uses_plt_got`).
+            Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
     }
 
-    /// Alignment of `.plt`, `.plt.sec` and `.plt.got`.
+    /// Alignment of `.plt`, `.plt.sec` and `.plt.got`: GNU ld's s390x
+    /// `.plt` is aligned to 4.
     #[must_use]
     pub fn plt_align(self) -> u64 {
-        16
+        if self == Self::S390x { 4 } else { 16 }
     }
 
     /// Alignment of a static executable's `.plt`, which holds only IFUNC
     /// stubs: GNU ld's i386 stubs are 8 bytes and aligned to 8.
     #[must_use]
     pub fn iplt_align(self) -> u64 {
-        if self == Self::I386 { 8 } else { 16 }
+        match self {
+            Self::I386 => 8,
+            Self::S390x => 4,
+            _ => 16,
+        }
     }
 
     /// Size of an IFUNC stub in a static executable.
@@ -1275,6 +1355,7 @@ impl Arch {
             Self::RiscV64 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
             Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
     }
 
@@ -1300,6 +1381,8 @@ impl Arch {
             Self::AArch64 | Self::RiscV64 | Self::LoongArch64 => plt,
             // The dynamic linker points every slot at its lazy entry.
             Self::Ppc64 => 0,
+            // The second half of the entry.
+            Self::S390x => entry.wrapping_add(crate::arch::s390x::PLT_LAZY_OFFSET),
         }
     }
 
@@ -1323,6 +1406,8 @@ impl Arch {
             Self::RiscV64 => riscv::write_plt_header(out, plt, got_plt),
             Self::LoongArch64 => loongarch::write_plt_header(out, plt, got_plt),
             Self::Ppc64 => ppc64::write_plt_header(out, plt, got_plt),
+            // `got_plt` is the GOT pointer on s390x (see `write_plt`).
+            Self::S390x => s390x::write_plt_header(out, plt, got_plt),
         }
     }
 
@@ -1364,6 +1449,7 @@ impl Arch {
             Self::RiscV64 => riscv::write_plt_entry(out, entry, slot),
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
             Self::Ppc64 => ppc64::write_plt_entry(out, entry, plt),
+            Self::S390x => s390x::write_plt_entry(out, entry, slot, index, plt),
         }
     }
 
@@ -1392,6 +1478,8 @@ impl Arch {
             Self::RiscV64 => riscv::write_plt_entry(out, entry, slot),
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
             Self::Ppc64 => ppc64::write_call_stub(out, slot, got_base),
+            // No `.plt.sec` or `.plt.got`.
+            Self::S390x => Err(ApplyError::BadInstruction),
         }
     }
 
@@ -1418,6 +1506,7 @@ impl Arch {
             Self::RiscV64 => riscv::write_plt_entry(out, stub, slot_address),
             Self::LoongArch64 => loongarch::write_plt_entry(out, stub, slot_address),
             Self::Ppc64 => ppc64::write_call_stub(out, slot_address, got_base),
+            Self::S390x => s390x::write_iplt(out, stub, slot_address),
         }
     }
 
@@ -1436,7 +1525,7 @@ impl Arch {
         r_type: u32,
     ) -> Result<bool, ApplyError> {
         match self {
-            Self::I386 => Ok(false),
+            Self::I386 | Self::S390x => Ok(false),
             Self::X86_64 | Self::RiscV64 => Ok(false),
             Self::LoongArch64 => loongarch::undefined_weak_branch(out, offset, r_type),
             Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
@@ -1454,6 +1543,7 @@ impl Arch {
             Self::RiscV64 => riscv::write_nops(out),
             Self::LoongArch64 => loongarch::write_nops(out),
             Self::Ppc64 => ppc64::write_nops(out),
+            Self::S390x => s390x::write_nops(out),
         }
     }
 }
@@ -1466,7 +1556,7 @@ fn slot<const N: usize>(out: &mut [u8], at: u64) -> Result<&mut [u8; N], ApplyEr
 }
 
 /// Writes `value` into the field of width `width` at `offset`, checking that
-/// it fits.
+/// it fits, in little-endian byte order ([`write_value_as`]).
 ///
 /// # Errors
 ///
@@ -1477,33 +1567,49 @@ pub fn write_value(
     width: Width,
     value: u64,
 ) -> Result<(), ApplyError> {
+    write_value_as::<crate::elf::read::Little>(out, offset, width, value)
+}
+
+/// Writes `value` into the field of width `width` at `offset`, checking that
+/// it fits. Data fields are stored in byte order `E`; instruction fields
+/// in their architecture's.
+///
+/// # Errors
+///
+/// [`ApplyError::Overflow`] or [`ApplyError::OutOfBounds`].
+pub fn write_value_as<E: crate::elf::read::Endian>(
+    out: &mut [u8],
+    offset: u64,
+    width: Width,
+    value: u64,
+) -> Result<(), ApplyError> {
     let signed = value as i64;
     match width {
         Width::None => {}
-        Width::W64 => *slot::<8>(out, offset)? = value.to_le_bytes(),
+        Width::W64 => *slot::<8>(out, offset)? = E::put_u64(value),
         Width::U32 => {
             let v = u32::try_from(value).map_err(|_| ApplyError::Overflow)?;
-            *slot::<4>(out, offset)? = v.to_le_bytes();
+            *slot::<4>(out, offset)? = E::put_u32(v);
         }
         Width::I32 => {
             let v = i32::try_from(signed).map_err(|_| ApplyError::Overflow)?;
-            *slot::<4>(out, offset)? = v.to_le_bytes();
+            *slot::<4>(out, offset)? = E::put_u32(v as u32);
         }
         Width::Any32 => {
             if i32::try_from(signed).is_err() && u32::try_from(value).is_err() {
                 return Err(ApplyError::Overflow);
             }
-            *slot::<4>(out, offset)? = (value as u32).to_le_bytes();
+            *slot::<4>(out, offset)? = E::put_u32(value as u32);
         }
         Width::Any16 => {
             if i16::try_from(signed).is_err() && u16::try_from(value).is_err() {
                 return Err(ApplyError::Overflow);
             }
-            *slot::<2>(out, offset)? = (value as u16).to_le_bytes();
+            *slot::<2>(out, offset)? = E::put_u16(value as u16);
         }
         Width::I16 => {
             let v = i16::try_from(signed).map_err(|_| ApplyError::Overflow)?;
-            *slot::<2>(out, offset)? = v.to_le_bytes();
+            *slot::<2>(out, offset)? = E::put_u16(v as u16);
         }
         Width::Any8 => {
             if i8::try_from(signed).is_err() && u8::try_from(value).is_err() {
@@ -1533,6 +1639,7 @@ pub fn write_value(
         }
         Width::LoongArch(field) => loongarch::write_field(out, offset, field, value)?,
         Width::Ppc(field) => write_ppc64(out, offset, field, signed)?,
+        Width::S390(field) => s390x::write_field(out, offset, field, value)?,
     }
     Ok(())
 }
@@ -1589,36 +1696,47 @@ fn write_ppc64(
 
 /// Adds `delta` to the field of width `width` at `offset`, wrapping as the
 /// label-difference relocations do ([`Kind::Add`]; [`Kind::Sub`] passes
-/// the negated value).
+/// the negated value), in little-endian byte order ([`add_value_as`]).
 ///
 /// # Errors
 ///
 /// [`ApplyError::OutOfBounds`], or [`ApplyError::BadInstruction`] for a
 /// width that is not data.
 pub fn add_value(out: &mut [u8], offset: u64, width: Width, delta: u64) -> Result<(), ApplyError> {
+    add_value_as::<crate::elf::read::Little>(out, offset, width, delta)
+}
+
+/// [`add_value`] for data fields in byte order `E`.
+///
+/// # Errors
+///
+/// [`ApplyError::OutOfBounds`], or [`ApplyError::BadInstruction`] for a
+/// width that is not data.
+pub fn add_value_as<E: crate::elf::read::Endian>(
+    out: &mut [u8],
+    offset: u64,
+    width: Width,
+    delta: u64,
+) -> Result<(), ApplyError> {
     match width {
         Width::W64 => {
             let word = slot::<8>(out, offset)?;
-            *word = u64::from_le_bytes(*word).wrapping_add(delta).to_le_bytes();
+            *word = E::put_u64(E::u64(*word).wrapping_add(delta));
         }
         Width::U32 | Width::I32 | Width::Any32 => {
             let word = slot::<4>(out, offset)?;
-            *word = u32::from_le_bytes(*word)
-                .wrapping_add(delta as u32)
-                .to_le_bytes();
+            *word = E::put_u32(E::u32(*word).wrapping_add(delta as u32));
         }
         Width::Any16 | Width::I16 => {
             let word = slot::<2>(out, offset)?;
-            *word = u16::from_le_bytes(*word)
-                .wrapping_add(delta as u16)
-                .to_le_bytes();
+            *word = E::put_u16(E::u16(*word).wrapping_add(delta as u16));
         }
         Width::Any8 | Width::I8 => {
             let [byte] = slot::<1>(out, offset)?;
             *byte = byte.wrapping_add(delta as u8);
         }
         Width::LoongArch(field) => loongarch::add_field(out, offset, field, delta)?,
-        Width::None | Width::Field(_) | Width::RiscV(_) | Width::Ppc(_) => {
+        Width::None | Width::Field(_) | Width::RiscV(_) | Width::Ppc(_) | Width::S390(_) => {
             return Err(ApplyError::BadInstruction);
         }
     }
@@ -1678,5 +1796,6 @@ pub fn width_bytes(width: Width) -> usize {
         Width::RiscV(field) => field.bytes(),
         Width::LoongArch(field) => field.bytes(),
         Width::Ppc(field) => field.bytes(),
+        Width::S390(field) => field.bytes(),
     }
 }

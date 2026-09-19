@@ -758,6 +758,7 @@ impl GnuParser {
             Action::CallGraphOrderingFile => o.call_graph_ordering_file = Some(path(m)?),
             Action::PrintSymbolOrder => o.print_symbol_order = Some(path(m)?),
             Action::GdbIndex(on) => o.gdb_index = on,
+            Action::S390Pgste => o.s390_pgste = true,
             Action::DebugNames(on) => o.debug_names = on,
             Action::SeparateDebugFile(on) => {
                 o.separate_debug_file = match (&m.value, on) {

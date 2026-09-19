@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
-use crate::elf::read::{Elf32Le, Elf64Le, ElfKind};
+use crate::elf::read::{Elf32Le, Elf64Be, Elf64Le, ElfKind};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
 use crate::passes::IcfMode;
@@ -90,7 +90,8 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     match input_kind(&prepared.options) {
         ElfKind::Elf64Le => link_as::<Elf64Le>(&prepared, diagnostics),
         ElfKind::Elf32Le => link_as::<Elf32Le>(&prepared, diagnostics),
-        kind @ (ElfKind::Elf64Be | ElfKind::Elf32Be) => Err(Error::Unimplemented(format!(
+        ElfKind::Elf64Be => link_as::<Elf64Be>(&prepared, diagnostics),
+        kind @ ElfKind::Elf32Be => Err(Error::Unimplemented(format!(
             "big-endian ELF output ({kind:?}) needs a big-endian architecture (M4)"
         ))),
     }
@@ -167,6 +168,14 @@ fn link_as<F: crate::elf::read::ElfFormat>(
     diagnostics: &dyn DiagnosticSink,
 ) -> Result<()> {
     let options = &prepared.options;
+    // The DWARF the indexes are built from is read little-endian only.
+    if <F::Endian as crate::elf::read::Endian>::ENDIANNESS == crate::target::Endianness::Big
+        && (options.gdb_index || options.debug_names)
+    {
+        return Err(Error::Unimplemented(
+            "--gdb-index and --debug-names for big-endian output".into(),
+        ));
+    }
     if options.kind == crate::args::OutputKind::Relocatable && F::KIND != ElfKind::Elf64Le {
         // `relocatable` writes 64-bit records, and has no `SHT_REL` output.
         return Err(Error::Unimplemented(format!(
@@ -720,6 +729,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
 
     let mut synth = Synth {
         arch: context.arch,
+        bind_now: options.bind_now,
         ..Synth::default()
     };
     narrow.run(|| synth.plan_entries(&refs, &scan, mode));

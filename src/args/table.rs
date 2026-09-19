@@ -201,6 +201,7 @@ pub(crate) enum Action {
     PrintSymbolOrder,
     GdbIndex(bool),
     DebugNames(bool),
+    S390Pgste,
     SeparateDebugFile(bool),
     PackDynRelocs,
     ApplyDynamicRelocs(bool),
@@ -1372,6 +1373,13 @@ pub static GNU_OPTIONS: &[OptionDef] = &[
         A::GdbIndex(false),
         "",
         "Do not write a .gdb_index section (default)",
+    ),
+    imp(
+        "s390-pgste",
+        F,
+        A::S390Pgste,
+        "",
+        "s390x: add a PT_S390_PGSTE segment, asking the kernel for page tables with guest storage extension",
     ),
     imp(
         "debug-names",

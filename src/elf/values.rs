@@ -176,6 +176,8 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
                 layout.output_places.get(output as usize).map_or(0, |p| p.1)
             }
             Value::GotBase if self.synth.arch.toc_bias().is_some() => self.got_base(),
+            // s390x's GOT pointer is where the reserved words are.
+            Value::GotBase if self.synth.got_header > 0 => self.got_base(),
             Value::GotBase => layout
                 .synthetic(Synthetic::GotPlt)
                 .or_else(|| layout.synthetic(Synthetic::Got))
@@ -423,6 +425,14 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
                 .layout
                 .synthetic(Synthetic::Got)
                 .map_or(0, |(addr, ..)| addr.wrapping_add(bias));
+        }
+        // s390x when `.got` comes first: the GOT pointer is its start,
+        // where the dynamic linker's reserved words are.
+        if self.synth.got_header > 0 {
+            return self
+                .layout
+                .synthetic(Synthetic::Got)
+                .map_or(0, |(addr, ..)| addr);
         }
         self.layout
             .synthetic(Synthetic::GotPlt)

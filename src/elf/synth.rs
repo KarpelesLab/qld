@@ -157,6 +157,13 @@ pub struct Synth {
     pub pac_plt: bool,
     /// Reserved words at the start of `.got.plt`.
     pub got_plt_reserved: u64,
+    /// Reserved words at the start of `.got`: PowerPC64's link-time TOC
+    /// pointer, or s390x's three words for the dynamic linker when `.got`
+    /// comes before `.got.plt`.
+    pub got_header: u64,
+    /// `-z now`, which puts `.got.plt` at the start of `.got` (so on
+    /// s390x the dynamic linker's words go there, not into `.got`).
+    pub bind_now: bool,
     /// Dynamic relocations in `.rela.dyn` that come from GOT entries and
     /// copy relocations, `(relative, other)`.
     pub got_dyn_relocs: (u64, u64),
@@ -315,13 +322,22 @@ impl Synth {
             || self.tlsld
             || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
-        // `.got.plt` words; GNU ld's i386 backend still reserves them, and
-        // `_GLOBAL_OFFSET_TABLE_` points at them.
-        self.got_plt_reserved = if (dynamic || self.arch == Arch::I386) && has_got_plt {
+        // `.got.plt` words; GNU ld's i386 and s390x backends still reserve
+        // them, and `_GLOBAL_OFFSET_TABLE_` points at them.
+        let reserve = (dynamic || matches!(self.arch, Arch::I386 | Arch::S390x)) && has_got_plt;
+        self.got_plt_reserved = if reserve {
             self.arch.got_plt_reserved()
         } else {
             0
         };
+        self.got_header = self.arch.got_header_words();
+        // s390x keeps the GOT pointer at the very start of the GOT area,
+        // so the reserved words belong to whichever of `.got` and
+        // `.got.plt` comes first (GNU ld's `s390_gotplt_after_got_p`).
+        if self.arch == Arch::S390x && !self.bind_now {
+            self.got_header = self.got_plt_reserved;
+            self.got_plt_reserved = 0;
+        }
         if self.arch == Arch::RiscV64 {
             self.riscv_attributes = super::arch::riscv::attributes::collect(refs);
         }
@@ -508,8 +524,7 @@ impl Synth {
     /// Number of words the GOT occupies.
     #[must_use]
     pub fn got_words(&self) -> u64 {
-        self.arch
-            .got_header_words()
+        self.got_header
             .saturating_add(u64_len(self.got.len()))
             .saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2))
             .saturating_add(u64_len(self.gottpoff.len()))
@@ -520,7 +535,7 @@ impl Synth {
     /// The first GOT word of each kind of entry.
     #[must_use]
     pub fn got_base_word(&self, kind: GotKind) -> u64 {
-        let header = self.arch.got_header_words();
+        let header = self.got_header;
         let address = header.saturating_add(u64_len(self.got.len()));
         let tlsgd = address.saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2));
         let tpoff = tlsgd.saturating_add(u64_len(self.gottpoff.len()));
@@ -982,7 +997,7 @@ pub fn plan_property_note<F: crate::elf::read::ElfFormat>(
         .into_iter()
         .filter(|&(_, value)| value != 0)
         .collect();
-        return encode_property_note(&properties, F::WORD_SIZE);
+        return encode_property_note::<F::Endian>(&properties, F::WORD_SIZE);
     }
     let mut features = features;
     if options.x86.ibt {
@@ -1009,27 +1024,30 @@ pub fn plan_property_note<F: crate::elf::read::ElfFormat>(
     .into_iter()
     .filter(|&(_, value)| value != 0)
     .collect();
-    encode_property_note(&properties, F::WORD_SIZE)
+    encode_property_note::<F::Endian>(&properties, F::WORD_SIZE)
 }
 
-/// Encodes `.note.gnu.property` from `(type, value)` pairs, in type order.
-/// Each property's data is padded to the class's word size (`word`): 16
-/// bytes a property in ELF64, 12 in ELF32.
-fn encode_property_note(properties: &[(u32, u32)], word: usize) -> Option<Vec<u8>> {
+/// Encodes `.note.gnu.property` from `(type, value)` pairs, in type order,
+/// in the output's byte order. Each property's data is padded to the
+/// class's word size (`word`): 16 bytes a property in ELF64, 12 in ELF32.
+fn encode_property_note<E: crate::elf::read::Endian>(
+    properties: &[(u32, u32)],
+    word: usize,
+) -> Option<Vec<u8>> {
     if properties.is_empty() {
         return None;
     }
     let entry = 8usize.saturating_add(4usize.next_multiple_of(word.max(1)));
     let descsz = u32::try_from(properties.len().saturating_mul(entry)).ok()?;
     let mut note = Vec::with_capacity(16usize.saturating_add(descsz as usize));
-    note.extend_from_slice(&4u32.to_le_bytes());
-    note.extend_from_slice(&descsz.to_le_bytes());
-    note.extend_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
+    note.extend_from_slice(&E::put_u32(4));
+    note.extend_from_slice(&E::put_u32(descsz));
+    note.extend_from_slice(&E::put_u32(NT_GNU_PROPERTY_TYPE_0));
     note.extend_from_slice(b"GNU\0");
     for &(kind, value) in properties {
-        note.extend_from_slice(&kind.to_le_bytes());
-        note.extend_from_slice(&4u32.to_le_bytes());
-        note.extend_from_slice(&value.to_le_bytes());
+        note.extend_from_slice(&E::put_u32(kind));
+        note.extend_from_slice(&E::put_u32(4));
+        note.extend_from_slice(&E::put_u32(value));
         note.resize(note.len().next_multiple_of(word.max(1)), 0);
     }
     Some(note)
@@ -1049,14 +1067,15 @@ pub fn plan_interp(options: &LinkOptions, mode: Mode, arch: Arch) -> Option<Vec<
     Some(path)
 }
 
-/// Writes the header of a build-id note of `size` bytes into `out`; the
-/// descriptor is filled in after the image is complete.
-pub fn write_build_id_header(out: &mut [u8], size: u64) {
+/// Writes the header of a build-id note of `size` bytes into `out`, in the
+/// output's byte order; the descriptor is filled in after the image is
+/// complete.
+pub fn write_build_id_header<E: crate::elf::read::Endian>(out: &mut [u8], size: u64) {
     let descsz = u32::try_from(size).unwrap_or(0);
     let header = [
-        4u32.to_le_bytes(),
-        descsz.to_le_bytes(),
-        NT_GNU_BUILD_ID.to_le_bytes(),
+        E::put_u32(4),
+        E::put_u32(descsz),
+        E::put_u32(NT_GNU_BUILD_ID),
         *b"GNU\0",
     ];
     for (chunk, bytes) in out.as_chunks_mut::<4>().0.iter_mut().zip(header) {

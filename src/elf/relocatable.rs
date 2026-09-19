@@ -2007,7 +2007,7 @@ fn write_chunk<'a, F: crate::elf::read::ElfFormat>(
             Ok(())
         }
         Chunk::BuildId => {
-            crate::elf::synth::write_build_id_header(
+            crate::elf::synth::write_build_id_header::<F::Endian>(
                 out,
                 u64::try_from(out.len()).unwrap_or(0).saturating_sub(16),
             );
