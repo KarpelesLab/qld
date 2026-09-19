@@ -520,8 +520,16 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
         return Ok(());
     }
 
-    let needed = narrow.run(|| dso::plan_needed(files, &symbols, &rules, &resolution));
     let mode = Mode::new(options, files.iter().any(|f| f.shared.is_some()));
+    let rule_set = RuleSet::for_link(script, diagnostics, super::arch::Arch::of(options, files));
+    // Which shared objects the output needs and where input sections go are
+    // independent passes; neither keeps every thread busy.
+    let (needed, mut placement) = narrow.run(|| {
+        rayon::join(
+            || dso::plan_needed(files, &symbols, &rules, &resolution),
+            || place::place(&rule_set, files, &sections, options),
+        )
+    });
     if mode.dynamic && !mode.shared {
         narrow.run(|| dso::mark_dependency_symbols(files, &symbols, &needed, options));
     }
@@ -531,8 +539,6 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
     }
     let always = always.as_slice();
 
-    let rule_set = RuleSet::for_link(script, diagnostics, super::arch::Arch::of(options, files));
-    let mut placement = narrow.run(|| place::place(&rule_set, files, &sections, options));
     for id in &placement.discarded {
         if let Some(slot) = sections.live.get_mut(id.index()) {
             *slot = false;

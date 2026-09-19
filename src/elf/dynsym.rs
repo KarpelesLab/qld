@@ -803,7 +803,31 @@ pub fn plan_chosen<F: crate::elf::read::ElfFormat>(
         .par_iter()
         .map(|&entry| entry_name(entry))
         .collect();
-    plan.names = dynstr.add_all(&texts)?;
+    // The hash tables need no string offset and the string table no hash:
+    // they are built side by side (clang exports 150,000 symbols, and each
+    // takes about the same time).
+    let (names, hashes) = rayon::join(
+        || dynstr.add_all(&texts),
+        || -> Result<(Vec<u8>, Vec<u8>)> {
+            let hashed_names: Vec<(u32, &[u8])> = hashed
+                .iter()
+                .map(|&(hash, entry, _)| (hash, entry_name(entry)))
+                .collect();
+            let gnu_hash = if gnu {
+                build_gnu_hash(&hashed_names, nbuckets, plan.first_hashed, kind)?
+            } else {
+                Vec::new()
+            };
+            let sysv_hash = if sysv {
+                build_sysv_hash(&texts, kind)?
+            } else {
+                Vec::new()
+            };
+            Ok((gnu_hash, sysv_hash))
+        },
+    );
+    plan.names = names?;
+    (plan.gnu_hash, plan.sysv_hash) = hashes?;
 
     // `.gnu.version`.
     if versioned {
@@ -934,18 +958,6 @@ pub fn plan_chosen<F: crate::elf::read::ElfFormat>(
         plan.verdef = data;
     }
 
-    // Hash tables.
-    let hashed_names: Vec<(u32, &[u8])> = hashed
-        .iter()
-        .map(|&(hash, entry, _)| (hash, entry_name(entry)))
-        .collect();
-    if gnu {
-        plan.gnu_hash = build_gnu_hash(&hashed_names, nbuckets, plan.first_hashed, kind)?;
-    }
-    if sysv {
-        let names: Vec<&[u8]> = plan.entries.iter().map(|&e| entry_name(e)).collect();
-        plan.sysv_hash = build_sysv_hash(&names, kind)?;
-    }
     plan.dynstr = dynstr.data;
 
     plan.dynamic = dynamic_entries(
