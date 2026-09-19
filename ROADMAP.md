@@ -213,12 +213,19 @@ and TLS models.
       meaning. Outstanding: shrinking relaxation (deleting `nop`s,
       `R_LARCH_ALIGN`), B26 thunks, ALIGN synthesis in `-r`; the fixtures run
       under qemu in CI
-- [ ] **s390x**
-- [~] Big-endian ELF and ELF32 handled through the same generic code
+- [x] **s390x** (big-endian): the relocation set including the
+      halfword-counted PC-relative forms, `GOTENT`/`GOTPCDBL`, the 32-byte PLT
+      with lazy binding, IFUNC, all TLS models through `__tls_get_offset` with
+      the `GDCALL`/`LDCALL` markers and their relaxations, `lgrl`→`larl`,
+      eight-byte `.hash`, `--s390-pgste`; compared with GNU ld 2.42 function
+      by function and run under qemu. Outstanding: `-r`, `--gdb-index` and
+      `--debug-names` for big-endian output, `R_390_PLTOFF*`
+- [x] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths): the
       pipeline is generic over `ElfFormat` and chosen once in `elf::link`.
-      ELF32 and ELF64 little-endian are built; big-endian is encoded and
-      decoded in unit tests but has no architecture yet (PowerPC64 BE, s390x)
+      ELF64/ELF32 little-endian and ELF64 big-endian are instantiated, the
+      last exercised end to end by s390x; `Elf32Be` is only decoded in unit
+      tests so far
 
 **Status:** AArch64 is the second architecture. Validation without an arm64
 machine: every fixture links with qld and with `aarch64-unknown-linux-gnu-ld`,
