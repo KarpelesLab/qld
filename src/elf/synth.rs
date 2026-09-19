@@ -322,7 +322,7 @@ impl Synth {
         } else {
             0
         };
-        if self.arch == Arch::RiscV64 {
+        if self.arch.is_riscv() {
             self.riscv_attributes = super::arch::riscv::attributes::collect(refs);
         }
         self.section_dyn_relocs = scan.section_dyn_relocs();

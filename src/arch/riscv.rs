@@ -20,6 +20,9 @@ pub const NOP: u32 = 0x0000_0013;
 pub const C_NOP: u16 = 0x0001;
 /// `c.j` with a zero offset.
 pub const C_J: u16 = 0xa001;
+/// `c.jal` with a zero offset (RV32C only: RV64C reuses the encoding for
+/// `c.addiw`).
+pub const C_JAL: u16 = 0x2001;
 /// `jal` with a zero offset and `rd` = x0.
 pub const JAL: u32 = 0x0000_006f;
 
@@ -31,6 +34,8 @@ pub const AUIPC: u32 = 0x17;
 pub const JALR: u32 = 0x67;
 /// Opcode and function of `ld`.
 pub const LD: u32 = 0x3003;
+/// Opcode and function of `lw`.
+pub const LW: u32 = 0x2003;
 /// Opcode of `lui`.
 pub const LUI: u32 = 0x37;
 /// Opcode and function of `srli`.
@@ -478,6 +483,14 @@ impl Field {
     }
 }
 
+/// `value` as RV32 sees it in a `%hi`/`%lo` pair: addresses wrap at 32
+/// bits, so every value is in reach of `lui` and `auipc` (lld sign-extends
+/// `value + 0x800` from 32 bits before checking the range).
+#[must_use]
+pub const fn wrap32_hi(value: u64) -> u64 {
+    (value.wrapping_add(0x800) as u32 as i32 as i64 as u64).wrapping_sub(0x800)
+}
+
 /// Whether `%hi(value)` fits the 20-bit `lui`/`auipc` immediate, as a
 /// signed number.
 ///
@@ -530,6 +543,25 @@ mod tests {
         assert_eq!(word(Field::Lo12I, 0x0005_0513, 0x1234_5678), 0x6785_0513);
         // sw a1, %lo(0x12345678)(a0)
         assert_eq!(word(Field::Lo12S, 0x00b5_2023, 0x1234_5678), 0x66b5_2c23);
+    }
+
+    #[test]
+    fn rv32_upper_parts_wrap() {
+        // 0x80000000 is out of RV64's `lui` range, but RV32 wraps: `lui`
+        // loads 0x80000 whether the value reads as 2 GiB or -2 GiB.
+        assert_eq!(check_hi(0x8000_0000), Err(FieldError::Overflow));
+        for value in [0x8000_0000u64, 0x7fff_f800, 0xffff_f7ff, 0x1_0000_0010] {
+            let wrapped = wrap32_hi(value);
+            assert_eq!(check_hi(wrapped), Ok(()), "{value:#x}");
+            assert_eq!(hi20(wrapped), hi20(value), "{value:#x}");
+            assert_eq!(lo12(wrapped), lo12(value), "{value:#x}");
+        }
+        assert_eq!(wrap32_hi(0x1234), 0x1234);
+        assert_eq!(wrap32_hi((-8i64) as u64), (-8i64) as u64);
+        assert_eq!(
+            word(Field::Hi20, 0x0000_0537, wrap32_hi(0x8000_0000)),
+            0x8000_0537
+        );
     }
 
     #[test]

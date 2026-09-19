@@ -1625,7 +1625,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         return write_eh_frame(input, eh, base, out);
     }
     // RISC-V relocations depend on each other and on linker relaxation.
-    if input.context.arch == Arch::RiscV64 {
+    if input.context.arch.is_riscv() {
         let section = super::arch::riscv::apply::SectionWrite {
             id,
             file: file_index,

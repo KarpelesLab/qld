@@ -15,10 +15,11 @@
 //!   known before layout.
 //!
 //! `.eh_frame` relocations follow their records to their output offsets;
-//! those of dropped records become `R_X86_64_NONE`. Relocation types are the
-//! input's, except that `GOTPCRELX` relocations the link relaxed become
-//! `R_X86_64_PC32` (or `R_X86_64_32S`/`R_X86_64_32` for immediates), as in
-//! GNU ld; TLS relaxations are not reflected.
+//! those of dropped records become `R_X86_64_NONE`. Entries are the output
+//! class's `Elf_Rela` (`SHT_REL` inputs are not supported). Relocation
+//! types are the input's, except that `GOTPCRELX` relocations the link
+//! relaxed become `R_X86_64_PC32` (or `R_X86_64_32S`/`R_X86_64_32` for
+//! immediates), as in GNU ld; TLS relaxations are not reflected.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -42,9 +43,6 @@ use super::symtab::SymtabPlan;
 use super::values::Addresses;
 use super::write::WriteInput;
 use crate::symbols::SymbolFlags;
-
-/// Size of an `Elf64_Rela`.
-const RELA_SIZE: usize = 24;
 
 fn relocations<'a, F: crate::elf::read::ElfFormat>(
     object: &ObjectInput<'a, F>,
@@ -134,15 +132,24 @@ pub fn count<F: crate::elf::read::ElfFormat>(
         .reduce(|| 0, u64::saturating_add))
 }
 
-/// Writes one output relocation.
-fn put(out: &mut [u8], offset: u64, symbol: usize, r_type: u32, addend: i64) {
-    let Some(entry) = out.first_chunk_mut::<RELA_SIZE>() else {
-        return;
+/// Writes one output relocation, an `Elf_Rela` of the output's class.
+fn put<F: crate::elf::read::ElfFormat>(
+    out: &mut [u8],
+    offset: u64,
+    symbol: usize,
+    r_type: u32,
+    addend: i64,
+) {
+    use crate::elf::read::RawRecord;
+    let rel = Relocation {
+        offset,
+        symbol: u32::try_from(symbol).unwrap_or(0),
+        r_type,
+        addend,
     };
-    let symbol = u64::try_from(symbol).unwrap_or(0) & 0xffff_ffff;
-    entry[0..8].copy_from_slice(&offset.to_le_bytes());
-    entry[8..16].copy_from_slice(&((symbol << 32) | u64::from(r_type)).to_le_bytes());
-    entry[16..24].copy_from_slice(&addend.to_le_bytes());
+    if let Some(entry) = out.get_mut(..<F::Rela as RawRecord>::SIZE) {
+        entry.copy_from_slice(F::encode_rela(&rel).as_bytes());
+    }
 }
 
 /// The output symbol and addend of relocation `rel` of `file`.
@@ -264,7 +271,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
         );
         let len = usize::try_from(count)
             .unwrap_or(usize::MAX)
-            .saturating_mul(RELA_SIZE)
+            .saturating_mul(<F::Rela as crate::elf::read::RawRecord>::SIZE)
             .min(rest.len());
         let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
         slices.push((placed.member, head));
@@ -289,7 +296,8 @@ pub fn write<F: crate::elf::read::ElfFormat>(
             return;
         };
         let base = addresses.section_address(id).unwrap_or(0);
-        let mut entries = out.as_chunks_mut::<RELA_SIZE>().0.iter_mut();
+        // Whole entries: the slice was sized above from the same count.
+        let mut entries = out.chunks_mut(<F::Rela as crate::elf::read::RawRecord>::SIZE);
         if section.kind == SectionKind::EhFrame {
             let Some(eh) = addresses
                 .eh_frames
@@ -306,7 +314,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         continue;
                     };
                     if !record.live {
-                        put(entry, 0, 0, R_X86_64_NONE, 0);
+                        put::<F>(entry, 0, 0, R_X86_64_NONE, 0);
                         continue;
                     }
                     let local = rel
@@ -315,8 +323,10 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         .wrapping_add(u64::from(record.out_offset));
                     let place = base.wrapping_add(local);
                     match output_symbol(addresses, plan, section_symbols, file, &rel) {
-                        Some((symbol, addend)) => put(entry, place, symbol, rel.r_type, addend),
-                        None => put(entry, place, 0, R_X86_64_NONE, 0),
+                        Some((symbol, addend)) => {
+                            put::<F>(entry, place, symbol, rel.r_type, addend)
+                        }
+                        None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
                     }
                 }
             }
@@ -333,7 +343,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                 let relax = &addresses.layout.relax;
                 let place = base.wrapping_add(relax.map(id, rel.offset));
                 match output_symbol(addresses, plan, section_symbols, file, &rel) {
-                    Some((symbol, addend)) => put(
+                    Some((symbol, addend)) => put::<F>(
                         entry,
                         place,
                         symbol,
@@ -344,7 +354,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         ),
                         addend,
                     ),
-                    None => put(entry, place, 0, R_X86_64_NONE, 0),
+                    None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
                 }
             }
         }

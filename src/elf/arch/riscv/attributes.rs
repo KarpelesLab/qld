@@ -513,6 +513,36 @@ mod tests {
         );
     }
 
+    /// RV32 ISA strings merge the same way, `rv32e` included (the base is
+    /// the first object's, as in lld).
+    #[test]
+    fn rv32_arch_strings_are_unioned() {
+        let a = section(&[(
+            ARCH,
+            Value::Text(b"rv32i2p1_m2p0_a2p1_c2p0_zicsr2p0".to_vec()),
+        )]);
+        let b = section(&[(
+            ARCH,
+            Value::Text(b"rv32i2p0_m2p0_zba1p0_zbb1p0_zicsr2p0".to_vec()),
+        )]);
+        let merged = merge(&[("a.o".into(), &a), ("b.o".into(), &b)]);
+        assert!(merged.problems.is_empty(), "{:?}", merged.problems);
+        assert_eq!(
+            parse(&merged.bytes).unwrap(),
+            [(
+                ARCH,
+                Value::Text(b"rv32i2p1_m2p0_a2p1_c2p0_zicsr2p0_zba1p0_zbb1p0".to_vec())
+            )]
+        );
+        let e = section(&[(ARCH, Value::Text(b"rv32e2p0_c2p0".to_vec()))]);
+        let merged = merge(&[("e.o".into(), &e)]);
+        assert!(merged.problems.is_empty(), "{:?}", merged.problems);
+        assert_eq!(
+            parse(&merged.bytes).unwrap(),
+            [(ARCH, Value::Text(b"rv32e2p0_c2p0".to_vec()))]
+        );
+    }
+
     #[test]
     fn conflicts_are_reported() {
         let a = section(&[(STACK_ALIGN, Value::Int(16)), (ATOMIC_ABI, Value::Int(1))]);

@@ -761,7 +761,7 @@ fn relax_pass<'a, F: crate::elf::read::ElfFormat>(
         relax: input.options.relax,
         tp: layout.tls.map(|tls| tls.tp(arch)),
         gp: match arch {
-            Arch::RiscV64 if input.options.relax_gp => {
+            Arch::RiscV64 | Arch::RiscV32 if input.options.relax_gp => {
                 super::riscv::relax::global_pointer(input, layout)
             }
             _ => None,
@@ -864,7 +864,7 @@ fn relax_section<F: crate::elf::read::ElfFormat>(
 /// [`layout`].
 #[must_use]
 pub fn applies(arch: Arch) -> bool {
-    arch == Arch::RiscV64
+    arch.is_riscv()
 }
 
 /// The architecture's edits of one section.
@@ -873,7 +873,7 @@ fn decide<F: crate::elf::read::ElfFormat>(
     section: &SectionInput<'_, '_, F>,
 ) -> Result<Edits> {
     match pass.context.arch {
-        Arch::RiscV64 => super::riscv::relax::decide(pass, section),
+        Arch::RiscV64 | Arch::RiscV32 => super::riscv::relax::decide(pass, section),
         _ => Ok(Edits::default()),
     }
 }
@@ -881,7 +881,7 @@ fn decide<F: crate::elf::read::ElfFormat>(
 /// The type `--emit-relocs` gives the relocation of a deleted instruction.
 fn deleted_type(arch: Arch) -> u32 {
     match arch {
-        Arch::RiscV64 => crate::elf::read::consts::riscv::R_RISCV_RELAX,
+        Arch::RiscV64 | Arch::RiscV32 => crate::elf::read::consts::riscv::R_RISCV_RELAX,
         _ => 0,
     }
 }
