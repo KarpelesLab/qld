@@ -1,0 +1,36 @@
+# M4: a shared library and an executable linked against it, for 32-bit
+# Arm. Covers the PLT and GOT of a shared object (`R_ARM_JUMP_SLOT` and
+# `R_ARM_GLOB_DAT` through `SHT_REL` entries), a copy relocation for the
+# library's data, the callback that needs --export-dynamic, and a TLS
+# variable of the library read from the executable (initial-exec through a
+# `R_ARM_TLS_TPOFF32` GOT entry, while the library's own accesses keep
+# their general-dynamic `__tls_get_addr` calls).
+description = "Arm shared library plus executable, with a callback and library TLS"
+compile = ["cc -O2 -fPIC -c greet.c", "cc -O2 -fPIE -c main.c"]
+driver = "cc"
+link = [
+  "-shared -Wl,-soname,libgreet.so -o libgreet.so greet.o",
+  "-o out main.o -L. -lgreet -Wl,-rpath,$ORIGIN -rdynamic",
+]
+run = "./out"
+expect.stdout = """
+hello from libgreet (tls=5)
+callback: 10
+greet_calls=1 lib_tls=5
+"""
+expect.readelf = [
+  "ARM",
+  "Shared library: [libgreet.so]",
+  "$ORIGIN",
+  "exe_callback_qld",
+  "R_ARM_JUMP_SLOT",
+  "R_ARM_TLS_TPOFF32",
+]
+expect.readelf_files."libgreet.so" = [
+  "DYN (",
+  "Library soname: [libgreet.so]",
+  "R_ARM_TLS_DTPMOD32",
+  "greet_calls_qld",
+]
+targets = ["arm-linux-gnueabihf"]
+determinism = true

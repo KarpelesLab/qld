@@ -1,0 +1,24 @@
+# M4: the 32-bit Arm counterpart of `hello-static-c`. Static glibc: ELF32
+# with `SHT_REL` relocations whose addends are in the instructions, Thumb
+# and A32 code calling each other through `bl`/`blx`, the exception index
+# of libc collected into one `.ARM.exidx` covered by `PT_ARM_EXIDX`, and
+# the string functions' IFUNCs resolved through `.rel.iplt` IRELATIVE
+# relocations between `__rel_iplt_start` and `__rel_iplt_end`.
+description = "static hello world in C, for 32-bit Arm"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "ELF32",
+  "ARM",
+  "EXEC (Executable file)",
+  "EXIDX",
+  "!INTERP",
+  "!.dynamic",
+  "R_ARM_IRELATIVE",
+  "!R_ARM_JUMP_SLOT",
+]
+targets = ["arm-linux-gnueabihf"]
+determinism = true

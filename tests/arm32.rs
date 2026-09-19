@@ -726,6 +726,13 @@ fn render(
         // The pair is one address: print it here.
         return format!("{op} {} {}", ops[0], image.symbolize_code(value));
     }
+    // `adr rD, #imm` (both states) addresses the word-aligned PC.
+    if op.starts_with("adr") && ops.len() == 2 {
+        let value = imm(&ops[1]).unwrap_or(0);
+        let address = (pc_value(pc, thumb) & !3).wrapping_add_signed(value) & 0xffff_ffff;
+        regs.insert(ops[0].clone(), Value::Address(address));
+        return format!("{op} {} {}", ops[0], image.symbolize(address, false));
+    }
     // `add rD, pc, rS` (A32) and `add rD, pc` (Thumb) make an address.
     if op.starts_with("add")
         && (ops.get(1).map(String::as_str) == Some("pc")
@@ -736,6 +743,15 @@ fn render(
         } else {
             ops.first()
         };
+        // `add rD, pc, #imm` is `adr` in another spelling.
+        if let Some(operand) = source
+            && operand.starts_with('#')
+            && let Some(value) = imm(operand)
+        {
+            let address = pc_value(pc, thumb).wrapping_add_signed(value) & 0xffff_ffff;
+            regs.insert(ops[0].clone(), Value::Address(address));
+            return format!("{op} {} {}", ops[0], image.symbolize(address, false));
+        }
         let value = match source.and_then(|r| regs.get(r)) {
             Some(Value::Number(value)) => Some(*value),
             _ => None,
@@ -1427,6 +1443,93 @@ fn absolute_addressing_matches_lld() {
         &dir,
         "absolute",
         &["-static", "-e", "_start", "absolute.o"],
+    );
+    assert_same(tools, &dir, &lld, &ours);
+}
+
+/// One of every relocation kind the assembler emits for code that
+/// addresses another section: `movw`/`movt` pairs (absolute and
+/// PC-relative, in both instruction sets), the group-zero `adr` and `ldr`
+/// forms, every branch, and data relocations.
+const RELOCS_S: &str = r#"
+	.syntax unified
+	.text
+	.arm
+	.globl arm_relocs
+	.type arm_relocs, %function
+arm_relocs:
+	movw r0, :lower16:target
+	movt r0, :upper16:target
+	movw r1, :lower16:(target - (1f + 8))
+	movt r1, :upper16:(target - (1f + 8))
+1:	add r1, pc, r1
+	adr r2, other_data
+	ldr r3, other_data
+	bl target
+	b target
+	bleq target
+	bx lr
+	.size arm_relocs, .-arm_relocs
+
+	.thumb
+	.globl thumb_relocs
+	.thumb_func
+	.type thumb_relocs, %function
+thumb_relocs:
+	movw r0, :lower16:target
+	movt r0, :upper16:target
+	movw r1, :lower16:(target - (2f + 4))
+	movt r1, :upper16:(target - (2f + 4))
+2:	add r1, pc
+	adr.w r2, other_data
+	ldr.w r3, other_data
+	bl target
+	b.w target
+	beq.w target
+	b.n 3f
+	beq.n 3f
+3:	bx lr
+	.size thumb_relocs, .-thumb_relocs
+
+	.section .text.other, "ax", %progbits
+	.thumb
+	.globl target
+	.type target, %function
+	.thumb_func
+target:
+	bx lr
+	.size target, .-target
+	.p2align 2
+	.globl other_data
+other_data:
+	.word 0
+
+	.data
+	.globl data_relocs
+data_relocs:
+	.word target
+	.word target - .
+	.short small_value
+	.byte tiny_value
+	.p2align 2
+	.word thumb_relocs(PREL31)
+
+	.globl small_value
+	.set small_value, 0x1234
+	.globl tiny_value
+	.set tiny_value, 0x12
+"#;
+
+#[test]
+fn every_relocation_kind_matches_lld() {
+    let tools = require!();
+    let dir = scratch("relocs");
+    compile(tools, &dir, "relocs.s", RELOCS_S, "relocs.o", &[]);
+    let (lld, ours) = link_both(
+        tools,
+        &dir,
+        "relocs",
+        &["-static", "-e", "arm_relocs", "relocs.o"],
     );
     assert_same(tools, &dir, &lld, &ours);
 }

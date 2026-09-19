@@ -784,14 +784,19 @@ impl Arch {
         self.got_plt_reserved() == 3
     }
 
-    /// Rejects options whose AArch64 effect is not implemented, rather
-    /// than silently producing a binary that does not have it.
+    /// Rejects options whose effect is not implemented, rather than
+    /// silently producing a binary that does not have it.
     ///
     /// # Errors
     ///
-    /// None at present.
+    /// [`crate::error::Error::Unimplemented`] for `--emit-relocs` on Arm,
+    /// whose `SHT_REL` relocations the emitter does not write.
     pub fn check_options(self, options: &LinkOptions) -> crate::error::Result<()> {
-        let _ = options;
+        if self == Self::Arm && options.emit_relocs {
+            return Err(crate::error::Error::Unimplemented(
+                "--emit-relocs for 32-bit Arm (SHT_REL relocations)".into(),
+            ));
+        }
         Ok(())
     }
 

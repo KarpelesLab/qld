@@ -1,0 +1,23 @@
+# M4: C++ exceptions on 32-bit Arm, which unwind through the exception
+# index rather than `.eh_frame`: the linker has to collect every
+# `.ARM.exidx` input section into one table in address order, add
+# `EXIDX_CANTUNWIND` entries for the code that has none (the C runtime's
+# startup files) and a sentinel at the end, and cover it with
+# `PT_ARM_EXIDX`, which the unwinder finds through `dl_iterate_phdr`. The
+# `.ARM.extab` entries reach their personality routine and type
+# information through `PREL31` and `TARGET2` (GOT-relative) relocations.
+description = "C++ exceptions across two frames, for 32-bit Arm"
+compile = ["c++ -O2 -fPIE -c throw.cpp"]
+driver = "c++"
+link = "-pie -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "ARM",
+  "EXIDX",
+  ".ARM.exidx",
+  ".ARM.extab",
+  "R_ARM_JUMP_SLOT",
+]
+targets = ["arm-linux-gnueabihf"]
+determinism = true

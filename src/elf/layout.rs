@@ -1716,9 +1716,27 @@ pub(crate) fn set_links(sections: &mut [OutSection<'_>], synth: &Synth) {
                 }
                 // GNU ld gives the i386 `.plt` an entry size of 4.
                 Synthetic::Plt if synth.arch == super::arch::Arch::I386 => section.entsize = 4,
+                // Arm PLT entries are 12 bytes, which is not the 16 the
+                // other architectures use; lld leaves the entry size out.
+                Synthetic::Plt if synth.arch == super::arch::Arch::Arm => section.entsize = 0,
                 Synthetic::Plt | Synthetic::PltSec => section.entsize = 16,
                 Synthetic::PltGot => section.entsize = if synth.ibt { 16 } else { 8 },
                 _ => {}
+            }
+        }
+    }
+    // Arm: `.ARM.exidx` keeps `SHF_LINK_ORDER` and points at the code it
+    // describes, as GNU ld writes it.
+    if synth.arch == super::arch::Arch::Arm {
+        let text = sections
+            .iter()
+            .position(|s| s.flags & SHF_EXECINSTR != 0)
+            .and_then(|p| u32::try_from(p.saturating_add(1)).ok())
+            .unwrap_or(0);
+        for section in sections.iter_mut() {
+            if section.sh_type == super::arch::arm::SHT_ARM_EXIDX {
+                section.flags |= crate::elf::read::consts::SHF_LINK_ORDER;
+                section.link = text;
             }
         }
     }

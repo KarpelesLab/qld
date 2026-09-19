@@ -1,0 +1,25 @@
+# M4: A32 and Thumb code calling each other. The linker rewrites a `bl`
+# whose target is in the other instruction set into a `blx`, keeps the
+# Thumb bit of a function's address in `R_ARM_ABS32` (so that a call
+# through a function pointer switches state), and puts a `b.w` that would
+# have to change state through an interworking thunk. Getting any of it
+# wrong ends in a SIGILL or a wrong answer, so running the program is the
+# check.
+description = "A32 and Thumb calling each other, for 32-bit Arm"
+compile = [
+  "cc -O2 -marm -c arm_side.c",
+  "cc -O2 -mthumb -c thumb_side.c",
+]
+driver = "cc"
+link = "-o out arm_side.o thumb_side.o"
+run = "./out"
+expect.stdout = """
+arm 7 7
+thumb 9 11
+"""
+expect.readelf = [
+  "ARM",
+  "EXIDX",
+]
+targets = ["arm-linux-gnueabihf"]
+determinism = true

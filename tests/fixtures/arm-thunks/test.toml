@@ -1,0 +1,22 @@
+# M4: range-extension and interworking thunks. The `bl`/`b` destinations
+# are 64 MiB away, past the ±32 MiB an A32 branch and the ±16 MiB a Thumb
+# one reach, so the link only succeeds if the linker inserts thunks; one
+# of them is a Thumb function, so the thunk also has to switch state, and
+# the callers of the same destination share a thunk. The far branches are
+# guarded by a zero byte in `.data`, so the program runs to its `write`
+# and `exit` without taking them.
+description = "Arm range-extension and interworking thunks for out-of-range branches"
+compile = ["cc -c far.s", "cc -c far_def.s"]
+link = "-static -e _start -o out far.o far_def.o"
+run = "./out"
+expect.stdout = "thunks work\n"
+expect.exit = 7
+expect.readelf = [
+  "ARM",
+  "EXEC (Executable file)",
+  "!INTERP",
+]
+targets = ["arm-linux-gnueabihf"]
+determinism = true
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]
