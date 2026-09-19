@@ -1,7 +1,8 @@
 # The GOTPCRELX forms GNU ld relaxes for x32, freestanding: loads become
 # `lea`, indirect calls and jumps direct ones, and (in position-dependent
 # output) `test` and binary operators take the address as an immediate,
-# with or without a REX prefix. `ext` is undefined weak and `abs` absolute.
+# with or without a REX prefix. `ext` is an undefined weak symbol, which
+# resolves to zero in a static executable.
 	.text
 	.globl	_start
 	.type	_start, @function
