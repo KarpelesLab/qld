@@ -103,20 +103,21 @@ pub struct Context {
     pub copy_relocs: bool,
     /// The architecture, chosen once per link.
     pub arch: Arch,
-    /// Undefined weak symbols are 0 in position-dependent i386 output (GNU
-    /// ld's backend): absolute references to them need no dynamic
-    /// relocation, and in a static executable GOT loads of them relax.
+    /// Undefined weak symbols are 0 in an x86 executable (GNU ld's
+    /// backends): absolute references to them need no dynamic relocation,
+    /// and in a static position-dependent executable GOT loads of them
+    /// relax to the constant.
     pub weak_zero: bool,
 }
 
 impl Context {
-    /// Whether GOT loads of undefined weak symbols relax to 0 in a link of
-    /// `arch` in `mode`: i386 position-dependent output, and an x32 static
-    /// executable (GNU ld's x86-64 backend, whose other x32 relaxations qld
-    /// follows).
+    /// Whether an undefined weak symbol is 0 in a link of `arch` in
+    /// `mode`, needing no dynamic relocation: every executable of the x86
+    /// family, as in GNU ld's shared x86 backend
+    /// (`UNDEFINED_WEAK_RESOLVED_TO_ZERO`, which covers PIEs too).
     #[must_use]
     pub fn weak_zero(arch: Arch, mode: Mode) -> bool {
-        !mode.pic && (arch == Arch::I386 || (arch == Arch::X32 && !mode.dynamic))
+        mode.executable() && matches!(arch, Arch::I386 | Arch::X32 | Arch::X86_64)
     }
 }
 
@@ -198,9 +199,13 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
 #[cold]
 #[inline(never)]
 fn relax_weak_zero(context: &Context, target: &Target, classify: &mut ClassifyContext) {
-    // Only without a dynamic linker: a dynamic executable keeps the GOT
-    // entry, which it may still bind.
-    if context.relax && !context.mode.dynamic && matches!(target.def, Def::Undefined { weak: true })
+    // Only in a static position-dependent executable: a dynamic one keeps
+    // the GOT entry, which it may still bind, and position-independent
+    // code has no immediate to relax to (GNU ld does neither).
+    if context.relax
+        && !context.mode.dynamic
+        && !context.mode.pic
+        && matches!(target.def, Def::Undefined { weak: true })
     {
         classify.relax_got = true;
     }
@@ -322,10 +327,10 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
                     if mode.pic && (p.defined || !p.global) && !p.absolute {
                         decision.dynamic = Dynamic::Relative;
                     }
-                } else if context.weak_zero && p.undefined_weak && mode.executable() {
-                    // GNU ld's i386 backend resolves an undefined weak
-                    // symbol to 0 in a position-dependent executable, with
-                    // no dynamic relocation (crtbegin.o's `_ITM_*`).
+                } else if context.weak_zero && p.undefined_weak {
+                    // GNU ld's x86 backends resolve an undefined weak
+                    // symbol to 0 in an executable, with no dynamic
+                    // relocation (crtbegin.o's `_ITM_*`).
                 } else if mode.shared || writable || !p.shared {
                     decision.dynamic = Dynamic::Symbolic(DynKind::Abs64);
                     decision.flags |= SymbolFlags::NEEDS_DYNSYM;

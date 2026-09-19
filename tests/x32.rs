@@ -489,7 +489,12 @@ impl Image {
                 continue;
             };
             // GNU ld leaves a spare `R_X86_64_NONE` entry at address 0.
-            if place.len() != 8 || !kind.starts_with("R_X86_64_") || *kind == "R_X86_64_NONE" {
+            // An offset is 8 hex digits in an ELF32 output and 16 in an
+            // ELF64 one (`undefined_weak_symbols` links both).
+            if !matches!(place.len(), 8 | 16)
+                || !kind.starts_with("R_X86_64_")
+                || *kind == "R_X86_64_NONE"
+            {
                 continue;
             }
             let Some(place) = hex(place) else { continue };
@@ -523,6 +528,23 @@ impl Image {
 
     fn section(&self, name: &str) -> Option<&Section> {
         self.sections.iter().find(|s| s.name == name)
+    }
+
+    /// The `width`-byte little-endian word at `address`, if it is in the
+    /// file.
+    fn word(&self, address: u64, width: u64) -> Option<u64> {
+        let section = self.section_of(address)?;
+        if section.kind == "NOBITS" {
+            return Some(0);
+        }
+        let at = usize::try_from(section.offset + (address - section.addr)).ok()?;
+        let end = at.checked_add(usize::try_from(width).ok()?)?;
+        let bytes = self.data.get(at..end)?;
+        let mut value = 0u64;
+        for (i, byte) in bytes.iter().enumerate() {
+            value |= u64::from(*byte) << (8 * i);
+        }
+        Some(value)
     }
 
     /// The 8 bytes at `address`, if they are in the file.
@@ -715,6 +737,24 @@ impl Image {
     }
 }
 
+/// Whether `file` has a `.rela.plt` holding nothing but `R_X86_64_TLSDESC`
+/// relocations. GNU ld before 2.46 puts TLS descriptors there, so its
+/// output has `DT_JMPREL`, `DT_PLTREL` and `DT_PLTRELSZ` without a PLT
+/// relocation; 2.46 moved them to `.rela.dyn`, where qld puts them (the
+/// same difference W40 found on i386).
+fn only_tls_descriptors_in_rela_plt(tools: &Tools, dir: &Path, file: &str) -> bool {
+    let listing = run_ok(dir, &tools.readelf, &["-rW", file]);
+    let mut lines = listing.lines();
+    if !lines.any(|l| l.starts_with("Relocation section '.rela.plt'")) {
+        return false;
+    }
+    lines
+        .skip_while(|l| !l.trim_start().starts_with("Offset"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .all(|l| l.split_whitespace().nth(2) == Some("R_X86_64_TLSDESC"))
+}
+
 /// The `.dynamic` tags of `file`, sorted, without values.
 fn dynamic_tags(tools: &Tools, dir: &Path, file: &str) -> Vec<String> {
     let mut tags: Vec<String> = run_ok(dir, &tools.readelf, &["-dW", file])
@@ -799,12 +839,45 @@ fn compare_with(tools: &Tools, dir: &Path, other: &str, file: &str, functions: &
     // own; qld, like lld, leaves them to the dynamic linker's eager pass
     // (`docs/compatibility.md`).
     expected.retain(|tag| !tag.starts_with("TLSDESC"));
+    if only_tls_descriptors_in_rela_plt(tools, dir, &gnu_file) {
+        expected.retain(|tag| !matches!(tag.as_str(), "JMPREL" | "PLTREL" | "PLTRELSZ"));
+    }
     assert_eq!(
         dynamic_tags(tools, dir, &other_file),
         expected,
         "{file}: .dynamic tags (left: {other}, right: GNU ld)"
     );
     check_header(tools, dir, &other_file);
+}
+
+/// The addresses an `SHT_RELR` section relocates: an even word is an
+/// address, and the odd words after it are bitmaps of the words that
+/// follow it (the format `write::encode_relr` produces).
+fn relr_places(image: &Image, section: &Section) -> Vec<u64> {
+    let word = section.entsize.max(1);
+    let bits = word * 8;
+    let mut places = Vec::new();
+    let mut where_ = 0u64;
+    let mut at = section.addr;
+    while at + word <= section.addr + section.size {
+        let Some(entry) = image.word(at, word) else {
+            break;
+        };
+        if entry & 1 == 0 {
+            where_ = entry;
+            places.push(where_);
+            where_ += word;
+        } else {
+            for bit in 1..bits {
+                if entry & (1 << bit) != 0 {
+                    places.push(where_ + (bit - 1) * word);
+                }
+            }
+            where_ += (bits - 1) * word;
+        }
+        at += word;
+    }
+    places
 }
 
 /// The words of a GOT section, each as the dynamic relocation that fills
@@ -1260,6 +1333,79 @@ fn cxx_exceptions() {
     }
 }
 
+/// Undefined weak symbols resolve to zero in an executable, with no
+/// dynamic relocation for the absolute references (GNU ld's x86 backends:
+/// `UNDEFINED_WEAK_RESOLVED_TO_ZERO`), while a shared object keeps them.
+/// crtbegin.o's `_ITM_registerTMCloneTable` is the everyday case; qld used
+/// to emit `R_X86_64_32` against it in an x32 executable. The rule belongs
+/// to the whole x86 family, so x86-64 is linked here too: it had the same
+/// bug for a 64-bit word in a PIE.
+#[test]
+fn undefined_weak_symbols() {
+    let tools = require!();
+    let dir = scratch("undefined-weak");
+    let source = format!("{DATA}/weak.c");
+    let qld = PathBuf::from(env!("CARGO_BIN_EXE_qld"));
+    for (abi, emulation, tag) in [
+        ("-mx32", "elf32_x86_64", "x32"),
+        ("-m64", "elf_x86_64", "x86_64"),
+    ] {
+        for (mode, pic) in [
+            ("-no-pie", "-fno-pic"),
+            ("-pie", "-fPIC"),
+            ("-shared", "-fPIC"),
+        ] {
+            let object = format!("weak-{tag}{mode}.o");
+            let built = run(
+                &dir,
+                &tools.cc,
+                &[
+                    abi,
+                    pic,
+                    "-O2",
+                    "-ffreestanding",
+                    "-fno-builtin",
+                    "-c",
+                    &source,
+                    "-o",
+                    &object,
+                ],
+            );
+            assert!(built.status.success(), "{abi} {pic}: cannot compile weak.c");
+            let mut relocations = Vec::new();
+            for (linker, program) in [("gnu", tools.ld.clone()), ("qld", qld.clone())] {
+                let out = format!("{linker}/weak-{tag}{mode}");
+                run_ok(
+                    &dir,
+                    &program,
+                    &[
+                        "-m",
+                        emulation,
+                        mode,
+                        "--dynamic-linker",
+                        INTERPRETER,
+                        &object,
+                        "-o",
+                        &out,
+                    ],
+                );
+                relocations.push(Image::load(tools, &dir, &out).dynamic_relocations());
+            }
+            assert_eq!(
+                relocations[1], relocations[0],
+                "{tag} {mode}: dynamic relocations (left: qld, right: GNU ld)"
+            );
+            // The absolute reference in data is the one that differed.
+            let has_data = relocations[1].iter().any(|r| r.ends_with("(weak_data)"));
+            assert_eq!(
+                has_data,
+                mode == "-shared",
+                "{tag} {mode}: `weak_data` dynamic relocation"
+            );
+        }
+    }
+}
+
 /// `-z pack-relative-relocs`: an x32 static PIE's relative relocations
 /// are `SHT_RELR` words of 4 bytes, and relocate the same places as GNU
 /// ld's.
@@ -1295,31 +1441,29 @@ fn packed_relative_relocations() {
             "desc.o",
         ],
     );
-    let places = |linker: &str| -> Vec<String> {
+    // `.relr.dyn` is decoded here rather than read from `readelf`, whose
+    // listing of it differs between binutils versions.
+    let places = |linker: &str| -> Option<Vec<String>> {
         let file = format!("{linker}/static-pie");
         let image = Image::load(tools, &dir, &file);
-        let listing = run_ok(&dir, &tools.readelf, &["-rW", &file]);
-        let mut all: Vec<String> = listing
-            .lines()
-            .skip_while(|l| !l.contains("'.relr.dyn'"))
-            .filter_map(|l| {
-                let fields: Vec<&str> = l.split_whitespace().collect();
-                let [index, _, address, ..] = fields.as_slice() else {
-                    return None;
-                };
-                if !index.ends_with(':') || index.len() != 5 {
-                    return None;
-                }
-                Some(image.name(hex(address)?))
-            })
+        let section = image.section(".relr.dyn")?;
+        let mut all: Vec<String> = relr_places(&image, section)
+            .into_iter()
+            .map(|place| image.name(place))
             .collect();
         all.sort();
-        assert!(!all.is_empty(), "{file} has no packed relocations");
-        all
+        Some(all)
     };
+    // GNU ld before 2.38 has no `-z pack-relative-relocs`, and nothing to
+    // compare with then.
+    let Some(expected) = places("gnu").filter(|places| !places.is_empty()) else {
+        println!("SKIPPED: this GNU ld packs no relative relocations for x32");
+        return;
+    };
+    let actual = places("qld");
     assert_eq!(
-        places("qld"),
-        places("gnu"),
+        actual.as_deref(),
+        Some(expected.as_slice()),
         ".relr.dyn places (left: qld, right: GNU ld)"
     );
     let entsize = Image::load(tools, &dir, "qld/static-pie")
