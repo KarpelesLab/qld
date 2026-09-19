@@ -212,9 +212,26 @@ for all three, and identical to the branch point's hashes
 5,012,809,706 instructions at the branch point, 4,946,494,826 on this
 branch (1.32% fewer), same output.
 
-(The wall-clock table above was taken before the last commit, 1a1506c,
-which only removes instructions; the laps and the whole-link times would
-move a little further down with it.)
+The wall-clock tables above were taken before the last commit, 1a1506c.
+A run of the finished branch against the branch point alone (same driver,
+`--only qld-base,qld`, 3 interleaved runs, load 31, min wall):
+
+| benchmark | threads | before | after |
+| --- | --- | --- | --- |
+| clang | default | 112 ms | 101 ms |
+| clang | 8 | 139 ms | 129 ms |
+| clang | 64 | 123 ms | 111 ms |
+| libclang-cpp | default | 88 ms | 77 ms |
+| libclang-cpp | 8 | 91 ms | 85 ms |
+| libclang-cpp | 64 | 84 ms | 78 ms |
+| small-count | default | 11 ms | 11 ms |
+| small-count | 8 | 10 ms | 8 ms |
+| small-count | 64 | 12 ms | 15 ms |
+
+(small-count links 1 object and 2 archives: its numbers are process
+startup and are the same either way, the 64-thread row included — that one
+is the cost of starting 64 rayon workers, and it moves by 3-4 ms between
+runs.)
 
 ## Standing after W28 (symbol resolution), stated plainly
 
