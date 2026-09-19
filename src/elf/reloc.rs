@@ -111,10 +111,12 @@ pub struct Context {
 
 impl Context {
     /// Whether GOT loads of undefined weak symbols relax to 0 in a link of
-    /// `arch` in `mode`.
+    /// `arch` in `mode`: i386 position-dependent output, and an x32 static
+    /// executable (GNU ld's x86-64 backend, whose other x32 relaxations qld
+    /// follows).
     #[must_use]
     pub fn weak_zero(arch: Arch, mode: Mode) -> bool {
-        arch == Arch::I386 && !mode.pic
+        !mode.pic && (arch == Arch::I386 || (arch == Arch::X32 && !mode.dynamic))
     }
 }
 

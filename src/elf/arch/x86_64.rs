@@ -17,6 +17,19 @@
 //!   the thread pointer; general-dynamic and descriptors → initial-exec when
 //!   the variable is in a shared library. Shared objects keep the dynamic
 //!   models.
+//!
+//! **x32** (`elf32_x86_64`) uses the same relocations in ELF32 objects, and
+//! the same PLT, with 8-byte GOT and `.got.plt` entries. Its code differs in
+//! the TLS sequences, which [`classify_x32`] and [`relax_tls_x32`] rewrite
+//! as GNU ld does: the general-dynamic `lea` has no `0x66` prefix, so the
+//! relaxed sequences are 15 bytes from 3 bytes before the relocation;
+//! local-dynamic becomes `nopl` and `movl %fs:0, %eax`; initial-exec code
+//! may use a `0x40` or `0x44` REX prefix, or none; descriptors are loaded
+//! with `rex leal` and called with `call *(%eax)` (`67 ff 10`), which
+//! becomes `nopl (%rax)`. In position-dependent output a `GOTPCRELX` load
+//! becomes a `mov` of the address as a 32-bit immediate (REX.W cleared), as
+//! GNU ld does, and `test` and binary operators take the immediate with or
+//! without a REX prefix ([`relax_got_x32`]).
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -168,6 +181,96 @@ pub fn classify(
     })
 }
 
+/// Whether `op` (with its ModR/M byte after it) is one of the instructions
+/// a `GOTPCRELX` relaxes to an immediate operand: `test`, or `adc`, `add`,
+/// `and`, `cmp`, `or`, `sbb`, `sub` or `xor` into a register.
+fn is_binop(op: u8) -> bool {
+    matches!(
+        op,
+        0x85 | 0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 | 0x3b
+    )
+}
+
+/// Whether `byte` is a REX prefix. In 64-bit mode (x32 code runs in it)
+/// 0x40–0x4f are always prefixes.
+fn is_rex(byte: u8) -> bool {
+    byte & 0xf0 == 0x40
+}
+
+/// Classifies x32 relocation `r_type` at `offset` in section `data`: as
+/// [`classify`] does for x86-64, except for x32's general-dynamic sequence
+/// and for `GOTPCRELX` relaxations in position-dependent output, which
+/// GNU ld makes into immediate operands: loads as well as `test` and binary
+/// operators, with or without a REX prefix.
+///
+/// A `GOTPCRELX` (not `REX_GOTPCRELX`) instruction takes an immediate only
+/// when the byte before its opcode cannot be taken for a REX prefix, so
+/// that [`relax_got_x32`], which sees the instruction but not the
+/// relocation type, rewrites a REX prefix only where there is one; a load
+/// then becomes a `lea` instead.
+///
+/// # Errors
+///
+/// [`ClassifyError`] for unsupported types and unrecognized TLS code.
+pub fn classify_x32(
+    r_type: u32,
+    addend: i64,
+    data: &[u8],
+    offset: u64,
+    context: ClassifyContext,
+) -> Result<Class, ClassifyError> {
+    use Kind as K;
+    use Width as W;
+    match r_type {
+        R_X86_64_TLSGD => {
+            // 48 8d 3d <x@tlsgd>, then 66 66 48 e8 <__tls_get_addr@plt> or
+            // 66 48 ff 15 <__tls_get_addr@gotpcrel>: no 0x66 before the
+            // `lea`, unlike x86-64.
+            if context.tls == TlsMode::Dynamic {
+                return Ok(got(K::Got, W::I32, GotKind::TlsGd));
+            }
+            let lea = [3, 2, 1].map(|back| byte_before(data, offset, back));
+            let call = [4, 5, 6, 7].map(|forward| byte_after(data, offset, forward));
+            let lea_ok = lea == [Some(0x48), Some(0x8d), Some(0x3d)];
+            let call_ok = matches!(
+                call,
+                [Some(0x66), Some(0x66), Some(0x48), Some(0xe8)]
+                    | [Some(0x66), Some(0x48), Some(0xff), Some(0x15)]
+            );
+            if !lea_ok || !call_ok {
+                return Err(ClassifyError::BadTlsInstruction);
+            }
+            Ok(if context.tls == TlsMode::LocalExec {
+                class(K::GdToLe, W::None).skipping()
+            } else {
+                class(K::GdToIe, W::None).skipping()
+            })
+        }
+        R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+            let op = byte_before(data, offset, 2);
+            let modrm = byte_before(data, offset, 1);
+            let relaxable = context.relax_got && addend == -4;
+            let prefix = byte_before(data, offset, 3);
+            let immediate = relaxable
+                && !context.pic
+                && if r_type == R_X86_64_REX_GOTPCRELX {
+                    prefix.is_some_and(is_rex)
+                } else {
+                    !prefix.is_some_and(is_rex)
+                };
+            Ok(match (op, modrm) {
+                (Some(op), _) if immediate && (op == 0x8b || is_binop(op)) => {
+                    class(K::RelaxGotPcNoPic, W::I32)
+                }
+                (Some(0x8b), _) if relaxable => class(K::RelaxGotPc, W::I32),
+                (Some(0xff), Some(0x15 | 0x25)) if relaxable => class(K::RelaxGotPc, W::I32),
+                _ => class(K::Got, W::I32),
+            })
+        }
+        _ => classify(r_type, addend, data, offset, context),
+    }
+}
+
 fn slot<const N: usize>(out: &mut [u8], at: u64) -> Result<&mut [u8; N], ApplyError> {
     let start = usize::try_from(at).map_err(|_| ApplyError::OutOfBounds)?;
     out.get_mut(start..)
@@ -265,6 +368,171 @@ pub fn relax_got(out: &mut [u8], offset: u64, kind: Kind, value: i64) -> Result<
         }
         _ => Err(ApplyError::BadInstruction),
     }
+}
+
+/// Rewrites a relaxed x32 `GOTPCRELX` instruction and writes `value`, as
+/// [`relax_got`] does. For an immediate operand ([`Kind::RelaxGotPcNoPic`])
+/// a REX prefix, if there is one, has its R bit moved to B; a load becomes
+/// `movl $foo, %reg` with REX.W cleared (x32 addresses are 32 bits), while a
+/// `test` or binary operator keeps its operand size. Without REX.W the
+/// immediate is not extended, so any 32-bit address fits.
+///
+/// # Errors
+///
+/// [`ApplyError`] if the instruction is not one that was classified as
+/// relaxable, or the value does not fit.
+pub fn relax_got_x32(
+    out: &mut [u8],
+    offset: u64,
+    kind: Kind,
+    value: i64,
+) -> Result<(), ApplyError> {
+    if kind != Kind::RelaxGotPcNoPic {
+        return relax_got(out, offset, kind, value);
+    }
+    let op = get(out, offset, 2)?;
+    let modrm = get(out, offset, 1)?;
+    // `classify_x32` relaxes a REX-less form only when this byte is not
+    // a REX prefix.
+    let mut rex = byte_before(out, offset, 3).filter(|&b| is_rex(b));
+    let (op, modrm) = if op == 0x8b {
+        // mov foo@GOTPCREL(%rip), %reg -> movl $foo, %reg
+        rex = rex.map(|r| r & !0x08);
+        (0xc7, 0xc0 | ((modrm & 0x38) >> 3))
+    } else if op == 0x85 {
+        // test %reg, foo@GOTPCREL(%rip) -> test $foo, %reg
+        (0xf7, 0xc0 | ((modrm & 0x38) >> 3))
+    } else if is_binop(op) {
+        // binop foo@GOTPCREL(%rip), %reg -> binop $foo, %reg
+        (0x81, 0xc0 | ((modrm & 0x38) >> 3) | (op & 0x38))
+    } else {
+        return Err(ApplyError::BadInstruction);
+    };
+    // The immediate replaces the address loaded from the GOT: undo the -4
+    // of the PC-relative form.
+    let value = value.checked_add(4).ok_or(ApplyError::Overflow)?;
+    let wide = rex.is_some_and(|r| r & 0x08 != 0);
+    let width = if wide { Width::I32 } else { Width::Any32 };
+    write_value(out, offset, width, value as u64)?;
+    if let Some(rex) = rex {
+        put(out, offset, -3, (rex & !0x4) | ((rex & 0x4) >> 2))?;
+    }
+    put(out, offset, -2, op)?;
+    put(out, offset, -1, modrm)
+}
+
+/// x32 general-dynamic → local-exec: `movl %fs:0, %eax` followed by
+/// `lea x@tpoff(%rax), %rax`, from 3 bytes before the relocation.
+const X32_GD_TO_LE: [u8; 15] = [
+    0x64, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x8d, 0x80, 0, 0, 0, 0,
+];
+
+/// x32 general-dynamic → initial-exec: `movl %fs:0, %eax` followed by
+/// `addq x@gottpoff(%rip), %rax`.
+const X32_GD_TO_IE: [u8; 15] = [
+    0x64, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x03, 0x05, 0, 0, 0, 0,
+];
+
+/// x32 local-dynamic → local-exec after a direct call: `nopl 0(%rax)` and
+/// `movl %fs:0, %eax`.
+const X32_LD_TO_LE: [u8; 12] = [0x0f, 0x1f, 0x40, 0x00, 0x64, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
+
+/// The same after an indirect call, one byte longer: `nopw 0(%rax)`.
+const X32_LD_TO_LE_INDIRECT: [u8; 13] = [
+    0x66, 0x0f, 0x1f, 0x40, 0x00, 0x64, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+];
+
+/// Relaxes an x32 TLS access to local-exec or initial-exec, with GNU ld's
+/// x32 sequences (see the module documentation).
+///
+/// # Errors
+///
+/// [`ApplyError`] for unrecognized instruction sequences.
+pub fn relax_tls_x32(
+    out: &mut [u8],
+    offset: u64,
+    kind: Kind,
+    values: RelaxValues,
+) -> Result<(), ApplyError> {
+    let start = |back: u64| offset.checked_sub(back).ok_or(ApplyError::BadInstruction);
+    let after = |forward: u64| offset.checked_add(forward).ok_or(ApplyError::OutOfBounds);
+    let plus4 = values.tpoff.checked_add(4).ok_or(ApplyError::Overflow);
+    match kind {
+        Kind::GdToLe => {
+            copy_at(out, start(3)?, &X32_GD_TO_LE)?;
+            write_i32(out, after(8)?, plus4?)
+        }
+        Kind::GdToIe => {
+            copy_at(out, start(3)?, &X32_GD_TO_IE)?;
+            // As on x86-64, the displacement is at P + 8 and relative to
+            // P + 12.
+            let got_pc = values.got_pc.checked_sub(8).ok_or(ApplyError::Overflow)?;
+            write_i32(out, after(8)?, got_pc)
+        }
+        Kind::LdToLe => {
+            if byte_after(out, offset, 4) == Some(0xff) {
+                copy_at(out, start(3)?, &X32_LD_TO_LE_INDIRECT)
+            } else {
+                copy_at(out, start(3)?, &X32_LD_TO_LE)
+            }
+        }
+        Kind::IeToLe => {
+            // mov foo@gottpoff(%rip), %reg -> mov $foo, %reg
+            // add foo@gottpoff(%rip), %reg -> lea foo(%reg), %reg
+            // add foo@gottpoff(%rip), %esp or %r12d -> add $foo, %reg
+            // with a REX prefix of 0x4c or 0x44 moving its R bit to B; any
+            // other byte before the opcode is left alone.
+            let prefix = byte_before(out, offset, 3);
+            let op = get(out, offset, 2)?;
+            let reg = (get(out, offset, 1)? >> 3) & 7;
+            let (op, modrm, rex_w, rex) = match op {
+                0x8b => (0xc7, 0xc0 | reg, 0x49, 0x41),
+                0x03 if reg == 4 => (0x81, 0xc0 | reg, 0x49, 0x41),
+                0x03 => (0x8d, 0x80 | reg | (reg << 3), 0x4d, 0x45),
+                _ => return Err(ApplyError::BadInstruction),
+            };
+            match prefix {
+                Some(0x4c) => put(out, offset, -3, rex_w)?,
+                Some(0x44) => put(out, offset, -3, rex)?,
+                _ => {}
+            }
+            put(out, offset, -2, op)?;
+            put(out, offset, -1, modrm)?;
+            write_i32(out, offset, plus4?)
+        }
+        Kind::DescToLe => {
+            // rex leal x@tlsdesc(%rip), %reg -> rex movl $x@tpoff, %reg
+            let rex = get(out, offset, 3)?;
+            let op = get(out, offset, 2)?;
+            let modrm = get(out, offset, 1)?;
+            if !matches!(rex & 0xfb, 0x40 | 0x48) || op != 0x8d || modrm & 0xc7 != 0x05 {
+                return Err(ApplyError::BadInstruction);
+            }
+            put(out, offset, -3, (rex & 0x48) | ((rex >> 2) & 1))?;
+            put(out, offset, -2, 0xc7)?;
+            put(out, offset, -1, 0xc0 | ((modrm >> 3) & 7))?;
+            write_i32(out, offset, plus4?)
+        }
+        Kind::DescCallToLe => {
+            // call *(%eax) -> nopl (%rax); call *(%rax) -> xchg %ax,%ax
+            if byte_after(out, offset, 0) == Some(0x67) {
+                copy_at(out, offset, &[0x0f, 0x1f, 0x00])
+            } else {
+                copy_at(out, offset, &[0x66, 0x90])
+            }
+        }
+        _ => relax_tls(out, offset, kind, values),
+    }
+}
+
+/// Copies `bytes` over `out` at `at`.
+fn copy_at(out: &mut [u8], at: u64, bytes: &[u8]) -> Result<(), ApplyError> {
+    let at = usize::try_from(at).map_err(|_| ApplyError::OutOfBounds)?;
+    let end = at.checked_add(bytes.len()).ok_or(ApplyError::OutOfBounds)?;
+    out.get_mut(at..end)
+        .ok_or(ApplyError::BadInstruction)?
+        .copy_from_slice(bytes);
+    Ok(())
 }
 
 /// `mov %fs:0, %rax` followed by `lea x@tpoff(%rax), %rax`.
@@ -735,5 +1003,172 @@ mod tests {
             ),
             Err(ClassifyError::BadTlsInstruction)
         );
+    }
+
+    /// x32 general-dynamic: the `lea` has no `0x66` prefix, and the
+    /// relaxed sequences start 3 bytes before the relocation.
+    #[test]
+    fn x32_relaxes_general_dynamic() {
+        let mut code = vec![
+            0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x66, 0x66, 0x48, 0xe8, 0, 0, 0, 0,
+        ];
+        let class = classify_x32(
+            R_X86_64_TLSGD,
+            -4,
+            &code,
+            3,
+            ClassifyContext::static_exec(true),
+        )
+        .unwrap();
+        assert_eq!(class.kind, Kind::GdToLe);
+        assert!(class.skip_next);
+        relax_tls_x32(&mut code, 3, Kind::GdToLe, tpoff(-8 - 4)).unwrap();
+        assert_eq!(&code[..11], &X32_GD_TO_LE[..11]);
+        assert_eq!(&code[11..], &(-8i32).to_le_bytes());
+        // Without the `lea` an x32 sequence is not recognized.
+        assert_eq!(
+            classify_x32(
+                R_X86_64_TLSGD,
+                -4,
+                &[
+                    0x90, 0x90, 0x90, 0, 0, 0, 0, 0x66, 0x66, 0x48, 0xe8, 0, 0, 0, 0
+                ],
+                3,
+                ClassifyContext::static_exec(true)
+            ),
+            Err(ClassifyError::BadTlsInstruction)
+        );
+        // To initial-exec: `addq x@gottpoff(%rip), %rax` reads the entry
+        // 12 bytes past the relocation.
+        let mut gd = vec![
+            0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x66, 0x48, 0xff, 0x15, 0, 0, 0, 0,
+        ];
+        relax_tls_x32(&mut gd, 3, Kind::GdToIe, got_pc(0x100 - 4)).unwrap();
+        assert_eq!(&gd[..11], &X32_GD_TO_IE[..11]);
+        assert_eq!(&gd[11..], &(0x100i32 - 12).to_le_bytes());
+    }
+
+    /// x32 local-dynamic: `nopl 0(%rax)` before `movl %fs:0, %eax`, one
+    /// byte longer for the indirect call.
+    #[test]
+    fn x32_relaxes_local_dynamic() {
+        let mut direct = vec![0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0];
+        let class = classify_x32(
+            R_X86_64_TLSLD,
+            -4,
+            &direct,
+            3,
+            ClassifyContext::static_exec(true),
+        )
+        .unwrap();
+        assert_eq!(class.kind, Kind::LdToLe);
+        relax_tls_x32(&mut direct, 3, Kind::LdToLe, tpoff(0)).unwrap();
+        assert_eq!(direct, X32_LD_TO_LE);
+        let mut indirect = vec![0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xff, 0x15, 0, 0, 0, 0];
+        relax_tls_x32(&mut indirect, 3, Kind::LdToLe, tpoff(0)).unwrap();
+        assert_eq!(indirect, X32_LD_TO_LE_INDIRECT);
+    }
+
+    /// x32 initial-exec: `addl` without a REX prefix, with an empty one,
+    /// and with `0x44`, whose R bit moves to B.
+    #[test]
+    fn x32_relaxes_initial_exec() {
+        // addl foo@gottpoff(%rip), %eax -> leal foo(%rax), %eax
+        let mut plain = vec![0x03, 0x05, 0, 0, 0, 0];
+        relax_tls_x32(&mut plain, 2, Kind::IeToLe, tpoff(-0x14)).unwrap();
+        assert_eq!(plain, [0x8d, 0x80, 0xf0, 0xff, 0xff, 0xff]);
+        // rex addl foo@gottpoff(%rip), %eax -> rex leal foo(%rax), %eax
+        let mut rex = vec![0x40, 0x03, 0x05, 0, 0, 0, 0];
+        relax_tls_x32(&mut rex, 3, Kind::IeToLe, tpoff(-0x14)).unwrap();
+        assert_eq!(rex, [0x40, 0x8d, 0x80, 0xf0, 0xff, 0xff, 0xff]);
+        // addl foo@gottpoff(%rip), %r9d -> leal foo(%r9), %r9d
+        let mut high = vec![0x44, 0x03, 0x0d, 0, 0, 0, 0];
+        relax_tls_x32(&mut high, 3, Kind::IeToLe, tpoff(-0x14)).unwrap();
+        assert_eq!(high, [0x45, 0x8d, 0x89, 0xf0, 0xff, 0xff, 0xff]);
+        // addl foo@gottpoff(%rip), %r12d -> addl $foo, %r12d
+        let mut stack = vec![0x44, 0x03, 0x25, 0, 0, 0, 0];
+        relax_tls_x32(&mut stack, 3, Kind::IeToLe, tpoff(-0x14)).unwrap();
+        assert_eq!(stack, [0x41, 0x81, 0xc4, 0xf0, 0xff, 0xff, 0xff]);
+        // movl foo@gottpoff(%rip), %ecx -> movl $foo, %ecx
+        let mut load = vec![0x8b, 0x0d, 0, 0, 0, 0];
+        relax_tls_x32(&mut load, 2, Kind::IeToLe, tpoff(-0x14)).unwrap();
+        assert_eq!(load, [0xc7, 0xc1, 0xf0, 0xff, 0xff, 0xff]);
+    }
+
+    /// x32 TLS descriptors: `rex leal x@tlsdesc(%rip), %eax` and
+    /// `call *(%eax)`, which becomes `nopl (%rax)`.
+    #[test]
+    fn x32_relaxes_descriptors() {
+        let mut lea = vec![0x40, 0x8d, 0x05, 0, 0, 0, 0];
+        let class = classify_x32(
+            R_X86_64_GOTPC32_TLSDESC,
+            -4,
+            &lea,
+            3,
+            ClassifyContext::static_exec(true),
+        )
+        .unwrap();
+        assert_eq!(class.kind, Kind::DescToLe);
+        relax_tls_x32(&mut lea, 3, Kind::DescToLe, tpoff(-0x8 - 4)).unwrap();
+        assert_eq!(lea, [0x40, 0xc7, 0xc0, 0xf8, 0xff, 0xff, 0xff]);
+        // REX.R moves to REX.B: `rex.R leal ..., %r9d` -> `rex.B movl`.
+        let mut high = vec![0x44, 0x8d, 0x0d, 0, 0, 0, 0];
+        relax_tls_x32(&mut high, 3, Kind::DescToLe, tpoff(-4)).unwrap();
+        assert_eq!(high, [0x41, 0xc7, 0xc1, 0, 0, 0, 0]);
+        // The descriptor call, with and without the address-size prefix.
+        let mut call = vec![0x67, 0xff, 0x10];
+        relax_tls_x32(&mut call, 0, Kind::DescCallToLe, RelaxValues::default()).unwrap();
+        assert_eq!(call, [0x0f, 0x1f, 0x00]);
+        let mut lp64 = vec![0xff, 0x10];
+        relax_tls_x32(&mut lp64, 0, Kind::DescCallToLe, RelaxValues::default()).unwrap();
+        assert_eq!(lp64, [0x66, 0x90]);
+        // To initial-exec, the `lea` becomes a `mov` of the GOT entry.
+        let mut ie = vec![0x40, 0x8d, 0x05, 0, 0, 0, 0];
+        relax_tls_x32(&mut ie, 3, Kind::DescToIe, got_pc(0x20)).unwrap();
+        assert_eq!(ie, [0x40, 0x8b, 0x05, 0x20, 0, 0, 0]);
+    }
+
+    /// x32 `GOTPCRELX`: in position-dependent output a load takes the
+    /// address as an immediate with REX.W cleared, and `test` and binary
+    /// operators do so with or without a REX prefix. A form whose REX
+    /// prefix cannot be told from the previous instruction's last byte is
+    /// left to the `lea` relaxation.
+    #[test]
+    fn x32_relaxes_got_loads() {
+        let context = ClassifyContext::static_exec(true);
+        // movq foo@GOTPCREL(%rip), %rax -> movl $foo, %eax
+        let mut wide = vec![0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        let class = classify_x32(R_X86_64_REX_GOTPCRELX, -4, &wide, 3, context).unwrap();
+        assert_eq!(class.kind, Kind::RelaxGotPcNoPic);
+        relax_got_x32(&mut wide, 3, class.kind, 0x4000f8).unwrap();
+        assert_eq!(wide, [0x40, 0xc7, 0xc0, 0xfc, 0x00, 0x40, 0x00]);
+        // movl foo@GOTPCREL(%rip), %eax, with no REX prefix at all.
+        let mut plain = vec![0x8b, 0x05, 0, 0, 0, 0];
+        let class = classify_x32(R_X86_64_GOTPCRELX, -4, &plain, 2, context).unwrap();
+        assert_eq!(class.kind, Kind::RelaxGotPcNoPic);
+        relax_got_x32(&mut plain, 2, class.kind, 0xfc).unwrap();
+        assert_eq!(plain, [0xc7, 0xc0, 0x00, 0x01, 0x00, 0x00]);
+        // addl foo@GOTPCREL(%rip), %eax -> addl $foo, %eax
+        let mut binop = vec![0x03, 0x05, 0, 0, 0, 0];
+        let class = classify_x32(R_X86_64_GOTPCRELX, -4, &binop, 2, context).unwrap();
+        relax_got_x32(&mut binop, 2, class.kind, 0xfc).unwrap();
+        assert_eq!(binop, [0x81, 0xc0, 0x00, 0x01, 0x00, 0x00]);
+        // A byte that could be a REX prefix before a `GOTPCRELX` load: the
+        // load relaxes to a `lea`, which rewrites no prefix.
+        let ambiguous = vec![0x41, 0x8b, 0x05, 0, 0, 0, 0];
+        let class = classify_x32(R_X86_64_GOTPCRELX, -4, &ambiguous, 3, context).unwrap();
+        assert_eq!(class.kind, Kind::RelaxGotPc);
+        // In position-independent output nothing takes an immediate: a
+        // load becomes a `lea` and the rest keep their GOT entry.
+        let pic = ClassifyContext {
+            pic: true,
+            ..context
+        };
+        let load = [0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        let class = classify_x32(R_X86_64_REX_GOTPCRELX, -4, &load, 3, pic).unwrap();
+        assert_eq!(class.kind, Kind::RelaxGotPc);
+        let add = [0x03, 0x05, 0, 0, 0, 0];
+        let class = classify_x32(R_X86_64_GOTPCRELX, -4, &add, 2, pic).unwrap();
+        assert_eq!(class.kind, Kind::Got);
     }
 }
