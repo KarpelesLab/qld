@@ -54,19 +54,17 @@ pub enum Arch {
     LoongArch64,
     /// PowerPC64, little-endian, ELFv2 ABI.
     Ppc64,
+    /// s390x (z/Architecture, 64-bit, big-endian).
+    S390x,
     /// i386 (32-bit x86).
+    ///
+    /// The ELF32 architectures are last, so that the checks for them are
+    /// one comparison ([`Arch::is_word`], [`Arch::kind`]).
     I386,
     /// x32: x86-64 with 32-bit pointers (ILP32), in ELF32 objects.
     X32,
-<<<<<<< HEAD
-    /// s390x (z/Architecture, 64-bit, big-endian).
-    S390x,
-=======
     /// RISC-V 32 (ILP32, little-endian): the RV64 code with 4-byte words.
-    /// The ELF32 architectures are last, so that the checks for them are
-    /// one comparison ([`Arch::is_word`]).
     RiscV32,
->>>>>>> worktree-agent-afe6b0f8b0ff1ca7a
 }
 
 /// What a relocation computes.
