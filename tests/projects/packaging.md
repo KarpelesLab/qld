@@ -109,6 +109,12 @@ On the development machine (Gentoo, x86-64, gcc 15.3, clang 22):
 - cargo-deb 3.8 with the metadata in `packaging/README.md`: the `.deb` has
   the three links (`dpkg-deb -c`).
 - The Homebrew formula: `ruby -c` only.
+- `release-plz.yml`: opens the release PR and, on merge, bumps the version,
+  tags, publishes to crates.io and creates the GitHub Release, then
+  dispatches `release.yml` for the prebuilt binaries. It needs the
+  group-wide `RELEASE_PLZ_TOKEN` and `CARGO_REGISTRY_TOKEN` secrets, as in
+  the purecrypto repository. Note that `Cargo.lock` is always published with
+  the crate, because qld has a binary target: `exclude` cannot drop it.
 - `release.yml`: actionlint 1.7 (with shellcheck) reports nothing. It has
   not run: pushes and tags are the maintainers'.
 

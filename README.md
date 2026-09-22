@@ -1,5 +1,10 @@
 # qld
 
+[![CI](https://github.com/KarpelesLab/qld/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/qld/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/qld.svg)](https://crates.io/crates/qld)
+[![docs.rs](https://img.shields.io/docsrs/qld)](https://docs.rs/qld)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **qld** is a fast, parallel linker (link editor) written in pure Rust. It is
 designed as a drop-in replacement for GNU ld, gold, lld and mold: it accepts
 their command lines, so compiler drivers (`gcc`, `clang`, `rustc`) and build
