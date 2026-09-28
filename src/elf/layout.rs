@@ -1444,7 +1444,7 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
     })
 }
 
-/// Appends the trailing sections (`--emit-relocs` `.rela` sections,
+/// Appends the trailing sections (`--emit-relocs` relocation sections,
 /// `.symtab`, `.strtab`, `.shstrtab`) to `out_sections`, names every
 /// section, and links the trailers. Returns the number of section symbols
 /// and the `.shstrtab` contents.
@@ -1456,9 +1456,16 @@ pub(crate) fn add_trailers<F: crate::elf::read::ElfFormat>(
     // Trailers. With `--emit-relocs`, the symbol table starts with a section
     // symbol for every output section (whose header index is its position
     // plus one, as trailers come last), and every output section with input
-    // relocations gets a `.rela` section.
+    // relocations gets a `.rel` or `.rela` section.
     let mut section_symbols = 0u32;
     if input.options.emit_relocs && input.trailers.symtab > 0 {
+        // The entries keep the form the architecture's inputs use.
+        let use_rel = super::emit::uses_rel(input.synth.arch);
+        let entry_size = if use_rel {
+            kind.rel_size()
+        } else {
+            kind.rela_size()
+        };
         let regular = out_sections.len();
         section_symbols =
             u32::try_from(regular).map_err(|_| Error::Limit("too many output sections".into()))?;
@@ -1471,6 +1478,7 @@ pub(crate) fn add_trailers<F: crate::elf::read::ElfFormat>(
                 input.sections,
                 input.eh_frames,
                 &target.members,
+                use_rel,
             )?;
             if count == 0 {
                 continue;
@@ -1478,13 +1486,17 @@ pub(crate) fn add_trailers<F: crate::elf::read::ElfFormat>(
             let mut rela = trailer(
                 target.name,
                 Trailer::Rela(u32::try_from(position).unwrap_or(NONE)),
-                crate::elf::read::consts::SHT_RELA,
-                count.saturating_mul(kind.rela_size()),
+                if use_rel {
+                    crate::elf::read::consts::SHT_REL
+                } else {
+                    crate::elf::read::consts::SHT_RELA
+                },
+                count.saturating_mul(entry_size),
                 kind.word_size(),
             );
-            rela.name_prefix = b".rela";
+            rela.name_prefix = if use_rel { b".rel" } else { b".rela" };
             rela.flags = crate::elf::read::consts::SHF_INFO_LINK;
-            rela.entsize = kind.rela_size();
+            rela.entsize = entry_size;
             rela.info = u32::try_from(position.saturating_add(1)).unwrap_or(0);
             out_sections.push(rela);
         }

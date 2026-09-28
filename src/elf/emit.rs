@@ -11,15 +11,19 @@
 //!   symbol of the output section they lie in, with the addend adjusted to
 //!   the same place, including pieces of merged sections;
 //! - a target that is not in the output (a discarded COMDAT copy, a
-//!   garbage-collected section) gives `R_X86_64_NONE`, keeping the counts
+//!   garbage-collected section) gives `R_*_NONE` (0), keeping the counts
 //!   known before layout.
 //!
 //! `.eh_frame` relocations follow their records to their output offsets;
-//! those of dropped records become `R_X86_64_NONE`. Entries are the output
-//! class's `Elf_Rela` (`SHT_REL` inputs are not supported). Relocation
-//! types are the input's, except that `GOTPCRELX` relocations the link
-//! relaxed become `R_X86_64_PC32` (or `R_X86_64_32S`/`R_X86_64_32` for
-//! immediates), as in GNU ld; TLS relaxations are not reflected.
+//! those of dropped records become `R_*_NONE`. Entries keep the form the
+//! architecture's inputs use, in the output's class and byte order:
+//! `Elf_Rela` in `.rela<name>` sections everywhere except i386 and 32-bit
+//! Arm, whose `Elf_Rel` entries go into `.rel<name>` sections and carry no
+//! addend (the value is in the field the relocation patched, as the link
+//! left it). Relocation types are the input's, except that `GOTPCRELX`
+//! relocations the link relaxed become `R_X86_64_PC32` (or
+//! `R_X86_64_32S`/`R_X86_64_32` for immediates), as in GNU ld; TLS
+//! relaxations are not reflected.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -29,7 +33,7 @@ use crate::elf::read::consts::x86_64::{
     R_X86_64_32, R_X86_64_32S, R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_NONE, R_X86_64_PC32,
     R_X86_64_REX_GOTPCRELX,
 };
-use crate::elf::read::{RelaSlice, Relocation, Relocations};
+use crate::elf::read::{RawRecord, Relocation, Relocations};
 use crate::error::{Error, Result};
 
 use super::arch::x86_64::Kind;
@@ -47,21 +51,19 @@ use crate::symbols::SymbolFlags;
 fn relocations<'a, F: crate::elf::read::ElfFormat>(
     object: &ObjectInput<'a, F>,
     index: u32,
-) -> Option<RelaSlice<'a, F>> {
+) -> Option<Relocations<'a, F>> {
     let section = object.section(index)?;
     if section.relocs == 0 {
         return None;
     }
     let header = object.section(section.relocs)?.header;
-    match object
-        .elf
-        .relocation_section(section.relocs, &header)
-        .ok()??
-        .relocations
-    {
-        Relocations::Rela(rela) => Some(rela),
-        Relocations::Rel(_) => None,
-    }
+    Some(
+        object
+            .elf
+            .relocation_section(section.relocs, &header)
+            .ok()??
+            .relocations,
+    )
 }
 
 /// The number of relocations one output section member contributes.
@@ -97,18 +99,26 @@ fn member_count<F: crate::elf::read::ElfFormat>(
     relocations(object, index).map_or(0, |r| r.len() as u64)
 }
 
+/// Whether `--emit-relocs` writes `SHT_REL` sections: the form the
+/// architecture's inputs use, as GNU ld copies it.
+#[must_use]
+pub fn uses_rel(arch: super::arch::Arch) -> bool {
+    arch.uses_rel()
+}
+
 /// The number of relocations `--emit-relocs` writes for an output section
 /// with these members.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unimplemented`] when a member has `SHT_REL`
-/// relocations.
+/// Returns [`Error::Unimplemented`] when a member's relocations are not in
+/// the form the output writes.
 pub fn count<F: crate::elf::read::ElfFormat>(
     files: &[ElfInput<'_, F>],
     sections: &Sections,
     eh_frames: &EhFrames<'_, F>,
     members: &[Placed],
+    use_rel: bool,
 ) -> Result<u64> {
     for placed in members {
         if let Member::Input(id) = placed.member
@@ -116,13 +126,14 @@ pub fn count<F: crate::elf::read::ElfFormat>(
             && let Some(object) = files.get(file).and_then(|f| f.object.as_ref())
             && let Some(section) = object.section(index)
             && section.relocs != 0
-            && object
-                .section(section.relocs)
-                .is_some_and(|r| r.header.sh_type == crate::elf::read::consts::SHT_REL)
+            && let Some(relocs) = object.section(section.relocs)
+            && (relocs.header.sh_type == crate::elf::read::consts::SHT_REL) != use_rel
         {
             return Err(Error::Unimplemented(format!(
-                "--emit-relocs with SHT_REL relocations in {}",
-                object.source().path.display()
+                "--emit-relocs with {} relocations in {} (the output uses {})",
+                if use_rel { "SHT_RELA" } else { "SHT_REL" },
+                object.source().path.display(),
+                if use_rel { "SHT_REL" } else { "SHT_RELA" },
             )));
         }
     }
@@ -132,24 +143,41 @@ pub fn count<F: crate::elf::read::ElfFormat>(
         .reduce(|| 0, u64::saturating_add))
 }
 
-/// Writes one output relocation, an `Elf_Rela` of the output's class and
-/// byte order.
+/// Writes one output relocation, an `Elf_Rel` or `Elf_Rela` of the
+/// output's class and byte order.
 fn put<F: crate::elf::read::ElfFormat>(
     out: &mut [u8],
+    use_rel: bool,
     offset: u64,
     symbol: usize,
     r_type: u32,
     addend: i64,
 ) {
-    use crate::elf::read::RawRecord;
     let rel = Relocation {
         offset,
         symbol: u32::try_from(symbol).unwrap_or(0),
         r_type,
         addend,
     };
-    if let Some(entry) = out.get_mut(..<F::Rela as RawRecord>::SIZE) {
-        entry.copy_from_slice(F::encode_rela(&rel).as_bytes());
+    if use_rel {
+        let encoded = F::encode_rel(&rel);
+        if let Some(entry) = out.get_mut(..<F::Rel as RawRecord>::SIZE) {
+            entry.copy_from_slice(encoded.as_bytes());
+        }
+    } else {
+        let encoded = F::encode_rela(&rel);
+        if let Some(entry) = out.get_mut(..<F::Rela as RawRecord>::SIZE) {
+            entry.copy_from_slice(encoded.as_bytes());
+        }
+    }
+}
+
+/// Size of one output relocation.
+fn entry_size<F: crate::elf::read::ElfFormat>(use_rel: bool) -> usize {
+    if use_rel {
+        <F::Rel as RawRecord>::SIZE
+    } else {
+        <F::Rela as RawRecord>::SIZE
     }
 }
 
@@ -265,6 +293,8 @@ pub fn write<F: crate::elf::read::ElfFormat>(
     let refs = &addresses.refs;
     let layout = addresses.layout;
     let section_symbols = layout.section_symbols;
+    let use_rel = uses_rel(input.context.arch);
+    let size = entry_size::<F>(use_rel);
     let Some(section) = layout.sections.get(position as usize) else {
         return Ok(());
     };
@@ -279,7 +309,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
         );
         let len = usize::try_from(count)
             .unwrap_or(usize::MAX)
-            .saturating_mul(<F::Rela as crate::elf::read::RawRecord>::SIZE)
+            .saturating_mul(size)
             .min(rest.len());
         let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
         slices.push((placed.member, head));
@@ -305,7 +335,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
         };
         let base = addresses.section_address(id).unwrap_or(0);
         // Whole entries: the slice was sized above from the same count.
-        let mut entries = out.chunks_mut(<F::Rela as crate::elf::read::RawRecord>::SIZE);
+        let mut entries = out.chunks_mut(size);
         if section.kind == SectionKind::EhFrame {
             let Some(eh) = addresses
                 .eh_frames
@@ -314,7 +344,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
             else {
                 return;
             };
-            // Relocations of dropped records stay, as R_X86_64_NONE.
+            // Relocations of dropped records stay, as R_*_NONE.
             for record in &eh.records {
                 for reloc in record.relocs.0..record.relocs.1 {
                     let (Some(rel), Some(entry)) = (eh.reloc(reloc as usize), entries.next())
@@ -322,7 +352,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         continue;
                     };
                     if !record.live {
-                        put::<F>(entry, 0, 0, R_X86_64_NONE, 0);
+                        put::<F>(entry, use_rel, 0, 0, R_X86_64_NONE, 0);
                         continue;
                     }
                     let local = rel
@@ -332,9 +362,9 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                     let place = base.wrapping_add(local);
                     match output_symbol(addresses, plan, section_symbols, file, &rel) {
                         Some((symbol, addend)) => {
-                            put::<F>(entry, place, symbol, rel.r_type, addend)
+                            put::<F>(entry, use_rel, place, symbol, rel.r_type, addend);
                         }
-                        None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
+                        None => put::<F>(entry, use_rel, place, 0, R_X86_64_NONE, 0),
                     }
                 }
             }
@@ -346,13 +376,15 @@ pub fn write<F: crate::elf::read::ElfFormat>(
             object.section_data(section).unwrap_or_default()
         };
         if let Some(relas) = relocations(object, index) {
-            for (index, (rel, entry)) in relas.iter().zip(entries).enumerate() {
+            let all = (0..relas.len()).filter_map(|i| relas.get(i));
+            for (index, (rel, entry)) in all.zip(entries).enumerate() {
                 // Linker relaxation (RISC-V) moves offsets in code.
                 let relax = &addresses.layout.relax;
                 let place = base.wrapping_add(relax.map(id, rel.offset));
                 match output_symbol(addresses, plan, section_symbols, file, &rel) {
                     Some((symbol, addend)) => put::<F>(
                         entry,
+                        use_rel,
                         place,
                         symbol,
                         relax.emitted_type(
@@ -362,7 +394,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(
                         ),
                         addend,
                     ),
-                    None => put::<F>(entry, place, 0, R_X86_64_NONE, 0),
+                    None => put::<F>(entry, use_rel, place, 0, R_X86_64_NONE, 0),
                 }
             }
         }
