@@ -217,7 +217,13 @@ and TLS models.
       (`-fno-plt`/`-mlongcall`), `R_PPC64_TOC`, `ADDR64_LOCAL`,
       `GOT_DTPREL*`, multi-TOC, `DT_PPC64_OPT`, thunks under linker
       scripts
-- [ ] **PowerPC64 BE** (ELFv1 with OPDs; needs big-endian ELF)
+- [~] **PowerPC64 BE** (ELFv1, `elf64ppc`): the relocation set with
+      big-endian instruction fields, `.opd` function descriptors, `.TOC.`,
+      TLS with its relaxations, IFUNC stubs, C++ exceptions, `-r`; static
+      output is compared with GNU ld 2.42 and run under qemu. Outstanding:
+      dynamic output (ELFv1's `.plt` of descriptors, refused with a clear
+      error), `.opd` splitting for `--gc-sections`, taking an IFUNC's
+      address, `.gnu.attributes` merging
 - [x] **LoongArch64**: the relocation set (including the extreme code model
       and ADD/SUB/ULEB128), PLT/GOT, all TLS models with TLSDESC and IE/TLSDESC
       relaxation, size-preserving relaxation, `-r`; compared with lld by
@@ -235,8 +241,10 @@ and TLS models.
       (monomorphized, no run-time endianness checks on hot paths): the
       pipeline is generic over `ElfFormat` and chosen once in `elf::link`.
       ELF64/ELF32 little-endian and ELF64 big-endian are instantiated, the
-      last exercised end to end by s390x; `Elf32Be` is only decoded in unit
-      tests so far
+      all four class and byte-order combinations are instantiated. ELF64 BE
+      is exercised end to end by s390x and PowerPC64 BE; `Elf32Be` is
+      instantiated and decodes input, but no architecture selects it for
+      output yet (32-bit Arm BE8 is next)
 
 **Status:** AArch64 is the second architecture. Validation without an arm64
 machine: every fixture links with qld and with `aarch64-unknown-linux-gnu-ld`,
