@@ -217,6 +217,9 @@ pub enum Field {
     /// A TOC-indirect `ld` turned into the `addi` of a TOC-relative
     /// address, then packed as [`Field::LoToc`].
     LoDsToAddi,
+    /// `#ha` of a PC-relative value in a DX-form instruction's split
+    /// immediate (`addpcis`, `R_PPC64_REL16DX_HA`).
+    RelDxHa,
     /// A 24-bit branch displacement (`b`, `bl`).
     Rel24,
     /// A 14-bit conditional branch displacement (`bc`).
@@ -333,6 +336,15 @@ impl Field {
                     return Err(EncodeError::Overflow);
                 }
                 Ok(low(insn, (insn & ds_mask) | lo(v)))
+            }
+            // The DX-form immediate is split: bits 15-6 and bit 0 stay
+            // where they are, and bits 5-1 move up to 20-16.
+            Self::RelDxHa => {
+                if !fits_signed(value.wrapping_add(0x8000), 32) {
+                    return Err(EncodeError::Overflow);
+                }
+                let half = ha(v);
+                Ok((insn & !0x001f_ffc1) | (half & 0xffc1) | ((half & 0x3e) << 15))
             }
             Self::HaToc => {
                 if ha_is_zero(v) {
