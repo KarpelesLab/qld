@@ -197,6 +197,91 @@ _start:
     }
 }
 
+const LINKER_SYMBOL_REFS: &str = "
+    .section mysec,\"a\",@progbits
+    .quad 1
+    .text
+    .globl getp
+    .type getp,@function
+getp:
+    movq _end@GOTPCREL(%rip), %rax
+    movq _edata@GOTPCREL(%rip), %rcx
+    movq __bss_start@GOTPCREL(%rip), %rdx
+    movq __start_mysec@GOTPCREL(%rip), %rsi
+    movq __stop_mysec@GOTPCREL(%rip), %rdi
+    movq mysym@GOTPCREL(%rip), %r8
+    movq __ehdr_start@GOTPCREL(%rip), %r9
+    movq _DYNAMIC@GOTPCREL(%rip), %r10
+    ret
+    .section .note.GNU-stack,\"\",@progbits
+";
+
+/// GNU ld and lld export a shared object's linker-defined symbols: `_end`,
+/// `_edata`, `__bss_start`, `_etext` and `--defsym` symbols with default
+/// visibility, `__start_SEC`/`__stop_SEC` protected. qld made them all
+/// local, so a GOT slot for one was bound at link time where the two
+/// reference linkers emit `GLOB_DAT`. The per-module symbols
+/// (`__ehdr_start`, `__executable_start`, `_DYNAMIC`) stay hidden.
+#[test]
+fn a_shared_object_exports_its_linker_defined_symbols() {
+    require!("as", "readelf");
+    let dir = scratch("linker-symbol-exports");
+    assemble(&dir, "lib", LINKER_SYMBOL_REFS);
+    let common = [
+        "-shared",
+        "--no-relax",
+        "--defsym",
+        "mysym=0x1234",
+        "lib.o",
+        "-o",
+    ];
+    let mut args = common.to_vec();
+    args.push("out.so");
+    qld_ok(&dir, &args);
+    let dynsym = readelf(&dir, &["--dyn-syms", "out.so"]);
+    let entry = |name: &str| -> String {
+        dynsym
+            .lines()
+            .find(|line| line.split_whitespace().nth(7) == Some(name))
+            .map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                format!("{} {}", f[4], f[5])
+            })
+            .unwrap_or_else(|| "absent".to_string())
+    };
+    for name in ["_end", "_edata", "__bss_start", "mysym"] {
+        assert_eq!(entry(name), "GLOBAL DEFAULT", "{name}");
+    }
+    for name in ["__start_mysec", "__stop_mysec"] {
+        assert_eq!(entry(name), "GLOBAL PROTECTED", "{name}");
+    }
+    for name in ["__ehdr_start", "__executable_start", "_DYNAMIC"] {
+        assert_eq!(entry(name), "absent", "{name} should stay per-module");
+    }
+    // The exported ones are preemptible, so their GOT slots get GLOB_DAT
+    // rather than a link-time value; the protected and hidden ones do not.
+    let relocs = readelf(&dir, &["-r", "out.so"]);
+    let bound: Vec<&str> = relocs
+        .lines()
+        .filter(|line| line.contains("GLOB_DAT"))
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .collect();
+    for name in ["_end", "_edata", "__bss_start", "mysym"] {
+        assert!(bound.contains(&name), "{name} has no GLOB_DAT: {bound:?}");
+    }
+    for name in ["__start_mysec", "__stop_mysec", "_DYNAMIC"] {
+        assert!(!bound.contains(&name), "{name} should not be preempted");
+    }
+    // `-z start-stop-visibility=` overrides the protected default.
+    let mut args = common.to_vec();
+    args.extend_from_slice(&["hidden.so", "-z", "start-stop-visibility=hidden"]);
+    qld_ok(&dir, &args);
+    assert!(
+        !readelf(&dir, &["--dyn-syms", "hidden.so"]).contains("__start_mysec"),
+        "-z start-stop-visibility=hidden still exported __start_mysec"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // IFUNC
 // ---------------------------------------------------------------------------

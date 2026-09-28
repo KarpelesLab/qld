@@ -489,7 +489,7 @@ fn write_chunk<F: crate::elf::read::ElfFormat>(
             Ok(())
         }
         Chunk::Symtab => {
-            write_symtab(input.symtab, addresses, input.linker, out);
+            write_symtab(input.symtab, addresses, input.linker, input.options, out);
             Ok(())
         }
         Chunk::Strtab => {

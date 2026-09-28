@@ -85,11 +85,16 @@ pub enum Value {
 }
 
 /// Whether a symbol gets hidden visibility (`PROVIDE_HIDDEN`).
+///
+/// `__executable_start` is per-module like `__ehdr_start`, so it is hidden
+/// as lld makes it; GNU ld's shared-object script does not define it at
+/// all.
 #[must_use]
 pub fn is_hidden(value: Value) -> bool {
     matches!(
         value,
         Value::EhdrStart
+            | Value::ExecutableStart
             | Value::SectionStart(_)
             | Value::SectionEnd(_)
             | Value::RelaIpltStart
@@ -500,6 +505,32 @@ pub fn linker_shndx<F: crate::elf::read::ElfFormat>(
     u16::try_from(position.checked_add(1)?)
         .ok()
         .filter(|&i| i < crate::elf::read::consts::SHN_LORESERVE)
+}
+
+/// The visibility of a linker-defined symbol.
+///
+/// `PROVIDE_HIDDEN` symbols ([`is_hidden`]) are per-module and hidden.
+/// `__start_SEC` and `__stop_SEC` are `STV_PROTECTED`, as in GNU ld and
+/// lld: a module's own references to the bounds of its own output section
+/// must not be preempted. `-z start-stop-visibility=` overrides that.
+/// Everything else keeps default visibility, so a shared object exports
+/// `_end`, `_edata`, `__bss_start` and `--defsym` symbols as both
+/// reference linkers do.
+#[must_use]
+pub fn visibility(value: Value, options: &LinkOptions) -> u8 {
+    use crate::elf::read::consts::{STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED};
+    if is_hidden(value) {
+        return STV_HIDDEN;
+    }
+    if matches!(value, Value::OutputStart(_) | Value::OutputEnd(_)) {
+        return match options.start_stop_visibility {
+            None | Some(crate::args::Visibility::Protected) => STV_PROTECTED,
+            Some(crate::args::Visibility::Default) => STV_DEFAULT,
+            Some(crate::args::Visibility::Hidden) => STV_HIDDEN,
+            Some(crate::args::Visibility::Internal) => STV_INTERNAL,
+        };
+    }
+    STV_DEFAULT
 }
 
 /// Backend flag: the symbol's value is an absolute number, not an address

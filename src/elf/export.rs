@@ -43,7 +43,7 @@ use crate::ids::{FileId, SymbolId};
 use crate::script::{Pattern, VersionNode};
 use crate::symbols::{DefinitionKind, Resolution, SymbolFlags, SymbolTable, SymbolUse};
 
-use super::defined::{LinkerSymbols, is_hidden};
+use super::defined::LinkerSymbols;
 use super::dso::{Needed, REF_DYNAMIC};
 use super::inputs::{ElfInput, InputRole};
 use super::refs::LINKER_FILE;
@@ -450,12 +450,15 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                     // `_GLOBAL_OFFSET_TABLE_`, `_DYNAMIC`, `__ehdr_start` and the
                     // other PROVIDE_HIDDEN symbols are per-module: never exported,
                     // not even with --export-dynamic (as in GNU ld and lld).
+                    // `__start_SEC`/`__stop_SEC` are protected, so the module's
+                    // own references to them are not preempted.
                     if def.file == LINKER_FILE
-                        && linker
-                            .get(def.index)
-                            .is_some_and(|(_, value)| is_hidden(value))
+                        && let Some((_, value)) = linker.get(def.index)
                     {
-                        visibility = STV_HIDDEN;
+                        visibility = super::defined::visibility(value, options);
+                        if visibility == STV_PROTECTED {
+                            set |= VIS_PROTECTED;
+                        }
                     }
                     // Explicit versions from `name@VERSION` and
                     // `name@@VERSION`.
@@ -505,7 +508,7 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                             || (options.export_dynamic && mode.kind != OutputKind::StaticPie)
                             || flags.contains(REF_DYNAMIC)
                             || listed);
-                    if exported && !(linker_defined && mode.shared) {
+                    if exported {
                         set |= SymbolFlags::EXPORTED;
                         if mode.shared && visibility == STV_DEFAULT {
                             let weak = raw.is_some_and(|r| r.binding() == STB_WEAK);
