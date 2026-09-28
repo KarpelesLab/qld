@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::tools::{driver_is_clang, find_program, skip, tools, tools_required};
-use qld::elf::read::{Elf64Le, ElfFile, SectionIndex, Source};
+use qld::elf::read::{Elf64Be, Elf64Le, ElfFile, ElfFormat, SectionIndex, Source};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -172,10 +172,36 @@ fn section<'a>(elf: &ElfFile<'a, Elf64Le>, name: &[u8]) -> Option<&'a [u8]> {
     elf.section_data(&header).ok()
 }
 
-fn read_gdb_index(path: &Path) -> Option<GdbIndex> {
+/// Whether the ELF file at `path` is big-endian (`e_ident[EI_DATA]`).
+fn is_big_endian(path: &Path) -> bool {
+    fs::read(path).unwrap().get(5) == Some(&2)
+}
+
+fn section_in<F: ElfFormat>(data: &[u8], path: &Path, name: &[u8]) -> Option<Vec<u8>> {
+    let elf = ElfFile::<F>::parse(data, Source::new(path)).unwrap();
+    let (_, header) = elf.section_by_name(name)?;
+    Some(elf.section_data(&header).ok()?.to_vec())
+}
+
+/// The contents of output section `name`, from either byte order.
+fn section_bytes(path: &Path, name: &[u8]) -> Option<Vec<u8>> {
     let data = fs::read(path).unwrap();
-    let elf = ElfFile::<Elf64Le>::parse(&data, Source::new(path)).unwrap();
-    let d = section(&elf, b".gdb_index")?;
+    if is_big_endian(path) {
+        section_in::<Elf64Be>(&data, path, name)
+    } else {
+        section_in::<Elf64Le>(&data, path, name)
+    }
+}
+
+/// Whether the output has a section named `name`.
+fn has_section(path: &Path, name: &[u8]) -> bool {
+    section_bytes(path, name).is_some()
+}
+
+/// `.gdb_index` is little-endian whatever the target's byte order, as GDB
+/// defines it and lld writes it.
+fn read_gdb_index(path: &Path) -> Option<GdbIndex> {
+    let d = &section_bytes(path, b".gdb_index")?[..];
     let word = |i: usize| u32_at(d, i * 4) as usize;
     let (cu_list, types, areas, symtab, pool) = (word(1), word(2), word(3), word(4), word(5));
     let mut index = GdbIndex {
@@ -210,10 +236,8 @@ fn read_gdb_index(path: &Path) -> Option<GdbIndex> {
     Some(index)
 }
 
-/// The function symbols of an output, sorted by address.
-fn functions(path: &Path) -> Vec<(u64, String)> {
-    let data = fs::read(path).unwrap();
-    let elf = ElfFile::<Elf64Le>::parse(&data, Source::new(path)).unwrap();
+fn functions_in<F: ElfFormat>(data: &[u8], path: &Path) -> Vec<(u64, String)> {
+    let elf = ElfFile::<F>::parse(data, Source::new(path)).unwrap();
     let (index, _) = elf.section_by_name(b".symtab").unwrap();
     let mut out: Vec<(u64, String)> = elf
         .symbol_table(index)
@@ -225,6 +249,16 @@ fn functions(path: &Path) -> Vec<(u64, String)> {
         .collect();
     out.sort();
     out
+}
+
+/// The function symbols of an output, sorted by address.
+fn functions(path: &Path) -> Vec<(u64, String)> {
+    let data = fs::read(path).unwrap();
+    if is_big_endian(path) {
+        functions_in::<Elf64Be>(&data, path)
+    } else {
+        functions_in::<Elf64Le>(&data, path)
+    }
 }
 
 /// The index with addresses replaced by `function+offset`, for comparing
@@ -286,10 +320,8 @@ fn gdb_index_lists_units_ranges_and_names() {
     assert_eq!(kind("global_var"), Some(2));
     assert!(index.names.contains_key("ns::inner::deep"));
     // The consumed input sections are gone.
-    let data = fs::read(dir.join("out")).unwrap();
-    let elf = ElfFile::<Elf64Le>::parse(&data, Source::new(Path::new("out"))).unwrap();
-    assert!(elf.section_by_name(b".debug_gnu_pubnames").is_none());
-    assert!(elf.section_by_name(b".debug_gnu_pubtypes").is_none());
+    assert!(!has_section(&dir.join("out"), b".debug_gnu_pubnames"));
+    assert!(!has_section(&dir.join("out"), b".debug_gnu_pubtypes"));
 }
 
 #[test]
@@ -484,11 +516,35 @@ fn uleb(data: &[u8], at: &mut usize) -> u64 {
     }
 }
 
+/// `.debug_names` is a DWARF section: it is in the output's byte order.
 fn read_debug_names(path: &Path) -> Option<NameIndex> {
-    let data = fs::read(path).unwrap();
-    let elf = ElfFile::<Elf64Le>::parse(&data, Source::new(path)).unwrap();
-    let d = section(&elf, b".debug_names")?;
-    let strings = section(&elf, b".debug_str").unwrap();
+    let big = is_big_endian(path);
+    let u32_at = |d: &[u8], at: usize| {
+        let b: [u8; 4] = d[at..at + 4].try_into().unwrap();
+        if big {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        }
+    };
+    let u64_at = |d: &[u8], at: usize| {
+        let b: [u8; 8] = d[at..at + 8].try_into().unwrap();
+        if big {
+            u64::from_be_bytes(b)
+        } else {
+            u64::from_le_bytes(b)
+        }
+    };
+    let u16_at = |d: &[u8], at: usize| {
+        let b: [u8; 2] = d[at..at + 2].try_into().unwrap();
+        if big {
+            u16::from_be_bytes(b)
+        } else {
+            u16::from_le_bytes(b)
+        }
+    };
+    let d = &section_bytes(path, b".debug_names")?[..];
+    let strings = &section_bytes(path, b".debug_str").unwrap()[..];
     let length = u32_at(d, 0) as usize;
     assert_eq!(length + 4, d.len(), "one name index covers the section");
     let count = |i: usize| u32_at(d, 8 + i * 4) as usize;
@@ -553,7 +609,7 @@ fn read_debug_names(path: &Path) -> Option<NameIndex> {
                 let value = match form {
                     0x19 => 1,
                     0x0b | 0x11 => u64::from(d[e]),
-                    0x05 | 0x12 => u64::from(u16::from_le_bytes([d[e], d[e + 1]])),
+                    0x05 | 0x12 => u64::from(u16_at(d, e)),
                     0x06 | 0x13 => u64::from(u32_at(d, e)),
                     0x07 | 0x14 => u64_at(d, e),
                     other => panic!("form {other:#x}"),
@@ -706,6 +762,163 @@ fn debug_names_merges_type_units() {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Big-endian output (s390x).
+// ---------------------------------------------------------------------------
+
+const BIG_ENDIAN_TRIPLE: &str = "s390x-linux-gnu";
+
+/// A clang that can compile the test sources for big-endian s390x, with
+/// its C++ driver and the target flags. The sources are freestanding, so
+/// no cross sysroot is needed — only a clang with the SystemZ back end.
+fn big_endian_compilers() -> Option<(PathBuf, PathBuf, Vec<String>)> {
+    let t = tools();
+    let pick = |configured: &Option<PathBuf>, name: &str| {
+        configured
+            .clone()
+            .filter(|c| driver_is_clang(c))
+            .or_else(|| find_program(name))
+    };
+    let (Some(cc), Some(cxx)) = (pick(&t.cc, "clang"), pick(&t.cxx, "clang++")) else {
+        assert!(!tools_required(), "no clang for {BIG_ENDIAN_TRIPLE}");
+        skip("no clang (needed for big-endian objects)");
+        return None;
+    };
+    let flags = vec![format!("--target={BIG_ENDIAN_TRIPLE}")];
+    let dir = scratch("s390x-probe");
+    fs::write(dir.join("t.c"), "int t(void) { return 0; }\n").unwrap();
+    let mut args: Vec<&str> = flags.iter().map(String::as_str).collect();
+    args.extend(["-c", "t.c", "-o", "t.o"]);
+    if !run(&dir, &cc, &args).status.success() {
+        assert!(!tools_required(), "clang cannot build {BIG_ENDIAN_TRIPLE}");
+        skip(format!("{} cannot build {BIG_ENDIAN_TRIPLE}", cc.display()));
+        return None;
+    }
+    Some((cc, cxx, flags))
+}
+
+/// Compiles the sources for s390x into `a.o` and `b.o`.
+fn compile_big_endian(dir: &Path, cc: &Path, cxx: &Path, target: &[String], flags: &[&str]) {
+    fs::write(dir.join("a.c"), C_SOURCE).unwrap();
+    fs::write(dir.join("b.cc"), CXX_SOURCE).unwrap();
+    let target: Vec<&str> = target.iter().map(String::as_str).collect();
+    let mut args: Vec<&str> = target.clone();
+    args.extend(["-c", "a.c", "-o", "a.o"]);
+    args.extend_from_slice(flags);
+    run_ok(dir, cc, &args);
+    let mut args: Vec<&str> = target;
+    args.extend([
+        "-c",
+        "b.cc",
+        "-o",
+        "b.o",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-fno-asynchronous-unwind-tables",
+    ]);
+    args.extend_from_slice(flags);
+    run_ok(dir, cxx, &args);
+}
+
+/// `.gdb_index` stays little-endian on a big-endian target, and holds the
+/// same units, ranges and names as lld's.
+#[test]
+fn gdb_index_matches_lld_on_big_endian() {
+    let Some((cc, cxx, target)) = big_endian_compilers() else {
+        return;
+    };
+    let Some(lld) = &tools().lld else {
+        skip("no lld");
+        return;
+    };
+    let dir = scratch("s390x-gdb-index");
+    compile_big_endian(&dir, &cc, &cxx, &target, &["-g", "-O1", "-ggnu-pubnames"]);
+    let args = [
+        "-m",
+        "elf64_s390",
+        "a.o",
+        "b.o",
+        "-e",
+        "_start",
+        "--gdb-index",
+    ];
+    let mut ours = args.to_vec();
+    ours.extend(["-o", "qld.out"]);
+    qld(&dir, &ours);
+    let mut theirs = args.to_vec();
+    theirs.extend(["-o", "lld.out"]);
+    run_ok(&dir, lld, &theirs);
+    assert!(is_big_endian(&dir.join("qld.out")));
+    let index = read_gdb_index(&dir.join("qld.out")).expect("no .gdb_index");
+    assert_eq!(index.version, 8);
+    assert_eq!(index.units.len(), 2);
+    assert!(index.names.contains_key("ns::inner::deep"), "{index:?}");
+    assert_eq!(
+        canonical(&dir.join("qld.out")),
+        canonical(&dir.join("lld.out"))
+    );
+}
+
+/// `.debug_names` follows the output's byte order, and holds the same
+/// index as lld's.
+#[test]
+fn debug_names_matches_lld_on_big_endian() {
+    let Some((cc, cxx, target)) = big_endian_compilers() else {
+        return;
+    };
+    let Some(lld) = &tools().lld else {
+        skip("no lld");
+        return;
+    };
+    let dir = scratch("s390x-debug-names");
+    compile_big_endian(
+        &dir,
+        &cc,
+        &cxx,
+        &target,
+        &["-g", "-gdwarf-5", "-gpubnames", "-O1"],
+    );
+    let args = [
+        "-m",
+        "elf64_s390",
+        "a.o",
+        "b.o",
+        "-e",
+        "_start",
+        "--debug-names",
+    ];
+    let mut ours = args.to_vec();
+    ours.extend(["-o", "qld.out"]);
+    qld(&dir, &ours);
+    let mut theirs = args.to_vec();
+    theirs.extend(["-o", "lld.out"]);
+    run_ok(&dir, lld, &theirs);
+    let index = read_debug_names(&dir.join("qld.out")).expect("no .debug_names");
+    assert_eq!(index.units, 2);
+    for name in ["add", "global_var", "deep", "Widget", "_start", "int"] {
+        assert!(
+            index.names.contains_key(name),
+            "{name}: {:?}",
+            index.names.keys()
+        );
+    }
+    // The section really is big-endian: its first word is the length.
+    let bytes = section_bytes(&dir.join("qld.out"), b".debug_names").unwrap();
+    assert_eq!(
+        u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize + 4,
+        bytes.len()
+    );
+    assert_eq!(Some(index), read_debug_names(&dir.join("lld.out")));
+    if let Some(dwarfdump) = find_program("llvm-dwarfdump") {
+        let output = run(&dir, &dwarfdump, &["--verify", "--debug-names", "qld.out"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 }
 

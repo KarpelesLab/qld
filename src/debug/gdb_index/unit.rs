@@ -125,7 +125,7 @@ pub(crate) fn unit_header<F: crate::elf::read::ElfFormat>(
     offset: usize,
     types: bool,
 ) -> Parsed<UnitHeader> {
-    let mut r = Reader::at(section.data, offset);
+    let mut r = section.reader(offset);
     let (length, offset_size) = r.initial_length()?;
     let start = r.pos();
     let end = usize::try_from(length)
@@ -229,9 +229,9 @@ pub(crate) struct AbbrevTable {
 
 impl AbbrevTable {
     /// Parses the table at `offset` of `data`.
-    pub(crate) fn parse(data: &[u8], offset: u64) -> Parsed<Self> {
+    pub(crate) fn parse(data: &[u8], offset: u64, big: bool) -> Parsed<Self> {
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        let mut r = Reader::at(data, start);
+        let mut r = Reader::at(data, start, big);
         if start > data.len() {
             return Err(r.error("abbreviation offset (out of range)"));
         }
@@ -305,7 +305,8 @@ impl Abbrevs {
                     Some(section) => obj.data_of(section).unwrap_or_default(),
                     None => obj.abbrev.as_ref().map_or(&[][..], |s| s.data),
                 };
-                self.tables.push((key, AbbrevTable::parse(data, key.0)?));
+                self.tables
+                    .push((key, AbbrevTable::parse(data, key.0, obj.is_big_endian())?));
                 self.tables.len().saturating_sub(1)
             }
         };
@@ -616,7 +617,7 @@ pub(crate) fn str_offset<F: crate::elf::read::ElfFormat>(
         .checked_mul(unit.offset_size as u64)
         .and_then(|o| o.checked_add(base))?;
     let pos = usize::try_from(entry).ok()?;
-    let mut r = Reader::at(section.data, pos);
+    let mut r = section.reader(pos);
     let raw = r.uint(unit.offset_size).ok()?;
     Some(obj.relocate(section, pos, raw))
 }
@@ -634,7 +635,7 @@ fn addrx<F: crate::elf::read::ElfFormat>(
         .checked_mul(unit.address_size as u64)
         .and_then(|o| o.checked_add(base))?;
     let pos = usize::try_from(entry).ok()?;
-    let mut r = Reader::at(section.data, pos);
+    let mut r = section.reader(pos);
     let raw = r.uint(unit.address_size).ok()?;
     Some(obj.relocate(section, pos, raw))
 }
@@ -693,7 +694,7 @@ pub(crate) fn unit_info<'a, F: crate::elf::read::ElfFormat>(
     unit: &UnitHeader,
     abbrevs: &AbbrevTable,
 ) -> Parsed<Option<UnitInfo>> {
-    let mut r = Reader::at(
+    let mut r = section.reader_over(
         section.data.get(..unit.end).unwrap_or_default(),
         unit.first_die,
     );
@@ -818,7 +819,7 @@ fn debug_ranges<F: crate::elf::read::ElfFormat>(
     let Ok(start) = usize::try_from(offset) else {
         return;
     };
-    let mut r = Reader::at(section.data, start);
+    let mut r = section.reader(start);
     loop {
         let pos = r.pos();
         let Ok(raw) = r.uint(size) else { return };
@@ -875,7 +876,7 @@ fn rnglist_offset<F: crate::elf::read::ElfFormat>(
     let entry = index
         .checked_mul(unit.offset_size as u64)
         .and_then(|o| o.checked_add(base))?;
-    let mut r = Reader::at(section.data, usize::try_from(entry).ok()?);
+    let mut r = section.reader(usize::try_from(entry).ok()?);
     let relative = r.uint(unit.offset_size).ok()?;
     relative.checked_add(base)
 }
@@ -897,7 +898,7 @@ fn rnglist<F: crate::elf::read::ElfFormat>(
     let Ok(start) = usize::try_from(offset) else {
         return;
     };
-    let mut r = Reader::at(section.data, start);
+    let mut r = section.reader(start);
     let address = |r: &mut Reader<'_>| -> Option<(u64, Option<u32>)> {
         let pos = r.pos();
         let raw = r.uint(size).ok()?;

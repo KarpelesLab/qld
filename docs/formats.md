@@ -123,6 +123,13 @@ every output format:
 | Determinism | fixed timestamp unless `--insert-timestamp` is given |
 | Resources | `.rsrc` from GNU windres objects, `.rsrc$01`/`.rsrc$02` from `cvtres`/`llvm-windres` |
 
+## Relocatable output
+
+`-r` writes records in the output's class and byte order, with the
+architecture's relocation form (`SHT_REL` for i386 and 32-bit Arm,
+`SHT_RELA` elsewhere). Code gaps between members are padded with NOPs, as
+GNU ld does.
+
 ## ELF32 output
 
 Emulations: `elf_i386`, `armelf_linux_eabi` (32-bit Arm: `SHT_REL`, a

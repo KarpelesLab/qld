@@ -244,7 +244,7 @@ succeed. The error message names the missing search path.
   `--gc-sections`, unreferenced common symbols are kept; `--defsym x=sym+off`
   makes `x` relative to `sym`'s section (GNU makes it absolute).
 - **`--emit-relocs`:** relocations to discarded COMDAT copies become
-  `R_X86_64_NONE` (GNU redirects debug relocations to the kept copy).
+  `R_*_NONE` (GNU redirects debug relocations to the kept copy).
 - **`--cref`** leaves out symbols mentioned only by shared libraries; **`-y`**
   prints `qld: note: main.o: reference to puts`.
 - **Compressed debug output** uses zlib level 1 below `-O2`, so a section
@@ -497,7 +497,24 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   bytes, leaving a stray byte. qld writes the intended 13-byte sequence.
 - lld rejects x32's `GOTTPOFF` and TLSDESC instruction forms, so it is only
   compared on position-independent output.
-- `-r` and `-b binary` are not implemented for ELF32 output.
+
+## Relocatable output and the debug indexes
+
+- `-r` and `--emit-relocs` work for every ELF class and byte order. The
+  records are the output's class and byte order, and the relocations keep
+  the architecture's form: `SHT_REL` in `.rel<name>` for i386 and 32-bit
+  Arm, `SHT_RELA` elsewhere, as GNU ld chooses. A `SHT_REL` entry has no
+  addend field, so the offset a redirected section reference needs is added
+  to the field being patched, as BFD does.
+- An input whose relocation form is not the architecture's is refused.
+- `--emit-relocs` keeps `.ARM.exidx` relocations that lld drops, and on
+  RISC-V keeps debug-section relocations lld drops.
+- `.gdb_index` is little-endian on every target, as in GDB's format and
+  lld's output; `.debug_names` follows the output's byte order. Both work
+  for big-endian output.
+- Still open: section ordering with `-r`, `-r` with `--gdb-index` or
+  `--debug-names`, GNU's built-in `-r` layout for architectures other than
+  x86-64, and `R_LARCH_ALIGN` synthesis in LoongArch `-r`.
 
 ## x86 family (i386, x32, x86-64)
 
@@ -522,7 +539,7 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   function left. Input mapping symbols are preserved.
 - One thunk pool per output section: a `.text` larger than a Thumb branch's
   ±16 MiB still reports "relocation out of range", as on AArch64 at ±128 MiB.
-- `--emit-relocs`, `-r` and BE8 are refused. `--target1-rel`, `--target2=`,
+- BE8 is refused. `--target1-rel`, `--target2=`,
   `--be8`, `--fix-cortex-a8`, `--long-plt` and `--pic-veneer` are not
   supported.
 - GNU TLS descriptors (`R_ARM_TLS_GOTDESC` and friends, GCC's
@@ -537,9 +554,6 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - IFUNC stubs go in `.plt` before `.text`, as in GNU ld, where lld uses
   `.iplt` after it; an address-taken IFUNC symbol keeps its resolver's
   address, where lld redirects it to the canonical PLT entry.
-- `-r` is not implemented for ELF32 output yet, so a partial link of RV32 or
-  i386 objects reports "not implemented yet".
-- `--emit-relocs` rejects `SHT_REL` inputs.
 - A dynamic output with no PLT entries still reserves `.got.plt` and emits
   `DT_PLTGOT`, as GNU ld does; lld emits neither.
 - A dynamic output with no PLT entries still reserves `.got.plt` and emits

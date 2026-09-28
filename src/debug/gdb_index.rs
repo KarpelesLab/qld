@@ -23,6 +23,9 @@
 //! 2. [`GdbIndex::render`], after layout: the unit offsets and the
 //!    addresses of the ranges' sections are filled in.
 //!
+//! The section itself is always little-endian, whatever the target's byte
+//! order: that is how GDB defines the format, and how lld writes it.
+//!
 //! Like lld, the index keeps address ranges of sections that ICF folded
 //! (at the address of the section they fold into) and drops those of
 //! sections `--gc-sections` removed, and the linker drops the input

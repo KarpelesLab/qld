@@ -17,6 +17,11 @@
 //! 2. [`DebugNames::render`], after layout, relocates the unit offsets and
 //!    the name string offsets (into the merged `.debug_str`).
 //!
+//! The records are written in the output's byte order, as a DWARF section
+//! is (lld's `DebugNamesSection` is templated on `ELFT`); only the name
+//! hashes and the entry pool's ULEB128 abbreviation codes are the same
+//! bytes either way.
+//!
 //! The name hashes are recomputed ([`hash`]). The input sections are not
 //! copied to the output. This follows lld's `DebugNamesBaseSection`
 //! (sharding and ordering included, so the section is lld's byte for
@@ -136,6 +141,8 @@ pub struct DebugNames {
     names: Vec<Name>,
     bucket_count: u32,
     pool_size: u64,
+    /// Whether the output is big-endian.
+    big: bool,
     /// The input sections merged, as (file, section index).
     pub inputs: Vec<(usize, u32)>,
 }
@@ -215,7 +222,11 @@ impl DebugNames {
             })
             .collect();
         let mut chunks: Vec<(usize, Vec<InputIndex<'a>>)> = Vec::new();
-        let mut this = Self::default();
+        let mut this = Self {
+            big: <F::Endian as crate::elf::read::Endian>::ENDIANNESS
+                == crate::target::Endianness::Big,
+            ..Self::default()
+        };
         for (result, &(file, _)) in parsed.into_iter().zip(objects) {
             if let Some((section, indexes)) = result? {
                 this.inputs.push((file, section));
@@ -469,7 +480,14 @@ impl DebugNames {
             .filter(|&l| l < 0xffff_fff0)
             .ok_or_else(|| Error::Limit("--debug-names: index exceeds 4 GiB".into()))?;
         let mut out = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        let w32 = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
+        let big = self.big;
+        let w32 = move |out: &mut Vec<u8>, v: u32| {
+            out.extend_from_slice(&if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            });
+        };
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         let field = |f: &Field| -> u32 {
             f.section
@@ -477,7 +495,11 @@ impl DebugNames {
                 .map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX))
         };
         w32(&mut out, length);
-        out.extend_from_slice(&5u16.to_le_bytes());
+        out.extend_from_slice(&if big {
+            5u16.to_be_bytes()
+        } else {
+            5u16.to_le_bytes()
+        });
         out.extend_from_slice(&[0, 0]);
         w32(&mut out, count(self.units.len()));
         w32(&mut out, count(self.local_types.len()));
@@ -494,7 +516,11 @@ impl DebugNames {
             w32(&mut out, field(unit));
         }
         for &signature in &self.foreign_types {
-            out.extend_from_slice(&signature.to_le_bytes());
+            out.extend_from_slice(&if big {
+                signature.to_be_bytes()
+            } else {
+                signature.to_le_bytes()
+            });
         }
         // Buckets: names by hash modulo the bucket count, in pool order.
         let buckets = self.bucket_count.max(1);
@@ -525,8 +551,18 @@ impl DebugNames {
             for entry in &name.entries {
                 push_uleb(&mut out, u64::from(entry.code));
                 for &(value, size) in &entry.values {
-                    let bytes = value.to_le_bytes();
-                    out.extend_from_slice(bytes.get(..usize::from(size)).unwrap_or_default());
+                    // The low `size` bytes of the value, in the output's
+                    // byte order.
+                    let size = usize::from(size);
+                    if big {
+                        let bytes = value.to_be_bytes();
+                        out.extend_from_slice(
+                            bytes.get(8usize.saturating_sub(size)..).unwrap_or_default(),
+                        );
+                    } else {
+                        let bytes = value.to_le_bytes();
+                        out.extend_from_slice(bytes.get(..size).unwrap_or_default());
+                    }
                 }
             }
             out.push(0);
@@ -672,7 +708,7 @@ fn parse_index<'a, F: crate::elf::read::ElfFormat>(
     start: usize,
 ) -> core::result::Result<(InputIndex<'a>, usize), Malformed> {
     let data = section.data;
-    let mut r = Reader::at(data, start);
+    let mut r = section.reader(start);
     let length = r.u32()?;
     if length >= 0xffff_fff0 {
         return Err(r.error("DWARF64 name index (unsupported)"));
@@ -683,7 +719,7 @@ fn parse_index<'a, F: crate::elf::read::ElfFormat>(
         .filter(|&e| e <= data.len())
         .ok_or_else(|| r.error("name index length"))?;
     let data = data.get(..end).unwrap_or_default();
-    let mut r = Reader::at(data, r.pos());
+    let mut r = r.like(data, r.pos());
     let version = r.u16()?;
     if version != 5 {
         return Err(r.error("name index version (not 5)"));
@@ -754,7 +790,7 @@ fn parse_index<'a, F: crate::elf::read::ElfFormat>(
         .checked_add(abbrev_size)
         .filter(|&e| e <= data.len())
         .ok_or_else(|| r.error("abbreviation table size"))?;
-    let mut a = Reader::at(data.get(..abbrev_end).unwrap_or_default(), abbrev_start);
+    let mut a = r.like(data.get(..abbrev_end).unwrap_or_default(), abbrev_start);
     loop {
         let code = a.uleb()?;
         if code == 0 {
@@ -787,7 +823,7 @@ fn parse_index<'a, F: crate::elf::read::ElfFormat>(
             .or_else(|| obj.str.as_ref().map(|s| s.data))
             .and_then(|d| string_at(d, string.value))
             .unwrap_or_default();
-        let mut e = Reader::at(
+        let mut e = r.like(
             data,
             pool.checked_add(entry_offset as usize)
                 .ok_or_else(|| r.error("entry offset"))?,
