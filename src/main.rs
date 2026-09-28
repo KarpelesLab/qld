@@ -21,6 +21,12 @@
 //! [`qld::args::OutputCompleteHook`] and, when the output is complete,
 //! sends its exit status to the parent, which exits with it. See [`fork`]
 //! for the channels and the failure modes.
+//!
+//! # Allocator tuning
+//!
+//! On glibc the binary widens two `malloc` thresholds at startup; see
+//! [`tune_allocator`]. The library does not, because a library call runs
+//! inside someone else's process.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -29,6 +35,7 @@ use qld::args::{OutputCompleteHook, ParseOutcome};
 use qld::diag::{Diagnostic, DiagnosticSink, Stderr};
 
 fn main() -> ExitCode {
+    tune_allocator();
     let args: Vec<OsString> = std::env::args_os().collect();
     #[cfg(unix)]
     if let Some(child) = fork::Child::from_env() {
@@ -41,6 +48,59 @@ fn main() -> ExitCode {
     }
     ExitCode::from(run(&args, Launch::MayFork))
 }
+
+/// Widens glibc's `malloc` thresholds for a linker's allocation profile.
+///
+/// A link allocates a few hundred megabytes in a burst and frees all of it
+/// at exit. With the defaults, each thread's arena grows 128 KiB at a time
+/// — every growth an `mprotect` that takes the address space's lock for
+/// writing — and `free` hands memory straight back to the kernel, which
+/// faults it in again on the next allocation. A clang link makes about
+/// 12,000 `mprotect` calls and 80,000 page faults that way, and spends
+/// three to four times as long in the kernel at 16 threads as at one.
+///
+/// `M_TOP_PAD` (64 MiB) is how much extra each `sbrk`/arena growth asks
+/// for, and `M_TRIM_THRESHOLD` (128 MiB) how much free space at the top an
+/// arena keeps before returning it. Both only raise the high-water mark of
+/// memory a process that is about to exit holds; peak RSS is unchanged
+/// because the pages are never touched. Measured on a clang link: 224 ms
+/// down to 180 on a loaded machine, 151 to 148 on a quiet one.
+///
+/// This is the binary's own tuning. It is deliberately not in the library,
+/// where `qld::link` runs inside a caller's process whose allocator
+/// settings are the caller's to choose. It is also not
+/// `glibc.malloc.hugetlb`, which is 7× slower when memory is tight and the
+/// kernel has to compact.
+///
+/// Nothing depends on it succeeding: `mallopt` returning 0 (not a glibc, or
+/// a parameter it does not know) only leaves the defaults in place.
+#[cfg(all(unix, target_env = "gnu"))]
+fn tune_allocator() {
+    /// `M_TRIM_THRESHOLD` in glibc's `malloc.h`.
+    const M_TRIM_THRESHOLD: i32 = -1;
+    /// `M_TOP_PAD` in glibc's `malloc.h`.
+    const M_TOP_PAD: i32 = -2;
+
+    unsafe extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+
+    // SAFETY: `int mallopt(int, int)` is glibc's, declared here with that
+    // signature, and it is linked in already because this target's std
+    // allocates through it. It takes no pointers and reads nothing of
+    // ours: it stores two integers in glibc's own tuning state. Calling it
+    // before any thread is started also keeps it away from the one case
+    // glibc documents as undefined, a concurrent allocation. The result (0
+    // if the parameter is not known) is ignored: the defaults then stay.
+    unsafe {
+        mallopt(M_TOP_PAD, 64 * 1024 * 1024);
+        mallopt(M_TRIM_THRESHOLD, 128 * 1024 * 1024);
+    }
+}
+
+/// Does nothing off glibc, where there is nothing to tune.
+#[cfg(not(all(unix, target_env = "gnu")))]
+fn tune_allocator() {}
 
 /// How [`run`] links.
 enum Launch {

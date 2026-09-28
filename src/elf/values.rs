@@ -214,8 +214,15 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
     /// `None` if the section is not in the output.
     #[must_use]
     pub fn section_offset_address(&self, file: usize, section: u32, offset: u64) -> Option<u64> {
+        let id = self.refs.sections.id(file, section)?;
+        self.offset_address(id, file, section, offset)
+    }
+
+    /// [`section_offset_address`](Self::section_offset_address) for a
+    /// section whose ID the caller already has; `file` and `section` are
+    /// that ID's, and are only needed for a merge section's size.
+    fn offset_address(&self, id: SectionId, file: usize, section: u32, offset: u64) -> Option<u64> {
         let refs = &self.refs;
-        let id = refs.sections.id(file, section)?;
         if !refs.sections.is_live(id) {
             // Folded by ICF: the kept section has the same contents.
             let kept = refs.sections.resolve(id)?;
@@ -349,19 +356,21 @@ impl<'x, 'a, F: crate::elf::read::ElfFormat> Addresses<'x, 'a, F> {
                 value,
             } => {
                 // Only numbered sections (of live objects) are in the output;
-                // for others every path below gives `None`.
-                let merge = self.refs.sections.kind_in(file, section) == Some(SectionKind::Merge);
+                // for others every path below gives `None`. The ID is what
+                // each of those paths starts from, so it is looked up once.
+                let sections = &self.refs.sections;
+                let id = sections.id(file, section)?;
+                let merge = sections.kind.get(id.index()).copied() == Some(SectionKind::Merge);
                 if merge && target.is_section_symbol() {
                     let offset = value.checked_add_signed(addend)?;
-                    return Some((self.section_offset_address(file, section, offset)?, 0));
+                    return Some((self.offset_address(id, file, section, offset)?, 0));
                 }
                 if let Some(global) = target.global {
-                    if !self.refs.sections.is_present_in(file, section) {
-                        return None;
-                    }
+                    // Live, or folded by ICF into a section that is.
+                    sections.resolve(id)?;
                     return Some((*self.globals.get(global.index())?, addend));
                 }
-                Some((self.section_offset_address(file, section, value)?, addend))
+                Some((self.offset_address(id, file, section, value)?, addend))
             }
             Def::Absolute(value) => Some((value, addend)),
             Def::Common(id) | Def::Linker(id) | Def::Shared(id) => {

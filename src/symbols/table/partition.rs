@@ -45,7 +45,7 @@ use hashbrown::hash_table::Entry;
 use rayon::prelude::*;
 
 use super::{
-    Definitions, InternJob, MIN_PARALLEL_CHUNK, PENDING, SHARD_COUNT, Shard, Slot, SymbolTable,
+    DefCell, InternJob, MIN_PARALLEL_CHUNK, PENDING, SHARD_COUNT, Shard, Slot, SymbolTable,
     get_mut, low32, overflow, shard_of, table_hash,
 };
 use crate::error::Result;
@@ -125,7 +125,7 @@ impl<'s, 'a> Sequence<'s, 'a> {
 pub struct LookupView<'t, 'a> {
     shards: Vec<&'t Shard<'a>>,
     names: &'t [SymbolName<'a>],
-    definitions: Definitions<'t>,
+    definitions: &'t [DefCell],
 }
 
 impl<'a> LookupView<'_, 'a> {
@@ -142,11 +142,12 @@ impl<'a> LookupView<'_, 'a> {
     #[inline]
     #[must_use]
     pub fn definition(&self, id: SymbolId) -> Definition {
-        self.definitions.get(id.index())
+        self.definitions[id.index()].load()
     }
 
-    /// The file of the definition of `id`, if it is lazy: two loads,
-    /// where [`definition`](Self::definition) reads five fields.
+    /// The file of the definition of `id`, if it is lazy: two loads of the
+    /// same cell, where [`definition`](Self::definition) reads all five
+    /// fields.
     ///
     /// # Panics
     ///
@@ -154,9 +155,9 @@ impl<'a> LookupView<'_, 'a> {
     #[inline]
     #[must_use]
     pub fn lazy_file(&self, id: SymbolId) -> Option<FileId> {
-        let index = id.index();
-        (self.definitions.kind[index].load(Ordering::Relaxed) == DefinitionKind::Lazy as u8)
-            .then(|| FileId::from_u32(self.definitions.file[index].load(Ordering::Relaxed)))
+        let cell = &self.definitions[id.index()];
+        (cell.kind.load(Ordering::Relaxed) == DefinitionKind::Lazy as u8)
+            .then(|| FileId::from_u32(cell.file.load(Ordering::Relaxed)))
     }
 
     /// Whether `id` is an ID [`find_all`](Self::find_all) found, rather
@@ -274,13 +275,7 @@ impl<'a> SymbolTable<'a> {
         LookupView {
             shards: self.shards.iter_mut().map(|s| &*get_mut(s)).collect(),
             names: &self.names,
-            definitions: Definitions {
-                kind: &self.def_kind,
-                file: &self.def_file,
-                index: &self.def_index,
-                position: &self.def_position,
-                aux: &self.def_aux,
-            },
+            definitions: &self.defs,
         }
     }
 

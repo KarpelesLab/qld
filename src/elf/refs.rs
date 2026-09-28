@@ -94,7 +94,7 @@ pub struct Refs<'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64
     pub sections: &'r Sections,
 }
 
-impl<'a, F: crate::elf::read::ElfFormat> Refs<'_, 'a, F> {
+impl<'r, 'a, F: crate::elf::read::ElfFormat> Refs<'r, 'a, F> {
     /// The global symbol ID of symbol `index` of `file`, if it is global.
     #[inline]
     #[must_use]
@@ -108,30 +108,30 @@ impl<'a, F: crate::elf::read::ElfFormat> Refs<'_, 'a, F> {
     }
 
     /// Resolves symbol `index` of `file`.
+    ///
+    /// A loop over one file's relocations should take
+    /// [`for_file`](Self::for_file) once instead: this looks the file, its
+    /// symbol table and its symbol IDs up again for every call.
     #[inline(always)]
     #[must_use]
     pub fn target(&self, file: usize, index: usize) -> Option<Target> {
+        self.for_file(file)?.target(index)
+    }
+
+    /// A view of one file's relocation targets, with the lookups that do
+    /// not depend on the symbol done once. `None` if `file` is not an
+    /// object.
+    #[inline]
+    #[must_use]
+    pub fn for_file(&self, file: usize) -> Option<FileTargets<'r, 'a, F>> {
         let object = self.files.get(file)?.object.as_ref()?;
-        let symbols = object.elf.symbols();
-        let raw = symbols.get_raw(index)?;
-        if index < object.first_global {
-            let def = local_def(file, index, &raw, symbols)?;
-            return Some(Target {
-                global: None,
-                def,
-                raw: Some(raw),
-            });
-        }
-        let id = self.global_id(file, index)?;
-        let mut target = self.global_target(id, raw.binding() == STB_WEAK);
-        // An undefined thread-local variable has no defining entry, and
-        // some relocations mean something else against an ordinary symbol
-        // (LoongArch's extreme code model): keep the reference's entry, so
-        // that `STT_TLS` is still visible.
-        if target.raw.is_none() && raw.kind() == STT_TLS {
-            target.raw = Some(raw);
-        }
-        Some(target)
+        Some(FileTargets {
+            refs: *self,
+            file,
+            symbols: object.elf.symbols(),
+            first_global: object.first_global,
+            ids: self.resolution.symbol_ids(FileId::new(file)),
+        })
     }
 
     /// Resolves global symbol `id`; `weak` is the binding of the reference.
@@ -217,6 +217,64 @@ impl<'a, F: crate::elf::read::ElfFormat> Refs<'_, 'a, F> {
             Def::Section { file, section, .. } => self.sections.id(file, section),
             _ => None,
         }
+    }
+}
+
+/// One file's relocation targets: [`Refs::for_file`].
+///
+/// Resolving a relocation's symbol starts with three lookups that are the
+/// same for every relocation of the file — the input, its symbol table and
+/// the symbol IDs resolution gave its globals. The scan and the writer walk
+/// millions of relocations file by file, so they take this view once and
+/// ask it for each symbol.
+#[derive(Clone, Copy)]
+pub struct FileTargets<'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
+    refs: Refs<'r, 'a, F>,
+    file: usize,
+    symbols: &'r crate::elf::read::SymbolTable<'a, F>,
+    first_global: usize,
+    ids: &'r [SymbolId],
+}
+
+impl<'r, 'a, F: crate::elf::read::ElfFormat> FileTargets<'r, 'a, F> {
+    /// The whole-link view this one came from.
+    #[inline]
+    #[must_use]
+    pub fn refs(&self) -> Refs<'r, 'a, F> {
+        self.refs
+    }
+
+    /// The global symbol ID of symbol `index`, if it is global.
+    #[inline]
+    #[must_use]
+    pub fn global_id(&self, index: usize) -> Option<SymbolId> {
+        let local = index.checked_sub(self.first_global)?;
+        self.ids.get(local).copied()
+    }
+
+    /// Resolves symbol `index` of the file.
+    #[inline(always)]
+    #[must_use]
+    pub fn target(&self, index: usize) -> Option<Target> {
+        let raw = self.symbols.get_raw(index)?;
+        if index < self.first_global {
+            let def = local_def(self.file, index, &raw, self.symbols)?;
+            return Some(Target {
+                global: None,
+                def,
+                raw: Some(raw),
+            });
+        }
+        let id = self.global_id(index)?;
+        let mut target = self.refs.global_target(id, raw.binding() == STB_WEAK);
+        // An undefined thread-local variable has no defining entry, and
+        // some relocations mean something else against an ordinary symbol
+        // (LoongArch's extreme code model): keep the reference's entry, so
+        // that `STT_TLS` is still visible.
+        if target.raw.is_none() && raw.kind() == STT_TLS {
+            target.raw = Some(raw);
+        }
+        Some(target)
     }
 }
 
