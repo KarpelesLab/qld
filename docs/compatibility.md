@@ -488,6 +488,10 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   `--disable-long-section-names` override the choice.
 - lld is stricter: it truncates even in a `-g` link and keeps long names
   only for discardable debug sections.
+- Whether a MinGW link carries DWARF depends on how the runtime was built,
+  not on `-g`: MSYS2's runtime has debugging information, so its images keep
+  long section names even without `-g`, while a runtime built without it
+  truncates them.
 
 ## PE/COFF: i386 and ARM64
 
