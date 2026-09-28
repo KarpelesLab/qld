@@ -917,6 +917,15 @@ fn dynamic_relocations(elf: &Elf) -> Vec<String> {
 /// dynamic relocations. lld keeps the GOT entries of relaxed GOT loads,
 /// qld drops them, so lld may have more `RELATIVE` relocations in `.got`.
 fn assert_same_dynamic(dir: &Path, name: &str) {
+    assert_same_dynamic_except(dir, name, &[]);
+}
+
+/// [`assert_same_dynamic`], also letting lld have relocations of its own
+/// whose description starts with one of `allow_extra` (entries an older
+/// lld reserves and a newer one does not). Relocations **qld** has and lld
+/// does not are never allowed: that is the side a spurious GOT entry
+/// appears on.
+fn assert_same_dynamic_except(dir: &Path, name: &str, allow_extra: &[&str]) {
     let theirs = Elf::read(&dir.join(format!("{name}.lld")));
     let ours = Elf::read(&dir.join(format!("{name}.qld")));
     assert_eq!(theirs.e_type, ours.e_type, "{name}: e_type");
@@ -950,7 +959,9 @@ fn assert_same_dynamic(dir: &Path, name: &str) {
     for reloc in their_relocs {
         if let Some(at) = our_relocs.iter().position(|r| *r == reloc) {
             our_relocs.remove(at);
-        } else if !reloc.starts_with("got: RELATIVE") {
+        } else if !reloc.starts_with("got: RELATIVE")
+            && !allow_extra.iter().any(|prefix| reloc.starts_with(prefix))
+        {
             extra.push(reloc);
         }
     }
@@ -1559,9 +1570,46 @@ fn extreme_model_general_dynamic_matches_lld() {
         let dir = scratch(&format!("extreme-{variant}"));
         compile(&tools, &dir, "tls", EXTREME_TLS, flags);
         link_both(&tools, &dir, "lib.so", &["-shared", "tls.o"], &[]);
+        // The spurious entry this test is about, first: its message names
+        // the GOT entry, where a code diff only shows the fallout.
+        assert_no_address_entry_for_tls(&dir, "lib.so");
+        // lld 22 reserves an unused initial-exec (`TPREL64`) GOT entry per
+        // thread-local symbol here — three extra words the code never
+        // loads — which lld 23 no longer does; qld matches lld 23. Only
+        // lld may have those; anything qld has and lld does not still
+        // fails.
+        assert_same_dynamic_except(&dir, "lib.so", &["got: TPREL64"]);
         assert_same_code(&dir, "lib.so", false);
-        assert_same_dynamic(&dir, "lib.so");
     }
+}
+
+/// The extreme code model reaches its general-dynamic pair through the GOT
+/// relocations of an ordinary address, so a linker that does not look at
+/// the symbol reserves a second, address-holding GOT entry for a
+/// thread-local variable (`ClassifyContext::tls_symbol`). Such an entry
+/// shows up as an address relocation naming a `STT_TLS` dynamic symbol,
+/// which nothing else in a correct output produces. Checked on qld's
+/// output alone, so no lld version can hide it.
+fn assert_no_address_entry_for_tls(dir: &Path, name: &str) {
+    let ours = Elf::read(&dir.join(format!("{name}.qld")));
+    let tls: Vec<&str> = ours
+        .dynsyms
+        .iter()
+        .filter(|s| s.kind == STT_TLS && !s.name.is_empty())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(!tls.is_empty(), "{name}: no thread-local dynamic symbols");
+    // R_LARCH_64, R_LARCH_JUMP_SLOT.
+    let wrong: Vec<String> = ours
+        .relas
+        .iter()
+        .filter(|r| matches!(r.kind, 2 | 5) && tls.contains(&r.symbol.as_str()))
+        .map(|r| format!("{} {}{:+}", reloc_name(r.kind), r.symbol, r.addend))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{name}: GOT entries holding the address of a thread-local symbol: {wrong:#?}"
+    );
 }
 
 const EXTREME_TLS: &str = r#"
