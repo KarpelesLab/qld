@@ -387,6 +387,7 @@ pub fn apply(
 fn location(addresses: &Addresses<'_, '_>, file: usize, section: &[u8], offset: u64) -> Location {
     let input = addresses.files.get(file);
     Location {
+        relation: crate::diag::Relation::ReferencedBy,
         file: input
             .and_then(|input| input.file)
             .map_or_else(|| "<internal>".into(), |file| file.path().to_path_buf()),

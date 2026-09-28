@@ -136,7 +136,9 @@ fn one_pipe_for_both_streams_keeps_their_order() {
     assert_eq!(forked, direct);
     let warning = forked.find("qld-bogus").unwrap();
     let map = forked.find("_start").unwrap();
-    assert!(warning < map, "the warning comes before the map: {forked}");
+    // Diagnostics are held back and sorted, so they follow the map; what
+    // matters here is that `--fork` does not change where they land.
+    assert!(map < warning, "the map comes before the warning: {forked}");
 }
 
 #[test]

@@ -847,7 +847,7 @@ fn report_duplicates(
         let mut diagnostic = Diagnostic::error(format!("duplicate symbol: {name}"))
             .detail(format!("defined at {}", where_(duplicate.winner.file)));
         for other in &duplicate.others {
-            diagnostic = diagnostic.note(format!("defined at {}", where_(other.file)));
+            diagnostic = diagnostic.detail(format!("defined at {}", where_(other.file)));
         }
         diagnostics.emit(diagnostic);
         errors = errors.saturating_add(1);
@@ -890,7 +890,11 @@ fn report_undefined(
             let file = files
                 .get(reference.file.index())
                 .map_or_else(|| "<unknown>".to_string(), CoffInput::display);
-            diagnostic = diagnostic.note(format!("referenced by {file}"));
+            diagnostic = diagnostic.at(crate::diag::Location {
+                relation: crate::diag::Relation::ReferencedBy,
+                file: file.into(),
+                ..crate::diag::Location::default()
+            });
         }
         diagnostics.emit(diagnostic);
         errors = errors.saturating_add(1);
