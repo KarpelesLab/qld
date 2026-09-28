@@ -920,6 +920,7 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
 
     let mut plan = plan;
     plan.add_section_symbols(layout.section_symbols as usize);
+    plan.add_mapping_symbols(layout.mapping_symbols.len());
     let tombstones = Tombstones::new(TombstoneStyle::Lld)
         .with_rules(
             options

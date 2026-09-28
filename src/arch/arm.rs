@@ -74,14 +74,33 @@ pub enum Field {
     ThumbAdr,
     /// Thumb-2 `ldr.w` from a literal: ±4095 from the word-aligned PC.
     ThumbLdrLiteral,
-    /// A32 `ldr` from a literal (`LDR_PC_G0`): ±4095.
-    LdrLiteral,
-    /// A32 `add`/`sub` from the PC with a rotated 8-bit immediate
-    /// (`ALU_PC_G0`), checked when `checked`.
-    AluPc {
-        /// Whether the value must be encodable exactly.
+    /// A32 `ldr`/`str` taking what is left of the value after `group`
+    /// groups (`LDR_PC_G0` … `LDR_PC_G2`): a 12-bit offset and a sign.
+    LdrGroup {
+        /// How many groups the instructions before it took.
+        group: u8,
+    },
+    /// A32 `ldrd`/`ldrh`/`ldrsb` taking what is left after `group` groups
+    /// (`LDRS_PC_G0` … `LDRS_PC_G2`): an 8-bit offset in two nibbles.
+    LdrsGroup {
+        /// How many groups the instructions before it took.
+        group: u8,
+    },
+    /// A32 `add`/`sub` taking group `group` of the value as a rotated
+    /// 8-bit immediate (`ALU_PC_G0` … `ALU_PC_G2`); `checked` forms leave
+    /// nothing behind ([`group_residual`]).
+    AluGroup {
+        /// Which group of the value it takes.
+        group: u8,
+        /// Whether nothing may be left after it.
         checked: bool,
     },
+    /// Thumb-1 `ldr`/`add` from the word-aligned PC (`THM_PC8`): an 8-bit
+    /// word offset, 0 to 1020.
+    ThumbPc8,
+    /// Thumb-1 `cbz`/`cbnz` (`THM_JUMP6`): a 6-bit halfword offset
+    /// forward, 0 to 126.
+    ThumbJump6,
 }
 
 impl Field {
@@ -89,7 +108,7 @@ impl Field {
     #[must_use]
     pub fn bytes(self) -> usize {
         match self {
-            Self::ThumbBranch11 | Self::ThumbBranch8 => 2,
+            Self::ThumbBranch11 | Self::ThumbBranch8 | Self::ThumbPc8 | Self::ThumbJump6 => 2,
             _ => 4,
         }
     }
@@ -112,7 +131,10 @@ impl Field {
     /// ABI's `Pa`) rather than the place itself.
     #[must_use]
     pub fn from_aligned_place(self) -> bool {
-        matches!(self, Self::ThumbAdr | Self::ThumbLdrLiteral)
+        matches!(
+            self,
+            Self::ThumbAdr | Self::ThumbLdrLiteral | Self::ThumbPc8
+        )
     }
 
     /// Reads the field's instruction at `at` in `data` (a 32-bit Thumb
@@ -185,7 +207,7 @@ impl Field {
                     imm.wrapping_neg()
                 }
             }
-            Self::LdrLiteral => {
+            Self::LdrGroup { .. } => {
                 let imm = i64::from(insn & 0xfff);
                 if insn & 0x0080_0000 != 0 {
                     imm
@@ -193,7 +215,23 @@ impl Field {
                     imm.wrapping_neg()
                 }
             }
-            Self::AluPc { .. } => {
+            Self::LdrsGroup { .. } => {
+                let imm = i64::from(((insn >> 4) & 0xf0) | (insn & 0xf));
+                if insn & 0x0080_0000 != 0 {
+                    imm
+                } else {
+                    imm.wrapping_neg()
+                }
+            }
+            // The ABI forms the signed addend of an unsigned field as
+            // `((imm8:00 + 4) & 0x3ff) - 4`, so that `imm8 = 0xff` can
+            // encode the PC bias of -4.
+            Self::ThumbPc8 => {
+                let imm = ((insn & 0xff) << 2).wrapping_add(4) & 0x3ff;
+                i64::from(imm as i32).wrapping_sub(4)
+            }
+            Self::ThumbJump6 => i64::from((((insn >> 9) & 1) << 6) | (((insn >> 3) & 0x1f) << 1)),
+            Self::AluGroup { .. } => {
                 let rotate = ((insn >> 8) & 0xf).wrapping_mul(2);
                 let imm = i64::from((insn & 0xff).rotate_right(rotate));
                 if insn & 0x0040_0000 != 0 {
@@ -262,22 +300,43 @@ impl Field {
                 let lo = (insn & 0xf000) | imm;
                 Ok((hi << 16) | lo)
             }
-            Self::LdrLiteral => {
-                let (imm, negative) = magnitude(value, 12)?;
+            Self::LdrGroup { group } => {
+                let (magnitude, negative) = split_sign(value)?;
+                let imm = group_residual(magnitude, group);
+                if imm > 0xfff {
+                    return Err(Overflow);
+                }
                 let up = if negative { 0 } else { 0x0080_0000 };
                 Ok((insn & 0xff7f_f000) | up | imm)
             }
-            Self::AluPc { checked } => {
-                let negative = value < 0;
-                let magnitude = value.unsigned_abs();
-                let (imm, rotate) = match u32::try_from(magnitude).ok().and_then(modified_immediate)
-                {
-                    Some(encoded) => encoded,
-                    None if checked => return Err(Overflow),
-                    // `_NC`: the most significant eight bits that can be
-                    // encoded, as the group relocations define G0.
-                    None => lossy_immediate(magnitude as u32),
-                };
+            Self::LdrsGroup { group } => {
+                let (magnitude, negative) = split_sign(value)?;
+                let imm = group_residual(magnitude, group);
+                if imm > 0xff {
+                    return Err(Overflow);
+                }
+                let up = if negative { 0 } else { 0x0080_0000 };
+                Ok((insn & 0xff7f_f0f0) | up | ((imm & 0xf0) << 4) | (imm & 0xf))
+            }
+            Self::ThumbPc8 => {
+                if !(0..=1020).contains(&value) || value % 4 != 0 {
+                    return Err(Overflow);
+                }
+                Ok((insn & 0xff00) | ((v >> 2) & 0xff))
+            }
+            Self::ThumbJump6 => {
+                if !(0..=126).contains(&value) || value % 2 != 0 {
+                    return Err(Overflow);
+                }
+                Ok((insn & !0x02f8) | ((v << 3) & 0x0200) | ((v << 2) & 0x00f8))
+            }
+            Self::AluGroup { group, checked } => {
+                let (magnitude, negative) = split_sign(value)?;
+                let residual = group_residual(magnitude, group);
+                let (imm, rotate) = group_immediate(residual);
+                if checked && next_residual(residual) != 0 {
+                    return Err(Overflow);
+                }
                 let opcode = if negative { 0x0040_0000 } else { 0x0080_0000 };
                 Ok((insn & 0xff3f_f000) | opcode | (rotate << 8) | imm)
             }
@@ -319,6 +378,55 @@ fn thumb_mov(insn: u32, imm: u32) -> u32 {
     (hi << 16) | lo
 }
 
+/// The magnitude of `value` and whether it is negative; group
+/// relocations encode the sign in the instruction's opcode.
+fn split_sign(value: i64) -> Result<(u32, bool), Overflow> {
+    let magnitude = u32::try_from(value.unsigned_abs()).map_err(|_| Overflow)?;
+    Ok((magnitude, value < 0))
+}
+
+/// What is left of `value` after the `group` groups before it took their
+/// share.
+///
+/// A group is the most significant eight bits of what is left, starting
+/// at an even bit position, which is what an A32 rotated immediate can
+/// hold: `add rN, pc, #G0; add rN, rN, #G1; ldr rD, [rN, #G2]` builds an
+/// address one group at a time.
+#[must_use]
+pub fn group_residual(value: u32, group: u8) -> u32 {
+    let mut left = value;
+    for _ in 0..group {
+        left = next_residual(left);
+    }
+    left
+}
+
+/// What is left of `value` once its most significant group is taken.
+fn next_residual(value: u32) -> u32 {
+    // The group starts at an even bit position, so round the leading
+    // zeros down; a zero value leaves nothing.
+    let lz = value.leading_zeros() & !1;
+    if lz >= 24 {
+        0
+    } else {
+        value & (0x00ff_ffff >> lz)
+    }
+}
+
+/// The most significant group of `value` as an A32 rotated immediate:
+/// the eight bits and the rotation (in units of two bits).
+fn group_immediate(value: u32) -> (u32, u32) {
+    let lz = value.leading_zeros() & !1;
+    if lz >= 24 {
+        (value & 0xff, 0)
+    } else {
+        (
+            (value >> (24u32.saturating_sub(lz))) & 0xff,
+            lz.saturating_add(8) / 2,
+        )
+    }
+}
+
 /// `value` as an A32 modified immediate: eight bits and a rotation (in
 /// units of two bits), if it is one.
 #[must_use]
@@ -327,20 +435,6 @@ pub fn modified_immediate(value: u32) -> Option<(u32, u32)> {
         let imm = value.rotate_left(rotate.wrapping_mul(2));
         (imm <= 0xff).then_some((imm, rotate))
     })
-}
-
-/// The most significant eight bits of `value`, from an even bit position,
-/// as an A32 modified immediate.
-fn lossy_immediate(value: u32) -> (u32, u32) {
-    if value == 0 {
-        return (0, 0);
-    }
-    let top = 31u32.saturating_sub(value.leading_zeros());
-    // The lowest bit kept, rounded down to an even position.
-    let low = top.saturating_sub(7) & !1;
-    let imm = (value >> low) & 0xff;
-    let rotate = (32u32.wrapping_sub(low) % 32) / 2;
-    (imm, rotate)
 }
 
 /// Whether A32 instruction `insn` is `blx <label>` (the unconditional
@@ -633,21 +727,101 @@ mod tests {
         assert_eq!(Field::ThumbAdr.decode(adr), 0x7ff);
         let ldr = Field::ThumbLdrLiteral.encode(0xf8df_0000, -4).unwrap();
         assert_eq!(Field::ThumbLdrLiteral.decode(ldr), -4);
-        let ldr = Field::LdrLiteral.encode(0xe59f_0000, -0x10).unwrap();
-        assert_eq!(Field::LdrLiteral.decode(ldr), -0x10);
-        let add = Field::AluPc { checked: true }
-            .encode(0xe28f_0000, 0x3f0)
+        let ldr = Field::LdrGroup { group: 0 }
+            .encode(0xe59f_0000, -0x10)
             .unwrap();
-        assert_eq!(Field::AluPc { checked: true }.decode(add), 0x3f0);
-        assert!(
-            Field::AluPc { checked: true }
-                .encode(0xe28f_0000, 0x101)
-                .is_err()
+        assert_eq!(Field::LdrGroup { group: 0 }.decode(ldr), -0x10);
+        let alu0 = Field::AluGroup {
+            group: 0,
+            checked: true,
+        };
+        let add = alu0.encode(0xe28f_0000, 0x3f0).unwrap();
+        assert_eq!(alu0.decode(add), 0x3f0);
+        assert!(alu0.encode(0xe28f_0000, 0x101).is_err());
+        let alu0_nc = Field::AluGroup {
+            group: 0,
+            checked: false,
+        };
+        let sub = alu0_nc.encode(0xe28f_0000, -0x8).unwrap();
+        assert_eq!(alu0_nc.decode(sub), -0x8);
+    }
+
+    /// The instructions GNU ld 2.42 writes for the sequences in
+    /// `tests/arm32.rs`, byte for byte.
+    #[test]
+    fn group_relocations_match_gnu_ld() {
+        let alu = |group, checked| Field::AluGroup { group, checked };
+        // add rD, pc, #:pc_g0_nc:; add rD, rD, #:pc_g1_nc:;
+        // ldr rD, [rD, #:pc_g2:] for a value of 0xabcdef.
+        assert_eq!(
+            alu(0, false).encode(0xe28f_0000, 0x00ab_cdef),
+            Ok(0xe28f_08ab)
         );
-        let sub = Field::AluPc { checked: false }
-            .encode(0xe28f_0000, -0x8)
-            .unwrap();
-        assert_eq!(Field::AluPc { checked: false }.decode(sub), -0x8);
+        assert_eq!(
+            alu(1, false).encode(0xe280_0000, 0x00ab_cdeb),
+            Ok(0xe280_0ccd)
+        );
+        assert_eq!(
+            Field::LdrGroup { group: 2 }.encode(0xe590_1000, 0x00ab_cde7),
+            Ok(0xe590_10e7)
+        );
+        // … with `add rD, rN, #:pc_g2:` as the last instruction.
+        assert_eq!(
+            alu(2, true).encode(0xe282_3000, 0x00ab_cde7),
+            Ok(0xe282_30e7)
+        );
+        // add rD, pc, #:pc_g0_nc:; ldrh rD, [rD, #:pc_g1:] for 0xabcd.
+        assert_eq!(alu(0, false).encode(0xe28f_4000, 0xabcd), Ok(0xe28f_4cab));
+        assert_eq!(
+            Field::LdrsGroup { group: 1 }.encode(0xe1d4_50b0, 0xabc9),
+            Ok(0xe1d4_5cb9)
+        );
+        // One instruction on its own: the checked forms leave nothing.
+        assert_eq!(alu(0, true).encode(0xe28f_6000, 0xab00), Ok(0xe28f_6cab));
+        assert_eq!(alu(0, true).encode(0xe28f_6000, 0xab08), Err(Overflow));
+        assert_eq!(
+            Field::LdrGroup { group: 0 }.encode(0xe59f_7000, 0xabc),
+            Ok(0xe59f_7abc)
+        );
+        assert_eq!(
+            Field::LdrsGroup { group: 0 }.encode(0xe1df_80b0, 0xab),
+            Ok(0xe1df_8abb)
+        );
+        assert_eq!(alu(1, true).encode(0xe289_9000, 0xabc9), Ok(0xe289_90c9));
+        // A group relocation with nothing left to place writes a zero.
+        assert_eq!(alu(1, true).encode(0xe289_9000, 0xab00), Ok(0xe289_9000));
+        // The residual of a 12-bit or 8-bit field must fit it.
+        assert_eq!(
+            Field::LdrGroup { group: 0 }.encode(0xe59f_7000, 0x1abc),
+            Err(Overflow)
+        );
+        assert_eq!(
+            Field::LdrsGroup { group: 0 }.encode(0xe1df_80b0, 0x1ab),
+            Err(Overflow)
+        );
+    }
+
+    #[test]
+    fn thumb_pc8_and_jump6_round_trip() {
+        // ldr r0, [pc, #0x1fc]
+        let ldr = Field::ThumbPc8.encode(0x4800, 0x1fc).unwrap();
+        assert_eq!(Field::ThumbPc8.decode(ldr), 0x1fc);
+        assert_eq!(ldr, 0x487f);
+        // `imm8 = 0xff` is the PC bias of -4, not +0x3fc.
+        assert_eq!(Field::ThumbPc8.decode(0x48ff), -4);
+        assert!(Field::ThumbPc8.encode(0x4800, 0x3fc + 4).is_err());
+        assert!(Field::ThumbPc8.encode(0x4800, 2).is_err());
+        assert!(Field::ThumbPc8.encode(0x4800, -4).is_err());
+        // cbz r0, . + 0x42
+        let cbz = Field::ThumbJump6.encode(0xb100, 0x42).unwrap();
+        assert_eq!(Field::ThumbJump6.decode(cbz), 0x42);
+        assert_eq!(
+            Field::ThumbJump6.encode(0xb100, 126).map(|i| i & !0x2f8),
+            Ok(0xb100)
+        );
+        assert!(Field::ThumbJump6.encode(0xb100, 128).is_err());
+        assert!(Field::ThumbJump6.encode(0xb100, -2).is_err());
+        assert!(Field::ThumbJump6.encode(0xb100, 3).is_err());
     }
 
     #[test]

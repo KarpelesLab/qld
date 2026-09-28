@@ -924,6 +924,7 @@ mod tests {
             tls: TlsMode::Dynamic,
             tls_ld: TlsMode::Dynamic,
             code: true,
+            tls_symbol: false,
         };
         let kept = classify(R_X86_64_TLSGD, -4, &code, 4, shared).unwrap();
         assert_eq!(kept.kind, Kind::Got);

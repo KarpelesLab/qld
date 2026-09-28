@@ -534,17 +534,25 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   `EXIDX_CANTUNWIND` and aligns to 1.
 - Thunks carry the caller's instruction state, so a Thumb `bl` gets a Thumb
   thunk where lld reuses an A32 thunk through `blx`.
-- No `$a`, `$t` or `$d` mapping symbols are written for qld's own PLT and
-  thunks, so a disassembler decodes those in whatever state the previous
-  function left. Input mapping symbols are preserved.
-- One thunk pool per output section: a `.text` larger than a Thumb branch's
-  ±16 MiB still reports "relocation out of range", as on AArch64 at ±128 MiB.
+- Mapping symbols are written for qld's own code: the PLT is marked
+  `$a`/`$d`/`$a` exactly where GNU ld marks the same PLT, and every thunk
+  carries its instruction state plus `$d` for its padding. `-x` and `-s`
+  drop them, and script-driven layout writes none because it places no
+  thunks.
+- Thunk pools sit every 8 MiB of an output section's content (64 MiB on
+  AArch64, 16 MiB on PowerPC64) plus one at the end, and a caller uses the
+  nearest. Pools can only go between input sections, so a single input
+  section longer than a branch's reach still fails, as do the short Thumb
+  branches (`R_ARM_THM_JUMP19`, `THM_JUMP8`) when the nearest pool is
+  further than they reach. A `-T` layout places no pools.
 - BE8 is refused. `--target1-rel`, `--target2=`,
   `--be8`, `--fix-cortex-a8`, `--long-plt` and `--pic-veneer` are not
   supported.
-- GNU TLS descriptors (`R_ARM_TLS_GOTDESC` and friends, GCC's
-  `-mtls-dialect=gnu2`) and group relocations past G0 are reported as
-  unsupported relocations.
+- Group relocations, `THM_PC8`, `THM_JUMP6` and the 12-bit GOT and TLS
+  forms are linked; a checked group form reports an overflow when a residual
+  is left. GNU TLS descriptors (`-mtls-dialect=gnu2`) are still reported as
+  unsupported relocations. RWPI `SBREL` is refused, as GNU ld refuses it
+  too ("dangerous relocation: unsupported relocation").
 
 ## RISC-V 32
 
@@ -591,12 +599,20 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - Thunks never use Power10 instructions (no `--power10-stubs`).
 - In dynamic outputs, IFUNC `IRELATIVE` relocations go to `.rela.dyn`, as
   GNU ld does: glibc's loader does not apply them from `.rela.plt`.
-- `.toc` is placed as an orphan after `.data`, not right after `.got`.
+- `.toc` goes into the output `.got`, as GNU ld's `elf64lppc` script does
+  (`*(.got .toc)`), so both stay within ±32 KiB of the TOC pointer; lld
+  keeps `.toc` a separate orphan. `.got` is 8-aligned, where GNU ld aligns
+  it to 256.
 
 ## LoongArch64
 
-- **Relaxation keeps code size:** relaxed sequences leave `nop`s, and
-  `R_LARCH_ALIGN` padding stays where it is, until shrinking is implemented.
+- **Relaxation shrinks sections**, as lld does: the `nop`s that relaxed
+  sequences leave are deleted, and `R_LARCH_ALIGN` padding is trimmed to
+  `(2^n − 4) − needed`, or dropped entirely past its max-bytes limit.
+- `-r` synthesizes `R_LARCH_ALIGN` before each input section that follows
+  relaxable code, so a later relaxing link keeps the alignment, as lld does.
+- There are no B26 range-extension thunks, as in lld; a branch out of range
+  is an error.
 - **GOT relaxation:**
   - only adjacent instruction pairs are relaxed;
   - the GOT entry that becomes unused is dropped (lld keeps it);

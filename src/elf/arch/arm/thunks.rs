@@ -1,7 +1,7 @@
 //! Planning Arm range-extension and interworking thunks.
 //!
-//! The shared framework ([`crate::elf::arch::thunk`]) places thunks at the
-//! end of the output section holding their callers and repeats layout
+//! The shared framework ([`crate::elf::arch::thunk`]) places thunks in the
+//! pools of the output section holding their callers and repeats layout
 //! until the set stops changing; this module decides which branches need
 //! one and what it must do. A thunk is keyed by its destination, the state
 //! of its callers (the thunk is in that state, so the branch to it needs
@@ -122,17 +122,16 @@ pub fn key_of(branch: &Branch, pic: bool) -> Option<u64> {
     Some(thunk_key(destination, branch.thumb_caller(), pic))
 }
 
-/// Plans the thunks the layout in `layout` needs, given the ones
-/// `previous` planned (whose space `layout` already reserves).
+/// Plans the thunks the layout in `layout` needs; `layout` says where the
+/// pools it reserved space for are ([`crate::elf::arch::thunk::Pool`]).
 #[must_use]
 pub fn plan<F: crate::elf::read::ElfFormat>(
     input: &LayoutInput<'_, '_, F>,
     layout: &Layout<'_>,
-    previous: &Thunks,
 ) -> Thunks {
     let refs = &input.refs;
     let pic = input.mode.pic;
-    let mut needed: Vec<(u32, u64)> = Vec::new();
+    let mut needed: Vec<(u32, u32, u64)> = Vec::new();
     for (file_index, file) in refs.files.iter().enumerate() {
         let Some(object) = &file.object else {
             continue;
@@ -186,16 +185,20 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                         super::Patch::Insn(field) => field.read(data, at).unwrap_or(0),
                         _ => 0,
                     };
+                    let place = base.wrapping_add(rel.offset);
                     let branch = Branch {
                         r_type: rel.r_type,
                         insn,
-                        place: base.wrapping_add(rel.offset),
+                        place,
                         destination: destination.address,
                         function: destination.function,
                         via_stub: destination.via_stub,
                     };
                     if let Some(key) = key_of(&branch, pic) {
-                        needed.push((output, key));
+                        let pool =
+                            crate::elf::arch::thunk::Pool::nearest(&layout.pools, output, place)
+                                .unwrap_or(0);
+                        needed.push((output, pool, key));
                     }
                 }
             );
@@ -204,14 +207,6 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
     if needed.is_empty() {
         return Thunks::default();
     }
-    let pool_start = |output: u32| -> u64 {
-        let size = layout
-            .sections
-            .iter()
-            .find(|s| s.output == output)
-            .map_or(0, |s| s.size);
-        let base = size.saturating_sub(previous.size_of(output));
-        base.saturating_add(3) & !3
-    };
-    Thunks::build_for(crate::elf::arch::Arch::Arm, needed, &pool_start)
+    let content = crate::elf::arch::thunk::pool_content(layout);
+    Thunks::build_for(crate::elf::arch::Arch::Arm, needed, &content)
 }

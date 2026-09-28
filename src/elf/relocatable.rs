@@ -280,6 +280,9 @@ struct Member {
     relocs: u64,
     /// Offset of its relocations in the output `.rela` section.
     rela_offset: u64,
+    /// Bytes of `nop` padding before it that a synthesized
+    /// `R_LARCH_ALIGN` covers (LoongArch; 0 otherwise).
+    align_pad: u64,
 }
 
 #[derive(Debug)]
@@ -774,6 +777,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                     offset: member.offset,
                     relocs: 0,
                     rela_offset: 0,
+                    align_pad: member.align_pad,
                 });
                 if let Some(id) = sections.id(member.file as usize, member.section)
                     && let Some(slot) = assign.get_mut(id.index())
@@ -913,6 +917,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                 offset: 0,
                 relocs: 0,
                 rela_offset: 0,
+                align_pad: 0,
             });
             if let Some(slot) = assign.get_mut(id.index()) {
                 *slot = out_index;
@@ -1025,16 +1030,45 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
             out.flags |= SHF_GROUP;
         }
         let mut size = 0u64;
+        // LoongArch: the assembler writes `R_LARCH_ALIGN` only for a
+        // section it marked relaxable, so a later relaxing link would not
+        // know that the sections after one have to stay aligned. As lld
+        // does, reserve `2^n - 4` bytes of `nop` padding before each of
+        // them and synthesize the relocation that covers it.
+        let synthesize_align =
+            arch == crate::elf::arch::Arch::LoongArch64 && out.flags & SHF_EXECINSTR != 0;
+        let mut relaxable_seen = false;
         for member in &mut out.members {
-            let Some(section) = files
+            let Some(object) = files
                 .get(member.file as usize)
                 .and_then(|f| f.object.as_ref())
-                .and_then(|o| o.section(member.section))
             else {
                 continue;
             };
+            let Some(section) = object.section(member.section) else {
+                continue;
+            };
+            let mut pad = member.align_pad;
+            if synthesize_align && !keep_offsets {
+                let align = section.header.sh_addralign;
+                // LoongArch relocations are always `SHT_RELA`.
+                let need = match relocations_of(object, section, false)? {
+                    Some(crate::elf::read::Relocations::Rela(relocs)) => {
+                        crate::elf::arch::loongarch::relax::section_align(&relocs, align)
+                    }
+                    _ => crate::elf::arch::loongarch::relax::SectionAlign::default(),
+                };
+                if !relaxable_seen {
+                    relaxable_seen = need.relaxes;
+                } else if align > 4 && !need.covered {
+                    pad = align.saturating_sub(4);
+                }
+            }
+            member.align_pad = pad;
             let offset = if keep_offsets {
                 member.offset
+            } else if pad != 0 {
+                add(size, pad)?
             } else {
                 align_to(size, section.header.sh_addralign)?
             };
@@ -1099,9 +1133,11 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                         .and_then(|at| p.counts.get(at))
                 })
                 .map_or(0, |(_, c)| *c);
-            member.relocs = count;
+            // A LoongArch `-r` member that needs `nop` padding also carries
+            // the synthesized `R_LARCH_ALIGN` covering it.
+            member.relocs = add(count, u64::from(member.align_pad != 0))?;
             member.rela_offset = mul(total, reloc_size)?;
-            total = add(total, count)?;
+            total = add(total, member.relocs)?;
         }
         out.relocs = total;
     }
@@ -2518,7 +2554,19 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
     let Some(section) = object.section(member.section) else {
         return Ok(());
     };
+    // The synthesized `R_LARCH_ALIGN` of the `nop` padding before this
+    // member (LoongArch `-r`): no symbol, and the padding as its addend.
+    // A section with no relocations of its own has only this one.
+    let synthesized = (member.align_pad != 0).then(|| Relocation {
+        offset: member.offset.wrapping_sub(member.align_pad),
+        symbol: 0,
+        r_type: crate::elf::arch::loongarch::R_LARCH_ALIGN,
+        addend: member.align_pad as i64,
+    });
     let Some(relas) = relocations_of(object, section, plan.use_rel)? else {
+        if let Some(rel) = synthesized {
+            write_one_reloc::<F>(out, plan, &rel);
+        }
         return Ok(());
     };
     let context = Context {
@@ -2561,6 +2609,7 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
             addend: if plan.use_rel { 0 } else { addend },
         });
     }
+    sorted.extend(synthesized);
     sorted.sort_by_key(|rel| rel.offset);
     let size = usize::try_from(plan.reloc_size).unwrap_or(usize::MAX);
     let entries = out.chunks_mut(size.max(1));
@@ -2570,19 +2619,29 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
         ));
     }
     for (entry, rel) in entries.zip(sorted) {
-        if plan.use_rel {
-            let encoded = F::encode_rel(&rel);
-            if let Some(dest) = entry.get_mut(..<F::Rel as RawRecord>::SIZE) {
-                dest.copy_from_slice(encoded.as_bytes());
-            }
-        } else {
-            let encoded = F::encode_rela(&rel);
-            if let Some(dest) = entry.get_mut(..<F::Rela as RawRecord>::SIZE) {
-                dest.copy_from_slice(encoded.as_bytes());
-            }
-        }
+        write_one_reloc::<F>(entry, plan, &rel);
     }
     Ok(())
+}
+
+/// Writes one relocation entry in the output's class, byte order and
+/// relocation form.
+fn write_one_reloc<F: crate::elf::read::ElfFormat>(
+    entry: &mut [u8],
+    plan: &Plan<'_>,
+    rel: &Relocation,
+) {
+    if plan.use_rel {
+        let encoded = F::encode_rel(rel);
+        if let Some(dest) = entry.get_mut(..<F::Rel as RawRecord>::SIZE) {
+            dest.copy_from_slice(encoded.as_bytes());
+        }
+    } else {
+        let encoded = F::encode_rela(rel);
+        if let Some(dest) = entry.get_mut(..<F::Rela as RawRecord>::SIZE) {
+            dest.copy_from_slice(encoded.as_bytes());
+        }
+    }
 }
 
 /// The 16-bit section index field for output section list index `out`.

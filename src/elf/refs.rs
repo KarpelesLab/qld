@@ -54,7 +54,8 @@ pub struct Target {
     pub global: Option<SymbolId>,
     /// The definition.
     pub def: Def,
-    /// The defining symbol's raw entry, when there is one in an object.
+    /// The defining symbol's raw entry, when there is one in an object;
+    /// for an undefined thread-local variable, the reference's.
     pub raw: Option<RawSymbol>,
 }
 
@@ -122,7 +123,15 @@ impl<'a, F: crate::elf::read::ElfFormat> Refs<'_, 'a, F> {
             });
         }
         let id = self.global_id(file, index)?;
-        Some(self.global_target(id, raw.binding() == STB_WEAK))
+        let mut target = self.global_target(id, raw.binding() == STB_WEAK);
+        // An undefined thread-local variable has no defining entry, and
+        // some relocations mean something else against an ordinary symbol
+        // (LoongArch's extreme code model): keep the reference's entry, so
+        // that `STT_TLS` is still visible.
+        if target.raw.is_none() && raw.kind() == STT_TLS {
+            target.raw = Some(raw);
+        }
+        Some(target)
     }
 
     /// Resolves global symbol `id`; `weak` is the binding of the reference.

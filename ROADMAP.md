@@ -196,8 +196,11 @@ and TLS models.
       range-extension and interworking thunks, `.ARM.exidx` merging and
       `EXIDX_CANTUNWIND` synthesis with `PT_ARM_EXIDX`, build-attribute and
       float-ABI merging, PLT/GOT, all TLS models, IFUNC, `R_ARM_V4BX`;
-      compared with lld symbolically, fixtures run under qemu. Outstanding:
-      BE8 (needs big-endian ELF32), mapping symbols for linker-generated code, GNU TLS descriptors, group relocations past
+      mapping symbols for the PLT and thunks, thunk pools spread through
+      large sections, group relocations and the 12-bit GOT/TLS forms;
+      compared with lld symbolically and with GNU ld where lld cannot link
+      the form, fixtures run under qemu. Outstanding:
+      BE8 (needs big-endian ELF32), GNU TLS descriptors, group relocations past
       G0
 - [x] **x32** (`elf32_x86_64`): the x86-64 relocations and PLT in ELF32 with
       8-byte GOT entries, x32's TLS forms and `GOTPCRELX` relaxations, IFUNCs,
@@ -209,11 +212,13 @@ and TLS models.
       stubs that save r2, thunks (including TOC-saving and PC-relative
       ones), all TLS models with relaxations, `.glink`/PLT, IFUNCs, `-r`;
       compared with lld by meaning, fixtures run under qemu in CI.
+      `.toc` in `.got` as GNU ld places it, `R_PPC64_REL16DX_HA`.
       Outstanding: `_savegpr*`/`_restgpr*`, inline PLT sequences
-      (`-fno-plt`/`-mlongcall`), multi-TOC, `DT_PPC64_OPT`, thunks under
-      linker scripts
+      (`-fno-plt`/`-mlongcall`), `R_PPC64_TOC`, `ADDR64_LOCAL`,
+      `GOT_DTPREL*`, multi-TOC, `DT_PPC64_OPT`, thunks under linker
+      scripts
 - [ ] **PowerPC64 BE** (ELFv1 with OPDs; needs big-endian ELF)
-- [~] **LoongArch64**: the relocation set (including the extreme code model
+- [x] **LoongArch64**: the relocation set (including the extreme code model
       and ADD/SUB/ULEB128), PLT/GOT, all TLS models with TLSDESC and IE/TLSDESC
       relaxation, size-preserving relaxation, `-r`; compared with lld by
       meaning. Outstanding: shrinking relaxation (deleting `nop`s,

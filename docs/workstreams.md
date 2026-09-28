@@ -87,10 +87,10 @@ can work at the same time without colliding.
 | W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | merged |
 | W47 | Single-thread speed and scaling (M5) | hot paths in `src/elf/{write,scan,reloc,object,inputs,layout}*`, `src/symbols/**`, `src/input/**`, `src/main.rs` (allocator tuning, agreed), `benches/**`, `tests/projects/bench*` | W42 | in progress |
 | W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | in progress |
-| W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | in progress |
+| W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | merged |
 | W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | merged |
 | W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | in progress |
-| W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | in progress |
+| W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | merged |
 | W53 | Option coverage and GNU differences | `src/args/**`, the x86-64 difference fixes in `src/elf/{defined,dynsym,synth}*`, `tests/args*` | W22, W43 | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
@@ -628,6 +628,17 @@ remaining option and GNU-difference gaps.
 
 ## Integration follow-ups
 
+- **W52 (PowerPC64 LE):** still open, with notes on the size of each:
+  `_savegpr*`/`_restgpr*` (lld implements these, so they are verifiable
+  locally; needs a new synthetic section), inline PLT
+  (`PLTSEQ`/`PLTCALL`/`PLT16_*`, GNU ld only), `R_PPC64_TOC` (overlaps
+  W48's ELFv1 work), `ADDR64_LOCAL`, `GOT_DTPREL*` (needs a new `GotKind`),
+  `DT_PPC64_OPT`, multi-TOC.
+- **Thunks under linker-script layout** are missing generically: the script
+  path returns before the thunk fixpoint (`layout.rs`) and
+  `script_layout/engine.rs` hard-codes an empty thunk list. Fixing it there
+  fixes AArch64, PowerPC64 and Arm at once.
+
 - **W43 (x32):** differences from GNU ld that are x86-64-wide, found while
   comparing x32: a GOT slot for a symbol weak-undefined in the inputs but
   defined by the linker (`_DYNAMIC`) holds the link-time address **with no
@@ -642,9 +653,8 @@ remaining option and GNU-difference gaps.
   `__rela_iplt_end` takes the following section's index at a boundary;
   `tests/riscv32.rs` duplicates ~600 lines of the RV64 symbolizer.
 
-- **W32 (LoongArch64):** shrinking relaxation on W30's framework;
-  `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis
-  in `-r`; move the `R_LARCH_*` constants to `src/elf/read/consts/`; remove
+- **W32/W52 (LoongArch64):** open: move the `R_LARCH_*` constants to
+  `src/elf/read/consts/`; remove
   the per-relocation lookahead cost on x86-64/AArch64 (in progress).
 - **W40 (ELF32/big-endian):** next architectures, smallest first: x32 (the
   x86-64 PLT and 8-byte GOT with 4-byte `RELATIVE`, its own TLS forms), RV32

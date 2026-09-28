@@ -27,7 +27,7 @@
 
 use rayon::prelude::*;
 
-use crate::args::{ExecStack, LinkOptions, SeparateCode};
+use crate::args::{DiscardMode, ExecStack, LinkOptions, SeparateCode};
 use crate::elf::read::ElfKind;
 use crate::elf::read::consts::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_RELRO, PT_GNU_STACK,
@@ -301,6 +301,12 @@ pub struct Layout<'a> {
     /// addresses, sorted by output section and destination (for a patch,
     /// the instruction it replaces).
     pub thunks: Vec<thunk::Placed>,
+    /// Where each output section's thunk pools are, sorted; empty when the
+    /// architecture needs no thunks.
+    pub pools: Vec<thunk::Pool>,
+    /// Arm mapping symbols for the PLT and the thunk pools
+    /// ([`super::arch::arm::mapping`]), sorted; empty elsewhere.
+    pub mapping_symbols: Vec<super::arch::arm::mapping::Mapping>,
     /// Linker relaxation edits ([`super::arch::shrink`]): the bytes deleted
     /// from each code section, which symbol addresses and the writer follow.
     pub relax: Relaxation,
@@ -322,10 +328,12 @@ impl Layout<'_> {
         self.sections.iter().find(|s| s.name == name)
     }
 
-    /// The address of the range-extension thunk that callers in output
-    /// section `output` use to reach `target`.
+    /// The address of the range-extension thunk that the caller at `place`
+    /// in output section `output` uses to reach `target`: the nearest of
+    /// them, since a section too large for one pool has several
+    /// ([`thunk::Pool`]).
     #[must_use]
-    pub fn thunk_for(&self, output: u32, target: u64) -> Option<u64> {
+    pub fn thunk_for(&self, output: u32, target: u64, place: u64) -> Option<u64> {
         let at = self
             .thunks
             .partition_point(|t| (t.output, t.target) < (output, target));
@@ -333,7 +341,8 @@ impl Layout<'_> {
             .get(at..)?
             .iter()
             .take_while(|t| (t.output, t.target) == (output, target))
-            .find(|t| t.patch.is_none())
+            .filter(|t| t.patch.is_none())
+            .min_by_key(|t| t.address.abs_diff(place))
             .map(|t| t.address)
     }
 
@@ -463,7 +472,7 @@ pub fn layout<'a, F: crate::elf::read::ElfFormat>(
     let mut thunks = Thunks::default();
     for _ in 0..thunk::MAX_ROUNDS {
         let layout = layout_once(input, &thunks)?;
-        let next = thunk::plan(input, &layout, &thunks);
+        let next = thunk::plan(input, &layout);
         if next == thunks {
             return Ok(layout);
         }
@@ -569,7 +578,12 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
             })
             .unwrap_or_default()
     };
-    let sized: Vec<Result<(Vec<Placed>, u64, u64)>> = members
+    // Thunk pools: one at the end of every output section, plus one every
+    // `spacing` bytes of content in a section too large for a branch to
+    // reach the end ([`thunk::Pool`]).
+    let pooled = input.synth.arch.needs_thunks();
+    let spacing = input.synth.arch.thunk_pool_spacing();
+    let sized: Vec<Result<Sized<'_>>> = members
         .into_par_iter()
         .enumerate()
         .map(|(output_index, mut keys)| {
@@ -672,6 +686,12 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
                 .with_min_len(MIN_SIZES_PER_TASK)
                 .map(|&member| member_size(input, member).ok())
                 .collect();
+            let output_id = u32::try_from(output_index).unwrap_or(NONE);
+            // `(index, content offset, offset)` of each thunk pool; the
+            // content offset ignores what the pools themselves take, so it
+            // is the same in every round ([`thunk::Pool`]).
+            let mut pools: Vec<(u32, u64, u64)> = Vec::new();
+            let mut taken = 0u64;
             for (member, size) in list.into_iter().zip(sizes) {
                 let (size, member_align) = match size {
                     Some(size) => size,
@@ -679,6 +699,27 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
                 };
                 if size == 0 && matches!(member, Member::Synthetic(_)) {
                     continue;
+                }
+                // A pool before the member that would put more than
+                // `spacing` bytes of content after the last one.
+                if pooled
+                    && spacing != 0
+                    && let Ok(next) = u64::try_from(pools.len().saturating_add(1))
+                    && let Some(boundary) = next.checked_mul(spacing)
+                    && offset.saturating_sub(taken) >= boundary
+                {
+                    let index = u32::try_from(pools.len()).unwrap_or(u32::MAX);
+                    let bytes = thunks.size_of(output_id, index);
+                    let start = if bytes == 0 {
+                        offset
+                    } else {
+                        align = align.max(4);
+                        align_up(offset, 4)?
+                    };
+                    pools.push((index, offset.saturating_sub(taken), start));
+                    let end = add(start, bytes)?;
+                    taken = add(taken, end.saturating_sub(offset))?;
+                    offset = end;
                 }
                 let member_align = member_align.max(1);
                 offset = align_up(offset, member_align)?;
@@ -690,12 +731,21 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
                 });
                 offset = add(offset, size)?;
             }
-            let pool = thunks.size_of(u32::try_from(output_index).unwrap_or(NONE));
-            if pool != 0 {
-                offset = add(align_up(offset, 4)?, pool)?;
-                align = align.max(4);
+            if pooled {
+                // The pool at the end of the section, the only one until a
+                // section grows past `spacing`.
+                let index = u32::try_from(pools.len()).unwrap_or(u32::MAX);
+                let bytes = thunks.size_of(output_id, index);
+                let start = if bytes == 0 {
+                    offset
+                } else {
+                    align = align.max(4);
+                    align_up(offset, 4)?
+                };
+                pools.push((index, offset.saturating_sub(taken), start));
+                offset = add(start, bytes)?;
             }
-            Ok((placed, offset, align))
+            Ok((placed, offset, align, pools))
         })
         .collect();
 
@@ -706,10 +756,15 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
     let mut out_sections: Vec<OutSection<'a>> = Vec::new();
     let mut index_of_output = vec![NONE; output_count];
     let mut dropped: Vec<(usize, Vec<Placed>)> = Vec::new();
+    let sized = sized.into_iter().collect::<Result<Vec<_>>>()?;
+    let mut pools_of: Vec<Vec<(u32, u64, u64)>> = Vec::with_capacity(sized.len());
     let mut sized: Vec<Option<(Vec<Placed>, u64, u64)>> = sized
         .into_iter()
-        .map(|r| r.map(Some))
-        .collect::<Result<_>>()?;
+        .map(|(placed, size, align, pools)| {
+            pools_of.push(pools);
+            Some((placed, size, align))
+        })
+        .collect();
     for &output_index in &order {
         let (Some(output), Some(slot)) = (
             placement.outputs.get(output_index),
@@ -802,6 +857,14 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
     }
 
     let (section_symbols, shstrtab) = add_trailers(input, &mut out_sections)?;
+
+    // Arm marks the code it generates itself with mapping symbols, which
+    // are locals of `.symtab` and share one block of `.strtab`. Only how
+    // many there are matters here; their addresses come with step 4.
+    let mapping_count = arm_mapping_symbols(input, thunks, &out_sections, false).len();
+    if mapping_count != 0 {
+        reserve_mapping_symbols(&mut out_sections, kind, mapping_count);
+    }
 
     // 3. Segment plan (before addresses: the header size depends on it).
     let mode = input.mode;
@@ -1070,12 +1133,28 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
             dot = end;
         }
     }
+    // Where every thunk pool ended up, so that planning can put the next
+    // round's thunks in the pool nearest their callers.
+    let mut pools: Vec<thunk::Pool> = Vec::new();
+    if pooled {
+        for section in &out_sections {
+            let Some(list) = pools_of.get(section.output as usize) else {
+                continue;
+            };
+            for &(index, content, offset) in list {
+                pools.push(thunk::Pool {
+                    output: section.output,
+                    index,
+                    content,
+                    address: section.addr.wrapping_add(offset),
+                });
+            }
+        }
+        pools.sort_unstable();
+    }
     let mut placed_thunks: Vec<thunk::Placed> = Vec::new();
     if !thunks.is_empty() {
         for section in &mut out_sections {
-            if thunks.size_of(section.output) == 0 {
-                continue;
-            }
             for (offset, bytes) in thunks.render(section.output, section.addr) {
                 section.data.push((offset, bytes));
             }
@@ -1091,20 +1170,25 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
                 patch: None,
             });
         }
-        // Erratum patches: one block after the thunks, which the writer
-        // fills once the patched sections are relocated.
-        for section in &mut out_sections {
-            let size = thunks.patch_bytes(section.output);
-            if let Some(first) = thunks
-                .patches
-                .iter()
-                .find(|p| p.site.output == section.output)
-                && size > 0
-            {
-                section
-                    .data
-                    .push((first.offset, vec![0; usize::try_from(size).unwrap_or(0)]));
-            }
+        // Erratum patches: one block after the thunks of every pool that
+        // holds any, which the writer fills once the patched sections are
+        // relocated.
+        for group in thunks
+            .patches
+            .chunk_by(|a, b| (a.site.output, a.pool) == (b.site.output, b.pool))
+        {
+            let (Some(first), Some(section)) = (
+                group.first(),
+                out_sections
+                    .iter_mut()
+                    .find(|s| Some(s.output) == group.first().map(|p| p.site.output)),
+            ) else {
+                continue;
+            };
+            let size = group.len().saturating_mul(
+                usize::try_from(crate::arch::aarch64::ERRATUM_PATCH_SIZE).unwrap_or(8),
+            );
+            section.data.push((first.offset, vec![0; size]));
         }
         for patch in &thunks.patches {
             let Some(section) = out_sections.iter().find(|s| s.output == patch.site.output) else {
@@ -1119,6 +1203,11 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         }
         placed_thunks.sort_unstable();
     }
+    let mapping_symbols = if mapping_count == 0 {
+        Vec::new()
+    } else {
+        arm_mapping_symbols(input, thunks, &out_sections, true)
+    };
     let end = align_up(dot, kind.word_size())?;
     place_empty_until(NONE, dot, &mut output_places);
 
@@ -1418,6 +1507,8 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         kind,
         sections: out_sections,
         thunks: placed_thunks,
+        pools,
+        mapping_symbols,
         relax: Relaxation::default(),
         output_places,
         section_addr,
@@ -1442,6 +1533,65 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         headers_reserved: 0,
         nocrossrefs: Vec::new(),
     })
+}
+
+/// One sized output section: its members, its size, its alignment, and
+/// `(index, content offset, offset)` for each of its thunk pools.
+type Sized<'a> = (Vec<Placed>, u64, u64, Vec<(u32, u64, u64)>);
+
+/// The Arm mapping symbols for the PLT and the thunk pools
+/// ([`super::arch::arm::mapping`]), with their addresses when `addressed`
+/// and zeros while layout is only counting them. Empty on every other
+/// architecture, when no `.symtab` is written, and under `-x`, which drops
+/// every local symbol.
+fn arm_mapping_symbols<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    thunks: &Thunks,
+    out_sections: &[OutSection<'_>],
+    addressed: bool,
+) -> Vec<super::arch::arm::mapping::Mapping> {
+    if input.synth.arch != Arch::Arm
+        || input.trailers.symtab == 0
+        || input.options.discard == DiscardMode::All
+    {
+        return Vec::new();
+    }
+    let at = |address: u64, position: usize| -> Option<(u64, u16)> {
+        let shndx = u16::try_from(position.saturating_add(1)).ok()?;
+        Some(if addressed { (address, shndx) } else { (0, 0) })
+    };
+    let plt_at = out_sections.iter().enumerate().find_map(|(position, s)| {
+        let placed = s
+            .members
+            .iter()
+            .find(|p| matches!(p.member, Member::Synthetic(Synthetic::Plt)))?;
+        at(s.addr.saturating_add(placed.offset), position)
+    });
+    let pool = |output: u32| -> Option<(u64, u16)> {
+        let position = out_sections.iter().position(|s| s.output == output)?;
+        at(out_sections.get(position)?.addr, position)
+    };
+    super::arch::arm::mapping::symbols(plt_at, input.synth.dynamic(), thunks, &pool)
+}
+
+/// Makes room in `.symtab` and `.strtab` for `count` mapping symbols and
+/// the one block of names they share. They are locals, so `sh_info`, the
+/// index of the first global, moves with them.
+fn reserve_mapping_symbols(out_sections: &mut [OutSection<'_>], kind: ElfKind, count: usize) {
+    let entries = u64::try_from(count).unwrap_or(0);
+    let names = u64::try_from(super::arch::arm::mapping::NAMES.len()).unwrap_or(0);
+    for section in out_sections.iter_mut() {
+        match section.trailer {
+            Trailer::Symtab => {
+                section.size = section
+                    .size
+                    .saturating_add(entries.saturating_mul(kind.sym_size()));
+                section.info = section.info.saturating_add(count.try_into().unwrap_or(0));
+            }
+            Trailer::Strtab => section.size = section.size.saturating_add(names),
+            _ => {}
+        }
+    }
 }
 
 /// Appends the trailing sections (`--emit-relocs` relocation sections,
@@ -1868,6 +2018,14 @@ pub(crate) fn member_size<F: crate::elf::read::ElfFormat>(
             // `.riscv.attributes` takes the place of the input sections.
             if input.synth.arch.is_riscv() {
                 return Ok(riscv_member_size(input, id, section));
+            }
+            // LoongArch: relaxation shrinks code the same way.
+            if input.synth.arch == Arch::LoongArch64 {
+                let removed = input.relax.map_or(0, |relax| relax.removed(id));
+                return Ok((
+                    section.header.sh_size.saturating_sub(removed),
+                    section.header.sh_addralign,
+                ));
             }
             if input.synth.arch == Arch::Arm {
                 return Ok(super::arch::arm::apply::member_size(
