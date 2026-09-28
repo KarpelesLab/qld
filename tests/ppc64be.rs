@@ -668,6 +668,44 @@ fn the_emulation_selects_the_backend() {
     assert_eq!(image.e_flags & 3, 1);
 }
 
+/// Relocatable output keeps the ABI, and linking it again gives the same
+/// program as linking the objects directly.
+#[test]
+fn relocatable_output_keeps_the_abi() {
+    let tools = require!();
+    let dir = scratch("relocatable");
+    compile(tools, &dir, "main.c", FREESTANDING, &["-O2"]);
+    compile(tools, &dir, "lib.c", LIBRARY, &["-O2"]);
+    qld_ok(&dir, &["-r", "-o", "partial.o", "main.o", "lib.o"]);
+    let partial = fs::read(dir.join("partial.o")).unwrap();
+    assert_eq!(&partial[4..6], &[2, 2], "ELF64, big-endian");
+    assert_eq!(
+        u32::from_be_bytes(partial[48..52].try_into().unwrap()) & 3,
+        1
+    );
+    qld_ok(
+        &dir,
+        &["-m", "elf64ppc", "-o", "out", "-e", "_start", "partial.o"],
+    );
+    let relinked = elf::Elf::read(&dir.join("out"));
+    let direct = link_freestanding(tools, &dir, "direct");
+    let entries = |image: &elf::Elf| -> Vec<Option<String>> {
+        ["_start", "caller_qld", "add_qld", "pick_qld"]
+            .into_iter()
+            .map(|name| {
+                image
+                    .symbol_at(image.word(image.symbols[name].value))
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+    assert_eq!(
+        entries(&relinked),
+        entries(&direct),
+        "the descriptors must point at the same functions either way"
+    );
+}
+
 /// `Elf32Be` is instantiated in `elf::link`'s dispatch: a big-endian ELF32
 /// input reaches the pipeline and is turned away by the architecture check
 /// inside it, not by the dispatch. No architecture produces ELF32
