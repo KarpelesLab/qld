@@ -1851,7 +1851,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                             .get(id.index())
                             .copied()
                             .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
-                        && let Some(thunk) = addresses.layout.thunk_for(output, sa)
+                        && let Some(thunk) = addresses.layout.thunk_for(output, sa, place)
                     {
                         sa = thunk;
                     }
@@ -2137,7 +2137,7 @@ fn ppc64_branch<F: crate::elf::read::ElfFormat>(
             .get(id.index())
             .copied()
             .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
-        && let Some(thunk) = addresses.layout.thunk_for(output, destination)
+        && let Some(thunk) = addresses.layout.thunk_for(output, destination, call.place)
     {
         sa = thunk;
     }

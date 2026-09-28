@@ -124,8 +124,8 @@ mod tests {
     use crate::elf::arch::arm::thunk_key;
 
     fn thunks(keys: &[u64]) -> Thunks {
-        let needed = keys.iter().map(|&key| (0u32, key)).collect();
-        Thunks::build_for(Arch::Arm, needed, &|_| 0x100)
+        let needed = keys.iter().map(|&key| (0u32, 0u32, key)).collect();
+        Thunks::build_for(Arch::Arm, needed, &|_, _| 0x100)
     }
 
     #[test]

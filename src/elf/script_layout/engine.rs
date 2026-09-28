@@ -2775,6 +2775,7 @@ fn assemble<'a, F: crate::elf::read::ElfFormat>(
         // Script-driven layout does not insert range-extension thunks, so
         // it writes no Arm mapping symbols for them either.
         thunks: Vec::new(),
+        pools: Vec::new(),
         mapping_symbols: Vec::new(),
         relax: Default::default(),
         output_places,

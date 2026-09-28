@@ -1282,6 +1282,102 @@ fn mapping_symbols_mark_linker_generated_code() {
     assert!(listing.contains(".word"), "{listing}");
 }
 
+/// A `.text` larger than a Thumb `bl` reaches, in one-MiB sections so
+/// that layout has somewhere to put a pool: every caller in it branches
+/// to a destination no branch reaches.
+fn big_text(sections: u32) -> String {
+    let mut out = String::from("\t.syntax unified\n");
+    for index in 0..sections {
+        out.push_str(&format!(
+            "\t.section .text.f{index:02},\"ax\",%progbits\n\t.thumb\n\
+             \t.globl f{index:02}\n\t.thumb_func\n\t.type f{index:02}, %function\n\
+             f{index:02}:\n\tbl far_thumb\n\tbx lr\n\t.size f{index:02}, .-f{index:02}\n\
+             \t.space 0x100000\n"
+        ));
+    }
+    out
+}
+
+/// The address an instruction's `bl` branches to.
+fn branch_target(tools: &Tools, dir: &Path, file: &str, at: u64) -> u64 {
+    let code = run_ok(
+        dir,
+        &tools.objdump,
+        &[
+            "-d",
+            &format!("--start-address=0x{at:x}"),
+            &format!("--stop-address=0x{:x}", at + 4),
+            file,
+        ],
+    );
+    code.lines()
+        .filter(|line| line.contains("bl"))
+        .find_map(|line| {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix("0x"))
+                .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+        })
+        .unwrap_or_else(|| panic!("no bl at {at:#x} in\n{code}"))
+}
+
+/// One pool at the end of an output section only reaches the callers
+/// within a branch of it, so layout spreads pools through a larger one.
+/// The Thumb `bl` here reaches ±16 MiB and `.text` is 18 MiB, so before
+/// this the link failed with "relocation out of range".
+#[test]
+fn thunk_pools_are_spread_through_a_large_text() {
+    let tools = require!();
+    let dir = scratch("thunk-pools");
+    compile(tools, &dir, "big.s", &big_text(18), "big.o", &[]);
+    compile(tools, &dir, "fardef.s", FARDEF_S, "fardef.o", &[]);
+    let entry = "\t.syntax unified\n\t.text\n\t.thumb\n\t.globl _start\n\
+                 \t.thumb_func\n_start:\n\tbl far_thumb\n\tbx lr\n";
+    compile(tools, &dir, "entry.s", entry, "entry.o", &[]);
+    let (_, ours) = link_both(
+        tools,
+        &dir,
+        "big",
+        &["-static", "-e", "_start", "big.o", "entry.o", "fardef.o"],
+    );
+    // Every caller reaches a thunk that loads far_thumb (0x4000011) and
+    // `bx`es to it, and the callers at the two ends do not share one.
+    let symbols = run_ok(dir.as_path(), &tools.readelf, &["-sW", &ours]);
+    let value = |name: &str| -> u64 {
+        symbols
+            .lines()
+            .find(|line| line.split_whitespace().last() == Some(name))
+            .and_then(|line| hex(line.split_whitespace().nth(1)?))
+            .unwrap_or_else(|| panic!("no {name} in\n{symbols}"))
+    };
+    let mut thunks = Vec::new();
+    for name in ["f00", "f09", "f17"] {
+        // The symbol carries the Thumb bit.
+        let caller = value(name) & !1;
+        let thunk = branch_target(tools, &dir, &ours, caller);
+        assert!(
+            caller.abs_diff(thunk) < (16 << 20),
+            "{name} at {caller:#x} branches {thunk:#x}, out of a Thumb bl's reach"
+        );
+        let code = run_ok(
+            dir.as_path(),
+            &tools.objdump,
+            &[
+                "-d",
+                &format!("--start-address=0x{thunk:x}"),
+                &format!("--stop-address=0x{:x}", thunk + 10),
+                &ours,
+            ],
+        );
+        assert!(code.contains("movw") && code.contains("#0x11"), "{code}");
+        assert!(code.contains("movt") && code.contains("#0x400"), "{code}");
+        thunks.push(thunk);
+    }
+    assert!(
+        thunks.first() != thunks.last(),
+        "one pool served all of {thunks:x?}"
+    );
+}
+
 const LIB_C: &str = r#"
 __thread int lib_tls = 1;
 static __thread int lib_tls_local = 2;
