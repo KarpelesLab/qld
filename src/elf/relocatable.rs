@@ -92,6 +92,15 @@ use super::synth::plan_property_note;
 /// Kept COMDAT group copies by signature: `(file, group index)`.
 type KeptGroups<'a> = HashMap<&'a [u8], (u32, u32), foldhash::fast::FixedState>;
 
+/// Largest alignment a section's file offset is padded to.
+///
+/// A relocatable output has no addresses, so `sh_addralign` constrains
+/// nothing in the file; GNU ld pads no further than this, and records the
+/// real alignment in the section header for the final link to honour.
+/// Without the cap, one input section with an absurd `sh_addralign` — a
+/// corrupt object's 2 GiB, say — would inflate the output by that much.
+const MAX_FILE_ALIGN: u64 = 1 << 16;
+
 /// Size of a symbol table entry of the output class.
 fn sym_size<F: ElfFormat>() -> u64 {
     <F::Sym as RawRecord>::SIZE as u64
@@ -1287,7 +1296,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     let mut offset = ehdr_size::<F>();
     for out in &mut outs {
         if out.has_file_bytes() {
-            offset = align_to(offset, out.align)?;
+            offset = align_to(offset, out.align.min(MAX_FILE_ALIGN))?;
             out.offset = offset;
             offset = add(offset, out.size)?;
         } else {

@@ -1,0 +1,361 @@
+//! End-to-end checks of the diagnostics framework (workstream W51).
+//!
+//! The unit tests in `src/diag.rs` pin the rendering; these run the `qld`
+//! binary and compare the shape of what it prints with GNU ld 2.4x and
+//! lld 2x, which `docs/compatibility.md` records. A test prints `SKIPPED:`
+//! and passes when a tool it needs is missing.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+/// A fresh, empty directory for one test.
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("diag-tests")
+        .join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn tool(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn host_ok() -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+}
+
+macro_rules! require {
+    ($($name:literal),*) => {
+        if !host_ok() {
+            println!("SKIPPED: host is not x86-64 Linux");
+            return;
+        }
+        $(
+            if tool($name).is_none() {
+                println!("SKIPPED: {} not found", $name);
+                return;
+            }
+        )*
+    };
+}
+
+fn run(dir: &Path, program: &str, args: &[&str]) -> Output {
+    Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {program}: {error}"))
+}
+
+fn qld(dir: &Path, args: &[&str]) -> Output {
+    run(dir, env!("CARGO_BIN_EXE_qld"), args)
+}
+
+/// Runs `qld`, expects it to fail, and returns its standard error.
+fn qld_err(dir: &Path, args: &[&str]) -> String {
+    let output = qld(dir, args);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success(),
+        "qld {} unexpectedly succeeded:\n{stderr}",
+        args.join(" ")
+    );
+    stderr
+}
+
+fn compile(dir: &Path, name: &str, source: &str, flags: &[&str]) {
+    fs::write(dir.join(format!("{name}.c")), source).unwrap();
+    let mut args = vec!["-c", "-O0", "-fno-pie"];
+    args.extend_from_slice(flags);
+    let source = format!("{name}.c");
+    let object = format!("{name}.o");
+    args.extend_from_slice(&[source.as_str(), "-o", object.as_str()]);
+    let output = run(dir, "cc", &args);
+    assert!(
+        output.status.success(),
+        "cc failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const MAIN: &str = "int missing(void);\nint dup(void) { return 1; }\nint main(void) { return \
+                    missing() + dup(); }\n";
+const OTHER: &str = "int dup(void) { return 2; }\n";
+
+/// An undefined symbol renders like lld's: the message, then the source
+/// position from DWARF, then the object reference aligned under it.
+#[test]
+fn undefined_symbol_shape() {
+    require!("cc");
+    let dir = scratch("undefined");
+    compile(&dir, "main", MAIN, &["-g"]);
+    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "main.o"]);
+
+    assert!(
+        stderr.starts_with("qld: error: undefined symbol: missing\n"),
+        "{stderr}"
+    );
+    let source = stderr
+        .lines()
+        .find(|line| line.starts_with(">>> referenced by "))
+        .unwrap_or_else(|| panic!("no `referenced by` line:\n{stderr}"));
+    assert!(source.contains("main.c:3"), "{stderr}");
+    // The object reference is on its own line, indented under the source.
+    assert!(
+        stderr.contains(">>>               main.o:(.text+"),
+        "{stderr}"
+    );
+    // GNU ld and lld print no summary count.
+    assert!(!stderr.contains("1 error"), "{stderr}");
+}
+
+/// Without debug information there is no source line, and the object
+/// reference takes the `referenced by` line itself, as in lld.
+#[test]
+fn undefined_symbol_without_debug_info() {
+    require!("cc");
+    let dir = scratch("undefined-nodebug");
+    compile(&dir, "main", MAIN, &[]);
+    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "main.o"]);
+    assert!(
+        stderr.contains(">>> referenced by main.o:(.text+"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(">>>               "), "{stderr}");
+}
+
+/// Two strong definitions: lld's `duplicate symbol:` wording, and every
+/// location labelled `defined at`, not `referenced by`.
+#[test]
+fn duplicate_symbol_shape() {
+    require!("cc");
+    let dir = scratch("duplicate");
+    compile(&dir, "main", MAIN, &[]);
+    compile(&dir, "other", OTHER, &[]);
+    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "main.o", "other.o"]);
+    assert!(
+        stderr.contains("qld: error: duplicate symbol: dup\n"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(">>> defined at main.o:(.text+"), "{stderr}");
+    assert!(
+        stderr.contains(">>> defined at other.o:(.text+"),
+        "{stderr}"
+    );
+}
+
+/// Errors come out sorted by `Diagnostic::order` — input order here — and
+/// that holds whatever the thread count is.
+#[test]
+fn output_is_deterministic_across_thread_counts() {
+    require!("cc");
+    let dir = scratch("deterministic");
+    for (index, name) in ["a", "b", "c", "d"].iter().enumerate() {
+        let source = format!(
+            "int missing_{name}(void);\nint use_{name}(void) {{ return missing_{name}(); }}\n"
+        );
+        compile(&dir, name, &source, &[]);
+        let _ = index;
+    }
+    compile(
+        &dir,
+        "main",
+        "int use_a(void); int use_b(void); int use_c(void); int use_d(void);\nint main(void) { \
+         return use_a() + use_b() + use_c() + use_d(); }\n",
+        &[],
+    );
+    let mut seen: Option<String> = None;
+    for threads in ["--threads=1", "--threads=2", "--threads=4"] {
+        let stderr = qld_err(
+            &dir,
+            &[
+                "--no-fork",
+                threads,
+                "--error-limit=0",
+                "-o",
+                "out",
+                "main.o",
+                "a.o",
+                "b.o",
+                "c.o",
+                "d.o",
+            ],
+        );
+        match &seen {
+            None => seen = Some(stderr),
+            Some(first) => assert_eq!(first, &stderr, "{threads} threads differ"),
+        }
+    }
+    let stderr = seen.unwrap();
+    let order: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("qld: error: undefined symbol: "))
+        .collect();
+    assert_eq!(
+        order,
+        ["missing_a", "missing_b", "missing_c", "missing_d"],
+        "{stderr}"
+    );
+}
+
+/// `--error-limit` truncates with lld's message, and `--error-limit=0`
+/// shows everything.
+#[test]
+fn error_limit_matches_lld() {
+    require!("cc");
+    let dir = scratch("error-limit");
+    let mut source = String::new();
+    let mut body = String::from("int main(void) { return 0");
+    for index in 0..30 {
+        source.push_str(&format!("int missing_{index:02}(void);\n"));
+        body.push_str(&format!(" + missing_{index:02}()"));
+    }
+    body.push_str("; }\n");
+    source.push_str(&body);
+    compile(&dir, "main", &source, &[]);
+
+    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "main.o"]);
+    let count = stderr.matches("undefined symbol: ").count();
+    assert_eq!(count, 20, "lld's default limit is 20:\n{stderr}");
+    assert!(
+        stderr.contains(
+            "qld: error: too many errors emitted, stopping now (use --error-limit=0 to see all \
+             errors)"
+        ),
+        "{stderr}"
+    );
+
+    let stderr = qld_err(
+        &dir,
+        &["--no-fork", "--error-limit=3", "-o", "out", "main.o"],
+    );
+    assert_eq!(stderr.matches("undefined symbol: ").count(), 3, "{stderr}");
+
+    let stderr = qld_err(
+        &dir,
+        &["--no-fork", "--error-limit=0", "-o", "out", "main.o"],
+    );
+    assert_eq!(stderr.matches("undefined symbol: ").count(), 30, "{stderr}");
+    assert!(!stderr.contains("too many errors"), "{stderr}");
+}
+
+/// `--color-diagnostics=always` colours the severity the way lld does, and
+/// `never` (the default when stderr is not a terminal) leaves it alone.
+#[test]
+fn color_diagnostics() {
+    require!("cc");
+    let dir = scratch("color");
+    compile(&dir, "main", MAIN, &[]);
+    let plain = qld_err(&dir, &["--no-fork", "-o", "out", "main.o"]);
+    assert!(!plain.contains('\x1b'), "{plain}");
+
+    let colored = qld_err(
+        &dir,
+        &[
+            "--no-fork",
+            "--color-diagnostics=always",
+            "-o",
+            "out",
+            "main.o",
+        ],
+    );
+    assert!(
+        colored.contains("qld: \x1b[0;31merror: \x1b[0mundefined symbol: missing"),
+        "{colored:?}"
+    );
+
+    let never = qld_err(
+        &dir,
+        &[
+            "--no-fork",
+            "--color-diagnostics=never",
+            "-o",
+            "out",
+            "main.o",
+        ],
+    );
+    assert_eq!(never, plain);
+}
+
+/// `--fatal-warnings` turns a link-time warning into an error and fails the
+/// link; `-w` drops warnings and cancels it, as in lld.
+#[test]
+fn fatal_warnings_and_no_warnings() {
+    require!("cc");
+    let dir = scratch("fatal-warnings");
+    compile(&dir, "main", "int main(void) { return 0; }\n", &[]);
+    let args = [
+        "--no-fork",
+        "-o",
+        "out",
+        "main.o",
+        "-z",
+        "qld-bogus-keyword",
+    ];
+
+    let output = qld(&dir, &args);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("qld: warning: "), "{stderr}");
+
+    let mut fatal = args.to_vec();
+    fatal.push("--fatal-warnings");
+    let stderr = qld_err(&dir, &fatal);
+    assert!(stderr.contains("qld: error: "), "{stderr}");
+    assert!(!stderr.contains("qld: warning: "), "{stderr}");
+
+    let mut quiet = fatal.clone();
+    quiet.push("-w");
+    let output = qld(&dir, &quiet);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "-w cancels --fatal-warnings: {stderr}"
+    );
+    assert_eq!(stderr, "");
+}
+
+/// The five fatal-error messages qld shares with GNU ld: a missing library,
+/// an unknown option, a file that is not an object, and a truncated one.
+#[test]
+fn fatal_errors_are_gnu_shaped() {
+    require!("cc");
+    let dir = scratch("fatal");
+    compile(&dir, "main", "int main(void) { return 0; }\n", &[]);
+
+    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "main.o", "-lqld-no-such"]);
+    assert!(
+        stderr.starts_with("qld: error: cannot find -lqld-no-such"),
+        "GNU ld says `cannot find -lfoo`: {stderr}"
+    );
+
+    let stderr = qld_err(
+        &dir,
+        &["--no-fork", "-o", "out", "--qld-no-such-option", "main.o"],
+    );
+    assert!(stderr.contains("--qld-no-such-option"), "{stderr}");
+    assert!(stderr.starts_with("qld: error: "), "{stderr}");
+
+    // Binary junk: text would be taken for a linker script, as lld does.
+    let junk: Vec<u8> = (0..512u32)
+        .map(|i| (i.wrapping_mul(97) ^ 0xa5) as u8)
+        .collect();
+    fs::write(dir.join("junk.o"), &junk).unwrap();
+    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "junk.o"]);
+    assert!(stderr.contains("junk.o"), "{stderr}");
+    assert!(stderr.contains("not recognized"), "{stderr}");
+
+    let mut truncated = fs::read(dir.join("main.o")).unwrap();
+    truncated.truncate(48);
+    fs::write(dir.join("short.o"), &truncated).unwrap();
+    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "short.o"]);
+    assert!(stderr.starts_with("qld: error: "), "{stderr}");
+    assert!(stderr.contains("short.o"), "{stderr}");
+}

@@ -189,6 +189,7 @@ pub fn location<F: crate::elf::read::ElfFormat>(
         .and_then(|o| o.section(section))
         .map(|s| String::from_utf8_lossy(s.name).into_owned());
     Location {
+        relation: crate::diag::Relation::ReferencedBy,
         file: input.map(|f| f.path()).unwrap_or_default(),
         member: input.and_then(|f| f.member()),
         section: name,

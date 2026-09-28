@@ -142,10 +142,7 @@ impl LineLookup {
             return None;
         }
         let file = self.files.get(usize::try_from(range.file).ok()?)?;
-        Some(SourceLocation {
-            file: file.clone(),
-            line: range.line,
-        })
+        Some(SourceLocation::new(file.clone(), range.line))
     }
 
     /// Problems found in individual units or line programs, which were
