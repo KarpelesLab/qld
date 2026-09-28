@@ -578,10 +578,10 @@ fn write_headers_as<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [
         class: F::CLASS,
         data: <F::Endian as Endian>::ELF_DATA,
         ident_version: 1, // EV_CURRENT
-        os_abi: if input.addresses.synth.iplt.is_empty() {
-            0
+        os_abi: if super::synth::gnu_osabi(input.addresses.refs.files, input.addresses.synth) {
+            crate::elf::read::consts::ELFOSABI_GNU
         } else {
-            3 // ELFOSABI_GNU
+            crate::elf::read::consts::ELFOSABI_NONE
         },
         abi_version: 0,
         e_type: if pic { ET_DYN } else { ET_EXEC },

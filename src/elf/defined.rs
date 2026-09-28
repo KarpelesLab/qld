@@ -470,6 +470,13 @@ fn symbol_def<F: crate::elf::read::ElfFormat>(
 /// value alone does not tell: a script symbol assigned relative to an
 /// output section, or `__start_SEC`/`__stop_SEC`, belongs to that section
 /// even at its end, where the next section may start.
+///
+/// `__ehdr_start` and `__executable_start` name the ELF header, which is
+/// before every section, so no section covers their address. GNU ld and
+/// lld both make them relative to the first allocated section, and so does
+/// qld: an `SHN_ABS` symbol is not relocated in a position-independent
+/// output, which would leave a GOT slot for it holding a link-time
+/// address.
 #[must_use]
 pub fn linker_shndx<F: crate::elf::read::ElfFormat>(
     addresses: &super::values::Addresses<'_, '_, F>,
@@ -483,6 +490,10 @@ pub fn linker_shndx<F: crate::elf::read::ElfFormat>(
         Value::OutputStart(output) | Value::OutputEnd(output) => {
             let position = layout.output_places.get(output as usize)?.2;
             (position != super::sections::NONE).then_some(position)?
+        }
+        Value::EhdrStart | Value::ExecutableStart => {
+            let first = layout.sections.iter().position(|s| s.is_alloc())?;
+            u32::try_from(first).ok()?
         }
         _ => return None,
     };

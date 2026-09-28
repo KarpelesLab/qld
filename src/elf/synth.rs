@@ -819,6 +819,26 @@ fn copy_shape<F: crate::elf::read::ElfFormat>(
     (raw.st_size, align, read_only)
 }
 
+/// Whether the output's `EI_OSABI` is `ELFOSABI_GNU`.
+///
+/// GNU ld sets it for an output that carries a GNU symbol-table or section
+/// extension: an `STT_GNU_IFUNC` symbol, an `STB_GNU_UNIQUE` binding, or a
+/// `SHF_GNU_RETAIN` or `SHF_GNU_MBIND` section. Assemblers stamp exactly
+/// those objects `ELFOSABI_GNU` themselves, so qld reads the flag off the
+/// relocatable inputs rather than re-deriving it, and adds the case an
+/// input cannot show: an IFUNC stub the link synthesized. Shared libraries
+/// do not count — a dynamic executable of a GNU libc stays `ELFOSABI_NONE`
+/// in GNU ld too.
+#[must_use]
+pub fn gnu_osabi<F: crate::elf::read::ElfFormat>(files: &[ElfInput<'_, F>], synth: &Synth) -> bool {
+    !synth.iplt.is_empty()
+        || files.iter().any(|file| {
+            file.object.as_ref().is_some_and(|object| {
+                object.elf.elf().header().os_abi == crate::elf::read::consts::ELFOSABI_GNU
+            })
+        })
+}
+
 /// The dynamic relocation one GOT word needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotReloc {
