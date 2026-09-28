@@ -336,9 +336,33 @@ passes" when it cannot settle). Known differences:
   `.eh_frame` keeps the FDEs of discarded COMDAT copies and the last FDE's
   padding. In PIEs, hidden functions called through `PLT32` stay
   `GLOBAL HIDDEN`.
-- Other known differences: `.dynstr` has no tail merging; `.dynamic` has no
-  spare `DT_NULL` slots and orders tags differently; there is no
-  version-definition symbol in `.symtab`; no empty `.got.plt` is kept.
+- Other known differences, with the reason for each:
+  - `.dynstr` is not tail-merged: the table is built once, in parallel, from
+    the exported names, and suffix merging would need a second sorted pass
+    over every string to save a few hundred bytes.
+  - `.dynamic` has no spare `DT_NULL` slots (`--spare-dynamic-tags` is
+    accepted and reserves none) and orders tags by qld's own emission
+    order. The spare slots existed for `prelink`, which is gone, and the
+    order is not specified.
+  - There is no version-definition symbol in `.symtab`: GNU ld adds one
+    `STT_OBJECT` per `.gnu.version_d` entry, and nothing reads them.
+  - No empty `.got.plt` is kept.
+- **Linker-defined symbols in a shared object are exported**, as in GNU ld
+  and lld: `_end`, `_edata`, `__bss_start`, `_etext` and `--defsym` symbols
+  with default visibility, and `__start_SEC` / `__stop_SEC` protected
+  (`-z start-stop-visibility=` overrides). The per-module ones
+  (`__ehdr_start`, `__executable_start`, `_DYNAMIC`,
+  `_GLOBAL_OFFSET_TABLE_`, `_TLS_MODULE_BASE_`) stay hidden.
+  `__executable_start` follows lld, since GNU ld's shared-object script
+  does not define it at all.
+- **`GLIBC_ABI_GNU_TLS` and `GLIBC_ABI_GNU2_TLS`** version dependencies are
+  added when the output keeps GNU TLS or TLS descriptors and a needed
+  library defines the version, as GNU ld 2.46 does; `--no-gnu-tls-tag` and
+  `--no-gnu2-tls-tag` turn them off. lld has neither option.
+- **`--dynamic-list-cpp-new` and `--dynamic-list-cpp-typeinfo`** match the
+  mangled prefixes `_Znw*`, `_Zna*`, `_Zdl*`, `_Zda*`, `_ZTI*` and `_ZTS*`.
+  GNU ld matches the demangled names through `extern "C++"`; under Itanium
+  mangling the two sets are the same.
 
 ### Demangled names
 
@@ -497,6 +521,23 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   bytes, leaving a stray byte. qld writes the intended 13-byte sequence.
 - lld rejects x32's `GOTTPOFF` and TLSDESC instruction forms, so it is only
   compared on position-independent output.
+
+## x86-64 differences settled against GNU ld and lld
+
+- **`GOTPCRELX` in position-dependent output:** GNU ld rewrites a GOT load
+  of a non-preemptible symbol to `mov $addr, %reg`; qld writes
+  `lea addr(%rip), %reg`, as lld does. Same address, same length.
+- **A data pointer to an IFUNC** gets a `RELATIVE` relocation to the
+  canonical PLT stub, as in lld, so `&f == f` holds. GNU ld writes an
+  `IRELATIVE` there, which stores the resolved address and makes the
+  comparison false — C requires it to be true.
+- **`SHF_GNU_RETAIN` does not make the output `ELFOSABI_GNU`.** GNU ld drops
+  the flag and leaves `ELFOSABI_NONE`; lld sets `ELFOSABI_GNU`. qld follows
+  GNU ld, and stamps `ELFOSABI_GNU` for an `STT_GNU_IFUNC` or
+  `STB_GNU_UNIQUE` symbol, as both linkers do.
+- `__ehdr_start` and `__executable_start` are relative to the first
+  allocated section, as in GNU ld and lld. They used to be `SHN_ABS`, which
+  also left their GOT slots unrelocated in a PIE.
 
 ## Relocatable output and the debug indexes
 

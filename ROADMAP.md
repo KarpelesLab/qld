@@ -23,6 +23,7 @@ Set up the project skeleton and the infrastructure every later milestone needs.
 - [x] CI: build and test on stable and 1.89, `clippy -D warnings`, `rustfmt --check`,
       `cargo doc`, `cargo deny` (licenses/advisories), Linux/macOS/Windows hosts
 - [ ] Diagnostics framework: error/warning/note with input location, GNU-style
+      (W51 in progress)
       `qld: error: ...` rendering, and structured form for library users
 - [x] GNU flavor argument parser
   - [x] Complete option table covering every GNU ld 2.4x, gold, lld and mold
