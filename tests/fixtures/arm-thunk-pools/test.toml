@@ -1,0 +1,20 @@
+# M4: thunk pools spread through a large output section. `.text` is 17 MiB
+# of Thumb code, more than a `bl` reaches (±16 MiB), so one pool at the end
+# of the section would leave the caller at the start out of range: the link
+# only succeeds if the linker also puts a pool in the middle. The call is
+# taken at run time, so the thunk it goes through has to work.
+description = "Arm thunk pools in a .text larger than a Thumb branch reaches"
+compile = ["cc -c pools.s"]
+link = "-static -e _start -o out pools.o"
+run = "./out"
+expect.stdout = "pools work\n"
+expect.exit = 7
+expect.readelf = [
+  "ARM",
+  "EXEC (Executable file)",
+  # The pool the caller uses is marked as Thumb code, like every thunk.
+  "$t",
+]
+targets = ["arm-linux-gnueabihf"]
+# qld adds a linker `.comment` when no input has one (as lld does).
+diff.ignore = [".comment"]

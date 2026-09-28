@@ -15,6 +15,11 @@ expect.readelf = [
   "ARM",
   "EXEC (Executable file)",
   "!INTERP",
+  # Mapping symbols for the thunks: their instruction set at the start of
+  # each one, and `$d` for the zeros after its instructions.
+  "$a",
+  "$t",
+  "$d",
 ]
 targets = ["arm-linux-gnueabihf"]
 determinism = true
