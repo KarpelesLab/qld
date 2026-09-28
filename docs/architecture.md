@@ -316,6 +316,7 @@ qld/
 │   ├── output/             # output file writer, build-id, post-write steps
 │   ├── elf/                # ELF backend (read, layout, synth, arch/)
 │   ├── coff/               # PE/COFF backend
+│   ├── hunk/              # AmigaOS Hunk load files, rendered from the image
 │   ├── macho/              # Mach-O backend, .tbd, fat binaries, code signing
 │   ├── arch/               # instruction-level helpers shared across formats
 │   ├── debug/              # DWARF: compression, indexes, line lookup

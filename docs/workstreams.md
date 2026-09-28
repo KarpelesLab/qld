@@ -637,6 +637,13 @@ the output needs an Amiga emulator and the user asked not to use one.
 
 ## Integration follow-ups
 
+- **W55 (Hunk/m68k):** a Hunk-specific section→hunk placement rule (vlink
+  gives each input section name its own hunk); Hunk object output
+  (`HUNK_UNIT`/`HUNK_EXT`), overlays and Hunk input; chip/fast memory
+  attributes, which need an option since no ELF section header carries
+  them; `HUNK_RELOC32SHORT` selection; m68k range-extension thunks and
+  dynamic output.
+
 - **W51 (diagnostics):** wording still unlike GNU ld in two places:
   `unknown option: --foo` (GNU: `unrecognized option '--foo'` plus a usage
   hint) and `malformed file format not recognized` (GNU: `file not

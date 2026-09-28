@@ -124,6 +124,23 @@ every output format:
 | Determinism | fixed timestamp unless `--insert-timestamp` is given |
 | Resources | `.rsrc` from GNU windres objects, `.rsrc$01`/`.rsrc$02` from `cvtres`/`llvm-windres` |
 
+## AmigaOS Hunk output (`--oformat amigahunk`)
+
+A load file rendered from the finished ELF image, as `--oformat binary` is.
+
+| Item | Scope |
+| --- | --- |
+| Blocks | `HUNK_HEADER`, `HUNK_CODE`, `HUNK_DATA`, `HUNK_BSS`, `HUNK_RELOC32`, `HUNK_SYMBOL`, `HUNK_END` |
+| Hunks | one per allocated output section, ordered code, data, bss |
+| Relocations | `HUNK_RELOC32`, hunk-relative, grouped by target hunk |
+| Sizes | longwords; a block omits trailing all-zero longwords, except one a relocation names |
+| Symbols | `HUNK_SYMBOL`: globals first, then locals, each in address order |
+| Memory | `MEMF_PUBLIC` only; chip and fast attributes need an option qld does not have |
+
+Validated against vlink 0.18a with objects from vasm 2.0f: the whole load
+file, including relocated code and data bytes, is compared byte for byte
+(`tests/data/hunk/`).
+
 ## Relocatable output
 
 `-r` writes records in the output's class and byte order, with the

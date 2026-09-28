@@ -76,6 +76,45 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - run: cargo test --all-features --test i386 -- --nocapture
 
+  amiga-hunk:
+    name: AmigaOS Hunk output (vasm + vlink oracle)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    env:
+      # a missing tool fails this job instead of skipping
+      QLD_REQUIRE_HUNK_TOOLS: "1"
+      CACHE: ${{ github.workspace }}/.hunk-tools
+      JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # vasm and vlink are small C programs with a plain `make`. Upstream
+      # ships only a "latest" tarball, so the versions are recorded in
+      # tests/data/hunk/MANIFEST.txt rather than pinned in the URL; the
+      # cache key names the versions the committed corpus was made with.
+      - name: Cache vasm and vlink
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CACHE }}
+          key: hunk-tools-${{ runner.os }}-vasm-2.0f-vlink-0.18a
+      - name: Build vasm and vlink, and regenerate the reference corpus
+        run: tests/data/hunk/generate.sh --build
+      # the downloadable reference set: the objects vasm produced, the load
+      # files vlink produced from them, the sources, the command lines and
+      # the tool versions (`gh run download -n hunk-reference`)
+      - name: Upload the reference corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hunk-reference
+          path: tests/data/hunk
+          if-no-files-found: error
+      - name: What the tools produce now, against what is committed
+        run: git diff --stat -- tests/data/hunk
+      - run: git checkout -- tests/data/hunk
+      - run: cargo test --all-features --test hunk --test m68k -- --nocapture
+
   corruption:
     name: randomized corruption of every fixture
     # heavy cross-architecture job: master pushes only

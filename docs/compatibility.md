@@ -630,6 +630,23 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   unsupported relocations. RWPI `SBREL` is refused, as GNU ld refuses it
   too ("dangerous relocation: unsupported relocation").
 
+## AmigaOS Hunk and m68k
+
+- **Section to hunk:** qld applies GNU ld's output-section rules, so
+  `.text.late` merges into `.text`; vlink gives every distinct input
+  section name its own hunk. The same for `.text`, `.rodata`, `.data` and
+  `.bss`, which is what vasm and vbcc emit.
+- **Out-of-range PC-relative branches are an error**, where vlink silently
+  truncates a `bsr.w` that cannot reach. There are no range-extension
+  thunks yet.
+- Gaps in m68k code are zero-filled, as GNU ld's m68k backend leaves them,
+  not `nop`-filled.
+- Hunk object output, overlays and Hunk input are not implemented; `-r` on
+  a Hunk target reports "not implemented yet". Chip and fast memory
+  attributes are always `MEMF_PUBLIC`.
+- m68k dynamic output, TLS beyond local-exec and IFUNC are refused with a
+  diagnostic rather than written wrong.
+
 ## PowerPC64 BE (ELFv1)
 
 - **Static output only.** Dynamic output needs ELFv1's `.plt` of function

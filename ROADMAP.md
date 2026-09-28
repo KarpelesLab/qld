@@ -243,6 +243,10 @@ and TLS models.
       eight-byte `.hash`, `--s390-pgste`; compared with GNU ld 2.42 function
       by function and run under qemu. Outstanding: `-r`, `--gdb-index` and
       `R_390_PLTOFF*`
+- [~] **m68k** (`EM_68K`, ELF32 big-endian): the `R_68K_*` relocation set,
+      static executables and `-r`; the section→hunk mapping and range
+      thunks are open, and dynamic output, TLS beyond local-exec and IFUNC
+      are refused with a clear error
 - [x] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths): the
       pipeline is generic over `ElfFormat` and chosen once in `elf::link`.
@@ -262,6 +266,17 @@ runner.
 **Exit criteria:** For each architecture, the fixture suite passes under
 `qemu-user`, and a Debian or Alpine userland package set builds with qld as
 its linker.
+
+---
+
+### AmigaOS Hunk output
+
+- [x] `--oformat amigahunk` (and `BinaryFormat::Hunk`): `HUNK_HEADER`,
+      `HUNK_CODE`/`DATA`/`BSS`, `HUNK_RELOC32`, `HUNK_SYMBOL`, `HUNK_END`,
+      rendered from the finished image as `--oformat binary` is. The load
+      file is byte-identical to vlink's on the whole reference corpus.
+- [ ] Hunk object output (`HUNK_UNIT`/`HUNK_EXT`), overlays, Hunk input,
+      chip/fast memory attributes, `HUNK_RELOC32SHORT` selection
 
 ---
 
