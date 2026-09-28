@@ -14,6 +14,9 @@ pub enum BinaryFormat {
     MachO,
     /// A flat image with no container, produced by `--oformat binary`.
     Binary,
+    /// AmigaOS Hunk (`--oformat amigahunk`), the load file and object
+    /// format of AmigaDOS.
+    Hunk,
 }
 
 /// Processor architecture.
@@ -40,6 +43,8 @@ pub enum Architecture {
     LoongArch64,
     /// IBM z/Architecture.
     S390x,
+    /// Motorola 68000 series.
+    M68k,
 }
 
 /// Byte order.

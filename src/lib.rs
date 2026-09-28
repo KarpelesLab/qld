@@ -52,7 +52,7 @@
 //! | [`passes`] | Format-neutral passes: GC, ICF, section merging |
 //! | [`script`] | GNU linker script parser and evaluator |
 //! | [`output`] | Output file writer and post-write steps |
-//! | [`elf`], [`coff`], [`macho`] | Format backends |
+//! | [`elf`], [`coff`], [`macho`], [`hunk`] | Format backends |
 //! | [`arch`] | Instruction-level helpers shared across formats |
 //! | [`debug`] | DWARF handling: compression, indexes, line lookup |
 //! | [`demangle`] | Itanium C++ and Rust symbol demangling for diagnostics |
@@ -83,6 +83,8 @@ pub mod elf;
 pub mod error;
 #[doc(hidden)]
 pub mod hints;
+#[doc(hidden)]
+pub mod hunk;
 #[doc(hidden)]
 pub mod ids;
 #[doc(hidden)]
@@ -180,6 +182,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         None | Some(BinaryFormat::Elf) => elf::link(options, diagnostics),
         Some(BinaryFormat::Pe) => coff::link(options, diagnostics),
         Some(BinaryFormat::MachO) => macho::link(options, diagnostics),
+        Some(BinaryFormat::Hunk) => hunk::link(options, diagnostics),
         Some(format) => Err(Error::Unimplemented(format!(
             "{format:?} output (see ROADMAP.md)"
         ))),
