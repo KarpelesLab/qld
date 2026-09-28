@@ -87,7 +87,7 @@ can work at the same time without colliding.
 | W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | merged |
 | W47 | Single-thread speed and scaling (M5) | hot paths in `src/elf/{write,scan,reloc,object,inputs,layout}*`, `src/symbols/**`, `src/input/**`, `src/main.rs` (allocator tuning, agreed), `benches/**`, `tests/projects/bench*` | W42 | in progress |
 | W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | in progress |
-| W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | in progress |
+| W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | merged |
 | W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | merged |
 | W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | in progress |
 | W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | merged |

@@ -196,8 +196,11 @@ and TLS models.
       range-extension and interworking thunks, `.ARM.exidx` merging and
       `EXIDX_CANTUNWIND` synthesis with `PT_ARM_EXIDX`, build-attribute and
       float-ABI merging, PLT/GOT, all TLS models, IFUNC, `R_ARM_V4BX`;
-      compared with lld symbolically, fixtures run under qemu. Outstanding:
-      BE8 (needs big-endian ELF32), mapping symbols for linker-generated code, GNU TLS descriptors, group relocations past
+      mapping symbols for the PLT and thunks, thunk pools spread through
+      large sections, group relocations and the 12-bit GOT/TLS forms;
+      compared with lld symbolically and with GNU ld where lld cannot link
+      the form, fixtures run under qemu. Outstanding:
+      BE8 (needs big-endian ELF32), GNU TLS descriptors, group relocations past
       G0
 - [x] **x32** (`elf32_x86_64`): the x86-64 relocations and PLT in ELF32 with
       8-byte GOT entries, x32's TLS forms and `GOTPCRELX` relaxations, IFUNCs,

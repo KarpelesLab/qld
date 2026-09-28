@@ -344,6 +344,11 @@ Who works where, and which files each task owns, is in
 - **Teardown**: the CLI exits without dropping the link state, as mold and
   lld do. The library API frees everything in the normal way.
 
+Layout reserves thunk pools at fixed content offsets of each output
+section, so a pool's place does not move as the pools grow, and it can grow
+`.symtab` and `.strtab` for symbols a backend generates (32-bit Arm's
+mapping symbols).
+
 ### Stages that run side by side
 
 Measured overlaps (W42): the GOT/PLT entry plan, the scan for non-empty

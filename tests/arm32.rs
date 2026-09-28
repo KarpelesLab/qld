@@ -1143,6 +1143,377 @@ fn interworking_and_thunks_match_lld() {
     assert!(code.contains("blx  arm_func"), "{code}");
 }
 
+/// A32 and Thumb callers of destinations no branch reaches, plus a call
+/// through the PLT.
+const MAPPING_S: &str = r#"
+	.syntax unified
+	.text
+	.arm
+	.globl _start
+	.type _start, %function
+_start:
+	bl far_func
+	bl shared_fn(PLT)
+	bx lr
+	.size _start, .-_start
+
+	.thumb
+	.globl thumb_entry
+	.thumb_func
+	.type thumb_entry, %function
+thumb_entry:
+	bl far_thumb
+	bx lr
+	.size thumb_entry, .-thumb_entry
+"#;
+
+/// The definition of the function the PLT call goes through.
+const SHARED_S: &str = r#"
+	.syntax unified
+	.text
+	.arm
+	.globl shared_fn
+	.type shared_fn, %function
+shared_fn:
+	bx lr
+	.size shared_fn, .-shared_fn
+"#;
+
+/// The mapping symbols in `file`, as `(address, name)`, for the section
+/// starting at `section`.
+fn marks_in(tools: &Tools, dir: &Path, file: &str, section: u64, end: u64) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    for line in run_ok(dir, &tools.readelf, &["-sW", file]).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [index, value, _, _, _, _, _, name, ..] = fields.as_slice() else {
+            continue;
+        };
+        if !index.ends_with(':') || !name.starts_with('$') {
+            continue;
+        }
+        let Some(value) = hex(value) else { continue };
+        if value >= section && value < end {
+            out.push((value, (*name).to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// qld marks the code it writes itself, as GNU ld and lld do: `$a` at the
+/// PLT header, `$d` at the word it loads the `.got.plt` offset from and
+/// `$a` at the first entry — the marks GNU ld 2.42 puts on the same PLT —
+/// and, for every thunk, its instruction set at its start with `$d` for
+/// the zeros after its instructions.
+#[test]
+fn mapping_symbols_mark_linker_generated_code() {
+    let tools = require!();
+    let dir = scratch("mapping-symbols");
+    compile(tools, &dir, "mapping.s", MAPPING_S, "mapping.o", &[]);
+    compile(tools, &dir, "fardef.s", FARDEF_S, "fardef.o", &[]);
+    compile(tools, &dir, "shared.s", SHARED_S, "shared.o", &["-fPIC"]);
+    run_ok(
+        dir.as_path(),
+        &tools.lld,
+        &[
+            "-shared",
+            "-soname",
+            "shared.so",
+            "shared.o",
+            "-o",
+            "shared.so",
+        ],
+    );
+    let (_, ours) = link_both(
+        tools,
+        &dir,
+        "mapping",
+        &["-e", "_start", "mapping.o", "fardef.o", "shared.so"],
+    );
+    let sections = run_ok(dir.as_path(), &tools.readelf, &["-SW", &ours]);
+    let find = |name: &str| -> (u64, u64) {
+        let row = |line: &str| -> Option<(u64, u64)> {
+            let fields: Vec<&str> = line.split_once(']')?.1.split_whitespace().collect();
+            let [found, _, addr, _, size, ..] = fields.as_slice() else {
+                return None;
+            };
+            if *found != name {
+                return None;
+            }
+            Some((hex(addr)?, hex(size)?))
+        };
+        let (addr, size) = sections
+            .lines()
+            .find_map(row)
+            .unwrap_or_else(|| panic!("no {name} in\n{sections}"));
+        (addr, addr + size)
+    };
+    // The PLT: the lazy header, the word it reads and the first entry.
+    let (plt, plt_end) = find(".plt");
+    assert_eq!(
+        marks_in(tools, &dir, &ours, plt, plt_end),
+        [
+            (plt, "$a".to_string()),
+            (plt + 16, "$d".to_string()),
+            (plt + 20, "$a".to_string()),
+        ]
+    );
+    // The thunk pool, at the end of `.text`: an A32 thunk for the A32
+    // caller and a Thumb one for the Thumb caller, 16 bytes each, sorted
+    // by key so the A32 one comes first.
+    let (_, text_end) = find(".text");
+    let pool = text_end - 32;
+    assert_eq!(
+        marks_in(tools, &dir, &ours, pool, text_end),
+        [
+            (pool, "$a".to_string()),
+            (pool + 12, "$d".to_string()),
+            (pool + 16, "$t".to_string()),
+            (pool + 26, "$d".to_string()),
+        ]
+    );
+    // The disassembler follows them: the word in the PLT header is data,
+    // not an instruction.
+    let listing = run_ok(
+        dir.as_path(),
+        &tools.objdump,
+        &["-d", "--section=.plt", &ours],
+    );
+    assert!(listing.contains(".word"), "{listing}");
+}
+
+/// A `.text` larger than a Thumb `bl` reaches, in one-MiB sections so
+/// that layout has somewhere to put a pool: every caller in it branches
+/// to a destination no branch reaches.
+fn big_text(sections: u32) -> String {
+    let mut out = String::from("\t.syntax unified\n");
+    for index in 0..sections {
+        out.push_str(&format!(
+            "\t.section .text.f{index:02},\"ax\",%progbits\n\t.thumb\n\
+             \t.globl f{index:02}\n\t.thumb_func\n\t.type f{index:02}, %function\n\
+             f{index:02}:\n\tbl far_thumb\n\tbx lr\n\t.size f{index:02}, .-f{index:02}\n\
+             \t.space 0x100000\n"
+        ));
+    }
+    out
+}
+
+/// The address an instruction's `bl` branches to.
+fn branch_target(tools: &Tools, dir: &Path, file: &str, at: u64) -> u64 {
+    let code = run_ok(
+        dir,
+        &tools.objdump,
+        &[
+            "-d",
+            &format!("--start-address=0x{at:x}"),
+            &format!("--stop-address=0x{:x}", at + 4),
+            file,
+        ],
+    );
+    code.lines()
+        .filter(|line| line.contains("bl"))
+        .find_map(|line| {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix("0x"))
+                .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+        })
+        .unwrap_or_else(|| panic!("no bl at {at:#x} in\n{code}"))
+}
+
+/// One pool at the end of an output section only reaches the callers
+/// within a branch of it, so layout spreads pools through a larger one.
+/// The Thumb `bl` here reaches ±16 MiB and `.text` is 18 MiB, so before
+/// this the link failed with "relocation out of range".
+#[test]
+fn thunk_pools_are_spread_through_a_large_text() {
+    let tools = require!();
+    let dir = scratch("thunk-pools");
+    compile(tools, &dir, "big.s", &big_text(18), "big.o", &[]);
+    compile(tools, &dir, "fardef.s", FARDEF_S, "fardef.o", &[]);
+    let entry = "\t.syntax unified\n\t.text\n\t.thumb\n\t.globl _start\n\
+                 \t.thumb_func\n_start:\n\tbl far_thumb\n\tbx lr\n";
+    compile(tools, &dir, "entry.s", entry, "entry.o", &[]);
+    let (_, ours) = link_both(
+        tools,
+        &dir,
+        "big",
+        &["-static", "-e", "_start", "big.o", "entry.o", "fardef.o"],
+    );
+    // Every caller reaches a thunk that loads far_thumb (0x4000011) and
+    // `bx`es to it, and the callers at the two ends do not share one.
+    let symbols = run_ok(dir.as_path(), &tools.readelf, &["-sW", &ours]);
+    let value = |name: &str| -> u64 {
+        symbols
+            .lines()
+            .find(|line| line.split_whitespace().last() == Some(name))
+            .and_then(|line| hex(line.split_whitespace().nth(1)?))
+            .unwrap_or_else(|| panic!("no {name} in\n{symbols}"))
+    };
+    let mut thunks = Vec::new();
+    for name in ["f00", "f09", "f17"] {
+        // The symbol carries the Thumb bit.
+        let caller = value(name) & !1;
+        let thunk = branch_target(tools, &dir, &ours, caller);
+        assert!(
+            caller.abs_diff(thunk) < (16 << 20),
+            "{name} at {caller:#x} branches {thunk:#x}, out of a Thumb bl's reach"
+        );
+        let code = run_ok(
+            dir.as_path(),
+            &tools.objdump,
+            &[
+                "-d",
+                &format!("--start-address=0x{thunk:x}"),
+                &format!("--stop-address=0x{:x}", thunk + 10),
+                &ours,
+            ],
+        );
+        assert!(code.contains("movw") && code.contains("#0x11"), "{code}");
+        assert!(code.contains("movt") && code.contains("#0x400"), "{code}");
+        thunks.push(thunk);
+    }
+    assert!(
+        thunks.first() != thunks.last(),
+        "one pool served all of {thunks:x?}"
+    );
+}
+
+/// Group relocations, which build an address one instruction at a time,
+/// each taking the most significant eight bits of what is left. Only the
+/// GNU assembler writes them (`#:pc_g0_nc:` and friends), and lld does not
+/// link them, so GNU ld is the oracle.
+const GROUP_S: &str = r#"
+	.syntax unified
+	.text
+	.arm
+	.globl _start
+	.type _start, %function
+_start:
+	add r0, pc, #:pc_g0_nc:(sym_a)
+	add r0, r0, #:pc_g1_nc:(sym_a)
+	ldr r1, [r0, #:pc_g2:(sym_a)]
+	add r2, pc, #:pc_g0_nc:(sym_b)
+	add r2, r2, #:pc_g1_nc:(sym_b)
+	add r3, r2, #:pc_g2:(sym_b)
+	add r4, pc, #:pc_g0_nc:(sym_c)
+	ldrh r5, [r4, #:pc_g1:(sym_c)]
+	add r6, pc, #:pc_g0:(sym_d)
+	ldr r7, [pc, #:pc_g0:(sym_e)]
+	ldrh r8, [pc, #:pc_g0:(sym_f)]
+	add r9, pc, #:pc_g0_nc:(sym_g)
+	add r9, r9, #:pc_g1:(sym_g)
+	bx lr
+	.size _start, .-_start
+"#;
+
+/// The destinations of [`GROUP_S`], chosen so that each sequence splits
+/// exactly: `.text` starts at 0x10000 and the value of a group relocation
+/// is `S + A - P`, with no PC bias.
+const GROUP_DEFS_S: &str = r#"
+	.syntax unified
+	.globl sym_a
+	.set sym_a, 0xabddef
+	.globl sym_b
+	.set sym_b, 0xabddfb
+	.globl sym_c
+	.set sym_c, 0x1abe5
+	.globl sym_d
+	.set sym_d, 0x1ab20
+	.globl sym_e
+	.set sym_e, 0x10ae0
+	.globl sym_f
+	.set sym_f, 0x100d3
+	.globl sym_g
+	.set sym_g, 0x1abf9
+"#;
+
+/// The GNU cross assembler and linker, which write and link what clang's
+/// assembler cannot. `None` when they are not installed.
+fn gnu_arm() -> Option<(PathBuf, PathBuf)> {
+    let assembler = tool("QLD_ARM_GNU_AS", "arm-linux-gnueabihf-as")?;
+    let linker = tool("QLD_ARM_GNU_LD", "arm-linux-gnueabihf-ld.bfd")?;
+    Some((assembler, linker))
+}
+
+/// The bytes of `section` in `file`, as `llvm-readelf -x` prints them.
+fn section_bytes(tools: &Tools, dir: &Path, file: &str, section: &str) -> Vec<u8> {
+    let dump = run_ok(dir, &tools.readelf, &["-x", section, file]);
+    let mut out = Vec::new();
+    for line in dump.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("0x") else {
+            continue;
+        };
+        for word in rest.split_whitespace().skip(1).take(4) {
+            let Some(bytes) = word.as_bytes().chunks(2).map(std::str::from_utf8).try_fold(
+                Vec::new(),
+                |mut acc, pair| {
+                    acc.push(u8::from_str_radix(pair.ok()?, 16).ok()?);
+                    Some(acc)
+                },
+            ) else {
+                continue;
+            };
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
+}
+
+#[test]
+fn group_relocations_match_gnu_ld() {
+    let tools = require!();
+    let Some((assembler, linker)) = gnu_arm() else {
+        let required = std::env::var_os("QLD_REQUIRE_ARM_GNU_TOOLS")
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "QLD_REQUIRE_ARM_GNU_TOOLS is set but no GNU Arm tools"
+        );
+        println!("SKIPPED: no arm-linux-gnueabihf-as");
+        return;
+    };
+    let dir = scratch("group-relocations");
+    for (name, source, object) in [
+        ("group.s", GROUP_S, "group.o"),
+        ("groupdefs.s", GROUP_DEFS_S, "groupdefs.o"),
+    ] {
+        fs::write(dir.join(name), source).unwrap();
+        run_ok(
+            dir.as_path(),
+            &assembler,
+            &["-mcpu=cortex-a9", "-o", object, name],
+        );
+    }
+    let args = [
+        "-e",
+        "_start",
+        "--section-start=.text=0x10000",
+        "group.o",
+        "groupdefs.o",
+    ];
+    let mut gnu_args = args.to_vec();
+    gnu_args.extend_from_slice(&["-o", "group.gnu"]);
+    run_ok(dir.as_path(), &linker, &gnu_args);
+    let mut our_args = vec!["-m", "armelf_linux_eabi", "--threads=2"];
+    our_args.extend_from_slice(&args);
+    our_args.extend_from_slice(&["-o", "group.qld"]);
+    run_ok(
+        dir.as_path(),
+        Path::new(env!("CARGO_BIN_EXE_qld")),
+        &our_args,
+    );
+    let gnu = section_bytes(tools, &dir, "group.gnu", ".text");
+    let ours = section_bytes(tools, &dir, "group.qld", ".text");
+    assert!(!gnu.is_empty());
+    assert_eq!(
+        ours,
+        gnu,
+        "\nqld {:02x?}\ngnu {:02x?}",
+        &ours[..ours.len().min(64)],
+        &gnu[..gnu.len().min(64)]
+    );
+}
+
 const LIB_C: &str = r#"
 __thread int lib_tls = 1;
 static __thread int lib_tls_local = 2;

@@ -926,6 +926,24 @@ impl Arch {
         matches!(self, Self::AArch64 | Self::Ppc64 | Self::Arm)
     }
 
+    /// How many bytes of an output section's content one thunk pool
+    /// serves: layout puts a pool every `thunk_pool_spacing` bytes, plus
+    /// one at the end, so that every caller has one within reach
+    /// ([`thunk::Pool`]). Half the shortest reach a thunked branch has
+    /// leaves room for the pools themselves; 0 where no thunks are needed.
+    #[must_use]
+    pub fn thunk_pool_spacing(self) -> u64 {
+        match self {
+            // `b`/`bl` reach ±128 MiB.
+            Self::AArch64 => 64 << 20,
+            // Thumb-2 `b.w`/`bl` reach ±16 MiB.
+            Self::Arm => 8 << 20,
+            // `bl` reaches ±32 MiB.
+            Self::Ppc64 => 16 << 20,
+            _ => 0,
+        }
+    }
+
     /// Number of bytes one range-extension thunk occupies.
     #[must_use]
     pub fn thunk_size(self) -> u64 {
