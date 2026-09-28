@@ -1806,11 +1806,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 // descriptor, and qld's IFUNC stub is code, so taking one's
                 // address is refused rather than written wrong (M4).
                 if arch == super::arch::Arch::Ppc64Be && class.kind != Kind::Pc {
-                    let name = symbol_name(refs, file_index, rel.symbol);
-                    report(format!(
-                        "taking the address of the ifunc `{name}' is not implemented \
-                         for the PowerPC64 ELFv1 ABI: it needs a function descriptor"
-                    ));
+                    report(ppc64_opd_ifunc_address(refs, file_index, rel.symbol));
                     continue;
                 }
                 s = stub;
@@ -2112,6 +2108,23 @@ fn add_delta(kind: Kind, value: u64) -> Option<u64> {
         Kind::Sub => Some(value.wrapping_neg()),
         _ => None,
     }
+}
+
+/// The diagnostic for taking the address of an ELFv1 IFUNC, which needs
+/// the function descriptor GNU ld's `.iplt` entry is; qld's IFUNC stub is
+/// code, so the address is refused rather than written wrong.
+#[cold]
+#[inline(never)]
+fn ppc64_opd_ifunc_address<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    symbol: u32,
+) -> String {
+    let name = symbol_name(refs, file, symbol);
+    format!(
+        "taking the address of the ifunc `{name}' is not implemented for the \
+         PowerPC64 ELFv1 ABI: it needs a function descriptor"
+    )
 }
 
 /// The code a PowerPC64 ELFv1 call reaches: the symbol names a function

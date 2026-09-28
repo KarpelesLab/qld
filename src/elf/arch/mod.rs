@@ -110,6 +110,9 @@ pub enum Kind {
     GotRel,
     /// `GOT + A - P`.
     GotBasePc,
+    /// `GOT + A`: the GOT base itself (PowerPC64 ELFv1 `R_PPC64_TOC`,
+    /// which fills the TOC word of a function descriptor).
+    GotBase,
     /// `Z + A`, the symbol's size.
     Size,
     /// `S + A - TP`.
@@ -157,10 +160,6 @@ pub enum Kind {
     /// `A` alone: a hint whose addend locates a related instruction
     /// (PowerPC64 `R_PPC64_PCREL_OPT`).
     Addend,
-    /// `GOT + A`: the GOT base itself (PowerPC64 ELFv1 `R_PPC64_TOC`,
-    /// which fills the TOC word of a function descriptor). Last, so that
-    /// the discriminants of the kinds the hot loops switch on do not move.
-    GotBase,
 }
 
 /// What a GOT entry holds.
