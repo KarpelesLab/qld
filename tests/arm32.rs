@@ -1143,6 +1143,145 @@ fn interworking_and_thunks_match_lld() {
     assert!(code.contains("blx  arm_func"), "{code}");
 }
 
+/// A32 and Thumb callers of destinations no branch reaches, plus a call
+/// through the PLT.
+const MAPPING_S: &str = r#"
+	.syntax unified
+	.text
+	.arm
+	.globl _start
+	.type _start, %function
+_start:
+	bl far_func
+	bl shared_fn(PLT)
+	bx lr
+	.size _start, .-_start
+
+	.thumb
+	.globl thumb_entry
+	.thumb_func
+	.type thumb_entry, %function
+thumb_entry:
+	bl far_thumb
+	bx lr
+	.size thumb_entry, .-thumb_entry
+"#;
+
+/// The definition of the function the PLT call goes through.
+const SHARED_S: &str = r#"
+	.syntax unified
+	.text
+	.arm
+	.globl shared_fn
+	.type shared_fn, %function
+shared_fn:
+	bx lr
+	.size shared_fn, .-shared_fn
+"#;
+
+/// The mapping symbols in `file`, as `(address, name)`, for the section
+/// starting at `section`.
+fn marks_in(tools: &Tools, dir: &Path, file: &str, section: u64, end: u64) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    for line in run_ok(dir, &tools.readelf, &["-sW", file]).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [index, value, _, _, _, _, _, name, ..] = fields.as_slice() else {
+            continue;
+        };
+        if !index.ends_with(':') || !name.starts_with('$') {
+            continue;
+        }
+        let Some(value) = hex(value) else { continue };
+        if value >= section && value < end {
+            out.push((value, (*name).to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// qld marks the code it writes itself, as GNU ld and lld do: `$a` at the
+/// PLT header, `$d` at the word it loads the `.got.plt` offset from and
+/// `$a` at the first entry — the marks GNU ld 2.42 puts on the same PLT —
+/// and, for every thunk, its instruction set at its start with `$d` for
+/// the zeros after its instructions.
+#[test]
+fn mapping_symbols_mark_linker_generated_code() {
+    let tools = require!();
+    let dir = scratch("mapping-symbols");
+    compile(tools, &dir, "mapping.s", MAPPING_S, "mapping.o", &[]);
+    compile(tools, &dir, "fardef.s", FARDEF_S, "fardef.o", &[]);
+    compile(tools, &dir, "shared.s", SHARED_S, "shared.o", &["-fPIC"]);
+    run_ok(
+        dir.as_path(),
+        &tools.lld,
+        &[
+            "-shared",
+            "-soname",
+            "shared.so",
+            "shared.o",
+            "-o",
+            "shared.so",
+        ],
+    );
+    let (_, ours) = link_both(
+        tools,
+        &dir,
+        "mapping",
+        &["-e", "_start", "mapping.o", "fardef.o", "shared.so"],
+    );
+    let sections = run_ok(dir.as_path(), &tools.readelf, &["-SW", &ours]);
+    let find = |name: &str| -> (u64, u64) {
+        let row = |line: &str| -> Option<(u64, u64)> {
+            let fields: Vec<&str> = line.split_once(']')?.1.split_whitespace().collect();
+            let [found, _, addr, _, size, ..] = fields.as_slice() else {
+                return None;
+            };
+            if *found != name {
+                return None;
+            }
+            Some((hex(addr)?, hex(size)?))
+        };
+        let (addr, size) = sections
+            .lines()
+            .find_map(row)
+            .unwrap_or_else(|| panic!("no {name} in\n{sections}"));
+        (addr, addr + size)
+    };
+    // The PLT: the lazy header, the word it reads and the first entry.
+    let (plt, plt_end) = find(".plt");
+    assert_eq!(
+        marks_in(tools, &dir, &ours, plt, plt_end),
+        [
+            (plt, "$a".to_string()),
+            (plt + 16, "$d".to_string()),
+            (plt + 20, "$a".to_string()),
+        ]
+    );
+    // The thunk pool, at the end of `.text`: an A32 thunk for the A32
+    // caller and a Thumb one for the Thumb caller, 16 bytes each, sorted
+    // by key so the A32 one comes first.
+    let (_, text_end) = find(".text");
+    let pool = text_end - 32;
+    assert_eq!(
+        marks_in(tools, &dir, &ours, pool, text_end),
+        [
+            (pool, "$a".to_string()),
+            (pool + 12, "$d".to_string()),
+            (pool + 16, "$t".to_string()),
+            (pool + 26, "$d".to_string()),
+        ]
+    );
+    // The disassembler follows them: the word in the PLT header is data,
+    // not an instruction.
+    let listing = run_ok(
+        dir.as_path(),
+        &tools.objdump,
+        &["-d", "--section=.plt", &ours],
+    );
+    assert!(listing.contains(".word"), "{listing}");
+}
+
 const LIB_C: &str = r#"
 __thread int lib_tls = 1;
 static __thread int lib_tls_local = 2;

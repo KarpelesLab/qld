@@ -25,6 +25,11 @@
 //! - **Undefined weak** branch targets without a PLT entry become `nop`s,
 //!   as in GNU ld.
 //!
+//! Input mapping symbols (`$a`, `$t`, `$d`) are kept as they are, and the
+//! code qld writes itself — the PLT and the thunk pools — gets its own
+//! ([`mapping`]), so a disassembler never decodes it in the state the
+//! previous function left.
+//!
 //! The exception index (`.ARM.exidx`, [`exidx`]) is rebuilt as one table
 //! sorted by code address, with `EXIDX_CANTUNWIND` entries for code
 //! without unwind information and a terminating sentinel, and
@@ -45,6 +50,7 @@
 pub mod apply;
 pub mod attributes;
 pub mod exidx;
+pub mod mapping;
 pub mod thunks;
 
 use crate::arch::arm::{self as insn, Field};

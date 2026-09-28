@@ -27,7 +27,7 @@
 
 use rayon::prelude::*;
 
-use crate::args::{ExecStack, LinkOptions, SeparateCode};
+use crate::args::{DiscardMode, ExecStack, LinkOptions, SeparateCode};
 use crate::elf::read::ElfKind;
 use crate::elf::read::consts::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, PT_GNU_RELRO, PT_GNU_STACK,
@@ -301,6 +301,9 @@ pub struct Layout<'a> {
     /// addresses, sorted by output section and destination (for a patch,
     /// the instruction it replaces).
     pub thunks: Vec<thunk::Placed>,
+    /// Arm mapping symbols for the PLT and the thunk pools
+    /// ([`super::arch::arm::mapping`]), sorted; empty elsewhere.
+    pub mapping_symbols: Vec<super::arch::arm::mapping::Mapping>,
     /// Linker relaxation edits ([`super::arch::shrink`]): the bytes deleted
     /// from each code section, which symbol addresses and the writer follow.
     pub relax: Relaxation,
@@ -803,6 +806,14 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
 
     let (section_symbols, shstrtab) = add_trailers(input, &mut out_sections)?;
 
+    // Arm marks the code it generates itself with mapping symbols, which
+    // are locals of `.symtab` and share one block of `.strtab`. Only how
+    // many there are matters here; their addresses come with step 4.
+    let mapping_count = arm_mapping_symbols(input, thunks, &out_sections, false).len();
+    if mapping_count != 0 {
+        reserve_mapping_symbols(&mut out_sections, kind, mapping_count);
+    }
+
     // 3. Segment plan (before addresses: the header size depends on it).
     let mode = input.mode;
     let separate = input.options.separate_code.unwrap_or({
@@ -1119,6 +1130,11 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         }
         placed_thunks.sort_unstable();
     }
+    let mapping_symbols = if mapping_count == 0 {
+        Vec::new()
+    } else {
+        arm_mapping_symbols(input, thunks, &out_sections, true)
+    };
     let end = align_up(dot, kind.word_size())?;
     place_empty_until(NONE, dot, &mut output_places);
 
@@ -1418,6 +1434,7 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         kind,
         sections: out_sections,
         thunks: placed_thunks,
+        mapping_symbols,
         relax: Relaxation::default(),
         output_places,
         section_addr,
@@ -1442,6 +1459,61 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
         headers_reserved: 0,
         nocrossrefs: Vec::new(),
     })
+}
+
+/// The Arm mapping symbols for the PLT and the thunk pools
+/// ([`super::arch::arm::mapping`]), with their addresses when `addressed`
+/// and zeros while layout is only counting them. Empty on every other
+/// architecture, when no `.symtab` is written, and under `-x`, which drops
+/// every local symbol.
+fn arm_mapping_symbols<F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, '_, F>,
+    thunks: &Thunks,
+    out_sections: &[OutSection<'_>],
+    addressed: bool,
+) -> Vec<super::arch::arm::mapping::Mapping> {
+    if input.synth.arch != Arch::Arm
+        || input.trailers.symtab == 0
+        || input.options.discard == DiscardMode::All
+    {
+        return Vec::new();
+    }
+    let at = |address: u64, position: usize| -> Option<(u64, u16)> {
+        let shndx = u16::try_from(position.saturating_add(1)).ok()?;
+        Some(if addressed { (address, shndx) } else { (0, 0) })
+    };
+    let plt_at = out_sections.iter().enumerate().find_map(|(position, s)| {
+        let placed = s
+            .members
+            .iter()
+            .find(|p| matches!(p.member, Member::Synthetic(Synthetic::Plt)))?;
+        at(s.addr.saturating_add(placed.offset), position)
+    });
+    let pool = |output: u32| -> Option<(u64, u16)> {
+        let position = out_sections.iter().position(|s| s.output == output)?;
+        at(out_sections.get(position)?.addr, position)
+    };
+    super::arch::arm::mapping::symbols(plt_at, input.synth.dynamic(), thunks, &pool)
+}
+
+/// Makes room in `.symtab` and `.strtab` for `count` mapping symbols and
+/// the one block of names they share. They are locals, so `sh_info`, the
+/// index of the first global, moves with them.
+fn reserve_mapping_symbols(out_sections: &mut [OutSection<'_>], kind: ElfKind, count: usize) {
+    let entries = u64::try_from(count).unwrap_or(0);
+    let names = u64::try_from(super::arch::arm::mapping::NAMES.len()).unwrap_or(0);
+    for section in out_sections.iter_mut() {
+        match section.trailer {
+            Trailer::Symtab => {
+                section.size = section
+                    .size
+                    .saturating_add(entries.saturating_mul(kind.sym_size()));
+                section.info = section.info.saturating_add(count.try_into().unwrap_or(0));
+            }
+            Trailer::Strtab => section.size = section.size.saturating_add(names),
+            _ => {}
+        }
+    }
 }
 
 /// Appends the trailing sections (`--emit-relocs` `.rela` sections,
