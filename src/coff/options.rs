@@ -137,6 +137,11 @@ pub struct PeOptions {
     pub add_stdcall_alias: bool,
     /// `--enable-stdcall-fixup`: resolve `_foo@8` against `_foo`, and back.
     pub enable_stdcall_fixup: Option<bool>,
+    /// `--enable-long-section-names` / `--disable-long-section-names`: keep
+    /// a section name longer than eight bytes in the image, through the
+    /// string table the symbol table carries. `None` leaves the choice to
+    /// [`crate::coff::symtab::long_section_names`].
+    pub enable_long_section_names: Option<bool>,
     /// `--enable-auto-import` / `--disable-auto-import`.
     pub auto_import: AutoImport,
     /// `--enable-runtime-pseudo-reloc`: emit the version 2 pseudo-relocation
@@ -223,6 +228,7 @@ impl PeOptions {
             kill_at: false,
             add_stdcall_alias: false,
             enable_stdcall_fixup: None,
+            enable_long_section_names: None,
             auto_import: AutoImport::Enabled,
             runtime_pseudo_reloc: true,
             no_default_lib: false,
@@ -315,6 +321,7 @@ impl PeOptions {
             kill_at: pe.kill_at,
             add_stdcall_alias: pe.add_stdcall_alias,
             enable_stdcall_fixup: pe.stdcall_fixup,
+            enable_long_section_names: pe.long_section_names,
             auto_import: if pe.auto_import {
                 AutoImport::Enabled
             } else {

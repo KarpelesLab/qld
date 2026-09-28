@@ -896,6 +896,7 @@ impl GnuParser {
                 PeFlag::KillAt => pe.kill_at = on,
                 PeFlag::AddStdcallAlias => pe.add_stdcall_alias = on,
                 PeFlag::StdcallFixup => pe.stdcall_fixup = Some(on),
+                PeFlag::LongSectionNames => pe.long_section_names = Some(on),
                 PeFlag::AutoImport => pe.auto_import = on,
                 PeFlag::RuntimePseudoReloc => pe.runtime_pseudo_reloc = on,
                 PeFlag::WarnDuplicateExports => pe.warn_duplicate_exports = on,
