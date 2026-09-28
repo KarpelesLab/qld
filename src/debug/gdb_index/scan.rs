@@ -24,7 +24,7 @@
 
 use std::borrow::Cow;
 
-use super::input::{DebugObject, Malformed, Reader, Section};
+use super::input::{DebugObject, Malformed, Section};
 use super::names::{NameEntry, gdb_hash};
 use super::unit::{self, AbbrevTable, Abbrevs, DW_AT_NAME, UnitHeader, UnitInfo, Value};
 
@@ -442,7 +442,7 @@ fn read_dies<'a, F: crate::elf::read::ElfFormat>(
     start: usize,
 ) -> Result<Dies<'a>, Malformed> {
     let data = info.data.get(..unit.end).unwrap_or_default();
-    let mut r = Reader::at(data, start);
+    let mut r = info.reader_over(data, start);
     let mut dies: Vec<Die<'a>> = Vec::new();
     let mut signatures = Vec::new();
     // Compiled abbreviations, by code (codes are small and dense).

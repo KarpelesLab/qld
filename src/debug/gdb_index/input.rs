@@ -13,8 +13,9 @@ use std::cell::Cell;
 
 use crate::elf::object::ObjectInput;
 use crate::elf::read::consts::SHF_GROUP;
-use crate::elf::read::{Relocation, Relocations, SectionIndex};
+use crate::elf::read::{Endian, Relocation, Relocations, SectionIndex};
 use crate::error::Result;
+use crate::target::Endianness;
 
 /// A debug section with its relocations.
 #[derive(Clone, Debug)]
@@ -29,7 +30,27 @@ pub struct Section<'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64L
     hint: Cell<usize>,
 }
 
-impl<F: crate::elf::read::ElfFormat> Section<'_, F> {
+impl<'a, F: crate::elf::read::ElfFormat> Section<'a, F> {
+    /// Whether the DWARF in this section is big-endian: debug sections
+    /// are in the object's byte order.
+    #[must_use]
+    pub fn is_big_endian(&self) -> bool {
+        <F::Endian as Endian>::ENDIANNESS == Endianness::Big
+    }
+
+    /// A reader over the section's contents, in the object's byte order.
+    #[must_use]
+    pub fn reader(&self, pos: usize) -> Reader<'a> {
+        Reader::at(self.data, pos, self.is_big_endian())
+    }
+
+    /// A reader over `data` (a part of the section, or a table it points
+    /// into), in the object's byte order.
+    #[must_use]
+    pub fn reader_over(&self, data: &'a [u8], pos: usize) -> Reader<'a> {
+        Reader::at(data, pos, self.is_big_endian())
+    }
+
     /// Index of the first relocation at or after `offset`: a few steps
     /// forward from the last lookup, else a binary search.
     fn find(&self, offset: u64) -> usize {
@@ -228,6 +249,12 @@ impl<'o, 'a, F: crate::elf::read::ElfFormat> DebugObject<'o, 'a, F> {
         Ok(this)
     }
 
+    /// Whether the object's DWARF is big-endian.
+    #[must_use]
+    pub fn is_big_endian(&self) -> bool {
+        <F::Endian as Endian>::ENDIANNESS == Endianness::Big
+    }
+
     fn load(&self, index: u32) -> Result<Section<'a, F>> {
         Self::load_from(self.object, index)
     }
@@ -324,11 +351,13 @@ impl<'o, 'a, F: crate::elf::read::ElfFormat> DebugObject<'o, 'a, F> {
     }
 }
 
-/// A bounds-checked little-endian cursor over DWARF data.
+/// A bounds-checked cursor over DWARF data, in the object's byte order.
 #[derive(Clone, Copy, Debug)]
 pub struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Whether fixed-size integers are big-endian.
+    big: bool,
 }
 
 /// A decoding failure: the offset where it happened, and what was wrong.
@@ -344,10 +373,27 @@ pub struct Malformed {
 pub type Parsed<T> = core::result::Result<T, Malformed>;
 
 impl<'a> Reader<'a> {
-    /// A reader at `pos` of `data` (reads fail if it is out of range).
+    /// A reader at `pos` of `data` (reads fail if it is out of range),
+    /// reading fixed-size integers in the given byte order.
     #[must_use]
-    pub fn at(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos }
+    pub fn at(data: &'a [u8], pos: usize, big: bool) -> Self {
+        Self { data, pos, big }
+    }
+
+    /// Another reader, over `data`, in the same byte order as this one.
+    #[must_use]
+    pub fn like(&self, data: &'a [u8], pos: usize) -> Self {
+        Self {
+            data,
+            pos,
+            big: self.big,
+        }
+    }
+
+    /// Whether fixed-size integers are read big-endian.
+    #[must_use]
+    pub fn is_big_endian(&self) -> bool {
+        self.big
     }
 
     /// The current position.
@@ -420,7 +466,8 @@ impl<'a> Reader<'a> {
         Ok(b)
     }
 
-    /// Reads a little-endian unsigned integer of 1 to 8 bytes.
+    /// Reads an unsigned integer of 1 to 8 bytes, in the reader's byte
+    /// order.
     ///
     /// # Errors
     ///
@@ -429,12 +476,20 @@ impl<'a> Reader<'a> {
         if !(1..=8).contains(&size) {
             return Err(self.error("integer size"));
         }
+        let big = self.big;
         let bytes = self.bytes(size)?;
         let mut buf = [0u8; 8];
-        if let Some(dst) = buf.get_mut(..size) {
-            dst.copy_from_slice(bytes);
+        if big {
+            if let Some(dst) = buf.get_mut(8usize.saturating_sub(size)..) {
+                dst.copy_from_slice(bytes);
+            }
+            Ok(u64::from_be_bytes(buf))
+        } else {
+            if let Some(dst) = buf.get_mut(..size) {
+                dst.copy_from_slice(bytes);
+            }
+            Ok(u64::from_le_bytes(buf))
         }
-        Ok(u64::from_le_bytes(buf))
     }
 
     /// Reads a `u16`.
