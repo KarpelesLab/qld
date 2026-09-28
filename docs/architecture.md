@@ -398,6 +398,9 @@ Scaling rules found by measurement (W24, W26; `tests/projects/bench.md`):
 - When the pool is larger than 16 threads, every stage except the
   relocation scan and section merging runs in a nested 16-thread pool:
   beyond that, idle stealing and system time cost more than they gain.
+- `src/elf/arch/shrink.rs` runs the shrinking-relaxation fixpoint for both
+  RISC-V and LoongArch; each supplies only its per-section decisions
+  (`src/elf/arch/{riscv,loongarch}/relax.rs`).
 - Links with at least 4 Mi merge pieces (large debug links) merge on every
   core; section merging runs alongside the relocation scan.
 - Archive members are discovered in parallel before the input walk, and a

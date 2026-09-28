@@ -209,11 +209,13 @@ and TLS models.
       stubs that save r2, thunks (including TOC-saving and PC-relative
       ones), all TLS models with relaxations, `.glink`/PLT, IFUNCs, `-r`;
       compared with lld by meaning, fixtures run under qemu in CI.
+      `.toc` in `.got` as GNU ld places it, `R_PPC64_REL16DX_HA`.
       Outstanding: `_savegpr*`/`_restgpr*`, inline PLT sequences
-      (`-fno-plt`/`-mlongcall`), multi-TOC, `DT_PPC64_OPT`, thunks under
-      linker scripts
+      (`-fno-plt`/`-mlongcall`), `R_PPC64_TOC`, `ADDR64_LOCAL`,
+      `GOT_DTPREL*`, multi-TOC, `DT_PPC64_OPT`, thunks under linker
+      scripts
 - [ ] **PowerPC64 BE** (ELFv1 with OPDs; needs big-endian ELF)
-- [~] **LoongArch64**: the relocation set (including the extreme code model
+- [x] **LoongArch64**: the relocation set (including the extreme code model
       and ADD/SUB/ULEB128), PLT/GOT, all TLS models with TLSDESC and IE/TLSDESC
       relaxation, size-preserving relaxation, `-r`; compared with lld by
       meaning. Outstanding: shrinking relaxation (deleting `nop`s,

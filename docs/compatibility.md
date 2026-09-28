@@ -591,12 +591,20 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - Thunks never use Power10 instructions (no `--power10-stubs`).
 - In dynamic outputs, IFUNC `IRELATIVE` relocations go to `.rela.dyn`, as
   GNU ld does: glibc's loader does not apply them from `.rela.plt`.
-- `.toc` is placed as an orphan after `.data`, not right after `.got`.
+- `.toc` goes into the output `.got`, as GNU ld's `elf64lppc` script does
+  (`*(.got .toc)`), so both stay within ±32 KiB of the TOC pointer; lld
+  keeps `.toc` a separate orphan. `.got` is 8-aligned, where GNU ld aligns
+  it to 256.
 
 ## LoongArch64
 
-- **Relaxation keeps code size:** relaxed sequences leave `nop`s, and
-  `R_LARCH_ALIGN` padding stays where it is, until shrinking is implemented.
+- **Relaxation shrinks sections**, as lld does: the `nop`s that relaxed
+  sequences leave are deleted, and `R_LARCH_ALIGN` padding is trimmed to
+  `(2^n − 4) − needed`, or dropped entirely past its max-bytes limit.
+- `-r` synthesizes `R_LARCH_ALIGN` before each input section that follows
+  relaxable code, so a later relaxing link keeps the alignment, as lld does.
+- There are no B26 range-extension thunks, as in lld; a branch out of range
+  is an error.
 - **GOT relaxation:**
   - only adjacent instruction pairs are relaxed;
   - the GOT entry that becomes unused is dropped (lld keeps it);
