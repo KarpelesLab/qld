@@ -671,6 +671,9 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   relaxable code, so a later relaxing link keeps the alignment, as lld does.
 - There are no B26 range-extension thunks, as in lld; a branch out of range
   is an error.
+- lld 22 reserves an unused initial-exec GOT entry for each thread-local
+  symbol in the extreme code model; lld 23 and qld do not. The comparison
+  tests tolerate lld's extra entries but never qld's.
 - **GOT relaxation:**
   - only adjacent instruction pairs are relaxed;
   - the GOT entry that becomes unused is dropped (lld keeps it);
