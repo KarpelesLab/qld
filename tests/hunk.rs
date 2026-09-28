@@ -205,7 +205,7 @@ fn build_archives(case: &Case, dir: &Path) -> Result<(), String> {
     for (lib, members) in &case.archives {
         let ar = std::env::var_os("QLD_TEST_AR").unwrap_or_else(|| "ar".into());
         let status = Command::new(&ar)
-            .arg("rcs")
+            .arg("rcsD")
             .arg(dir.join(lib))
             .args(members.iter().map(|m| dir.join(m)))
             .status()
