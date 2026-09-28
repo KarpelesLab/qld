@@ -30,6 +30,7 @@
 
 use std::ffi::OsString;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use qld::args::{OutputCompleteHook, ParseOutcome};
 use qld::diag::{Diagnostic, DiagnosticSink, Stderr};
@@ -39,8 +40,7 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     #[cfg(unix)]
     if let Some(child) = fork::Child::from_env() {
-        let hook = OutputCompleteHook::new(move || child.notify(0));
-        let code = run(&args, Launch::Child(hook));
+        let code = run(&args, Launch::Child(child));
         // A failed link, or a backend that finished without the hook
         // (cannot happen with `qld::link`, which runs it on success).
         child.notify(code);
@@ -106,18 +106,46 @@ fn tune_allocator() {}
 enum Launch {
     /// In a child process if `--fork` is in effect and supported, else here.
     MayFork,
-    /// Here, as the child process of `--fork`, running this hook once the
+    /// Here, as the child process of `--fork`, telling the parent once the
     /// output is complete.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    Child(OutputCompleteHook),
+    #[cfg(unix)]
+    Child(fork::Child),
 }
 
 /// Runs the command line and returns the exit status, after reporting any
 /// error.
 fn run(args: &[OsString], launch: Launch) -> u8 {
-    let diagnostics = Stderr::new(qld::PROGRAM_NAME);
-    match run_link(args, launch, &diagnostics) {
-        Ok(code) => code,
+    let diagnostics = Arc::new(Stderr::new(qld::PROGRAM_NAME));
+    // The sink buffers so that it can sort by `Diagnostic::order`. As the
+    // child of `--fork`, everything it holds has to reach the relayed
+    // stderr before the parent is told the link is done, because being told
+    // ends the relay.
+    let hook = match launch {
+        Launch::MayFork => None,
+        #[cfg(unix)]
+        Launch::Child(child) => {
+            let sink = Arc::clone(&diagnostics);
+            Some(OutputCompleteHook::new(move || {
+                sink.flush();
+                // The status the parent exits with, and only the first
+                // `notify` counts, so it has to be the real one here. The
+                // output is complete, so the link succeeded; what is left
+                // is `--fatal-warnings`, which promotes warnings to errors
+                // inside the sink without stopping the link, and
+                // `--noinhibit-exec`, which writes the output anyway.
+                child.notify(u8::from(sink.error_count() != 0));
+            }))
+        }
+    };
+    let result = run_link(args, hook, &diagnostics);
+    diagnostics.flush();
+    match result {
+        // `--fatal-warnings` turns link-time warnings into errors inside the
+        // sink, which the backends do not see.
+        Ok(code) if diagnostics.error_count() == 0 => code,
+        Ok(_) => 1,
+        // Every error was printed above; GNU ld and lld add no summary.
+        Err(qld::Error::Reported { .. }) => 1,
         Err(error) => {
             eprintln!("{}: error: {error}", qld::PROGRAM_NAME);
             1
@@ -127,8 +155,8 @@ fn run(args: &[OsString], launch: Launch) -> u8 {
 
 fn run_link(
     args: &[OsString],
-    launch: Launch,
-    diagnostics: &dyn DiagnosticSink,
+    hook: Option<OutputCompleteHook>,
+    diagnostics: &Stderr,
 ) -> qld::Result<u8> {
     let mut options = match qld::parse_gnu(args)? {
         ParseOutcome::Help => {
@@ -141,8 +169,10 @@ fn run_link(
         }
         ParseOutcome::Link(options) => options,
     };
-    match launch {
-        Launch::MayFork => {
+    // `--color-diagnostics`, `--error-limit`, `--fatal-warnings` and `-w`.
+    diagnostics.configure(&options);
+    match hook {
+        None => {
             #[cfg(unix)]
             if options.fork
                 && fork::allowed(args, &options)
@@ -151,21 +181,16 @@ fn run_link(
                 return Ok(code);
             }
         }
-        Launch::Child(hook) => options.on_output_complete = Some(hook),
+        Some(hook) => options.on_output_complete = Some(hook),
     }
     // GNU ld exits inside the plugin's fatal callback; plugins can
     // misbehave if the linker returns instead. Library callers get
     // an error (see LinkOptions::exit_on_plugin_fatal).
     options.exit_on_plugin_fatal = true;
-    if !options.no_warnings {
-        for warning in &options.warnings {
-            diagnostics.emit(Diagnostic::warning(warning.clone()));
-        }
-    }
-    if options.fatal_warnings && !options.warnings.is_empty() {
-        return Err(qld::Error::Reported {
-            errors: options.warnings.len(),
-        });
+    // `-w` drops these and `--fatal-warnings` turns them into errors, both
+    // in the sink; `run` fails the link when any error reached it.
+    for warning in &options.warnings {
+        diagnostics.emit(Diagnostic::warning(warning.clone()));
     }
     qld::link(&options, diagnostics)?;
     Ok(0)

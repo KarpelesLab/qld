@@ -30,6 +30,11 @@ use crate::symbols::{DefinitionKind, SymbolName, SymbolUse};
 
 use super::resolve::AUX_COMDAT;
 
+/// Largest alignment a section that is not allocated keeps. Its alignment
+/// constrains no address, only how far the output file is padded before it,
+/// and no real toolchain asks for more than a page.
+const MAX_NOALLOC_ALIGN: u64 = 1 << 16;
+
 /// How an input section takes part in the output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionKind {
@@ -355,11 +360,19 @@ impl<'a, F: ElfFormat> ObjectInput<'a, F> {
                 }
             }
             let flags = header.sh_flags;
+            // A table the link rebuilds from scratch, so neither its size
+            // nor its alignment reaches the output. Every other section's
+            // does, so both are checked below.
+            let mut rebuilt = false;
             let kind = match header.sh_type {
                 SHT_NULL | SHT_SYMTAB | SHT_STRTAB | SHT_REL | SHT_RELA | SHT_GROUP
-                | SHT_SYMTAB_SHNDX => SectionKind::Ignored,
+                | SHT_SYMTAB_SHNDX => {
+                    rebuilt = true;
+                    SectionKind::Ignored
+                }
                 SHT_LLVM_ADDRSIG => {
                     addrsig = index;
+                    rebuilt = true;
                     SectionKind::Ignored
                 }
                 _ if flags & SHF_EXCLUDE != 0 => SectionKind::Ignored,
@@ -390,9 +403,12 @@ impl<'a, F: ElfFormat> ObjectInput<'a, F> {
                 }
                 _ => SectionKind::Regular,
             };
-            if kind != SectionKind::Ignored {
-                // Layout trusts the sizes of copied sections: check now that
-                // their contents lie inside the file.
+            if !rebuilt {
+                // Layout trusts the sizes and alignments of the sections it
+                // copies, and a relocatable link or `--emit-relocs` copies
+                // ignored ones too (`.note.GNU-stack`, `SHF_EXCLUDE`), so
+                // check both here. GNU ld likewise rejects an object with
+                // "a section extending past end of file".
                 if contents.is_none() {
                     elf.section_data(&header)?;
                 }
@@ -401,6 +417,23 @@ impl<'a, F: ElfFormat> ObjectInput<'a, F> {
                         elf.elf().section_header_offset(index),
                         "section alignment (not a power of two)",
                     ));
+                }
+                if header.sh_addralign > u64::from(u32::MAX) {
+                    // lld's limit. Beyond it, aligning the output section
+                    // would reserve gigabytes for one input section.
+                    return Err(source.malformed(
+                        elf.elf().section_header_offset(index),
+                        "section alignment (too large)",
+                    ));
+                }
+                // A section that is not allocated has no address, so its
+                // alignment constrains nothing but file padding, which GNU
+                // ld does not do at all. Capping it keeps one absurd
+                // `sh_addralign` in a corrupt object — 2 GiB, say — from
+                // inflating the output, the merged string pool or a
+                // relocatable link by that much.
+                if flags & SHF_ALLOC == 0 {
+                    header.sh_addralign = header.sh_addralign.min(MAX_NOALLOC_ALIGN);
                 }
             }
             sections.push(InputSection {
