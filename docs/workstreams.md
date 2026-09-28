@@ -89,7 +89,7 @@ can work at the same time without colliding.
 | W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | merged |
 | W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | merged |
 | W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | merged |
-| W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | in progress |
+| W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | merged |
 | W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | merged |
 | W53 | Option coverage and GNU differences | `src/args/**`, the x86-64 difference fixes in `src/elf/{defined,dynsym,synth}*`, `tests/args*` | W22, W43 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
@@ -627,6 +627,14 @@ remaining option and GNU-difference gaps.
 ---
 
 ## Integration follow-ups
+
+- **W51 (diagnostics):** wording still unlike GNU ld in two places:
+  `unknown option: --foo` (GNU: `unrecognized option '--foo'` plus a usage
+  hint) and `malformed file format not recognized` (GNU: `file not
+  recognized: file format not recognized`). A relocation overflow could
+  carry lld's `is not in [min, max]` if `ApplyError` carried the value.
+  `SourceLocation::column` is always `None` until the DWARF line table
+  tracks a column. `Stderr` holds every diagnostic until flush.
 
 - **W54 (PE):** an unrecognised orphan section is placed differently from
   GNU ld (GNU puts `.averylongname` right after `.data`; qld puts it between

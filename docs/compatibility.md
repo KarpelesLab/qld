@@ -364,6 +364,26 @@ passes" when it cannot settle). Known differences:
   GNU ld matches the demangled names through `extern "C++"`; under Itanium
   mangling the two sets are the same.
 
+### Diagnostics
+
+- Diagnostics are held back and sorted by input position, so they read the
+  same however the link was scheduled. They therefore appear after anything
+  qld writes to stdout, such as the link map; GNU ld and lld stream theirs.
+- The rendering follows lld: `>>> referenced by` with the source position,
+  and the object reference aligned under it. A note attached to a
+  diagnostic renders `>>> note: …`, where lld writes a bare `>>>`.
+- No `N errors` summary is printed, matching both linkers.
+- `--error-limit` defaults to 20 with lld's message and its
+  `--error-limit=0` escape hatch; GNU ld has no such option.
+- `--color-diagnostics` uses lld's colours exactly, and `auto` means stderr
+  is a terminal.
+- `--fatal-warnings` promotes warnings to errors and fails the link, as in
+  both linkers; `-w` drops warnings and cancels it.
+- An input section whose contents lie outside the file is rejected, as GNU
+  ld rejects it (lld accepts). An `sh_addralign` above `UINT32_MAX` is
+  rejected, as in lld; on a non-allocated section it is capped at 64 KiB,
+  since there it only pads the file.
+
 ### Demangled names
 
 Diagnostics, map files and `--print-*` output demangle names unless
