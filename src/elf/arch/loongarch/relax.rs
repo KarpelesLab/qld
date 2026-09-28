@@ -360,3 +360,36 @@ mod tests {
         assert!(!pcaddi_reaches(2));
     }
 }
+
+/// What a partial link (`-r`) must know about an input section to keep its
+/// alignment through a later relaxing link.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionAlign {
+    /// The section carries `R_LARCH_RELAX` marks, so the sections after it
+    /// can move and need their alignment written down.
+    pub relaxes: bool,
+    /// An `R_LARCH_ALIGN` at its start already guarantees the alignment.
+    pub covered: bool,
+}
+
+/// [`SectionAlign`] of a section whose relocations are `relocs` and whose
+/// alignment is `align`. Following lld, a weaker `R_LARCH_ALIGN` at offset
+/// 0 (from an older assembler) does not count as covering the alignment.
+#[must_use]
+pub fn section_align<F: crate::elf::read::ElfFormat>(
+    relocs: &crate::elf::read::RelaSlice<'_, F>,
+    align: u64,
+) -> SectionAlign {
+    let mut out = SectionAlign::default();
+    for rel in relocs.iter() {
+        if rel.r_type == R_LARCH_RELAX {
+            out.relaxes = true;
+        } else if rel.r_type == R_LARCH_ALIGN
+            && rel.offset == 0
+            && u64::try_from(rel.addend).is_ok_and(|addend| addend >= align.saturating_sub(4))
+        {
+            out.covered = true;
+        }
+    }
+    out
+}

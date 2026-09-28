@@ -33,7 +33,7 @@
 //!   `pcaddu18i` + `jirl` within ±128 MiB becomes `bl` (or `b`) + `nop`,
 //!   and a local-exec `lu12i.w`/`add.d`/`addi.d` whose offset fits 12 bits
 //!   becomes `nop`/`nop`/`addi.d rd, $tp, off`. Layout then deletes those
-//!   `nop`s and trims the padding an `R_LARCH_ALIGN` marks ([`relax`], on
+//!   `nop`s and trims the padding an `R_LARCH_ALIGN` marks ([`mod@relax`], on
 //!   the shrinking framework of [`super::shrink`]), so the rewrites above
 //!   are what the writer falls back to when a sequence turns out not to
 //!   shrink.

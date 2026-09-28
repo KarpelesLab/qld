@@ -255,6 +255,9 @@ struct Member {
     relocs: u64,
     /// Offset of its relocations in the output `.rela` section.
     rela_offset: u64,
+    /// Bytes of `nop` padding before it that a synthesized
+    /// `R_LARCH_ALIGN` covers (LoongArch; 0 otherwise).
+    align_pad: u64,
 }
 
 #[derive(Debug)]
@@ -653,6 +656,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                     offset: member.offset,
                     relocs: 0,
                     rela_offset: 0,
+                    align_pad: member.align_pad,
                 });
                 if let Some(id) = sections.id(member.file as usize, member.section)
                     && let Some(slot) = assign.get_mut(id.index())
@@ -792,6 +796,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                 offset: 0,
                 relocs: 0,
                 rela_offset: 0,
+                align_pad: 0,
             });
             if let Some(slot) = assign.get_mut(id.index()) {
                 *slot = out_index;
@@ -904,16 +909,41 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
             out.flags |= SHF_GROUP;
         }
         let mut size = 0u64;
+        // LoongArch: the assembler writes `R_LARCH_ALIGN` only for a
+        // section it marked relaxable, so a later relaxing link would not
+        // know that the sections after one have to stay aligned. As lld
+        // does, reserve `2^n - 4` bytes of `nop` padding before each of
+        // them and synthesize the relocation that covers it.
+        let synthesize_align =
+            arch == crate::elf::arch::Arch::LoongArch64 && out.flags & SHF_EXECINSTR != 0;
+        let mut relaxable_seen = false;
         for member in &mut out.members {
-            let Some(section) = files
+            let Some(object) = files
                 .get(member.file as usize)
                 .and_then(|f| f.object.as_ref())
-                .and_then(|o| o.section(member.section))
             else {
                 continue;
             };
+            let Some(section) = object.section(member.section) else {
+                continue;
+            };
+            let mut pad = member.align_pad;
+            if synthesize_align && !keep_offsets {
+                let align = section.header.sh_addralign;
+                let need = relocations_of(object, section)?
+                    .map(|relocs| crate::elf::arch::loongarch::relax::section_align(&relocs, align))
+                    .unwrap_or_default();
+                if !relaxable_seen {
+                    relaxable_seen = need.relaxes;
+                } else if align > 4 && !need.covered {
+                    pad = align.saturating_sub(4);
+                }
+            }
+            member.align_pad = pad;
             let offset = if keep_offsets {
                 member.offset
+            } else if pad != 0 {
+                add(size, pad)?
             } else {
                 align_to(size, section.header.sh_addralign)?
             };
@@ -977,9 +1007,9 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                         .and_then(|at| p.counts.get(at))
                 })
                 .map_or(0, |(_, c)| *c);
-            member.relocs = count;
+            member.relocs = add(count, u64::from(member.align_pad != 0))?;
             member.rela_offset = mul(total, RELA_SIZE)?;
-            total = add(total, count)?;
+            total = add(total, member.relocs)?;
         }
         out.relocs = total;
     }
@@ -2312,8 +2342,26 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
     let Some(section) = object.section(member.section) else {
         return Ok(());
     };
-    let Some(relas) = relocations_of(object, section)? else {
-        return Ok(());
+    // The synthesized `R_LARCH_ALIGN` of the `nop` padding before this
+    // member (LoongArch `-r`): no symbol, and the padding as its addend.
+    // A section with no relocations of its own has only this one.
+    let synthesized = (member.align_pad != 0).then(|| {
+        (
+            member.offset.wrapping_sub(member.align_pad),
+            u64::from(crate::elf::arch::loongarch::R_LARCH_ALIGN),
+            member.align_pad as i64,
+        )
+    });
+    let relas = match relocations_of(object, section)? {
+        Some(relas) => relas,
+        None => {
+            if let (Some(entry), Some(slot)) =
+                (synthesized, out.as_chunks_mut::<24>().0.first_mut())
+            {
+                put_rela(slot, entry);
+            }
+            return Ok(());
+        }
     };
     let context = Context {
         refs,
@@ -2349,6 +2397,7 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
         let info = (u64::from(index) << 32) | u64::from(r_type);
         sorted.push((offset, info, addend));
     }
+    sorted.extend(synthesized);
     sorted.sort_by_key(|&(offset, ..)| offset);
     let entries = out.as_chunks_mut::<24>().0;
     if sorted.len() as u64 != member.relocs || entries.len() < sorted.len() {
@@ -2356,12 +2405,17 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
             "relocatable output: relocation count changed after planning".into(),
         ));
     }
-    for (entry, (offset, info, addend)) in entries.iter_mut().zip(sorted) {
-        entry[0..8].copy_from_slice(&offset.to_le_bytes());
-        entry[8..16].copy_from_slice(&info.to_le_bytes());
-        entry[16..24].copy_from_slice(&addend.to_le_bytes());
+    for (entry, item) in entries.iter_mut().zip(sorted) {
+        put_rela(entry, item);
     }
     Ok(())
+}
+
+/// Writes one `Elf64_Rela` entry.
+fn put_rela(entry: &mut [u8; 24], (offset, info, addend): (u64, u64, i64)) {
+    entry[0..8].copy_from_slice(&offset.to_le_bytes());
+    entry[8..16].copy_from_slice(&info.to_le_bytes());
+    entry[16..24].copy_from_slice(&addend.to_le_bytes());
 }
 
 /// The 16-bit section index field for output section list index `out`.

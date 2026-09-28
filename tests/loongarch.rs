@@ -1437,29 +1437,30 @@ fn alignment_padding_is_trimmed_like_lld() {
 }
 
 /// An assembly source whose alignment directives the assembler turns into
-/// `R_LARCH_ALIGN`: plain ones, and one with a maximum-bytes limit that the
-/// padding exceeds (so all of it goes).
+/// `R_LARCH_ALIGN`: it only does that when relaxable code comes before
+/// them, so each one follows a call that shrinks. The last has a
+/// maximum-bytes limit the padding exceeds, so all of it goes.
 const ALIGN_ASM: &str = r#"
 	.text
 	.globl	_start
 	.type	_start,@function
 _start:
-	nop
-	nop
+	la.pcrel $a0, data
+	la.got	 $a1, data
+	pcaddu18i $ra, %call36(far)
+	jirl	$ra, $ra, 0
 	.p2align 4
 aligned16:
 	nop
+	pcaddu18i $ra, %call36(far)
+	jirl	$ra, $ra, 0
 	.p2align 5
 aligned32:
 	nop
-	.p2align 4, , 4
-capped:
-	nop
-	la.pcrel $a0, data
-	la.got	 $a1, data
-	bl	far
 	pcaddu18i $ra, %call36(far)
 	jirl	$ra, $ra, 0
+	.p2align 4, , 4
+capped:
 	ret
 	.size	_start, .-_start
 
@@ -1473,6 +1474,67 @@ far:
 	.globl	data
 data:
 	.word	1
+"#;
+
+/// A partial link (`-r`) writes the alignment of every input section that
+/// carries no relaxation marks of its own as a synthesized `R_LARCH_ALIGN`,
+/// as lld does, so a later relaxing link still aligns it.
+#[test]
+fn relocatable_output_synthesizes_alignment() {
+    let tools = require!();
+    let dir = scratch("relocatable-align");
+    compile(&tools, &dir, "align", ALIGN_ASM, &["-mrelax"]);
+    compile(&tools, &dir, "wide", WIDE_ASM, &["-mno-relax"]);
+    link_both(&tools, &dir, "part.o", &["-r", "align.o", "wide.o"], &[]);
+    let theirs = Elf::read(&dir.join("part.o.lld"));
+    let ours = Elf::read(&dir.join("part.o.qld"));
+    let aligns = |elf: &Elf| -> Vec<(u64, i64)> {
+        let mut out: Vec<(u64, i64)> = elf
+            .relas
+            .iter()
+            .filter(|r| r.kind == 102)
+            .map(|r| (r.offset, r.addend))
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    assert_eq!(
+        aligns(&theirs),
+        aligns(&ours),
+        "the R_LARCH_ALIGN relocations of -r output differ"
+    );
+    let offset = |elf: &Elf, name: &str| {
+        elf.symbols
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.value)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    assert_eq!(offset(&theirs, "wide"), offset(&ours, "wide"));
+    // Linking the partial output puts `wide` back on its boundary.
+    run_ok(
+        &dir,
+        Path::new(env!("CARGO_BIN_EXE_qld")),
+        &["-o", "out.qld", "-static", "-e", "_start", "part.o.qld"],
+    );
+    let final_elf = Elf::read(&dir.join("out.qld"));
+    assert_eq!(
+        offset(&final_elf, "wide") % 32,
+        0,
+        "wide lost its alignment through the partial link"
+    );
+}
+
+/// An object with no relaxation marks whose section is 32-byte aligned.
+const WIDE_ASM: &str = r#"
+	.text
+	.p2align 5
+	.globl	wide
+	.type	wide,@function
+wide:
+	nop
+	ret
+	.size	wide, .-wide
 "#;
 
 /// The extreme code model's general-dynamic sequence reaches the GOT pair
