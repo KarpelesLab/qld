@@ -68,6 +68,30 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - run: cargo test --all-features --test i386 -- --nocapture
 
+  corruption:
+    name: randomized corruption of every fixture
+    runs-on: ubuntu-latest
+    env:
+      # the in-tree default already runs inside the `test` job; this is the
+      # long pass
+      QLD_CORRUPT_ITERS: "4000"
+      QLD_CORRUPT_SEEDS: "101,202,303,404,505,606,707,808"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --all-features --test corrupt -- --test-threads=2 --nocapture
+
+  diagnostics:
+    name: diagnostics compared with GNU ld and lld
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc binutils libc6-dev
+      - run: cargo test --all-features --test diag -- --test-threads=2 --nocapture
+
   relocatable:
     name: -r and --emit-relocs on every ELF class, compared with lld
     runs-on: ubuntu-24.04

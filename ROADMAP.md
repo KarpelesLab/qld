@@ -22,8 +22,10 @@ Set up the project skeleton and the infrastructure every later milestone needs.
 - [x] Work split into parallel workstreams ([workstreams.md](docs/workstreams.md))
 - [x] CI: build and test on stable and 1.89, `clippy -D warnings`, `rustfmt --check`,
       `cargo doc`, `cargo deny` (licenses/advisories), Linux/macOS/Windows hosts
-- [ ] Diagnostics framework: error/warning/note with input location, GNU-style
-      (W51 in progress)
+- [x] Diagnostics framework: error/warning/note with input location, in
+      lld's shape, held back and sorted by input position so a parallel link
+      reads the same every time; `--error-limit`, `--color-diagnostics`,
+      `--fatal-warnings` and `-w` behave as in lld
       `qld: error: ...` rendering, and structured form for library users
 - [x] GNU flavor argument parser
   - [x] Complete option table covering every GNU ld 2.4x, gold, lld and mold
