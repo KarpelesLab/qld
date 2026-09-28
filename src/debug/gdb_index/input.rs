@@ -390,12 +390,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Whether fixed-size integers are read big-endian.
-    #[must_use]
-    pub fn is_big_endian(&self) -> bool {
-        self.big
-    }
-
     /// The current position.
     #[must_use]
     pub fn pos(&self) -> usize {
