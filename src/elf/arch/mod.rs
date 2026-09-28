@@ -938,14 +938,10 @@ impl Arch {
     ///
     /// # Errors
     ///
-    /// [`crate::error::Error::Unimplemented`] for `--emit-relocs` on Arm,
-    /// whose `SHT_REL` relocations the emitter does not write.
+    /// [`crate::error::Error::Unimplemented`]; nothing is rejected here at
+    /// the moment.
     pub fn check_options(self, options: &LinkOptions) -> crate::error::Result<()> {
-        if self == Self::Arm && options.emit_relocs {
-            return Err(crate::error::Error::Unimplemented(
-                "--emit-relocs for 32-bit Arm (SHT_REL relocations)".into(),
-            ));
-        }
+        let _ = options;
         Ok(())
     }
 

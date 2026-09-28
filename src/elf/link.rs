@@ -166,21 +166,6 @@ fn link_as<F: crate::elf::read::ElfFormat>(
     diagnostics: &dyn DiagnosticSink,
 ) -> Result<()> {
     let options = &prepared.options;
-    // The DWARF the indexes are built from is read little-endian only.
-    if <F::Endian as crate::elf::read::Endian>::ENDIANNESS == crate::target::Endianness::Big
-        && (options.gdb_index || options.debug_names)
-    {
-        return Err(Error::Unimplemented(
-            "--gdb-index and --debug-names for big-endian output".into(),
-        ));
-    }
-    if options.kind == crate::args::OutputKind::Relocatable && F::KIND != ElfKind::Elf64Le {
-        // `relocatable` writes 64-bit records, and has no `SHT_REL` output.
-        return Err(Error::Unimplemented(format!(
-            "relocatable output (-r) for {:?} (roadmap M4: more ELF architectures)",
-            F::KIND
-        )));
-    }
     let timing = options.timing.as_ref();
     let start = Instant::now();
     let lap = |what: &str| {
