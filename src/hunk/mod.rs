@@ -99,8 +99,9 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
     // `Arch::from_target` only knows big-endian m68k.
     target.endian = Endianness::Big;
     target.pointer_width = PointerWidth::Bits32;
-    // The image is cut into hunks, not loaded as it is: page alignment
-    // between sections would only pad the hunks.
-    options.magic = crate::args::options::MagicMode::Nmagic;
+    // Page alignment between output sections costs nothing here: each
+    // hunk is one output section, and the space between two of them is
+    // never written. `-n`/`-N` are left alone, because they also change
+    // how much space `.bss` takes.
     crate::elf::link(&options, diagnostics)
 }

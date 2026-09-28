@@ -416,3 +416,37 @@ fn live_tools_agree() {
         compare(&case.name, &bytes, &reference, "vlink");
     }
 }
+
+/// The library entry point: a [`qld::BinaryFormat::Hunk`] target reaches
+/// `qld::hunk::link`, which settles the options a load file implies and
+/// hands the link to the ELF backend. The `qld` binary gets there through
+/// `--oformat amigahunk` instead, which every test above uses.
+#[test]
+fn hunk_target_links_through_the_library() {
+    use qld::{
+        Architecture, BinaryFormat, Endianness, InputAttrs, InputKind, LinkOptions,
+        OperatingSystem, OutputKind, PointerWidth, Target,
+    };
+
+    let dir = Path::new(DATA).join("basic");
+    let out = scratch("basic", "library").join("out.hunk");
+    let mut options = LinkOptions::new();
+    options.kind = OutputKind::StaticExecutable;
+    options.threads = Some(2);
+    options.output = Some(out.clone());
+    options.target = Some(Target {
+        format: BinaryFormat::Hunk,
+        arch: Architecture::M68k,
+        endian: Endianness::Big,
+        pointer_width: PointerWidth::Bits32,
+        os: OperatingSystem::None,
+    });
+    for object in ["main.o", "helper.o"] {
+        options.push_input(InputKind::File(dir.join(object)), InputAttrs::default());
+    }
+    let diagnostics = qld::diag::Collect::new();
+    qld::link(&options, &diagnostics).unwrap_or_else(|e| panic!("the library link failed: {e}"));
+    let bytes = fs::read(&out).expect("load file");
+    let reference = fs::read(dir.join("expected.hunk")).expect("reference");
+    compare("basic (library)", &bytes, &reference, "vlink");
+}
