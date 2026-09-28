@@ -44,7 +44,10 @@ Set up the project skeleton and the infrastructure every later milestone needs.
 - [x] Test harness: fixture compilation with the system gcc/clang,
       run-the-output tests, differential comparison against GNU ld
       ([testing.md](docs/testing.md))
-- [ ] Fuzz targets for every parser (`cargo fuzz`) — deferred: needs a separate crate; randomized corruption tests meanwhile
+- [x] Randomized corruption tests for every parser (`tests/corrupt.rs`:
+      seeded mutation of every committed fixture, fed through the readers and
+      the link drivers, with a time and memory watchdog). `cargo fuzz` itself
+      stays deferred: it needs a second crate, and qld is one crate
 
 **Exit criteria:** `qld --help` and `qld --version` work. All options on the
 test corpus of real-world command lines (captured from gcc, clang and rustc

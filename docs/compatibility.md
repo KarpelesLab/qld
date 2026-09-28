@@ -458,6 +458,17 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   static glibc's `_nl_current_LC_CTYPE_used`) keeps the constant; GNU ld adds
   the load base with an `R_AARCH64_RELATIVE`.
 
+## PE long section names
+
+- An image truncates a section name longer than eight bytes, as the
+  PE/COFF specification requires, **unless** the link is unstripped and the
+  output carries `.debug_*` sections. Then GNU ld's extension writes every
+  long name through the string table so GDB can find the DWARF, and qld
+  does the same. `--enable-long-section-names` and
+  `--disable-long-section-names` override the choice.
+- lld is stricter: it truncates even in a `-g` link and keeps long names
+  only for discardable debug sections.
+
 ## PE/COFF: i386 and ARM64
 
 - **SafeSEH** is a qld addition; GNU ld has none. It follows link.exe:
