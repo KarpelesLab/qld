@@ -130,6 +130,21 @@ the comparison looks at:
 MSRV (Rust 1.89) CI builds the crate and runs the unit tests.
 Integration tiers run on current stable.
 
+## What CI runs, and when
+
+Every push to master runs the whole matrix. A pull request runs the core
+jobs only — the three-platform `test` matrix, the GNU ld fixture
+validation, `lint`, `msrv` and `deny`, plus the macOS, Windows and arm64
+platform jobs — while the thirteen cross-architecture comparison jobs
+(i386, x32, RV32/RV64, PowerPC64 LE and BE, LoongArch, s390x, 32-bit Arm,
+the relocatable and debug-index suites and the long corruption pass) are
+gated on `github.event_name == 'push'`.
+
+The reason is runner capacity: with release-plz open, each master push
+produces both a push run and a pull-request run of the same workflow, which
+is roughly fifty jobs at once. A `concurrency` group per ref also cancels
+the runs a newer push supersedes.
+
 ## Benchmarks
 
 `benches/` contains drivers that capture a link once and replay it (the full

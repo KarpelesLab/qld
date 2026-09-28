@@ -5,6 +5,12 @@ on:
     branches: [master]
   pull_request:
 
+# One CI run per ref: a new push cancels the runs it supersedes, so a
+# stack of release-plz PR updates does not sit in the queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -57,6 +63,8 @@ jobs:
 
   i386:
     name: i386 links compared with GNU ld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_I386_TOOLS: "1"
@@ -70,6 +78,8 @@ jobs:
 
   corruption:
     name: randomized corruption of every fixture
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
       # the in-tree default already runs inside the `test` job; this is the
@@ -94,6 +104,8 @@ jobs:
 
   relocatable:
     name: -r and --emit-relocs on every ELF class, compared with lld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_TOOLS: "1"
@@ -115,6 +127,8 @@ jobs:
 
   debug-indexes:
     name: Debug indexes and section ordering compared with lld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_TOOLS: "1"
@@ -134,6 +148,8 @@ jobs:
 
   x32:
     name: x32 links compared with GNU ld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_X32_TOOLS: "1"
@@ -167,6 +183,8 @@ jobs:
 
   arm32:
     name: 32-bit Arm links compared with lld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_ARM_TOOLS: "1"
@@ -192,6 +210,8 @@ jobs:
 
   arm32-fixtures:
     name: 32-bit Arm fixtures run under qemu
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_TOOLS: "1"
@@ -209,6 +229,8 @@ jobs:
 
   ppc64be:
     name: PowerPC64 BE (ELFv1) links compared with GNU ld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_TOOLS: "1"
@@ -229,6 +251,8 @@ jobs:
 
   s390x:
     name: s390x links compared with GNU ld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_S390X_TOOLS: "1"
@@ -250,6 +274,8 @@ jobs:
 
   riscv32:
     name: RISC-V 32 links compared with lld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_RISCV_TOOLS: "1"
@@ -268,6 +294,8 @@ jobs:
 
   riscv64:
     name: RISC-V 64 links compared with lld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_RISCV_TOOLS: "1"
@@ -287,6 +315,8 @@ jobs:
 
   ppc64le:
     name: PowerPC64 LE links compared with lld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_TOOLS: "1"
@@ -305,6 +335,8 @@ jobs:
 
   loongarch64:
     name: LoongArch64 links compared with lld
+    # heavy cross-architecture job: master pushes only
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_LOONGARCH: "1"
