@@ -35,8 +35,8 @@ use rayon::prelude::*;
 
 use crate::args::{LinkOptions, OutputKind, SymbolicMode};
 use crate::elf::read::consts::{
-    STB_LOCAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL,
-    STV_PROTECTED, VERSYM_HIDDEN,
+    STB_LOCAL, STB_WEAK, STT_COMMON, STT_FUNC, STT_GNU_IFUNC, STT_OBJECT, STV_DEFAULT, STV_HIDDEN,
+    STV_INTERNAL, STV_PROTECTED, VERSYM_HIDDEN,
 };
 use crate::error::{Error, Result};
 use crate::ids::{FileId, SymbolId};
@@ -278,7 +278,34 @@ pub fn read_scripts(options: &LinkOptions) -> Result<(Option<VersionScript>, Vec
             }
         }
     }
+    // GNU ld's built-in C++ lists are `extern "C++"` patterns matched
+    // against demangled names (`operator new*`, `typeinfo for*`). qld has
+    // no demangling in version-script matching, and for Itanium mangling
+    // the two sets are exactly these mangled prefixes.
+    if options.dynamic_list_cpp_new {
+        patterns.extend(CPP_NEW.iter().map(|p| Pattern::file(p)));
+    }
+    if options.dynamic_list_cpp_typeinfo {
+        patterns.extend(CPP_TYPEINFO.iter().map(|p| Pattern::file(p)));
+    }
     Ok((script, patterns))
+}
+
+/// `--dynamic-list-cpp-new`: `operator new`, `operator new[]`,
+/// `operator delete` and `operator delete[]`, in every overload.
+const CPP_NEW: &[&[u8]] = &[b"_Znw*", b"_Zna*", b"_Zdl*", b"_Zda*"];
+
+/// `--dynamic-list-cpp-typeinfo`: "typeinfo for" and "typeinfo name for".
+const CPP_TYPEINFO: &[&[u8]] = &[b"_ZTI*", b"_ZTS*"];
+
+/// Whether a dynamic list is in effect, which in a shared object binds
+/// every symbol not on it, as `-Bsymbolic` would.
+#[must_use]
+fn has_dynamic_list(options: &LinkOptions) -> bool {
+    !options.dynamic_lists.is_empty()
+        || options.dynamic_list_data
+        || options.dynamic_list_cpp_new
+        || options.dynamic_list_cpp_typeinfo
 }
 
 /// The most restrictive visibility recorded in `flags`.
@@ -462,9 +489,17 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                         }
                     }
                     let local_visibility = matches!(visibility, STV_HIDDEN | STV_INTERNAL);
-                    let listed = !dynamic_patterns.is_empty()
-                        && name.version().is_none()
-                        && dynamic_patterns.iter().any(|p| p.matches(name.bytes()));
+                    let kind = raw.map_or(0, |r| r.kind());
+                    let function = kind == STT_FUNC || kind == STT_GNU_IFUNC;
+                    // `--dynamic-list-data` puts every defined data symbol
+                    // on the dynamic list, as GNU ld does: objects and
+                    // commons, not functions and not `STT_NOTYPE`.
+                    let data = matches!(kind, STT_OBJECT | STT_COMMON)
+                        || def.kind == DefinitionKind::Common;
+                    let listed = (name.version().is_none()
+                        && !dynamic_patterns.is_empty()
+                        && dynamic_patterns.iter().any(|p| p.matches(name.bytes())))
+                        || (options.dynamic_list_data && data);
                     let exported = !local_visibility
                         && (mode.shared
                             || (options.export_dynamic && mode.kind != OutputKind::StaticPie)
@@ -473,8 +508,6 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                     if exported && !(linker_defined && mode.shared) {
                         set |= SymbolFlags::EXPORTED;
                         if mode.shared && visibility == STV_DEFAULT {
-                            let kind = raw.map_or(0, |r| r.kind());
-                            let function = kind == STT_FUNC || kind == STT_GNU_IFUNC;
                             let weak = raw.is_some_and(|r| r.binding() == STB_WEAK);
                             let symbolic = match options.symbolic {
                                 SymbolicMode::None => false,
@@ -483,10 +516,13 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                                 SymbolicMode::NonWeak => !weak,
                                 SymbolicMode::NonWeakFunctions => function && !weak,
                             };
-                            let bound_by_list = !options.dynamic_lists.is_empty() && !listed;
+                            let bound_by_list = has_dynamic_list(options) && !listed;
                             let absolute = raw
                                 .is_some_and(|r| r.st_shndx == crate::elf::read::consts::SHN_ABS);
-                            if !symbolic && !bound_by_list && !absolute {
+                            // A symbol on the dynamic list stays
+                            // preemptible even under `-Bsymbolic`, as GNU
+                            // ld's `h->dynamic` does.
+                            if (listed || (!symbolic && !bound_by_list)) && !absolute {
                                 set |= PREEMPTIBLE;
                             }
                         }
