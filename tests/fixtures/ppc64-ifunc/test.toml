@@ -1,0 +1,23 @@
+# M4: an IFUNC in a static PowerPC64 BE executable. An ELFv1 resolver
+# returns a function pointer, which is the address of a descriptor, so the
+# call stub loads the descriptor's address out of the GOT slot an
+# `R_PPC64_IRELATIVE` filled, then the entry point and the callee's TOC
+# pointer out of the descriptor; the caller's `nop` becomes
+# `ld r2, 40(r1)`, ELFv1's TOC save slot. GNU ld writes a `R_PPC64_JMP_IREL`
+# against a `.iplt` entry that is the descriptor itself instead, so the
+# relocation type is not compared.
+description = "IFUNC called in a static executable, for PowerPC64 BE (ELFv1)"
+compile = ["cc -O2 -c ifunc.c"]
+driver = "cc"
+link = "-static -o out ifunc.o"
+run = "./out"
+expect.stdout = "pick 2 3\n"
+expect.readelf = [
+  "PowerPC64",
+  "big endian",
+  "abiv1",
+  ".opd",
+  "!R_PPC64_JMP_SLOT",
+]
+targets = ["powerpc64-linux-gnu"]
+determinism = true

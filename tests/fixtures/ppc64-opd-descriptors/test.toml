@@ -1,0 +1,21 @@
+# M4: ELFv1 function descriptors with nothing else in the link. A call
+# names the callee's `.opd` descriptor, so the linker follows the
+# descriptor's `R_PPC64_ADDR64` to the code (GNU ld's `opd_entry_value`);
+# taking the function's address, on the other hand, keeps the descriptor.
+# `e_entry` is `_start`'s descriptor, and the descriptors' second
+# doubleword is `R_PPC64_TOC`, the value of `.TOC.`.
+description = "ELFv1 function descriptors: calls follow .opd, pointers do not"
+compile = ["cc -O2 -c main.c", "cc -O2 -c other.c"]
+driver = "cc"
+link = "-nostdlib -nostartfiles -static -o out main.o other.o"
+run = "./out"
+expect.stdout = "opd ok\n"
+expect.readelf = [
+  "PowerPC64",
+  "big endian",
+  "abiv1",
+  ".opd",
+  ".got",
+]
+targets = ["powerpc64-linux-gnu"]
+determinism = true

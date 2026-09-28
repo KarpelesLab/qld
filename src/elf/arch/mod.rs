@@ -28,6 +28,7 @@ pub mod arm;
 pub mod i386;
 pub mod loongarch;
 pub mod ppc64;
+pub mod ppc64_elfv1;
 pub mod riscv;
 pub mod s390x;
 pub mod shrink;
@@ -35,10 +36,10 @@ pub mod thunk;
 pub mod x86_64;
 
 use crate::args::LinkOptions;
-use crate::elf::read::Relocation;
 use crate::elf::read::consts::{
     EM_AARCH64, EM_LOONGARCH, EM_PPC64, EM_RISCV, EM_X86_64, SHF_EXECINSTR, reloc_name,
 };
+use crate::elf::read::{Big, Little, Relocation};
 use crate::target::{Architecture, Target};
 
 /// The architecture an ELF link targets.
@@ -55,6 +56,10 @@ pub enum Arch {
     LoongArch64,
     /// PowerPC64, little-endian, ELFv2 ABI.
     Ppc64,
+    /// PowerPC64, big-endian, ELFv1 ABI (`elf64ppc`): the same relocations
+    /// and instruction encodings, in big-endian words, with function
+    /// descriptors in `.opd` ([`ppc64_elfv1`]).
+    Ppc64Be,
     /// s390x (z/Architecture, 64-bit, big-endian).
     S390x,
     /// i386 (32-bit x86).
@@ -105,6 +110,9 @@ pub enum Kind {
     GotRel,
     /// `GOT + A - P`.
     GotBasePc,
+    /// `GOT + A`: the GOT base itself (PowerPC64 ELFv1 `R_PPC64_TOC`,
+    /// which fills the TOC word of a function descriptor).
+    GotBase,
     /// `Z + A`, the symbol's size.
     Size,
     /// `S + A - TP`.
@@ -266,7 +274,12 @@ impl Class {
     pub fn uses_got_base(self) -> bool {
         matches!(
             self.kind,
-            Kind::GotSlotRel | Kind::GotRel | Kind::GotBasePc | Kind::GotPageOff | Kind::GotRelax
+            Kind::GotSlotRel
+                | Kind::GotRel
+                | Kind::GotBasePc
+                | Kind::GotBase
+                | Kind::GotPageOff
+                | Kind::GotRelax
         )
     }
 
@@ -484,9 +497,10 @@ impl Arch {
             Architecture::Arm if target.endian == crate::target::Endianness::Little => {
                 Some(Self::Arm)
             }
-            Architecture::PowerPc64 if target.endian == crate::target::Endianness::Little => {
-                Some(Self::Ppc64)
-            }
+            Architecture::PowerPc64 => Some(match target.endian {
+                crate::target::Endianness::Little => Self::Ppc64,
+                crate::target::Endianness::Big => Self::Ppc64Be,
+            }),
             Architecture::S390x => Some(Self::S390x),
             _ => None,
         }
@@ -516,19 +530,22 @@ impl Arch {
         files.iter().find_map(|file| {
             let object = file.object.as_ref()?;
             Self::from_machine(object.elf.elf().header().e_machine)
-                .map(|arch| arch.for_word_size(F::WORD_SIZE))
+                .map(|arch| arch.for_kind(F::KIND))
         })
     }
 
-    /// The variant of `self` for an ELF class whose words are `word_size`
-    /// bytes: RISC-V is one machine in both classes, and so are x86-64
-    /// and x32.
+    /// The variant of `self` for ELF class and byte order `kind`: RISC-V is
+    /// one machine in both classes, and so are x86-64 and x32, while
+    /// PowerPC64's byte order also picks its ABI (`EM_PPC64` is ELFv2
+    /// little-endian or ELFv1 big-endian).
     #[must_use]
-    pub fn for_word_size(self, word_size: usize) -> Self {
+    pub fn for_kind(self, kind: crate::elf::read::ElfKind) -> Self {
+        let word_size = kind.word_size();
         match self {
             Self::RiscV64 if word_size == 4 => Self::RiscV32,
             // An ELF32 x86-64 object is x32.
             Self::X86_64 if word_size == 4 => Self::X32,
+            Self::Ppc64 if kind.endianness() == crate::target::Endianness::Big => Self::Ppc64Be,
             _ => self,
         }
     }
@@ -573,6 +590,31 @@ impl Arch {
         ))
     }
 
+    /// Whether the output keeps one `.gnu.attributes` section rather than
+    /// every input's: the section is a single vendor section, not a list of
+    /// them, so concatenating them leaves something no reader can parse.
+    /// PowerPC64 is the architecture whose compilers always emit one
+    /// (`Tag_GNU_Power_ABI_FP`); qld keeps the first, where GNU ld merges
+    /// the tag values and diagnoses conflicts.
+    #[must_use]
+    pub fn one_gnu_attributes(self) -> bool {
+        matches!(self, Self::Ppc64 | Self::Ppc64Be)
+    }
+
+    /// Why this architecture cannot produce the output being linked, if it
+    /// cannot: the ELFv1 ABI's PLT is an array of function descriptors the
+    /// dynamic linker fills, addressed by `DT_PLTGOT`, where qld's model
+    /// has code in `.plt` and one-word slots in `.got.plt`, so a dynamic
+    /// ELFv1 output would be silently wrong.
+    #[must_use]
+    pub fn unsupported_output(self, dynamic: bool) -> Option<String> {
+        (self == Self::Ppc64Be && dynamic).then(|| {
+            "dynamic output for the PowerPC64 ELFv1 ABI (elf64ppc): its PLT is an array \
+             of function descriptors (roadmap M4). Static output (-static) works."
+                .to_owned()
+        })
+    }
+
     /// The ELF class and byte order of the output.
     ///
     /// Every encoder and decoder in the ELF backend is generic over the
@@ -584,7 +626,7 @@ impl Arch {
             Self::I386 | Self::X32 | Self::RiscV32 | Self::Arm => {
                 crate::elf::read::ElfKind::Elf32Le
             }
-            Self::S390x => crate::elf::read::ElfKind::Elf64Be,
+            Self::S390x | Self::Ppc64Be => crate::elf::read::ElfKind::Elf64Be,
             Self::X86_64 | Self::AArch64 | Self::RiscV64 | Self::LoongArch64 | Self::Ppc64 => {
                 crate::elf::read::ElfKind::Elf64Le
             }
@@ -658,7 +700,7 @@ impl Arch {
             Self::AArch64 => EM_AARCH64,
             Self::RiscV64 | Self::RiscV32 => EM_RISCV,
             Self::LoongArch64 => EM_LOONGARCH,
-            Self::Ppc64 => EM_PPC64,
+            Self::Ppc64 | Self::Ppc64Be => EM_PPC64,
             Self::S390x => crate::elf::read::consts::EM_S390,
         }
     }
@@ -676,6 +718,7 @@ impl Arch {
             Self::RiscV32 => "elf32lriscv",
             Self::LoongArch64 => "elf64loongarch",
             Self::Ppc64 => "elf64lppc",
+            Self::Ppc64Be => "elf64ppc",
             Self::S390x => "elf64_s390",
         }
     }
@@ -696,7 +739,7 @@ impl Arch {
     pub fn reloc_label(self, r_type: u32) -> String {
         let r_type = match self {
             Self::LoongArch64 => loongarch::base_type(r_type),
-            Self::Ppc64 => ppc64::base_type(r_type),
+            Self::Ppc64 | Self::Ppc64Be => ppc64::base_type(r_type),
             _ => r_type,
         };
         self.reloc_name(r_type)
@@ -717,7 +760,7 @@ impl Arch {
             | Self::RiscV64
             | Self::RiscV32
             | Self::Arm => 0x1000,
-            Self::AArch64 | Self::Ppc64 => 0x1_0000,
+            Self::AArch64 | Self::Ppc64 | Self::Ppc64Be => 0x1_0000,
             // GNU ld's; lld assumes 64 KiB.
             Self::LoongArch64 => 0x4000,
         }
@@ -733,7 +776,7 @@ impl Arch {
             Self::RiscV64 | Self::RiscV32 | Self::Arm => 0x1_0000,
             Self::LoongArch64 => 0x1_2000_0000,
             // The first 256 MiB segment boundary.
-            Self::Ppc64 => 0x1000_0000,
+            Self::Ppc64 | Self::Ppc64Be => 0x1000_0000,
             Self::S390x => 0x100_0000,
         }
     }
@@ -746,7 +789,7 @@ impl Arch {
         match self {
             Self::I386 | Self::S390x | Self::Arm => 3,
             Self::X86_64 | Self::X32 | Self::AArch64 => 3,
-            Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 | Self::Ppc64 => 2,
+            Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 | Self::Ppc64 | Self::Ppc64Be => 2,
         }
     }
 
@@ -760,6 +803,9 @@ impl Arch {
     ) -> u32 {
         if self == Self::Ppc64 {
             return ppc64::ABI_VERSION;
+        }
+        if self == Self::Ppc64Be {
+            return ppc64_elfv1::ABI_VERSION;
         }
         if self == Self::Arm {
             return arm::output_flags(arm::attributes::hard_float(files));
@@ -794,7 +840,7 @@ impl Arch {
     /// ([`for_each_relocation!`]).
     #[must_use]
     pub fn annotates(self) -> bool {
-        matches!(self, Self::LoongArch64 | Self::Ppc64)
+        matches!(self, Self::LoongArch64 | Self::Ppc64 | Self::Ppc64Be)
     }
 
     /// `rel` with what the architecture needs to know about the relocation
@@ -805,7 +851,7 @@ impl Arch {
     /// ([`ppc64::PCREL_CALL_HINT`]). Other architectures get `rel` back.
     #[must_use]
     pub fn annotate(self, rel: Relocation, next: Option<&Relocation>) -> Relocation {
-        if self == Self::Ppc64 {
+        if matches!(self, Self::Ppc64 | Self::Ppc64Be) {
             return ppc64::annotate(rel, next);
         }
         if self == Self::LoongArch64
@@ -836,7 +882,8 @@ impl Arch {
             | Self::AArch64
             | Self::RiscV64
             | Self::RiscV32
-            | Self::Ppc64 => {
+            | Self::Ppc64
+            | Self::Ppc64Be => {
                 let page = crate::arch::aarch64::page;
                 page(target).wrapping_sub(page(place))
             }
@@ -865,7 +912,8 @@ impl Arch {
             | Self::AArch64
             | Self::RiscV64
             | Self::RiscV32
-            | Self::Ppc64 => Err(ApplyError::BadInstruction),
+            | Self::Ppc64
+            | Self::Ppc64Be => Err(ApplyError::BadInstruction),
         }
     }
 
@@ -923,7 +971,10 @@ impl Arch {
     /// range-extension thunks.
     #[must_use]
     pub fn needs_thunks(self) -> bool {
-        matches!(self, Self::AArch64 | Self::Ppc64 | Self::Arm)
+        matches!(
+            self,
+            Self::AArch64 | Self::Ppc64 | Self::Ppc64Be | Self::Arm
+        )
     }
 
     /// How many bytes of an output section's content one thunk pool
@@ -948,7 +999,7 @@ impl Arch {
     #[must_use]
     pub fn thunk_size(self) -> u64 {
         match self {
-            Self::Ppc64 => crate::arch::ppc64::THUNK_SIZE,
+            Self::Ppc64 | Self::Ppc64Be => crate::arch::ppc64::THUNK_SIZE,
             Self::Arm => crate::arch::arm::THUNK_SIZE,
             _ => crate::arch::aarch64::THUNK_SIZE,
         }
@@ -968,7 +1019,9 @@ impl Arch {
         key: u64,
     ) -> Result<(), ApplyError> {
         match self {
-            Self::Ppc64 => crate::arch::ppc64::write_thunk(out, at, address, key)
+            Self::Ppc64 => crate::arch::ppc64::write_thunk::<Little>(out, at, address, key)
+                .map_err(|_| ApplyError::Overflow),
+            Self::Ppc64Be => crate::arch::ppc64::write_thunk::<Big>(out, at, address, key)
                 .map_err(|_| ApplyError::Overflow),
             Self::Arm => arm::write_thunk(out, at, address, key),
             _ => crate::arch::aarch64::write_thunk(out, at, address, key)
@@ -986,7 +1039,7 @@ impl Arch {
             Self::Arm => arm::is_thunk_branch(r_type),
             Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => false,
             Self::AArch64 => matches!(r_type, a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26),
-            Self::Ppc64 => ppc64::is_thunk_branch(r_type),
+            Self::Ppc64 | Self::Ppc64Be => ppc64::is_thunk_branch(r_type),
         }
     }
 
@@ -995,7 +1048,7 @@ impl Arch {
     #[must_use]
     pub fn branch_destination(self, branch: Branch) -> u64 {
         match self {
-            Self::Ppc64 => ppc64::branch_destination(branch),
+            Self::Ppc64 | Self::Ppc64Be => ppc64::branch_destination(branch),
             _ => branch.target,
         }
     }
@@ -1013,7 +1066,7 @@ impl Arch {
             Self::AArch64 => (self.is_thunk_branch(branch.r_type)
                 && !crate::arch::aarch64::branch_in_range(branch.place, branch.target))
             .then_some(branch.target),
-            Self::Ppc64 => ppc64::branch_thunk(branch),
+            Self::Ppc64 | Self::Ppc64Be => ppc64::branch_thunk(branch),
         }
     }
 
@@ -1032,7 +1085,8 @@ impl Arch {
         branch: Branch,
     ) -> Result<(), ApplyError> {
         match self {
-            Self::Ppc64 => ppc64::finish_call(out, offset, branch),
+            Self::Ppc64 => ppc64::finish_call::<Little>(out, offset, branch),
+            Self::Ppc64Be => ppc64_elfv1::finish_call(out, offset, branch),
             _ => Ok(()),
         }
     }
@@ -1058,6 +1112,7 @@ impl Arch {
             }
             Self::LoongArch64 => "/lib64/ld-linux-loongarch-lp64d.so.1",
             Self::Ppc64 => "/lib64/ld64.so.2",
+            Self::Ppc64Be => "/lib64/ld64.so.1",
             Self::S390x => "/lib/ld64.so.1",
         }
     }
@@ -1073,6 +1128,7 @@ impl Arch {
                 | Self::RiscV32
                 | Self::LoongArch64
                 | Self::Ppc64
+                | Self::Ppc64Be
                 | Self::Arm
         )
     }
@@ -1088,7 +1144,8 @@ impl Arch {
             | Self::RiscV64
             | Self::RiscV32
             | Self::LoongArch64
-            | Self::Ppc64 => 0,
+            | Self::Ppc64
+            | Self::Ppc64Be => 0,
             Self::AArch64 => 16,
             Self::Arm => 8,
         }
@@ -1100,7 +1157,7 @@ impl Arch {
     #[must_use]
     pub fn tp_past_tls_start(self) -> Option<u64> {
         match self {
-            Self::Ppc64 => Some(crate::arch::ppc64::TP_OFFSET),
+            Self::Ppc64 | Self::Ppc64Be => Some(crate::arch::ppc64::TP_OFFSET),
             _ => None,
         }
     }
@@ -1111,7 +1168,7 @@ impl Arch {
     #[must_use]
     pub fn dtv_offset(self) -> u64 {
         match self {
-            Self::Ppc64 => crate::arch::ppc64::DTV_OFFSET,
+            Self::Ppc64 | Self::Ppc64Be => crate::arch::ppc64::DTV_OFFSET,
             Self::RiscV64 | Self::RiscV32 => crate::arch::riscv::DTP_OFFSET,
             _ => 0,
         }
@@ -1123,7 +1180,7 @@ impl Arch {
     #[must_use]
     pub fn toc_bias(self) -> Option<u64> {
         match self {
-            Self::Ppc64 => Some(crate::arch::ppc64::TOC_BIAS),
+            Self::Ppc64 | Self::Ppc64Be => Some(crate::arch::ppc64::TOC_BIAS),
             _ => None,
         }
     }
@@ -1133,7 +1190,7 @@ impl Arch {
     #[must_use]
     pub fn got_header_words(self) -> u64 {
         match self {
-            Self::Ppc64 => 1,
+            Self::Ppc64 | Self::Ppc64Be => 1,
             _ => 0,
         }
     }
@@ -1144,6 +1201,8 @@ impl Arch {
     pub fn glink_offset(self) -> Option<u64> {
         match self {
             Self::Ppc64 => Some(crate::arch::ppc64::GLINK_HEADER_SIZE.wrapping_sub(32)),
+            // ELFv1 has no lazy PLT in qld yet (M4).
+            Self::Ppc64Be => None,
             _ => None,
         }
     }
@@ -1160,7 +1219,8 @@ impl Arch {
             | Self::RiscV32
             | Self::LoongArch64
             | Self::S390x
-            | Self::Arm => false,
+            | Self::Arm
+            | Self::Ppc64Be => false,
             Self::Ppc64 => true,
         }
     }
@@ -1180,7 +1240,10 @@ impl Arch {
     /// so do GNU ld's AArch64 and s390x backends, which have no `.plt.got`.
     #[must_use]
     pub fn uses_plt_got(self) -> bool {
-        !matches!(self, Self::Ppc64 | Self::AArch64 | Self::S390x | Self::Arm)
+        !matches!(
+            self,
+            Self::Ppc64 | Self::Ppc64Be | Self::AArch64 | Self::S390x | Self::Arm
+        )
     }
 
     /// Whether a dynamic output's `IRELATIVE` relocations go to
@@ -1189,7 +1252,7 @@ impl Arch {
     /// entries one by one, so GNU ld puts them in `.rela.dyn` there.
     #[must_use]
     pub fn irelative_in_rela_plt(self) -> bool {
-        self != Self::Ppc64
+        !matches!(self, Self::Ppc64 | Self::Ppc64Be)
     }
 
     /// The number written for dynamic relocation `kind`.
@@ -1286,7 +1349,7 @@ impl Arch {
                 DynKind::TpOff => loongarch::R_LARCH_TLS_TPREL64,
                 DynKind::TlsDesc => loongarch::R_LARCH_TLS_DESC64,
             },
-            Self::Ppc64 => match kind {
+            Self::Ppc64 | Self::Ppc64Be => match kind {
                 DynKind::Relative => p64::R_PPC64_RELATIVE,
                 DynKind::Irelative => p64::R_PPC64_IRELATIVE,
                 DynKind::JumpSlot => p64::R_PPC64_JMP_SLOT,
@@ -1331,7 +1394,9 @@ impl Arch {
             Self::Arm => arm::is_branch(r_type),
             Self::X86_64 => false, // answered above
             Self::X32 => matches!(r_type, x64::R_X86_64_PLT32 | x64::R_X86_64_PLT32_BND),
-            Self::Ppc64 => matches!(r_type, p64::R_PPC64_REL24 | p64::R_PPC64_REL24_NOTOC),
+            Self::Ppc64 | Self::Ppc64Be => {
+                matches!(r_type, p64::R_PPC64_REL24 | p64::R_PPC64_REL24_NOTOC)
+            }
             Self::AArch64 => matches!(
                 r_type,
                 a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26 | a64::R_AARCH64_PLT32
@@ -1365,7 +1430,8 @@ impl Arch {
             Self::AArch64 => aarch64::classify(r_type, context),
             Self::RiscV64 | Self::RiscV32 => riscv::classify(r_type, context),
             Self::LoongArch64 => loongarch::classify(r_type, addend, data, offset, context),
-            Self::Ppc64 => ppc64::classify(r_type, data, offset, context),
+            Self::Ppc64 => ppc64::classify::<Little>(r_type, data, offset, context),
+            Self::Ppc64Be => ppc64_elfv1::classify(r_type, data, offset, context),
             Self::S390x => s390x::classify(r_type, data, offset, context),
         }
     }
@@ -1392,6 +1458,7 @@ impl Arch {
             | Self::RiscV32
             | Self::LoongArch64
             | Self::Ppc64
+            | Self::Ppc64Be
             | Self::S390x
             | Self::Arm => Err(ApplyError::BadInstruction),
         }
@@ -1440,7 +1507,8 @@ impl Arch {
             // RISC-V and Arm sections are written by their own writers.
             Self::RiscV64 | Self::RiscV32 | Self::Arm => Err(ApplyError::BadInstruction),
             Self::LoongArch64 => loongarch::relax_tls(out, offset, kind, r_type, values),
-            Self::Ppc64 => ppc64::relax_tls(out, offset, kind, r_type, values),
+            Self::Ppc64 => ppc64::relax_tls::<Little>(out, offset, kind, r_type, values),
+            Self::Ppc64Be => ppc64::relax_tls::<Big>(out, offset, kind, r_type, values),
             Self::S390x => s390x::relax_tls(out, offset, kind, r_type, values),
         }
     }
@@ -1458,7 +1526,7 @@ impl Arch {
             }
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_HEADER_SIZE,
             Self::LoongArch64 => loongarch::PLT_HEADER_SIZE,
-            Self::Ppc64 => crate::arch::ppc64::GLINK_HEADER_SIZE,
+            Self::Ppc64 | Self::Ppc64Be => crate::arch::ppc64::GLINK_HEADER_SIZE,
             Self::S390x => s390x::PLT_HEADER_SIZE,
         }
     }
@@ -1473,7 +1541,7 @@ impl Arch {
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
-            Self::Ppc64 => 4,
+            Self::Ppc64 | Self::Ppc64Be => 4,
             Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
     }
@@ -1496,6 +1564,7 @@ impl Arch {
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
             Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            Self::Ppc64Be => ppc64_elfv1::CALL_STUB_SIZE,
             // No `.plt.got` (see `uses_plt_got`).
             Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
@@ -1534,6 +1603,7 @@ impl Arch {
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
             Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            Self::Ppc64Be => ppc64_elfv1::CALL_STUB_SIZE,
             Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
     }
@@ -1559,7 +1629,7 @@ impl Arch {
             // header finds the index from the entry's return address.
             Self::AArch64 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 | Self::Arm => plt,
             // The dynamic linker points every slot at its lazy entry.
-            Self::Ppc64 => 0,
+            Self::Ppc64 | Self::Ppc64Be => 0,
             // The second half of the entry.
             Self::S390x => entry.wrapping_add(crate::arch::s390x::PLT_LAZY_OFFSET),
         }
@@ -1587,7 +1657,8 @@ impl Arch {
                 riscv::write_plt_header(out, plt, got_plt, self.kind().word_size())
             }
             Self::LoongArch64 => loongarch::write_plt_header(out, plt, got_plt),
-            Self::Ppc64 => ppc64::write_plt_header(out, plt, got_plt),
+            Self::Ppc64 => ppc64::write_plt_header::<Little>(out, plt, got_plt),
+            Self::Ppc64Be => ppc64::write_plt_header::<Big>(out, plt, got_plt),
             // `got_plt` is the GOT pointer on s390x (see `write_plt`).
             Self::S390x => s390x::write_plt_header(out, plt, got_plt),
         }
@@ -1633,7 +1704,8 @@ impl Arch {
                 riscv::write_plt_entry(out, entry, slot, self.kind().word_size())
             }
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
-            Self::Ppc64 => ppc64::write_plt_entry(out, entry, plt),
+            Self::Ppc64 => ppc64::write_plt_entry::<Little>(out, entry, plt),
+            Self::Ppc64Be => ppc64::write_plt_entry::<Big>(out, entry, plt),
             Self::S390x => s390x::write_plt_entry(out, entry, slot, index, plt),
         }
     }
@@ -1665,7 +1737,8 @@ impl Arch {
                 riscv::write_plt_entry(out, entry, slot, self.kind().word_size())
             }
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
-            Self::Ppc64 => ppc64::write_call_stub(out, slot, got_base),
+            Self::Ppc64 => ppc64::write_call_stub::<Little>(out, slot, got_base),
+            Self::Ppc64Be => ppc64_elfv1::write_call_stub(out, slot, got_base),
             // No `.plt.sec` or `.plt.got`.
             Self::S390x => Err(ApplyError::BadInstruction),
         }
@@ -1696,7 +1769,8 @@ impl Arch {
                 riscv::write_plt_entry(out, stub, slot_address, self.kind().word_size())
             }
             Self::LoongArch64 => loongarch::write_plt_entry(out, stub, slot_address),
-            Self::Ppc64 => ppc64::write_call_stub(out, slot_address, got_base),
+            Self::Ppc64 => ppc64::write_call_stub::<Little>(out, slot_address, got_base),
+            Self::Ppc64Be => ppc64_elfv1::write_call_stub(out, slot_address, got_base),
             Self::S390x => s390x::write_iplt(out, stub, slot_address),
         }
     }
@@ -1721,7 +1795,8 @@ impl Arch {
             Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 => Ok(false),
             Self::LoongArch64 => loongarch::undefined_weak_branch(out, offset, r_type),
             Self::AArch64 => aarch64::nop_undefined_branch(out, offset, r_type),
-            Self::Ppc64 => ppc64::nop_undefined_branch(out, offset, r_type),
+            Self::Ppc64 => ppc64::nop_undefined_branch::<Little>(out, offset, r_type),
+            Self::Ppc64Be => ppc64::nop_undefined_branch::<Big>(out, offset, r_type),
         }
     }
 
@@ -1737,7 +1812,8 @@ impl Arch {
             Self::AArch64 => aarch64::write_nops(out),
             Self::RiscV64 | Self::RiscV32 => riscv::write_nops(out),
             Self::LoongArch64 => loongarch::write_nops(out),
-            Self::Ppc64 => ppc64::write_nops(out),
+            Self::Ppc64 => ppc64::write_nops::<Little>(out),
+            Self::Ppc64Be => ppc64::write_nops::<Big>(out),
             Self::S390x => s390x::write_nops(out),
         }
     }
@@ -1833,7 +1909,7 @@ pub fn write_value_as<E: crate::elf::read::Endian>(
             }
         }
         Width::LoongArch(field) => loongarch::write_field(out, offset, field, value)?,
-        Width::Ppc(field) => write_ppc64(out, offset, field, signed)?,
+        Width::Ppc(field) => write_ppc64::<E>(out, offset, field, signed)?,
         Width::S390(field) => s390x::write_field(out, offset, field, value)?,
         Width::Arm(field) => write_arm(out, offset, field, signed)?,
     }
@@ -1860,7 +1936,7 @@ fn write_arm(
 /// Writes PowerPC64 field `field` at `offset`. Out of line, so that
 /// [`write_value`] stays small for the other architectures.
 #[inline(never)]
-fn write_ppc64(
+fn write_ppc64<E: crate::elf::read::Endian>(
     out: &mut [u8],
     offset: u64,
     field: crate::arch::ppc64::Field,
@@ -1873,35 +1949,32 @@ fn write_ppc64(
     };
     if field == crate::arch::ppc64::Field::PcrelOpt {
         // Rewrites two instructions, `value` bytes apart.
-        return ppc64::relax_pcrel_opt(out, offset, value);
+        return ppc64::relax_pcrel_opt::<E>(out, offset, value);
     }
     match field.bytes() {
         2 => {
             let half = slot::<2>(out, offset)?;
-            *half = field
-                .encode16(u16::from_le_bytes(*half), value)
-                .map_err(error)?
-                .to_le_bytes();
+            *half = E::put_u16(field.encode16(E::u16(*half), value).map_err(error)?);
         }
         8 => {
             let words = slot::<8>(out, offset)?;
             let (prefix, suffix) = words.split_at_mut(4);
-            let old = (u64::from(u32::from_le_bytes([
-                prefix[0], prefix[1], prefix[2], prefix[3],
-            ])) << 32)
-                | u64::from(u32::from_le_bytes([
-                    suffix[0], suffix[1], suffix[2], suffix[3],
-                ]));
+            let old = (u64::from(E::u32([prefix[0], prefix[1], prefix[2], prefix[3]])) << 32)
+                | u64::from(E::u32([suffix[0], suffix[1], suffix[2], suffix[3]]));
             let encoded = field.encode64(old, value).map_err(error)?;
-            prefix.copy_from_slice(&((encoded >> 32) as u32).to_le_bytes());
-            suffix.copy_from_slice(&(encoded as u32).to_le_bytes());
+            prefix.copy_from_slice(&E::put_u32((encoded >> 32) as u32));
+            suffix.copy_from_slice(&E::put_u32(encoded as u32));
         }
         _ => {
+            // A field that rewrites the instruction but is named by a
+            // relocation on its low halfword starts `d_offset` earlier.
+            let offset = if field.rewrites_from_half() {
+                offset.wrapping_sub(crate::arch::ppc64::d_offset::<E>())
+            } else {
+                offset
+            };
             let word = slot::<4>(out, offset)?;
-            *word = field
-                .encode32(u32::from_le_bytes(*word), value)
-                .map_err(error)?
-                .to_le_bytes();
+            *word = E::put_u32(field.encode32(E::u32(*word), value).map_err(error)?);
         }
     }
     Ok(())
