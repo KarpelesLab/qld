@@ -207,6 +207,18 @@ pub struct Hunk {
 }
 
 impl Hunk {
+    /// The number of longwords the block must hold for every relocated
+    /// longword to be in it.
+    #[must_use]
+    pub fn last_relocated_long(&self) -> usize {
+        self.relocs
+            .iter()
+            .flat_map(|(_, offsets)| offsets.iter())
+            .map(|&offset| (offset as usize).saturating_div(4).saturating_add(1))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The number of longwords the loader allocates.
     ///
     /// # Errors
@@ -256,7 +268,7 @@ pub fn write(hunks: &[Hunk], form: RelocForm) -> Result<Vec<u8>> {
         match hunk.kind {
             Kind::Bss => put(&mut out, hunk.alloc_longs()?),
             _ => {
-                let kept = content_longs(&hunk.data);
+                let kept = content_longs(&hunk.data, hunk.last_relocated_long());
                 let longs = u32::try_from(kept).map_err(|_| {
                     Error::Limit("a Hunk hunk is larger than a size longword can name".into())
                 })?;
@@ -288,10 +300,12 @@ pub fn write(hunks: &[Hunk], form: RelocForm) -> Result<Vec<u8>> {
 /// How many longwords of `data` the block holds: the contents padded to a
 /// longword, without the trailing longwords that are entirely zero. The
 /// loader zeroes whatever the block leaves out, and vlink trims the same
-/// way, so the two agree byte for byte.
-fn content_longs(data: &[u8]) -> usize {
+/// way, so the two agree byte for byte — except that a longword a
+/// relocation names is always written, even when it is zero (`floor` is
+/// the number of longwords that must be kept for that reason).
+fn content_longs(data: &[u8], floor: usize) -> usize {
     let mut longs = data.len().div_ceil(4);
-    while longs > 0 {
+    while longs > floor {
         let start = longs.saturating_sub(1).saturating_mul(4);
         let end = start.saturating_add(4).min(data.len());
         // Bytes past the end are the zero padding of the last longword.
