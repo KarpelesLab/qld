@@ -628,6 +628,10 @@ remaining option and GNU-difference gaps.
 
 ## Integration follow-ups
 
+- **W54 (PE):** an unrecognised orphan section is placed differently from
+  GNU ld (GNU puts `.averylongname` right after `.data`; qld puts it between
+  `.tls` and `.reloc`). Orphan placement in `src/coff/layout.rs`.
+
 - **W53 (options):** `--print-sysroot` and `--print-output-format` need new
   `ParseOutcome` variants and a line in the frozen `src/main.rs`. Left
   unsupported with reasons: `--unique` (needs per-input output sections),
