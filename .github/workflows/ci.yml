@@ -356,6 +356,14 @@ jobs:
   arm64-linux:
     name: AArch64 fixtures on arm64
     runs-on: ubuntu-24.04-arm
+    env:
+      # The arm64 runner has 4 cores and 16 GiB, and the ELF pipeline is
+      # monomorphized over four class/byte-order combinations, so a default
+      # `cargo test` build was killed (exit 143) while compiling. Fewer
+      # parallel rustc processes and no debug info in the test profile keep
+      # it inside the runner.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
