@@ -1265,6 +1265,81 @@ fn dwarf_sections_survive() {
     assert!(sections.contains("IMAGE_SCN_MEM_DISCARDABLE"), "{sections}");
 }
 
+/// A section name longer than the eight bytes of the header field.
+///
+/// `.eh_frame` is an ordinary allocated section -- it is the one a MinGW
+/// C++ program brings in -- so an image truncates it to `.eh_fram`; a `-g`
+/// build keeps it whole, because GNU `ld` turns on long section names for
+/// the whole image as soon as the link carries DWARF, which is how GDB
+/// finds `.debug_*` in a PE image.
+const LONG_SECTION: &str = r#"
+int __attribute__((section(".eh_frame"))) tagged = 0x5678;
+int main(void) { return tagged - 0x5678; }
+"#;
+
+/// The section-table `Name` field is eight bytes and a PE image has no
+/// string table of its own, so long names are truncated -- unless the image
+/// carries DWARF, where GNU `ld` writes them through the symbol table's
+/// string table for GDB's sake. qld follows GNU `ld` in both directions,
+/// and `--enable`/`--disable-long-section-names` decide when given.
+#[test]
+fn long_section_names_match_gnu_ld() {
+    if tool(&mingw("gcc")).is_none() {
+        skip(&format!("{} not found", mingw("gcc")));
+        return;
+    }
+    let dir = scratch("long-section-names");
+    let names = |file: &str| -> Option<Vec<String>> {
+        Some(
+            readobj(&dir, file, &["--sections"])?
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("Name: "))
+                .map(|name| name.split_whitespace().next().unwrap_or("").to_owned())
+                .collect(),
+        )
+    };
+    // `flags` go to both the compiler and the link line, so each case
+    // compares qld with the GNU ld the same command line would have run.
+    let case = |name: &str, flags: &[&str]| -> Option<Vec<String>> {
+        let object = compile(&dir, name, LONG_SECTION, flags)?;
+        let gnu = format!("{name}-gnu.exe");
+        let qld = format!("{name}-qld.exe");
+        let mut args = vec![object.as_str(), "-o", gnu.as_str(), "-fno-lto"];
+        args.extend_from_slice(flags);
+        let argv = link_argv(&dir, &args)?;
+        let options = options_from(&argv, &dir.join(&qld));
+        let pe = PeOptions::from_link_options(&options);
+        if let Err(error) = qld_link(&options, &pe) {
+            panic!("qld failed to link {name}:\n{error}");
+        }
+        run(&mingw("gcc"), &args, &dir)?;
+        let (qld, gnu) = (names(&qld)?, names(&gnu)?);
+        assert_eq!(qld, gnu, "sections differ from GNU ld for {name}");
+        Some(qld)
+    };
+
+    // No debugging information: the image truncates, as the PE/COFF
+    // specification requires of an executable.
+    if let Some(plain) = case("plain", &[]) {
+        assert!(plain.contains(&".eh_fram".to_owned()), "{plain:?}");
+        assert!(!plain.contains(&".eh_frame".to_owned()), "{plain:?}");
+    }
+    // With DWARF, every long name survives, the tagged section included.
+    if let Some(debug) = case("debug", &["-g"]) {
+        assert!(debug.contains(&".eh_frame".to_owned()), "{debug:?}");
+        assert!(debug.contains(&".debug_info".to_owned()), "{debug:?}");
+    }
+    // `--disable-long-section-names` truncates a `-g` build too.
+    if let Some(off) = case("off", &["-g", "-Wl,--disable-long-section-names"]) {
+        assert!(off.contains(&".eh_fram".to_owned()), "{off:?}");
+        assert!(off.contains(&".debug_i".to_owned()), "{off:?}");
+    }
+    // `--enable-long-section-names` keeps them without DWARF.
+    if let Some(on) = case("on", &["-Wl,--enable-long-section-names"]) {
+        assert!(on.contains(&".eh_frame".to_owned()), "{on:?}");
+    }
+}
+
 /// The image is byte-identical across repeated links and thread counts.
 #[test]
 fn output_is_deterministic() {
