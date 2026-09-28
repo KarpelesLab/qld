@@ -88,7 +88,7 @@ can work at the same time without colliding.
 | W47 | Single-thread speed and scaling (M5) | hot paths in `src/elf/{write,scan,reloc,object,inputs,layout}*`, `src/symbols/**`, `src/input/**`, `src/main.rs` (allocator tuning, agreed), `benches/**`, `tests/projects/bench*` | W42 | in progress |
 | W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | in progress |
 | W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | in progress |
-| W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | in progress |
+| W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | merged |
 | W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | in progress |
 | W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | in progress |
 | W53 | Option coverage and GNU differences | `src/args/**`, the x86-64 difference fixes in `src/elf/{defined,dynsym,synth}*`, `tests/args*` | W22, W43 | in progress |
@@ -637,8 +637,7 @@ remaining option and GNU-difference gaps.
   position-dependent output GNU turns a `GOTPCRELX` load into `mov $foo`
   where qld writes `lea` (matched on x32 only); ELF32 `.symtab` is 8-aligned
   and `.eh_frame` carries a terminator GNU omits.
-- **W44 (RV32):** `-r` for ELF32 output (`relocatable.rs` writes 64-bit
-  records) blocks partial links for RV32, i386 and x32;
+- **W44 (RV32):** 
   `target.rs::default_target()` has no riscv32 host case;
   `__rela_iplt_end` takes the following section's index at a boundary;
   `tests/riscv32.rs` duplicates ~600 lines of the RV64 symbolizer.

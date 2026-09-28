@@ -67,6 +67,27 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - run: cargo test --all-features --test i386 -- --nocapture
 
+  relocatable:
+    name: -r and --emit-relocs on every ELF class, compared with lld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+      QLD_TEST_LLD: ld.lld-22
+      RAYON_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # one clang builds every architecture's objects (the test sources
+      # include no header, so no cross sysroot is needed); lld is the oracle,
+      # and gcc-multilib lets the i386 combined object be linked and run
+      - run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y clang-22 lld-22 llvm-22 gcc-multilib g++-multilib
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+      - run: cargo test --all-features --test relocatable -- --test-threads=2 --nocapture
+
   debug-indexes:
     name: Debug indexes and section ordering compared with lld
     runs-on: ubuntu-24.04
@@ -82,7 +103,7 @@ jobs:
       - run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh 22
-          sudo apt-get install -y lld-22 llvm-22 gdb
+          sudo apt-get install -y clang-22 lld-22 llvm-22 gdb
           echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
       - run: cargo test --all-features --test ordering --test debug_index -- --test-threads=2
 
