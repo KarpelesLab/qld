@@ -18,9 +18,11 @@
 
 #![deny(clippy::arithmetic_side_effects)]
 
+use crate::args::options::{LinkOptions, StripMode};
 use crate::symbols::DefinitionKind;
 
 use super::layout::Layout;
+use super::options::PeOptions;
 use super::read::consts::{IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_STATIC};
 use super::reloc::{Addresses, Value};
 
@@ -36,10 +38,10 @@ pub struct SymbolTable {
     pub count: u32,
     /// The raw 8-byte `Name` field of each output section header.
     ///
-    /// A name longer than eight bytes becomes `/<offset>` into the string
-    /// table, which is GNU `ld`'s `--enable-long-section-names`. DWARF
-    /// section names need it, and it is only possible when a string table is
-    /// written at all.
+    /// A name longer than eight bytes is truncated, as the PE/COFF
+    /// specification requires of an image, unless long section names are on:
+    /// then it becomes `/<offset>` into the string table, which is GNU
+    /// `ld`'s `--enable-long-section-names`. See [`long_section_names`].
     pub section_names: Vec<[u8; 8]>,
 }
 
@@ -61,15 +63,38 @@ struct Entry<'a> {
     aux: Option<[u8; SYMBOL_SIZE]>,
 }
 
-/// Builds the image's symbol table.
+/// Whether the image keeps section names longer than eight bytes, through
+/// the string table its symbol table carries.
+///
+/// The PE/COFF specification gives an image no string table, so its section
+/// names are truncated to the eight bytes of the header field; GNU `ld` and
+/// lld both do that. GNU `ld` makes one exception, which qld follows: an
+/// unstripped link whose output has DWARF sections keeps every long name,
+/// because GDB finds `.debug_*` in an image by name and cannot read a
+/// truncated one. `--enable-long-section-names` and
+/// `--disable-long-section-names` decide instead when either is given.
 #[must_use]
-pub fn build(addresses: &Addresses<'_, '_>, layout: &Layout) -> SymbolTable {
+pub fn long_section_names(options: &LinkOptions, pe: &PeOptions, layout: &Layout) -> bool {
+    if let Some(choice) = pe.enable_long_section_names {
+        return choice;
+    }
+    options.strip == StripMode::None
+        && layout
+            .sections
+            .iter()
+            .any(|section| section.name.starts_with(b".debug_"))
+}
+
+/// Builds the image's symbol table. `long_names` comes from
+/// [`long_section_names`].
+#[must_use]
+pub fn build(addresses: &Addresses<'_, '_>, layout: &Layout, long_names: bool) -> SymbolTable {
     // The string table starts with its own size, then the long section
     // names, so a section header can point into it.
     let mut strings: Vec<u8> = vec![0, 0, 0, 0];
     let mut section_names = Vec::with_capacity(layout.sections.len());
     for section in &layout.sections {
-        section_names.push(section_name_field(&section.name, &mut strings));
+        section_names.push(section_name_field(&section.name, long_names, &mut strings));
     }
 
     let mut entries: Vec<Entry<'_>> = Vec::new();
@@ -175,12 +200,14 @@ pub fn build(addresses: &Addresses<'_, '_>, layout: &Layout) -> SymbolTable {
 }
 
 /// The `Name` field of a section header: the name itself when it fits in
-/// eight bytes, or `/<decimal offset>` into the string table.
-fn section_name_field(name: &[u8], strings: &mut Vec<u8>) -> [u8; 8] {
+/// eight bytes, then either `/<decimal offset>` into the string table or the
+/// first eight bytes of the name, depending on `long_names`.
+fn section_name_field(name: &[u8], long_names: bool, strings: &mut Vec<u8>) -> [u8; 8] {
     let mut field = [0u8; 8];
-    if name.len() <= 8 {
-        if let Some(slot) = field.get_mut(..name.len()) {
-            slot.copy_from_slice(name);
+    if name.len() <= 8 || !long_names {
+        let len = name.len().min(8);
+        if let (Some(slot), Some(source)) = (field.get_mut(..len), name.get(..len)) {
+            slot.copy_from_slice(source);
         }
         return field;
     }
@@ -203,13 +230,32 @@ mod tests {
     #[test]
     fn long_section_names_go_to_the_string_table() {
         let mut strings = vec![0u8; 4];
-        assert_eq!(section_name_field(b".text", &mut strings), *b".text\0\0\0");
+        assert_eq!(
+            section_name_field(b".text", true, &mut strings),
+            *b".text\0\0\0"
+        );
         assert_eq!(strings.len(), 4, "a short name needs no string");
-        let field = section_name_field(b".debug_info", &mut strings);
+        let field = section_name_field(b".debug_info", true, &mut strings);
         assert_eq!(&field[..2], b"/4");
         assert_eq!(&strings[4..16], b".debug_info\0");
-        let field = section_name_field(b".debug_abbrev", &mut strings);
+        let field = section_name_field(b".debug_abbrev", true, &mut strings);
         assert_eq!(&field[..3], b"/16");
+    }
+
+    /// Without long section names the image truncates, as the PE/COFF
+    /// specification requires, and the string table stays empty.
+    #[test]
+    fn short_section_names_truncate_in_the_image() {
+        let mut strings = vec![0u8; 4];
+        assert_eq!(
+            section_name_field(b".eh_frame", false, &mut strings),
+            *b".eh_fram"
+        );
+        assert_eq!(
+            section_name_field(b".debug_info", false, &mut strings),
+            *b".debug_i"
+        );
+        assert_eq!(strings.len(), 4, "no long name was stored");
     }
 
     #[test]

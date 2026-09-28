@@ -398,7 +398,8 @@ fn link_once<'a>(
         let symbols = if options.strip >= StripMode::All {
             super::symtab::SymbolTable::default()
         } else {
-            super::symtab::build(&addresses, &plan)
+            let long_names = super::symtab::long_section_names(options, pe, &plan);
+            super::symtab::build(&addresses, &plan, long_names)
         };
         let subsystem = subsystem(&addresses, pe);
         let entry = entry_rva(&addresses, options, pe, subsystem, diagnostics);

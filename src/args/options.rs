@@ -635,6 +635,11 @@ pub struct PeArgs {
     /// `--enable-stdcall-fixup` (`Some(true)`) / `--disable-stdcall-fixup`
     /// (`Some(false)`). `None` means the linker decides.
     pub stdcall_fixup: Option<bool>,
+    /// `--enable-long-section-names` (`Some(true)`) /
+    /// `--disable-long-section-names` (`Some(false)`). `None` means the
+    /// linker decides: an image keeps long names only when it carries
+    /// debugging sections, which is what GNU `ld` does.
+    pub long_section_names: Option<bool>,
     /// `--enable-auto-import` (default) / `--disable-auto-import`.
     pub auto_import: bool,
     /// `--enable-runtime-pseudo-reloc` (default) /
@@ -706,6 +711,7 @@ impl Default for PeArgs {
             kill_at: false,
             add_stdcall_alias: false,
             stdcall_fixup: None,
+            long_section_names: None,
             auto_import: true,
             runtime_pseudo_reloc: true,
             exports: Vec::new(),

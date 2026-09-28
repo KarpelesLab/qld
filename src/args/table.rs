@@ -289,6 +289,7 @@ pub(crate) enum PeFlag {
     KillAt,
     AddStdcallAlias,
     StdcallFixup,
+    LongSectionNames,
     AutoImport,
     RuntimePseudoReloc,
     WarnDuplicateExports,
@@ -404,8 +405,6 @@ const LTO: &str = "qld does LTO through a -plugin only (roadmap M6)";
 const PE_V1: &str = "qld emits version 2 runtime pseudo-relocations only";
 const PE_BASE_FILE: &str = "writing a base file for dlltool is not supported";
 const PE_SEARCH_PREFIX: &str = "qld does not search for DLLs by name prefix";
-const PE_LONG_NAMES: &str =
-    "qld writes long section names whenever the output keeps a symbol table";
 const PE_OLD_CODE: &str = "linking against pre-2000 MS import libraries is not supported";
 const PE_COMPAT_IMPLIB: &str = "import libraries with undecorated aliases are not supported";
 const PE_UNDERSCORE: &str = "the symbol prefix follows the target, and x86-64 PE has none";
@@ -2274,12 +2273,24 @@ pub static GNU_OPTIONS: &[OptionDef] = &[
     ),
     ign("enable-auto-image-base", OV),
     ign("disable-auto-image-base", F),
-    ign("enable-long-section-names", F),
+    imp(
+        "enable-long-section-names",
+        F,
+        A::Pe(P::Flag(PeFlag::LongSectionNames, true)),
+        "",
+        "Keep section names longer than eight bytes in the image",
+    ),
+    imp(
+        "disable-long-section-names",
+        F,
+        A::Pe(P::Flag(PeFlag::LongSectionNames, false)),
+        "",
+        "Truncate section names to eight bytes in the image",
+    ),
     ign("enable-extra-pe-debug", F),
     ign("full-shutdown", F),
     uns("base-file", V, PE_BASE_FILE),
     uns("dll-search-prefix", V, PE_SEARCH_PREFIX),
-    uns("disable-long-section-names", F, PE_LONG_NAMES),
     uns("support-old-code", F, PE_OLD_CODE),
     uns("thumb-entry", V, M4_ARM),
     uns("compat-implib", F, PE_COMPAT_IMPLIB),

@@ -447,8 +447,9 @@ fn write_headers(input: &WriteInput<'_, '_>, bytes: &mut [u8]) -> Result<()> {
         w.u32(directory.size)?;
     }
 
-    // The section table. Long names need the string table the symbol table
-    // carries, so `-s` truncates them as GNU ld does.
+    // The section table. `symtab::build` already decided between the name
+    // and a `/<offset>` into the string table; without a symbol table there
+    // is no string table, so the name can only be truncated.
     for (index, section) in layout.sections.iter().enumerate() {
         let name = match input.symbols.section_names.get(index) {
             Some(name) => *name,
