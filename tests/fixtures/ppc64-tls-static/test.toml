@@ -1,0 +1,24 @@
+# M4: the TLS models in a static PowerPC64 BE executable. Everything is in
+# the executable, so general-dynamic and local-dynamic relax to local-exec
+# and initial-exec does too: the `addis`/`addi` pairs become thread-pointer
+# offsets and the `bl __tls_get_addr` marked by `R_PPC64_TLSGD` and
+# `R_PPC64_TLSLD` becomes a `nop`. The rewrites read and write big-endian
+# instruction words, and the `*16*` relocations name the low halfword, two
+# bytes into the instruction (GNU ld's `d_offset`).
+description = "PowerPC64 BE TLS relaxed to local-exec in a static executable"
+compile = ["cc -O2 -fPIC -c tls.c"]
+driver = "cc"
+link = "-static -o out tls.o"
+run = "./out"
+expect.stdout = "tls 63\n"
+expect.readelf = [
+  "PowerPC64",
+  "big endian",
+  "abiv1",
+  "TLS",
+  "!R_PPC64_DTPMOD64",
+  "!R_PPC64_DTPREL64",
+  "!R_PPC64_TPREL64",
+]
+targets = ["powerpc64-linux-gnu"]
+determinism = true

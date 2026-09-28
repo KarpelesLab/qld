@@ -41,6 +41,7 @@ jobs:
             binutils-loongarch64-linux-gnu libc6-dev-loong64-cross \
             gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu \
             binutils-powerpc64le-linux-gnu \
+            gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu \
             gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu \
             gcc-s390x-linux-gnu g++-s390x-linux-gnu binutils-s390x-linux-gnu \
             gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
@@ -181,6 +182,26 @@ jobs:
             binutils-arm-linux-gnueabihf qemu-user-static
       # linked by qld, run under qemu-arm
       - run: cargo test --all-features --test fixtures -- --nocapture
+
+  ppc64be:
+    name: PowerPC64 BE (ELFv1) links compared with GNU ld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # GNU ld is the reference: lld has no ELFv1 support
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu \
+            binutils-powerpc64-linux-gnu qemu-user-static
+      - run: cargo test --all-features --test ppc64be -- --nocapture
+      # the ppc64-* fixtures, linked with qld and run under qemu-ppc64
+      - run: cargo test --all-features --test fixtures -- --nocapture
+        env:
+          QLD_FIXTURE: ppc64-
 
   s390x:
     name: s390x links compared with GNU ld

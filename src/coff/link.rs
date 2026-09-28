@@ -489,6 +489,34 @@ fn check_supported(options: &LinkOptions, pe: &PeOptions) -> Result<()> {
     if !options.defsym.is_empty() {
         return unimplemented("--defsym");
     }
+    // Options that only an ELF output can honor. Accepting them silently
+    // would give a PE image that quietly lacks the index, the ordering or
+    // the separate debug file the caller asked for.
+    for (given, name) in [
+        (options.gdb_index, "--gdb-index"),
+        (options.debug_names, "--debug-names"),
+        (
+            options.separate_debug_file.is_some(),
+            "--separate-debug-file",
+        ),
+        (
+            options.symbol_ordering_file.is_some(),
+            "--symbol-ordering-file",
+        ),
+        (
+            options.call_graph_profile_sort.is_some(),
+            "--call-graph-profile-sort",
+        ),
+        (
+            options.call_graph_ordering_file.is_some(),
+            "--call-graph-ordering-file",
+        ),
+        (options.s390_pgste, "--s390-pgste"),
+    ] {
+        if given {
+            return unimplemented(name);
+        }
+    }
     Ok(())
 }
 

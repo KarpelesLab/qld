@@ -26,7 +26,7 @@ use crate::elf::read::{ElfFormat, ElfKind, RawRecord, RawSymbol, SectionIndex};
 use crate::ids::SymbolId;
 use crate::symbols::{DefinitionKind, SymbolFlags};
 
-use super::defined::{LinkerSymbols, is_hidden};
+use super::defined::LinkerSymbols;
 use super::dso::{REF_REGULAR, REF_REGULAR_STRONG};
 use super::dynsym::shndx_of_address;
 use super::export::PREEMPTIBLE;
@@ -92,13 +92,14 @@ fn keep_local(name: &[u8], raw: &RawSymbol, discard: DiscardMode) -> bool {
 fn global_visibility<F: crate::elf::read::ElfFormat>(
     refs: &Refs<'_, '_, F>,
     linker: &LinkerSymbols,
+    options: &LinkOptions,
     id: SymbolId,
 ) -> u8 {
     let target = refs.global_target(id, true);
     if let Def::Linker(_) = target.def {
         return match linker.entries.iter().find(|(i, _)| *i == id) {
-            Some((_, value)) if is_hidden(*value) => STV_HIDDEN,
-            _ => STV_DEFAULT,
+            Some((_, value)) => super::defined::visibility(*value, options),
+            None => STV_DEFAULT,
         };
     }
     target.raw.map_or(STV_DEFAULT, |raw| raw.visibility())
@@ -295,7 +296,7 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
             if !emit {
                 return None;
             }
-            let visibility = global_visibility(refs, linker, id);
+            let visibility = global_visibility(refs, linker, options, id);
             // GNU ld makes a hidden symbol local when it hides it itself:
             // the linker's and scripts' hidden symbols always, and every
             // hidden symbol of a shared object output. (In a PIE it also
@@ -545,16 +546,18 @@ pub fn write_symtab<F: crate::elf::read::ElfFormat>(
     plan: &SymtabPlan,
     addresses: &Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
+    options: &LinkOptions,
     out: &mut [u8],
 ) {
     // The link's input format is its output format.
-    write_symtab_as::<F>(plan, addresses, linker, out);
+    write_symtab_as::<F>(plan, addresses, linker, options, out);
 }
 
 fn write_symtab_as<F: ElfFormat>(
     plan: &SymtabPlan,
     addresses: &Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
+    options: &LinkOptions,
     out: &mut [u8],
 ) {
     /// Splits `out` after `count` entries, clamped to what it holds.
@@ -721,7 +724,7 @@ fn write_symtab_as<F: ElfFormat>(
                 )
             }
             Def::Linker(_) => {
-                let visibility = global_visibility(refs, linker, id);
+                let visibility = global_visibility(refs, linker, options, id);
                 let absolute = refs.symbols.flags(id).contains(super::defined::ABSOLUTE);
                 (
                     STB_GLOBAL,

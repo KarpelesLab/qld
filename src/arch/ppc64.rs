@@ -1,6 +1,6 @@
-//! PowerPC64 (little-endian, ELFv2) instruction encoding.
+//! PowerPC64 instruction encoding, for both ABIs.
 //!
-//! Everything here works on little-endian instruction words and knows
+//! Everything here works on instruction words and knows
 //! nothing about relocation types: the ELF backend maps a relocation to a
 //! [`Field`], computes the value the ABI prescribes, and asks this module to
 //! pack it into the instruction. The PLT call stubs, the lazy-binding
@@ -13,12 +13,19 @@
 //! back to `x`), and `#higher`, `#highest` and their `a` forms the bits
 //! above.
 //!
-//! A 16-bit field of a little-endian instruction is at the instruction's
-//! own address, so a relocation's offset is always the start of the word.
-//! A prefixed (Power10) instruction is two words, the prefix first, and is
-//! handled as one 64-bit value `prefix << 32 | suffix`.
+//! The instruction stream has the output's byte order, so the readers and
+//! writers here are generic over it ([`crate::elf::read::Endian`]):
+//! little-endian for the ELFv2 ABI, big-endian for ELFv1. A relocation's
+//! offset names the start of the instruction word in either order, and a
+//! 16-bit field is a halfword at that same address, because the ABI
+//! defines the offsets in terms of the big-endian layout the instruction
+//! set is written in. A prefixed (Power10) instruction is two words, the
+//! prefix first, and is handled as one 64-bit value `prefix << 32 |
+//! suffix`.
 
 #![deny(clippy::arithmetic_side_effects)]
+
+use crate::elf::read::Endian;
 
 /// `nop` (`ori 0, 0, 0`).
 pub const NOP: u32 = 0x6000_0000;
@@ -246,6 +253,26 @@ pub enum Field {
 }
 
 impl Field {
+    /// Whether the field is the 16-bit halfword of an instruction that the
+    /// field also reads or rewrites, so that a [`Field::bytes`] of four
+    /// starts two bytes before the relocation's place in a big-endian
+    /// output. The assembler puts such a relocation on the halfword itself
+    /// ([`d_offset`]), which in an ELFv2 (little-endian) instruction is the
+    /// start of the word and in an ELFv1 (big-endian) one its second half.
+    #[must_use]
+    pub const fn rewrites_from_half(self) -> bool {
+        matches!(
+            self,
+            Self::Ds
+                | Self::LoDs
+                | Self::HaToc
+                | Self::LoToc
+                | Self::LoDsToc
+                | Self::LoDsToAddi
+                | Self::LdR3LoDs
+        )
+    }
+
     /// The number of bytes the field occupies: two for a plain 16-bit
     /// field, four for a field that reads or rewrites its instruction,
     /// eight for a prefixed instruction.
@@ -452,35 +479,48 @@ pub fn prefixed34(insn: u64, value: i64) -> Result<u64, EncodeError> {
     Ok((insn & !0x0003_ffff_0000_ffff) | ((v & 0x3_ffff_0000) << 16) | (v & 0xffff))
 }
 
-/// Reads the instruction word at `at` in `data`.
+/// The distance from a relocation that names a 16-bit field of an
+/// instruction back to the instruction word, which GNU ld calls
+/// `d_offset`: the assembler puts the relocation on the halfword the ABI
+/// patches, which is the second half of a big-endian (ELFv1) instruction
+/// and the start of a little-endian (ELFv2) one.
 #[must_use]
-pub fn read_insn(data: &[u8], at: usize) -> Option<u32> {
-    data.get(at..)
-        .and_then(|rest| rest.first_chunk::<4>())
-        .map(|word| u32::from_le_bytes(*word))
+pub fn d_offset<E: Endian>() -> u64 {
+    match E::ENDIANNESS {
+        crate::target::Endianness::Big => 2,
+        crate::target::Endianness::Little => 0,
+    }
 }
 
-/// Writes instruction word `insn` at `at` in `data`.
-pub fn write_insn(data: &mut [u8], at: usize, insn: u32) -> Option<()> {
+/// Reads the instruction word at `at` in `data`, in byte order `E`.
+#[must_use]
+pub fn read_insn<E: Endian>(data: &[u8], at: usize) -> Option<u32> {
+    data.get(at..)
+        .and_then(|rest| rest.first_chunk::<4>())
+        .map(|word| E::u32(*word))
+}
+
+/// Writes instruction word `insn` at `at` in `data`, in byte order `E`.
+pub fn write_insn<E: Endian>(data: &mut [u8], at: usize, insn: u32) -> Option<()> {
     let slot = data
         .get_mut(at..)
         .and_then(|rest| rest.first_chunk_mut::<4>())?;
-    *slot = insn.to_le_bytes();
+    *slot = E::put_u32(insn);
     Some(())
 }
 
 /// Reads the prefixed instruction at `at`: `prefix << 32 | suffix`.
 #[must_use]
-pub fn read_prefixed(data: &[u8], at: usize) -> Option<u64> {
-    let prefix = read_insn(data, at)?;
-    let suffix = read_insn(data, at.checked_add(4)?)?;
+pub fn read_prefixed<E: Endian>(data: &[u8], at: usize) -> Option<u64> {
+    let prefix = read_insn::<E>(data, at)?;
+    let suffix = read_insn::<E>(data, at.checked_add(4)?)?;
     Some((u64::from(prefix) << 32) | u64::from(suffix))
 }
 
 /// Writes prefixed instruction `insn` (`prefix << 32 | suffix`) at `at`.
-pub fn write_prefixed(data: &mut [u8], at: usize, insn: u64) -> Option<()> {
-    write_insn(data, at, (insn >> 32) as u32)?;
-    write_insn(data, at.checked_add(4)?, insn as u32)
+pub fn write_prefixed<E: Endian>(data: &mut [u8], at: usize, insn: u64) -> Option<()> {
+    write_insn::<E>(data, at, (insn >> 32) as u32)?;
+    write_insn::<E>(data, at.checked_add(4)?, insn as u32)
 }
 
 /// Converts the X-form load, store or `add` of an initial-exec access
@@ -685,8 +725,13 @@ pub fn thunk(thunk: u64, key: u64) -> Result<[u32; 9], EncodeError> {
 ///
 /// [`EncodeError::Overflow`] when the target is out of range or `out` is
 /// too short.
-pub fn write_thunk(out: &mut [u8], at: u64, address: u64, target: u64) -> Result<(), EncodeError> {
-    write_words(out, at, &thunk(address, target)?)
+pub fn write_thunk<E: Endian>(
+    out: &mut [u8],
+    at: u64,
+    address: u64,
+    target: u64,
+) -> Result<(), EncodeError> {
+    write_words::<E>(out, at, &thunk(address, target)?)
 }
 
 /// Writes `words` into `out` starting at `at`.
@@ -694,14 +739,14 @@ pub fn write_thunk(out: &mut [u8], at: u64, address: u64, target: u64) -> Result
 /// # Errors
 ///
 /// [`EncodeError::Overflow`] when `out` is too short.
-pub fn write_words(out: &mut [u8], at: u64, words: &[u32]) -> Result<(), EncodeError> {
+pub fn write_words<E: Endian>(out: &mut [u8], at: u64, words: &[u32]) -> Result<(), EncodeError> {
     let at = usize::try_from(at).map_err(|_| EncodeError::Overflow)?;
     for (index, word) in words.iter().enumerate() {
         let offset = index
             .checked_mul(4)
             .and_then(|o| o.checked_add(at))
             .ok_or(EncodeError::Overflow)?;
-        write_insn(out, offset, *word).ok_or(EncodeError::Overflow)?;
+        write_insn::<E>(out, offset, *word).ok_or(EncodeError::Overflow)?;
     }
     Ok(())
 }
