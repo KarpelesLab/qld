@@ -585,6 +585,31 @@ impl Arch {
         ))
     }
 
+    /// Whether the output keeps one `.gnu.attributes` section rather than
+    /// every input's: the section is a single vendor section, not a list of
+    /// them, so concatenating them leaves something no reader can parse.
+    /// PowerPC64 is the architecture whose compilers always emit one
+    /// (`Tag_GNU_Power_ABI_FP`); qld keeps the first, where GNU ld merges
+    /// the tag values and diagnoses conflicts.
+    #[must_use]
+    pub fn one_gnu_attributes(self) -> bool {
+        matches!(self, Self::Ppc64 | Self::Ppc64Be)
+    }
+
+    /// Why this architecture cannot produce the output being linked, if it
+    /// cannot: the ELFv1 ABI's PLT is an array of function descriptors the
+    /// dynamic linker fills, addressed by `DT_PLTGOT`, where qld's model
+    /// has code in `.plt` and one-word slots in `.got.plt`, so a dynamic
+    /// ELFv1 output would be silently wrong.
+    #[must_use]
+    pub fn unsupported_output(self, dynamic: bool) -> Option<String> {
+        (self == Self::Ppc64Be && dynamic).then(|| {
+            "dynamic output for the PowerPC64 ELFv1 ABI (elf64ppc): its PLT is an array \
+             of function descriptors (roadmap M4). Static output (-static) works."
+                .to_owned()
+        })
+    }
+
     /// The ELF class and byte order of the output.
     ///
     /// Every encoder and decoder in the ELF backend is generic over the
@@ -1042,7 +1067,7 @@ impl Arch {
     ) -> Result<(), ApplyError> {
         match self {
             Self::Ppc64 => ppc64::finish_call::<Little>(out, offset, branch),
-            Self::Ppc64Be => ppc64::finish_call::<Big>(out, offset, branch),
+            Self::Ppc64Be => ppc64_elfv1::finish_call(out, offset, branch),
             _ => Ok(()),
         }
     }
@@ -1519,7 +1544,8 @@ impl Arch {
             Self::AArch64 => aarch64::plt_entry_size(aarch64::plt_got_flags(flags)),
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
-            Self::Ppc64 | Self::Ppc64Be => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            Self::Ppc64Be => ppc64_elfv1::CALL_STUB_SIZE,
             // No `.plt.got` (see `uses_plt_got`).
             Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
@@ -1557,7 +1583,8 @@ impl Arch {
             Self::AArch64 => aarch64::plt_entry_size(flags),
             Self::RiscV64 | Self::RiscV32 => riscv::PLT_ENTRY_SIZE,
             Self::LoongArch64 => loongarch::PLT_ENTRY_SIZE,
-            Self::Ppc64 | Self::Ppc64Be => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            Self::Ppc64 => crate::arch::ppc64::PLT_CALL_STUB_SIZE,
+            Self::Ppc64Be => ppc64_elfv1::CALL_STUB_SIZE,
             Self::S390x => s390x::PLT_ENTRY_SIZE,
         }
     }
@@ -1692,7 +1719,7 @@ impl Arch {
             }
             Self::LoongArch64 => loongarch::write_plt_entry(out, entry, slot),
             Self::Ppc64 => ppc64::write_call_stub::<Little>(out, slot, got_base),
-            Self::Ppc64Be => ppc64::write_call_stub::<Big>(out, slot, got_base),
+            Self::Ppc64Be => ppc64_elfv1::write_call_stub(out, slot, got_base),
             // No `.plt.sec` or `.plt.got`.
             Self::S390x => Err(ApplyError::BadInstruction),
         }
@@ -1724,7 +1751,7 @@ impl Arch {
             }
             Self::LoongArch64 => loongarch::write_plt_entry(out, stub, slot_address),
             Self::Ppc64 => ppc64::write_call_stub::<Little>(out, slot_address, got_base),
-            Self::Ppc64Be => ppc64::write_call_stub::<Big>(out, slot_address, got_base),
+            Self::Ppc64Be => ppc64_elfv1::write_call_stub(out, slot_address, got_base),
             Self::S390x => s390x::write_iplt(out, stub, slot_address),
         }
     }

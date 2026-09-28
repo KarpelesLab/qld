@@ -628,6 +628,9 @@ fn link_inputs<'a, F: crate::elf::read::ElfFormat>(
             arch.emulation()
         )));
     }
+    if let Some(what) = arch.unsupported_output(mode.dynamic) {
+        return Err(Error::Unimplemented(what));
+    }
     let context = reloc::Context {
         mode,
         relax: options.relax,

@@ -1802,6 +1802,17 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             if target.is_ifunc()
                 && let Some(stub) = addresses.iplt_address(owner)
             {
+                // The ELFv1 ABI's canonical address of a function is its
+                // descriptor, and qld's IFUNC stub is code, so taking one's
+                // address is refused rather than written wrong (M4).
+                if arch == super::arch::Arch::Ppc64Be && class.kind != Kind::Pc {
+                    let name = symbol_name(refs, file_index, rel.symbol);
+                    report(format!(
+                        "taking the address of the ifunc `{name}' is not implemented \
+                         for the PowerPC64 ELFv1 ABI: it needs a function descriptor"
+                    ));
+                    continue;
+                }
                 s = stub;
             }
             if flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)

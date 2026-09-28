@@ -28,11 +28,12 @@
 
 #![deny(clippy::arithmetic_side_effects)]
 
+use crate::arch::ppc64 as insn;
 use crate::elf::read::consts::ppc64::*;
 use crate::elf::read::{Big, ElfFormat, Relocation, Relocations};
 use crate::elf::refs::{Def, Refs};
 
-use super::{Class, ClassifyContext, ClassifyError, Kind, Width};
+use super::{ApplyError, Branch, Class, ClassifyContext, ClassifyError, Kind, Width};
 
 /// The ABI version the output's `e_flags` records: ELFv1.
 pub const ABI_VERSION: u32 = 1;
@@ -44,6 +45,13 @@ pub const OPD_ENTRY_SIZE: u64 = 24;
 /// `ld r2, 40(r1)`: ELFv1 restores the TOC pointer from 40(r1), where
 /// ELFv2 uses 24(r1).
 pub const LD_R2_40_R1: u32 = 0xe841_0028;
+
+/// `std r2, 40(r1)`: saves it there.
+pub const STD_R2_40_R1: u32 = 0xf841_0028;
+
+/// Size of a call stub that jumps through a GOT word holding a function
+/// descriptor's address.
+pub const CALL_STUB_SIZE: u64 = 28;
 
 /// The name of the section that holds function descriptors.
 pub const OPD_SECTION: &[u8] = b".opd";
@@ -123,6 +131,62 @@ pub fn descriptor<F: ElfFormat>(
         }
     }
     None
+}
+
+/// Writes the call stub that reaches the function whose descriptor's
+/// address is in the GOT word at `slot`, addressed from the TOC pointer
+/// `toc`: save the caller's TOC pointer, load the descriptor's address,
+/// then the entry point and the callee's TOC pointer out of it, and jump.
+/// The caller's `nop` after the `bl` reloads its own TOC pointer
+/// ([`finish_call`]).
+///
+/// GNU ld's `.iplt` entry is the descriptor itself, filled by a
+/// `R_PPC64_JMP_IREL`, so its stub loads the two words directly. qld's GOT
+/// word holds the descriptor's address (`R_PPC64_IRELATIVE`, which glibc's
+/// static startup also resolves for this ABI), so there is one more load.
+///
+/// # Errors
+///
+/// [`ApplyError`] when the word is more than 2 GiB from the TOC pointer,
+/// misaligned, or `out` is too short.
+pub fn write_call_stub(out: &mut [u8], slot: u64, toc: u64) -> Result<(), ApplyError> {
+    let offset = slot.wrapping_sub(toc) as i64;
+    if !insn::fits_signed(offset.wrapping_add(0x8000), 32) || offset & 3 != 0 {
+        return Err(ApplyError::Overflow);
+    }
+    let value = offset as u64;
+    let words = [
+        STD_R2_40_R1,
+        0x3d82_0000 | insn::ha(value), // addis r12, r2, #ha
+        0xe96c_0000 | insn::lo(value), // ld r11, #lo(r12)
+        0xe98b_0000,                   // ld r12, 0(r11)
+        0xe84b_0008,                   // ld r2, 8(r11)
+        insn::MTCTR_R12,
+        insn::BCTR,
+    ];
+    insn::write_words::<Big>(out, 0, &words).map_err(|error| match error {
+        insn::EncodeError::Overflow => ApplyError::Overflow,
+        insn::EncodeError::BadInstruction => ApplyError::BadInstruction,
+    })
+}
+
+/// Finishes a direct call as [`super::ppc64::finish_call`] does, with the
+/// ELFv1 TOC save slot: the `nop` after a `bl` through a stub becomes
+/// `ld r2, 40(r1)`.
+///
+/// # Errors
+///
+/// As [`super::ppc64::finish_call`].
+pub fn finish_call(out: &mut [u8], offset: u64, branch: Branch) -> Result<(), ApplyError> {
+    if !(branch.r_type == R_PPC64_REL24 && branch.via_stub) {
+        return super::ppc64::finish_call::<Big>(out, offset, branch);
+    }
+    let next = offset.wrapping_add(4);
+    let at = usize::try_from(next).map_err(|_| ApplyError::OutOfBounds)?;
+    if insn::read_insn::<Big>(out, at) == Some(insn::NOP) {
+        insn::write_insn::<Big>(out, at, LD_R2_40_R1).ok_or(ApplyError::OutOfBounds)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

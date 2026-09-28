@@ -1866,6 +1866,14 @@ pub(crate) fn member_size<F: crate::elf::read::ElfFormat>(
                     section.header.sh_addralign,
                 ));
             }
+            // PowerPC64: `.gnu.attributes` is one vendor section, not a
+            // list, so only the first input's is kept.
+            if section.header.sh_type == crate::elf::read::consts::SHT_GNU_ATTRIBUTES
+                && let Some(first) = input.synth.gnu_attributes
+                && first != id
+            {
+                return Ok((0, 1));
+            }
             let size = section.header.sh_size;
             (size, section.header.sh_addralign)
         }
