@@ -7,19 +7,26 @@
 //! Thunks are planned after addresses are assigned, so planning changes the
 //! addresses it was planned from: [`crate::elf::layout::layout`] repeats the
 //! assignment until the set of thunks stops changing (or the round cap is
-//! reached), the same fixpoint gold, lld and mold run. A thunk is placed at
-//! the end of the output section holding its callers, and every caller in
-//! that section that branches to the same address shares it, so the table
-//! stays small; it is sorted by output section and destination, so it does
-//! not depend on scheduling.
+//! reached), the same fixpoint gold, lld and mold run. Every caller in one
+//! pool's reach that branches to the same address shares one thunk, so the
+//! table stays small; it is sorted by output section, pool and destination,
+//! so it does not depend on scheduling.
 //!
-//! The pool at the end of one output section must be within reach of every
-//! caller in it, so an output section holding more than 128 MiB of code
-//! still gets "relocation out of range" from the writer. Splitting the pool
-//! is the next step if that ever matters.
+//! **Pools.** A pool must be within reach of the callers that use it, so an
+//! output section larger than a branch reaches gets more than one:
+//! [`Arch::thunk_pool_spacing`] bytes of content apart, plus one at the
+//! end, as lld spreads its thunk sections through the output. A caller uses
+//! the pool nearest to it ([`Pool::nearest`]). A section smaller than the
+//! spacing has exactly one pool, at its end, which is where every pool was
+//! before. Branches with a much shorter reach than the spacing
+//! (`R_ARM_THM_JUMP19`, `R_ARM_THM_JUMP8`) can still fail to reach one.
 //!
-//! The same pool holds the Cortex-A53 erratum patches
-//! ([`super::aarch64_errata`]), after the thunks: 8 bytes each, the moved
+//! A pool's position is fixed in *content* offsets — the offsets the
+//! section would have if no pool took any space — so it does not move as
+//! the pools grow, and layout and planning agree on it round after round.
+//!
+//! A pool also holds the Cortex-A53 erratum patches
+//! ([`super::aarch64_errata`]), after its thunks: 8 bytes each, the moved
 //! instruction and a branch back. Their sites depend on addresses too, so
 //! they take part in the same fixpoint.
 //!
@@ -48,12 +55,41 @@ use super::{Arch, Branch};
 /// How many times layout may be repeated before giving up on a fixpoint.
 pub const MAX_ROUNDS: u32 = 8;
 
+/// Where one thunk pool goes in its output section.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pool {
+    /// The output section (its index in `Placement::outputs`).
+    pub output: u32,
+    /// Its index among that section's pools, in address order.
+    pub index: u32,
+    /// Its offset in the section with no pool taking any space, which is
+    /// what it is placed from and does not change between rounds.
+    pub content: u64,
+    /// Its address in the layout that recorded it.
+    pub address: u64,
+}
+
+impl Pool {
+    /// The pool of output section `output` nearest to `place`, which is
+    /// the one its callers use.
+    #[must_use]
+    pub fn nearest(pools: &[Self], output: u32, place: u64) -> Option<u32> {
+        pools
+            .iter()
+            .filter(|pool| pool.output == output)
+            .min_by_key(|pool| pool.address.abs_diff(place))
+            .map(|pool| pool.index)
+    }
+}
+
 /// One planned thunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Thunk {
     /// The output section (its index in `Placement::outputs`) whose callers
-    /// use this thunk, and at the end of which it is placed.
+    /// use this thunk.
     pub output: u32,
+    /// The pool of that section it is in ([`Pool::index`]).
+    pub pool: u32,
     /// The address the thunk branches to.
     pub target: u64,
     /// Offset of the thunk in its output section.
@@ -65,6 +101,8 @@ pub struct Thunk {
 pub struct Patch {
     /// The instruction it replaces.
     pub site: Site,
+    /// The pool it is in ([`Pool::index`]).
+    pub pool: u32,
     /// Offset of the patch in the site's output section.
     pub offset: u64,
 }
@@ -88,101 +126,151 @@ impl Thunks {
         self.entries.is_empty() && self.patches.is_empty()
     }
 
-    /// The bytes the thunks and patches of output section `output` occupy.
+    /// The bytes the thunks and patches of pool `pool` of output section
+    /// `output` occupy, which is what layout reserves for it.
     #[must_use]
-    pub fn size_of(&self, output: u32) -> u64 {
-        self.thunk_bytes(output)
-            .saturating_add(self.patch_bytes(output))
+    pub fn size_of(&self, output: u32, pool: u32) -> u64 {
+        self.thunk_bytes(output, pool)
+            .saturating_add(self.patch_bytes(output, pool))
     }
 
-    /// The bytes the thunks of output section `output` occupy.
-    fn thunk_bytes(&self, output: u32) -> u64 {
-        let count = self.entries.iter().filter(|t| t.output == output).count();
+    /// The bytes the thunks of one pool occupy.
+    fn thunk_bytes(&self, output: u32, pool: u32) -> u64 {
+        let count = self
+            .entries
+            .iter()
+            .filter(|t| (t.output, t.pool) == (output, pool))
+            .count();
         u64::try_from(count)
             .unwrap_or(0)
             .saturating_mul(self.arch.thunk_size())
     }
 
-    /// The bytes the erratum patches of output section `output` occupy.
+    /// The bytes the erratum patches of one pool occupy.
     #[must_use]
-    pub fn patch_bytes(&self, output: u32) -> u64 {
+    pub fn patch_bytes(&self, output: u32, pool: u32) -> u64 {
         let count = self
             .patches
             .iter()
-            .filter(|p| p.site.output == output)
+            .filter(|p| (p.site.output, p.pool) == (output, pool))
             .count();
         u64::try_from(count)
             .unwrap_or(0)
             .saturating_mul(aarch64::ERRATUM_PATCH_SIZE)
     }
 
-    /// The offset in its output section of the thunk of `output` that
-    /// branches to `target`.
+    /// The offset in its output section of the thunk of pool `pool` of
+    /// `output` that branches to `target`.
     #[must_use]
-    pub fn offset_of(&self, output: u32, target: u64) -> Option<u64> {
+    pub fn offset_of(&self, output: u32, pool: u32, target: u64) -> Option<u64> {
         let at = self
             .entries
-            .binary_search_by_key(&(output, target), |t| (t.output, t.target))
+            .binary_search_by_key(&(output, pool, target), |t| (t.output, t.pool, t.target))
             .ok()?;
         self.entries.get(at).map(|t| t.offset)
     }
 
-    /// Builds the AArch64 table from the destinations each output section
-    /// needs, starting each section's pool at `pool_start`.
+    /// Builds the AArch64 table from the destinations each pool needs,
+    /// with `content` giving where each pool goes.
     #[must_use]
-    pub fn build(needed: Vec<(u32, u64)>, pool_start: &dyn Fn(u32) -> u64) -> Self {
-        Self::build_for(Arch::AArch64, needed, pool_start)
+    pub fn build(needed: Vec<(u32, u32, u64)>, content: &dyn Fn(u32, u32) -> u64) -> Self {
+        Self::build_for(Arch::AArch64, needed, content)
     }
 
-    /// Builds the table of `arch` from the thunk keys each output section
-    /// needs ([`Arch::branch_thunk`]), starting each section's pool at
-    /// `pool_start`.
+    /// Builds the table of `arch` from the `(output, pool, key)` thunk keys
+    /// each pool needs ([`Arch::branch_thunk`]). `content` gives a pool's
+    /// offset in its output section with no pool taking space
+    /// ([`Pool::content`]); the pools before it push it further along.
     #[must_use]
     pub fn build_for(
         arch: Arch,
-        mut needed: Vec<(u32, u64)>,
-        pool_start: &dyn Fn(u32) -> u64,
+        mut needed: Vec<(u32, u32, u64)>,
+        content: &dyn Fn(u32, u32) -> u64,
     ) -> Self {
-        let size = arch.thunk_size();
         needed.sort_unstable();
         needed.dedup();
-        let mut entries = Vec::with_capacity(needed.len());
-        let mut current = None;
-        let mut next = 0u64;
-        for (output, target) in needed {
-            if current != Some(output) {
-                current = Some(output);
-                next = pool_start(output);
-            }
-            entries.push(Thunk {
+        let entries = needed
+            .into_iter()
+            .map(|(output, pool, target)| Thunk {
                 output,
+                pool,
                 target,
-                offset: next,
-            });
-            next = next.saturating_add(size);
-        }
-        Self {
+                offset: 0,
+            })
+            .collect();
+        let mut thunks = Self {
             entries,
             patches: Vec::new(),
             arch,
-        }
+        };
+        thunks.assign(content);
+        thunks
     }
 
-    /// Adds patches for `sites` (sorted), after the thunks of each output
-    /// section's pool, which starts at `pool_start`.
+    /// Adds patches for `sites` (sorted by output section and address),
+    /// each in the pool `pool_of` puts it in, after that pool's thunks.
     #[must_use]
-    pub fn with_patches(mut self, sites: Vec<Site>, pool_start: &dyn Fn(u32) -> u64) -> Self {
-        let mut current = None;
-        let mut next = 0u64;
-        for site in sites {
-            if current != Some(site.output) {
-                current = Some(site.output);
-                next = pool_start(site.output).saturating_add(self.thunk_bytes(site.output));
-            }
-            self.patches.push(Patch { site, offset: next });
-            next = next.saturating_add(aarch64::ERRATUM_PATCH_SIZE);
-        }
+    pub fn with_patches(
+        mut self,
+        sites: Vec<Site>,
+        pool_of: &dyn Fn(&Site) -> u32,
+        content: &dyn Fn(u32, u32) -> u64,
+    ) -> Self {
+        self.patches = sites
+            .into_iter()
+            .map(|site| Patch {
+                pool: pool_of(&site),
+                site,
+                offset: 0,
+            })
+            .collect();
+        self.patches
+            .sort_unstable_by_key(|p| (p.site.output, p.pool, p.site.address));
+        self.assign(content);
         self
+    }
+
+    /// Gives every thunk and patch its offset: pool after pool in each
+    /// output section, thunks first, each pool starting where its content
+    /// offset falls once the pools before it have been inserted.
+    fn assign(&mut self, content: &dyn Fn(u32, u32) -> u64) {
+        let size = self.arch.thunk_size();
+        let (mut thunk_at, mut patch_at) = (0usize, 0usize);
+        let mut output = None;
+        // What the pools of this output section have added to its offsets.
+        let mut extra = 0u64;
+        loop {
+            // The next pool holding anything, in order.
+            let next_thunk = self.entries.get(thunk_at).map(|t| (t.output, t.pool));
+            let next_patch = self.patches.get(patch_at).map(|p| (p.site.output, p.pool));
+            let key = match (next_thunk, next_patch) {
+                (Some(thunk), Some(patch)) => thunk.min(patch),
+                (Some(key), None) | (None, Some(key)) => key,
+                (None, None) => break,
+            };
+            if output != Some(key.0) {
+                output = Some(key.0);
+                extra = 0;
+            }
+            let at = content(key.0, key.1).saturating_add(extra);
+            // Layout aligns a pool to 4 before reserving it.
+            let mut next = at.saturating_add(3) & !3;
+            while let Some(thunk) = self.entries.get_mut(thunk_at)
+                && (thunk.output, thunk.pool) == key
+            {
+                thunk.offset = next;
+                next = next.saturating_add(size);
+                thunk_at = thunk_at.saturating_add(1);
+            }
+            while let Some(patch) = self.patches.get_mut(patch_at)
+                && (patch.site.output, patch.pool) == key
+            {
+                patch.offset = next;
+                next = next.saturating_add(aarch64::ERRATUM_PATCH_SIZE);
+                patch_at = patch_at.saturating_add(1);
+            }
+            extra = extra.saturating_add(next.saturating_sub(at));
+        }
     }
 
     /// The bytes of the thunks of output section `output`, whose contents
@@ -290,6 +378,13 @@ fn branch_target<F: crate::elf::read::ElfFormat>(
     {
         return Some((plt, Some(slot_of(input, layout, owner)), 0));
     }
+    // PowerPC64 ELFv1: the symbol names a function descriptor, so the
+    // branch really goes to the code its first doubleword points at.
+    if input.synth.arch == Arch::Ppc64Be
+        && let Some((owner, entry)) = super::ppc64_elfv1::descriptor(refs, &target, addend)
+    {
+        return branch_target(input, layout, owner, entry.symbol, entry.addend);
+    }
     let st_other = target.raw.map_or(0, |raw| raw.st_other);
     let address = match target.def {
         Def::Section {
@@ -319,13 +414,12 @@ fn branch_target<F: crate::elf::read::ElfFormat>(
     Some((address.wrapping_add_signed(addend), None, st_other))
 }
 
-/// Plans the thunks the layout in `layout` needs, given the ones `previous`
-/// round planned (whose space `layout` already reserves).
+/// Plans the thunks the layout in `layout` needs; `layout` says where the
+/// pools it reserved space for are ([`Pool`]).
 #[must_use]
 pub fn plan<F: crate::elf::read::ElfFormat>(
     input: &LayoutInput<'_, '_, F>,
     layout: &Layout<'_>,
-    previous: &Thunks,
 ) -> Thunks {
     let arch = input.synth.arch;
     if !arch.needs_thunks() {
@@ -334,10 +428,10 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
     // Arm thunks also interwork, so their planning knows the instruction
     // set of both ends.
     if arch == Arch::Arm {
-        return super::arm::thunks::plan(input, layout, previous);
+        return super::arm::thunks::plan(input, layout);
     }
     let refs = &input.refs;
-    let mut needed: Vec<(u32, u64)> = Vec::new();
+    let mut needed: Vec<(u32, u32, u64)> = Vec::new();
     for (file_index, file) in refs.files.iter().enumerate() {
         let Some(object) = &file.object else {
             continue;
@@ -392,7 +486,8 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                     slot: stub_slot,
                 };
                 if let Some(key) = arch.branch_thunk(branch) {
-                    needed.push((output, key));
+                    let pool = Pool::nearest(&layout.pools, output, place).unwrap_or(0);
+                    needed.push((output, pool, key));
                 }
             }
         }
@@ -405,16 +500,23 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
     if needed.is_empty() && sites.is_empty() {
         return Thunks::default();
     }
-    let pool_start = |output: u32| -> u64 {
-        let size = layout
-            .sections
+    let content = pool_content(layout);
+    let pool_of =
+        |site: &Site| Pool::nearest(&layout.pools, site.output, site.address).unwrap_or(0);
+    Thunks::build_for(arch, needed, &content).with_patches(sites, &pool_of, &content)
+}
+
+/// Where each pool of `layout` goes, ignoring what the pools take: the
+/// offsets [`Thunks::build_for`] places from, which do not change between
+/// rounds.
+pub fn pool_content(layout: &Layout<'_>) -> impl Fn(u32, u32) -> u64 {
+    move |output: u32, pool: u32| -> u64 {
+        layout
+            .pools
             .iter()
-            .find(|s| s.output == output)
-            .map_or(0, |s| s.size);
-        let base = size.saturating_sub(previous.size_of(output));
-        base.saturating_add(3) & !3
-    };
-    Thunks::build_for(arch, needed, &pool_start).with_patches(sites, &pool_start)
+            .find(|p| (p.output, p.index) == (output, pool))
+            .map_or(0, |p| p.content)
+    }
 }
 
 #[cfg(test)]
@@ -424,17 +526,56 @@ mod tests {
     #[test]
     fn thunks_are_shared_and_ordered() {
         let plan = Thunks::build(
-            vec![(1, 0x9000_0000), (1, 0x8000_0000), (1, 0x9000_0000)],
-            &|_| 0x100,
+            vec![
+                (1, 0, 0x9000_0000),
+                (1, 0, 0x8000_0000),
+                (1, 0, 0x9000_0000),
+            ],
+            &|_, _| 0x100,
         );
         assert_eq!(plan.entries.len(), 2);
-        assert_eq!(plan.size_of(1), 2 * aarch64::THUNK_SIZE);
-        assert_eq!(plan.offset_of(1, 0x8000_0000), Some(0x100));
+        assert_eq!(plan.size_of(1, 0), 2 * aarch64::THUNK_SIZE);
+        assert_eq!(plan.offset_of(1, 0, 0x8000_0000), Some(0x100));
         assert_eq!(
-            plan.offset_of(1, 0x9000_0000),
+            plan.offset_of(1, 0, 0x9000_0000),
             Some(0x100 + aarch64::THUNK_SIZE)
         );
-        assert_eq!(plan.offset_of(2, 0x8000_0000), None);
+        assert_eq!(plan.offset_of(2, 0, 0x8000_0000), None);
+    }
+
+    #[test]
+    fn a_pool_starts_where_the_ones_before_it_left_off() {
+        // Two pools of one output section, 0x1000 bytes of content apart:
+        // the second one moves by what the first one took.
+        let plan = Thunks::build(
+            vec![
+                (1, 0, 0x8000_0000),
+                (1, 1, 0x9000_0000),
+                (2, 0, 0xa000_0000),
+            ],
+            &|_, pool| u64::from(pool) * 0x1000,
+        );
+        assert_eq!(plan.offset_of(1, 0, 0x8000_0000), Some(0));
+        assert_eq!(
+            plan.offset_of(1, 1, 0x9000_0000),
+            Some(0x1000 + aarch64::THUNK_SIZE)
+        );
+        // Another output section starts its own accounting.
+        assert_eq!(plan.offset_of(2, 0, 0xa000_0000), Some(0));
+    }
+
+    #[test]
+    fn the_nearest_pool_is_the_one_used() {
+        let pool = |index, address| Pool {
+            output: 1,
+            index,
+            content: 0,
+            address,
+        };
+        let pools = [pool(0, 0x1000), pool(1, 0x9000)];
+        assert_eq!(Pool::nearest(&pools, 1, 0x2000), Some(0));
+        assert_eq!(Pool::nearest(&pools, 1, 0x8000), Some(1));
+        assert_eq!(Pool::nearest(&pools, 2, 0x2000), None);
     }
 
     #[test]
@@ -445,10 +586,11 @@ mod tests {
             section: SectionId::new(0),
             offset: address,
         };
-        let plan = Thunks::build(vec![(1, 0x8000_0000)], &|_| 0x100)
-            .with_patches(vec![site(1, 0x10), site(1, 0x20), site(2, 0x30)], &|_| {
-                0x100
-            });
+        let plan = Thunks::build(vec![(1, 0, 0x8000_0000)], &|_, _| 0x100).with_patches(
+            vec![site(1, 0x10), site(1, 0x20), site(2, 0x30)],
+            &|_| 0,
+            &|_, _| 0x100,
+        );
         assert_eq!(plan.patches[0].offset, 0x100 + aarch64::THUNK_SIZE);
         assert_eq!(
             plan.patches[1].offset,
@@ -456,10 +598,10 @@ mod tests {
         );
         assert_eq!(plan.patches[2].offset, 0x100);
         assert_eq!(
-            plan.size_of(1),
+            plan.size_of(1, 0),
             aarch64::THUNK_SIZE + 2 * aarch64::ERRATUM_PATCH_SIZE
         );
-        assert_eq!(plan.patch_bytes(2), aarch64::ERRATUM_PATCH_SIZE);
+        assert_eq!(plan.patch_bytes(2, 0), aarch64::ERRATUM_PATCH_SIZE);
         assert!(!plan.is_empty());
     }
 
@@ -489,7 +631,7 @@ mod tests {
 
     #[test]
     fn rendered_thunks_branch_to_their_target() {
-        let plan = Thunks::build(vec![(0, 0x8000_1000)], &|_| 0);
+        let plan = Thunks::build(vec![(0, 0, 0x8000_1000)], &|_, _| 0);
         let rendered = plan.render(0, 0x1000);
         assert_eq!(rendered.len(), 1);
         let (offset, bytes) = &rendered[0];

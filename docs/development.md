@@ -57,6 +57,11 @@ See [architecture.md](architecture.md#module-layout) for the layout and
   and `liblto` modules) may lift it, module by module, with a comment saying why. The
   plugin host declares `dlopen`/`dlsym`/`dlerror` itself rather than
   depending on `libloading` or `libc`.
+- `src/main.rs` (the binary, not the library) calls glibc's `mallopt` once
+  at startup to widen `M_TOP_PAD` and `M_TRIM_THRESHOLD`; see
+  `tune_allocator`. It is the only `unsafe` outside those three modules,
+  and the library keeps none, because `qld::link` runs in a caller's
+  process.
 - Every `unsafe` block has a `// SAFETY:` comment stating the invariant.
 - Typed views over input bytes use `from_le_bytes`/`from_be_bytes` on slices,
   or `#[repr(C)]` structs with alignment-1 integer wrappers. Never cast a

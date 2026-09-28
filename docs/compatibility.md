@@ -244,7 +244,7 @@ succeed. The error message names the missing search path.
   `--gc-sections`, unreferenced common symbols are kept; `--defsym x=sym+off`
   makes `x` relative to `sym`'s section (GNU makes it absolute).
 - **`--emit-relocs`:** relocations to discarded COMDAT copies become
-  `R_X86_64_NONE` (GNU redirects debug relocations to the kept copy).
+  `R_*_NONE` (GNU redirects debug relocations to the kept copy).
 - **`--cref`** leaves out symbols mentioned only by shared libraries; **`-y`**
   prints `qld: note: main.o: reference to puts`.
 - **Compressed debug output** uses zlib level 1 below `-O2`, so a section
@@ -336,9 +336,33 @@ passes" when it cannot settle). Known differences:
   `.eh_frame` keeps the FDEs of discarded COMDAT copies and the last FDE's
   padding. In PIEs, hidden functions called through `PLT32` stay
   `GLOBAL HIDDEN`.
-- Other known differences: `.dynstr` has no tail merging; `.dynamic` has no
-  spare `DT_NULL` slots and orders tags differently; there is no
-  version-definition symbol in `.symtab`; no empty `.got.plt` is kept.
+- Other known differences, with the reason for each:
+  - `.dynstr` is not tail-merged: the table is built once, in parallel, from
+    the exported names, and suffix merging would need a second sorted pass
+    over every string to save a few hundred bytes.
+  - `.dynamic` has no spare `DT_NULL` slots (`--spare-dynamic-tags` is
+    accepted and reserves none) and orders tags by qld's own emission
+    order. The spare slots existed for `prelink`, which is gone, and the
+    order is not specified.
+  - There is no version-definition symbol in `.symtab`: GNU ld adds one
+    `STT_OBJECT` per `.gnu.version_d` entry, and nothing reads them.
+  - No empty `.got.plt` is kept.
+- **Linker-defined symbols in a shared object are exported**, as in GNU ld
+  and lld: `_end`, `_edata`, `__bss_start`, `_etext` and `--defsym` symbols
+  with default visibility, and `__start_SEC` / `__stop_SEC` protected
+  (`-z start-stop-visibility=` overrides). The per-module ones
+  (`__ehdr_start`, `__executable_start`, `_DYNAMIC`,
+  `_GLOBAL_OFFSET_TABLE_`, `_TLS_MODULE_BASE_`) stay hidden.
+  `__executable_start` follows lld, since GNU ld's shared-object script
+  does not define it at all.
+- **`GLIBC_ABI_GNU_TLS` and `GLIBC_ABI_GNU2_TLS`** version dependencies are
+  added when the output keeps GNU TLS or TLS descriptors and a needed
+  library defines the version, as GNU ld 2.46 does; `--no-gnu-tls-tag` and
+  `--no-gnu2-tls-tag` turn them off. lld has neither option.
+- **`--dynamic-list-cpp-new` and `--dynamic-list-cpp-typeinfo`** match the
+  mangled prefixes `_Znw*`, `_Zna*`, `_Zdl*`, `_Zda*`, `_ZTI*` and `_ZTS*`.
+  GNU ld matches the demangled names through `extern "C++"`; under Itanium
+  mangling the two sets are the same.
 
 ### Demangled names
 
@@ -497,7 +521,41 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   bytes, leaving a stray byte. qld writes the intended 13-byte sequence.
 - lld rejects x32's `GOTTPOFF` and TLSDESC instruction forms, so it is only
   compared on position-independent output.
-- `-r` and `-b binary` are not implemented for ELF32 output.
+
+## x86-64 differences settled against GNU ld and lld
+
+- **`GOTPCRELX` in position-dependent output:** GNU ld rewrites a GOT load
+  of a non-preemptible symbol to `mov $addr, %reg`; qld writes
+  `lea addr(%rip), %reg`, as lld does. Same address, same length.
+- **A data pointer to an IFUNC** gets a `RELATIVE` relocation to the
+  canonical PLT stub, as in lld, so `&f == f` holds. GNU ld writes an
+  `IRELATIVE` there, which stores the resolved address and makes the
+  comparison false — C requires it to be true.
+- **`SHF_GNU_RETAIN` does not make the output `ELFOSABI_GNU`.** GNU ld drops
+  the flag and leaves `ELFOSABI_NONE`; lld sets `ELFOSABI_GNU`. qld follows
+  GNU ld, and stamps `ELFOSABI_GNU` for an `STT_GNU_IFUNC` or
+  `STB_GNU_UNIQUE` symbol, as both linkers do.
+- `__ehdr_start` and `__executable_start` are relative to the first
+  allocated section, as in GNU ld and lld. They used to be `SHN_ABS`, which
+  also left their GOT slots unrelocated in a PIE.
+
+## Relocatable output and the debug indexes
+
+- `-r` and `--emit-relocs` work for every ELF class and byte order. The
+  records are the output's class and byte order, and the relocations keep
+  the architecture's form: `SHT_REL` in `.rel<name>` for i386 and 32-bit
+  Arm, `SHT_RELA` elsewhere, as GNU ld chooses. A `SHT_REL` entry has no
+  addend field, so the offset a redirected section reference needs is added
+  to the field being patched, as BFD does.
+- An input whose relocation form is not the architecture's is refused.
+- `--emit-relocs` keeps `.ARM.exidx` relocations that lld drops, and on
+  RISC-V keeps debug-section relocations lld drops.
+- `.gdb_index` is little-endian on every target, as in GDB's format and
+  lld's output; `.debug_names` follows the output's byte order. Both work
+  for big-endian output.
+- Still open: section ordering with `-r`, `-r` with `--gdb-index` or
+  `--debug-names`, GNU's built-in `-r` layout for architectures other than
+  x86-64, and `R_LARCH_ALIGN` synthesis in LoongArch `-r`.
 
 ## x86 family (i386, x32, x86-64)
 
@@ -517,17 +575,42 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   `EXIDX_CANTUNWIND` and aligns to 1.
 - Thunks carry the caller's instruction state, so a Thumb `bl` gets a Thumb
   thunk where lld reuses an A32 thunk through `blx`.
-- No `$a`, `$t` or `$d` mapping symbols are written for qld's own PLT and
-  thunks, so a disassembler decodes those in whatever state the previous
-  function left. Input mapping symbols are preserved.
-- One thunk pool per output section: a `.text` larger than a Thumb branch's
-  ±16 MiB still reports "relocation out of range", as on AArch64 at ±128 MiB.
-- `--emit-relocs`, `-r` and BE8 are refused. `--target1-rel`, `--target2=`,
+- Mapping symbols are written for qld's own code: the PLT is marked
+  `$a`/`$d`/`$a` exactly where GNU ld marks the same PLT, and every thunk
+  carries its instruction state plus `$d` for its padding. `-x` and `-s`
+  drop them, and script-driven layout writes none because it places no
+  thunks.
+- Thunk pools sit every 8 MiB of an output section's content (64 MiB on
+  AArch64, 16 MiB on PowerPC64) plus one at the end, and a caller uses the
+  nearest. Pools can only go between input sections, so a single input
+  section longer than a branch's reach still fails, as do the short Thumb
+  branches (`R_ARM_THM_JUMP19`, `THM_JUMP8`) when the nearest pool is
+  further than they reach. A `-T` layout places no pools.
+- BE8 is refused. `--target1-rel`, `--target2=`,
   `--be8`, `--fix-cortex-a8`, `--long-plt` and `--pic-veneer` are not
   supported.
-- GNU TLS descriptors (`R_ARM_TLS_GOTDESC` and friends, GCC's
-  `-mtls-dialect=gnu2`) and group relocations past G0 are reported as
-  unsupported relocations.
+- Group relocations, `THM_PC8`, `THM_JUMP6` and the 12-bit GOT and TLS
+  forms are linked; a checked group form reports an overflow when a residual
+  is left. GNU TLS descriptors (`-mtls-dialect=gnu2`) are still reported as
+  unsupported relocations. RWPI `SBREL` is refused, as GNU ld refuses it
+  too ("dangerous relocation: unsupported relocation").
+
+## PowerPC64 BE (ELFv1)
+
+- **Static output only.** Dynamic output needs ELFv1's `.plt` of function
+  descriptors, which qld does not build yet; `-shared`, PIE and an
+  executable that links a shared object are refused with a clear error
+  rather than written wrong.
+- Static IFUNCs use `R_PPC64_IRELATIVE` against a `.got.plt` word with a
+  seven-instruction stub; GNU ld uses `R_PPC64_JMP_IREL` against a `.iplt`
+  entry that is itself the descriptor. glibc's static startup accepts both.
+  Taking an IFUNC's address is reported as unimplemented.
+- `--gc-sections` does not split `.opd`, so a descriptor keeps its function
+  alive; GNU ld's `ppc64_elf_edit_opd` drops unreferenced ones.
+- `.gnu.attributes`: qld keeps the first input's section, where GNU ld
+  merges the tag values, so a hard-float and soft-float mix is not
+  diagnosed. (qld used to concatenate them, which produced a section
+  `readelf` refused to parse; that affected PowerPC64 LE too.)
 
 ## RISC-V 32
 
@@ -537,9 +620,6 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - IFUNC stubs go in `.plt` before `.text`, as in GNU ld, where lld uses
   `.iplt` after it; an address-taken IFUNC symbol keeps its resolver's
   address, where lld redirects it to the canonical PLT entry.
-- `-r` is not implemented for ELF32 output yet, so a partial link of RV32 or
-  i386 objects reports "not implemented yet".
-- `--emit-relocs` rejects `SHT_REL` inputs.
 - A dynamic output with no PLT entries still reserves `.got.plt` and emits
   `DT_PLTGOT`, as GNU ld does; lld emits neither.
 - A dynamic output with no PLT entries still reserves `.got.plt` and emits
@@ -577,12 +657,20 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - Thunks never use Power10 instructions (no `--power10-stubs`).
 - In dynamic outputs, IFUNC `IRELATIVE` relocations go to `.rela.dyn`, as
   GNU ld does: glibc's loader does not apply them from `.rela.plt`.
-- `.toc` is placed as an orphan after `.data`, not right after `.got`.
+- `.toc` goes into the output `.got`, as GNU ld's `elf64lppc` script does
+  (`*(.got .toc)`), so both stay within ±32 KiB of the TOC pointer; lld
+  keeps `.toc` a separate orphan. `.got` is 8-aligned, where GNU ld aligns
+  it to 256.
 
 ## LoongArch64
 
-- **Relaxation keeps code size:** relaxed sequences leave `nop`s, and
-  `R_LARCH_ALIGN` padding stays where it is, until shrinking is implemented.
+- **Relaxation shrinks sections**, as lld does: the `nop`s that relaxed
+  sequences leave are deleted, and `R_LARCH_ALIGN` padding is trimmed to
+  `(2^n − 4) − needed`, or dropped entirely past its max-bytes limit.
+- `-r` synthesizes `R_LARCH_ALIGN` before each input section that follows
+  relaxable code, so a later relaxing link keeps the alignment, as lld does.
+- There are no B26 range-extension thunks, as in lld; a branch out of range
+  is an error.
 - **GOT relaxation:**
   - only adjacent instruction pairs are relaxed;
   - the GOT entry that becomes unused is dropped (lld keeps it);

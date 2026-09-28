@@ -23,6 +23,7 @@ Set up the project skeleton and the infrastructure every later milestone needs.
 - [x] CI: build and test on stable and 1.89, `clippy -D warnings`, `rustfmt --check`,
       `cargo doc`, `cargo deny` (licenses/advisories), Linux/macOS/Windows hosts
 - [ ] Diagnostics framework: error/warning/note with input location, GNU-style
+      (W51 in progress)
       `qld: error: ...` rendering, and structured form for library users
 - [x] GNU flavor argument parser
   - [x] Complete option table covering every GNU ld 2.4x, gold, lld and mold
@@ -196,9 +197,11 @@ and TLS models.
       range-extension and interworking thunks, `.ARM.exidx` merging and
       `EXIDX_CANTUNWIND` synthesis with `PT_ARM_EXIDX`, build-attribute and
       float-ABI merging, PLT/GOT, all TLS models, IFUNC, `R_ARM_V4BX`;
-      compared with lld symbolically, fixtures run under qemu. Outstanding:
-      BE8 (needs big-endian ELF32), `-r` and `--emit-relocs`, mapping symbols
-      for linker-generated code, GNU TLS descriptors, group relocations past
+      mapping symbols for the PLT and thunks, thunk pools spread through
+      large sections, group relocations and the 12-bit GOT/TLS forms;
+      compared with lld symbolically and with GNU ld where lld cannot link
+      the form, fixtures run under qemu. Outstanding:
+      BE8 (needs big-endian ELF32), GNU TLS descriptors, group relocations past
       G0
 - [x] **x32** (`elf32_x86_64`): the x86-64 relocations and PLT in ELF32 with
       8-byte GOT entries, x32's TLS forms and `GOTPCRELX` relaxations, IFUNCs,
@@ -210,11 +213,19 @@ and TLS models.
       stubs that save r2, thunks (including TOC-saving and PC-relative
       ones), all TLS models with relaxations, `.glink`/PLT, IFUNCs, `-r`;
       compared with lld by meaning, fixtures run under qemu in CI.
+      `.toc` in `.got` as GNU ld places it, `R_PPC64_REL16DX_HA`.
       Outstanding: `_savegpr*`/`_restgpr*`, inline PLT sequences
-      (`-fno-plt`/`-mlongcall`), multi-TOC, `DT_PPC64_OPT`, thunks under
-      linker scripts
-- [ ] **PowerPC64 BE** (ELFv1 with OPDs; needs big-endian ELF)
-- [~] **LoongArch64**: the relocation set (including the extreme code model
+      (`-fno-plt`/`-mlongcall`), `R_PPC64_TOC`, `ADDR64_LOCAL`,
+      `GOT_DTPREL*`, multi-TOC, `DT_PPC64_OPT`, thunks under linker
+      scripts
+- [~] **PowerPC64 BE** (ELFv1, `elf64ppc`): the relocation set with
+      big-endian instruction fields, `.opd` function descriptors, `.TOC.`,
+      TLS with its relaxations, IFUNC stubs, C++ exceptions, `-r`; static
+      output is compared with GNU ld 2.42 and run under qemu. Outstanding:
+      dynamic output (ELFv1's `.plt` of descriptors, refused with a clear
+      error), `.opd` splitting for `--gc-sections`, taking an IFUNC's
+      address, `.gnu.attributes` merging
+- [x] **LoongArch64**: the relocation set (including the extreme code model
       and ADD/SUB/ULEB128), PLT/GOT, all TLS models with TLSDESC and IE/TLSDESC
       relaxation, size-preserving relaxation, `-r`; compared with lld by
       meaning. Outstanding: shrinking relaxation (deleting `nop`s,
@@ -226,13 +237,15 @@ and TLS models.
       the `GDCALL`/`LDCALL` markers and their relaxations, `lgrl`→`larl`,
       eight-byte `.hash`, `--s390-pgste`; compared with GNU ld 2.42 function
       by function and run under qemu. Outstanding: `-r`, `--gdb-index` and
-      `--debug-names` for big-endian output, `R_390_PLTOFF*`
+      `R_390_PLTOFF*`
 - [x] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths): the
       pipeline is generic over `ElfFormat` and chosen once in `elf::link`.
       ELF64/ELF32 little-endian and ELF64 big-endian are instantiated, the
-      last exercised end to end by s390x; `Elf32Be` is only decoded in unit
-      tests so far
+      all four class and byte-order combinations are instantiated. ELF64 BE
+      is exercised end to end by s390x and PowerPC64 BE; `Elf32Be` is
+      instantiated and decodes input, but no architecture selects it for
+      output yet (32-bit Arm BE8 is next)
 
 **Status:** AArch64 is the second architecture. Validation without an arm64
 machine: every fixture links with qld and with `aarch64-unknown-linux-gnu-ld`,

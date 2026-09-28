@@ -262,12 +262,12 @@ pub fn usage() -> String {
     text.push_str(
         "qld: supported targets: elf64-x86-64 elf32-x86-64 elf32-i386 \
          elf64-littleaarch64 elf32-littlearm elf64-littleriscv elf32-littleriscv \
-         elf64-powerpcle elf64-loongarch elf64-s390 \
+         elf64-powerpcle elf64-powerpc elf64-loongarch elf64-s390 \
          pei-x86-64 pei-i386 pei-aarch64-little\n",
     );
     text.push_str(
         "qld: supported emulations: elf_x86_64 elf32_x86_64 elf_i386 \
-         aarch64linux armelf_linux_eabi elf64lriscv elf32lriscv elf64lppc \
+         aarch64linux armelf_linux_eabi elf64lriscv elf32lriscv elf64lppc elf64ppc \
          elf64loongarch elf64_s390 i386pep i386pe arm64pe\n",
     );
     text
@@ -633,6 +633,15 @@ impl GnuParser {
             Action::ExportDynamicSymbol => o.export_dynamic_symbols.push(text(m)?),
             Action::ExportDynamicSymbolList => o.export_dynamic_symbol_lists.push(path(m)?),
             Action::DynamicList => o.dynamic_lists.push(path(m)?),
+            Action::DynamicListData => o.dynamic_list_data = true,
+            Action::DynamicListCppNew => o.dynamic_list_cpp_new = true,
+            Action::DynamicListCppTypeinfo => o.dynamic_list_cpp_typeinfo = true,
+            Action::BGroup => {
+                // GNU ld: a group must be self-contained, so `-Bgroup`
+                // also turns undefined symbols into errors.
+                o.dynamic_flags.group = true;
+                o.no_undefined = Some(true);
+            }
             Action::ExcludeLibs => o.exclude_libs.extend(
                 text(m)?
                     .split([',', ':'])
@@ -681,6 +690,8 @@ impl GnuParser {
             Action::EmitRelocs => o.emit_relocs = true,
             Action::Magic(mode) => o.magic = mode,
             Action::Relax(on) => o.relax = on,
+            Action::GnuTlsTag(on) => o.gnu_tls_tag = on,
+            Action::Gnu2TlsTag(on) => o.gnu2_tls_tag = on,
             Action::RelaxGp(on) => o.relax_gp = on,
             Action::MergeExidx(on) => o.merge_exidx_entries = on,
             Action::ImageBase => o.image_base = Some(integer(m)?),

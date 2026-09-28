@@ -18,6 +18,48 @@ use crate::elf::read::consts::{
     SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHT_NOBITS, SHT_NOTE,
 };
 use crate::script::{Pattern, init_priority};
+use std::collections::HashMap;
+
+/// How many bytes of a pattern's literal prefix key [`RuleSet::place`]'s
+/// index. Four is enough to tell the section name families apart
+/// (`.text`, `.rodata`, `.data`, `.bss`, `.eh_frame`, …) while every
+/// pattern of the built-in rules still has a prefix that long.
+const KEY: usize = 4;
+
+/// One pattern in a bucket of [`RuleSet::index`], with the next eight bytes
+/// of its literal prefix so that a name can be rejected by one masked word
+/// comparison, without calling the matcher.
+///
+/// A bucket holds a whole family of names (`.text` keys twelve of the
+/// default rules' patterns), and inside it the patterns differ in the bytes
+/// just after the key.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    /// Position in [`RuleSet::patterns`], which is match order.
+    position: u32,
+    /// Bytes `KEY..KEY + 8` of the literal prefix, little-endian, zero
+    /// where the prefix ends.
+    word: u64,
+    /// The bytes of `word` the prefix reaches, all ones.
+    mask: u64,
+}
+
+/// Bytes `KEY..KEY + 8` of `name` as a little-endian word, zero-padded, and
+/// a mask of the bytes the name reaches.
+fn tail_word(name: &[u8]) -> (u64, u64) {
+    let tail = name.get(KEY..).unwrap_or_default();
+    let mut bytes = [0u8; 8];
+    let len = tail.len().min(8);
+    if let (Some(head), Some(from)) = (bytes.get_mut(..len), tail.get(..len)) {
+        head.copy_from_slice(from);
+    }
+    let mask = match len {
+        8 => u64::MAX,
+        // `len < 8`, so the shift is in range.
+        _ => (1u64 << (len.wrapping_mul(8))).wrapping_sub(1),
+    };
+    (u64::from_le_bytes(bytes), mask)
+}
 
 /// How the input sections matched by one description are ordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,8 +422,11 @@ macro_rules! default_rules {
                 rule(".dynamic", &[plain(&[".dynamic"])]),
                 Synthetic::Dynamic,
             )),
+            // PowerPC64: GNU ld's `elf64lppc` script puts `.toc` in `.got`
+            // (`*(.got .toc)`), so both are within reach of the TOC
+            // pointer; no other target emits `.toc`.
             relro(synth(
-                rule(".got", &[plain(&[".got"]), plain(&[".igot"])]),
+                rule(".got", &[plain(&[".got", ".toc"]), plain(&[".igot"])]),
                 Synthetic::Got,
             )),
             synth(
@@ -508,6 +553,12 @@ pub struct RuleSet<'r> {
     pub outputs: &'static [OutputRule],
     /// `(output, input description, pattern)` in match order.
     patterns: Vec<(u16, u16, Pattern)>,
+    /// [`patterns`](Self::patterns) indexed by the first [`KEY`] bytes of
+    /// each pattern's literal prefix; see [`RuleSet::place`].
+    index: HashMap<[u8; KEY], Vec<Candidate>, foldhash::fast::FixedState>,
+    /// Whether every pattern is in [`index`](Self::index): none of them has
+    /// a literal prefix shorter than [`KEY`].
+    indexed: bool,
     /// For each orphan class, the output rule it follows.
     holds: Vec<(OrphanClass, u16)>,
     /// The linker script plan, when scripts drive layout.
@@ -588,9 +639,31 @@ impl<'r> RuleSet<'r> {
                 holds.push((class, output_index));
             }
         }
+        // Index by the first KEY bytes every match must start with. A
+        // pattern with a shorter literal prefix (`*`, `*suffix`) could match
+        // a name in any bucket, so it turns the index off rather than
+        // joining every bucket; the built-in rules have none.
+        let mut index: HashMap<[u8; KEY], Vec<Candidate>, foldhash::fast::FixedState> =
+            HashMap::default();
+        let mut indexed = true;
+        for (position, (.., pattern)) in patterns.iter().enumerate() {
+            let prefix = pattern.literal_prefix();
+            let Some(key) = prefix.first_chunk::<KEY>() else {
+                indexed = false;
+                continue;
+            };
+            let (word, mask) = tail_word(prefix);
+            index.entry(*key).or_default().push(Candidate {
+                position: u32::try_from(position).unwrap_or(u32::MAX),
+                word,
+                mask,
+            });
+        }
         Self {
             outputs,
             patterns,
+            index,
+            indexed,
             holds,
             script: None,
             diagnostics: None,
@@ -599,34 +672,53 @@ impl<'r> RuleSet<'r> {
 
     /// Finds the first description matching section `name` of a file whose
     /// base name is `file_name`.
+    ///
+    /// A section name and a rule pattern can only match when the name starts
+    /// with the pattern's literal prefix. Only the patterns indexed under the
+    /// name's first [`KEY`] bytes are considered — a dozen instead of all
+    /// hundred-odd, for the `.text.*` and `.rodata.*` names that are most of
+    /// a large link's sections — and of those, only the ones whose next
+    /// eight prefix bytes are the name's are matched in full. Both lists are
+    /// in rule order, so the first match is the one the whole list gives.
     #[must_use]
     pub fn place(&self, name: &[u8], file_name: &[u8]) -> Option<Placement> {
-        for (output, input, pattern) in &self.patterns {
-            if !pattern.matches(name) {
-                continue;
+        match name.first_chunk::<KEY>() {
+            Some(key) if self.indexed => {
+                let bucket = self.index.get(key)?;
+                let (tail, _) = tail_word(name);
+                bucket
+                    .iter()
+                    .filter(|candidate| tail & candidate.mask == candidate.word)
+                    .find_map(|c| self.try_at(c.position as usize, name, file_name))
             }
-            let Some(rule) = self
-                .outputs
-                .get(usize::from(*output))
-                .and_then(|o| o.inputs.get(usize::from(*input)))
-            else {
-                continue;
-            };
-            let applies = match rule.files {
-                FileFilter::Any => true,
-                FileFilter::NotCrtBeginEnd => {
-                    !(matches!(name, b".ctors" | b".dtors") && is_crt_begin_end(file_name))
-                }
-                FileFilter::CrtBegin => is_crt_begin(file_name),
-            };
-            if applies {
-                return Some(Placement {
-                    output: *output,
-                    input: *input,
-                });
-            }
+            // A name shorter than the key, or rules with a pattern the index
+            // cannot hold: test every pattern.
+            _ => (0..self.patterns.len()).find_map(|p| self.try_at(p, name, file_name)),
         }
-        None
+    }
+
+    /// The placement pattern `position` gives `name`, if it matches and its
+    /// description applies to the file.
+    fn try_at(&self, position: usize, name: &[u8], file_name: &[u8]) -> Option<Placement> {
+        let (output, input, pattern) = self.patterns.get(position)?;
+        if !pattern.matches(name) {
+            return None;
+        }
+        let rule = self
+            .outputs
+            .get(usize::from(*output))
+            .and_then(|o| o.inputs.get(usize::from(*input)))?;
+        let applies = match rule.files {
+            FileFilter::Any => true,
+            FileFilter::NotCrtBeginEnd => {
+                !(matches!(name, b".ctors" | b".dtors") && is_crt_begin_end(file_name))
+            }
+            FileFilter::CrtBegin => is_crt_begin(file_name),
+        };
+        applies.then_some(Placement {
+            output: *output,
+            input: *input,
+        })
     }
 
     /// The output rule orphans of `class` follow.
@@ -758,6 +850,52 @@ mod tests {
         let unlikely = rules.place(b".text.unlikely.x", b"a.o").unwrap();
         let normal = rules.place(b".text.x", b"a.o").unwrap();
         assert!(unlikely.input < normal.input);
+    }
+
+    /// Every name the rules can see must be placed where a scan of all the
+    /// patterns in order would place it, whether or not the index is used.
+    #[test]
+    fn the_prefix_index_agrees_with_a_full_scan() {
+        // A short pattern (shorter than the key) turns the index off.
+        static SHORT: &[OutputRule] = &[
+            rule(".x", &[plain(&[".x", ".x.*"])]),
+            rule(".text", &[plain(&["*.text", ".text*"])]),
+        ];
+        let mut names: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b".".to_vec(),
+            b".x".to_vec(),
+            b".xy".to_vec(),
+            b".x.1".to_vec(),
+            b"a.text".to_vec(),
+            b"rodata".to_vec(),
+            b".gnu.linkonce.t.f".to_vec(),
+        ];
+        for rules in [DEFAULT_RULES, REL_RULES, ARM_RULES, SHORT] {
+            for output in rules {
+                for input in output.inputs {
+                    for pattern in input.patterns {
+                        let text = pattern.replace('*', "z");
+                        names.push(text.into_bytes());
+                        names.push(pattern.trim_end_matches('*').as_bytes().to_vec());
+                    }
+                }
+            }
+        }
+        for rules in [DEFAULT_RULES, REL_RULES, ARM_RULES, SHORT] {
+            let set = RuleSet::new(rules);
+            for name in &names {
+                for file in [&b"a.o"[..], b"crtbegin.o", b"crtend.o"] {
+                    let scan = (0..set.patterns.len()).find_map(|p| set.try_at(p, name, file));
+                    assert_eq!(
+                        set.place(name, file),
+                        scan,
+                        "{}",
+                        String::from_utf8_lossy(name)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

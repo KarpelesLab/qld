@@ -275,7 +275,10 @@ them into a universal binary. Per architecture:
 The ELF pipeline is generic over `F: ElfFormat` (class and byte order).
 `elf::link` picks the format once from the target (`elf::target` infers it
 from the first input that names one: ELF headers, GCC LTO objects, or an LLVM
-bitcode triple), so ELF64 and ELF32
+bitcode triple). All four class and byte-order combinations are
+instantiated: ELF64 little- and big-endian and ELF32 little-endian have
+architectures, while `Elf32Be` decodes input but no architecture selects it
+for output yet. So ELF64 and ELF32
 little-endian are two monomorphized copies of the pipeline. Run-time
 dispatch on the format in readers cost 5.8% on the clang link, and
 target-only checks inside the hottest relocation code cost up to 8%, so
@@ -344,6 +347,11 @@ Who works where, and which files each task owns, is in
 - **Teardown**: the CLI exits without dropping the link state, as mold and
   lld do. The library API frees everything in the normal way.
 
+Layout reserves thunk pools at fixed content offsets of each output
+section, so a pool's place does not move as the pools grow, and it can grow
+`.symtab` and `.strtab` for symbols a backend generates (32-bit Arm's
+mapping symbols).
+
 ### Stages that run side by side
 
 Measured overlaps (W42): the GOT/PLT entry plan, the scan for non-empty
@@ -398,6 +406,9 @@ Scaling rules found by measurement (W24, W26; `tests/projects/bench.md`):
 - When the pool is larger than 16 threads, every stage except the
   relocation scan and section merging runs in a nested 16-thread pool:
   beyond that, idle stealing and system time cost more than they gain.
+- `src/elf/arch/shrink.rs` runs the shrinking-relaxation fixpoint for both
+  RISC-V and LoongArch; each supplies only its per-section decisions
+  (`src/elf/arch/{riscv,loongarch}/relax.rs`).
 - Links with at least 4 Mi merge pieces (large debug links) merge on every
   core; section merging runs alongside the relocation scan.
 - Archive members are discovered in parallel before the input walk, and a

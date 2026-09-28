@@ -1,0 +1,24 @@
+# M4: --gc-sections on PowerPC64 BE. Liveness follows the TOC-relative and
+# branch relocations of big-endian code, so the referenced function and
+# data stay.
+#
+# `.opd` is one section here and qld keeps it whole, so the descriptors of
+# unreferenced functions keep those functions and the data they read alive:
+# GNU ld edits `.opd` entry by entry (`ppc64_elf_edit_opd`) and does drop
+# them. The fixture therefore checks what is kept, not what is dropped;
+# splitting `.opd` is the remaining ELFv1 GC work.
+description = "--gc-sections keeps what is reachable, for PowerPC64 BE (ELFv1)"
+compile = ["cc -O2 -ffunction-sections -fdata-sections -c main.c"]
+driver = "cc"
+link = "-static -o out main.o -Wl,--gc-sections"
+run = "./out"
+expect.stdout = "42\n"
+expect.readelf = [
+  "PowerPC64",
+  "big endian",
+  "abiv1",
+  "live_function_qld",
+  "live_data_qld",
+]
+targets = ["powerpc64-linux-gnu"]
+determinism = true

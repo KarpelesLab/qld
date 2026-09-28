@@ -245,11 +245,7 @@ pub struct SymbolTable<'a> {
     shards: Box<[Mutex<Shard<'a>>]>,
     names: Vec<SymbolName<'a>>,
     flags: Vec<AtomicU32>,
-    def_kind: Vec<AtomicU8>,
-    def_file: Vec<AtomicU32>,
-    def_index: Vec<AtomicU32>,
-    def_position: Vec<AtomicU64>,
-    def_aux: Vec<AtomicU64>,
+    defs: Vec<DefCell>,
     def_locks: Box<[Mutex<()>]>,
     /// The most symbols this table may hold: [`MAX_SYMBOLS`], lowered only
     /// by tests.
@@ -296,11 +292,7 @@ impl<'a> SymbolTable<'a> {
             shards,
             names: Vec::with_capacity(symbols),
             flags: Vec::with_capacity(symbols),
-            def_kind: Vec::with_capacity(symbols),
-            def_file: Vec::with_capacity(symbols),
-            def_index: Vec::with_capacity(symbols),
-            def_position: Vec::with_capacity(symbols),
-            def_aux: Vec::with_capacity(symbols),
+            defs: Vec::with_capacity(symbols),
             def_locks,
             limit: MAX_SYMBOLS,
         }
@@ -802,54 +794,18 @@ impl<'a> SymbolTable<'a> {
 
     /// Appends default per-symbol state for `count` new symbols.
     fn grow_state(&mut self, count: usize) {
-        let Self {
-            flags,
-            def_kind,
-            def_file,
-            def_index,
-            def_position,
-            def_aux,
-            ..
-        } = self;
+        let Self { flags, defs, .. } = self;
         if count < MIN_PARALLEL_GROW {
             flags.extend((0..count).map(|_| AtomicU32::new(0)));
-            def_kind.extend((0..count).map(|_| AtomicU8::new(DefinitionKind::Undefined as u8)));
-            def_file.extend((0..count).map(|_| AtomicU32::new(0)));
-            def_index.extend((0..count).map(|_| AtomicU32::new(0)));
-            def_position.extend((0..count).map(|_| AtomicU64::new(0)));
-            def_aux.extend((0..count).map(|_| AtomicU64::new(0)));
+            defs.extend((0..count).map(|_| DefCell::undefined()));
             return;
         }
         fn grow<T: Send>(vec: &mut Vec<T>, count: usize, make: impl Fn() -> T + Sync + Send) {
             vec.par_extend((0..count).into_par_iter().map(|_| make()));
         }
         rayon::join(
-            || {
-                rayon::join(
-                    || grow(flags, count, || AtomicU32::new(0)),
-                    || {
-                        grow(def_kind, count, || {
-                            AtomicU8::new(DefinitionKind::Undefined as u8)
-                        });
-                    },
-                )
-            },
-            || {
-                rayon::join(
-                    || grow(def_file, count, || AtomicU32::new(0)),
-                    || {
-                        rayon::join(
-                            || grow(def_index, count, || AtomicU32::new(0)),
-                            || {
-                                rayon::join(
-                                    || grow(def_position, count, || AtomicU64::new(0)),
-                                    || grow(def_aux, count, || AtomicU64::new(0)),
-                                )
-                            },
-                        )
-                    },
-                )
-            },
+            || grow(flags, count, || AtomicU32::new(0)),
+            || grow(defs, count, DefCell::undefined),
         );
     }
 
@@ -969,7 +925,7 @@ impl<'a> SymbolTable<'a> {
     #[inline]
     #[must_use]
     pub fn definition_kind(&self, id: SymbolId) -> DefinitionKind {
-        DefinitionKind::from_u8(self.def_kind[id.index()].load(Ordering::Relaxed))
+        DefinitionKind::from_u8(self.defs[id.index()].kind.load(Ordering::Relaxed))
     }
 
     /// Returns the file of a symbol's current definition, or `None` if it is
@@ -981,62 +937,77 @@ impl<'a> SymbolTable<'a> {
     #[inline]
     #[must_use]
     pub fn definition_file(&self, id: SymbolId) -> Option<FileId> {
-        let index = id.index();
-        (self.def_kind[index].load(Ordering::Relaxed) != DefinitionKind::Undefined as u8)
-            .then(|| FileId::from_u32(self.def_file[index].load(Ordering::Relaxed)))
+        let cell = &self.defs[id.index()];
+        (cell.kind.load(Ordering::Relaxed) != DefinitionKind::Undefined as u8)
+            .then(|| FileId::from_u32(cell.file.load(Ordering::Relaxed)))
     }
 
     #[inline]
     fn load_definition(&self, index: usize) -> Definition {
-        self.definitions().get(index)
-    }
-
-    /// The definition vectors, for reading.
-    #[inline]
-    fn definitions(&self) -> Definitions<'_> {
-        Definitions {
-            kind: &self.def_kind,
-            file: &self.def_file,
-            index: &self.def_index,
-            position: &self.def_position,
-            aux: &self.def_aux,
-        }
+        self.defs[index].load()
     }
 
     #[inline]
     fn store_definition(&self, index: usize, definition: &Definition) {
-        self.def_file[index].store(definition.file.as_u32(), Ordering::Relaxed);
-        self.def_index[index].store(definition.index, Ordering::Relaxed);
-        self.def_position[index].store(definition.position.raw(), Ordering::Relaxed);
-        self.def_aux[index].store(definition.aux, Ordering::Relaxed);
-        self.def_kind[index].store(definition.kind as u8, Ordering::Relaxed);
+        self.defs[index].store(definition);
     }
 }
 
-/// The per-field definition vectors of a table, borrowed for reading.
-#[derive(Clone, Copy)]
-struct Definitions<'t> {
-    kind: &'t [AtomicU8],
-    file: &'t [AtomicU32],
-    index: &'t [AtomicU32],
-    position: &'t [AtomicU64],
-    aux: &'t [AtomicU64],
+/// One symbol's current definition, as five atomic fields side by side.
+///
+/// The fields were five vectors of their own until the relocation scan and
+/// the writer, which read a whole definition for every relocation against a
+/// global symbol, were found to touch five cache lines each time. Together
+/// they are 32 bytes, so a read is one line (two symbols share it).
+#[derive(Debug)]
+struct DefCell {
+    /// [`Definition::position`], raw.
+    position: AtomicU64,
+    /// [`Definition::aux`].
+    aux: AtomicU64,
+    /// [`Definition::file`], raw.
+    file: AtomicU32,
+    /// [`Definition::index`].
+    index: AtomicU32,
+    /// [`Definition::kind`] as `u8`; `Undefined` means the rest is unset.
+    kind: AtomicU8,
 }
 
-impl Definitions<'_> {
+impl DefCell {
+    /// A cell for a symbol with no definition yet.
+    fn undefined() -> Self {
+        Self {
+            position: AtomicU64::new(0),
+            aux: AtomicU64::new(0),
+            file: AtomicU32::new(0),
+            index: AtomicU32::new(0),
+            kind: AtomicU8::new(DefinitionKind::Undefined as u8),
+        }
+    }
+
     #[inline]
-    fn get(&self, index: usize) -> Definition {
-        let kind = DefinitionKind::from_u8(self.kind[index].load(Ordering::Relaxed));
+    fn load(&self) -> Definition {
+        let kind = DefinitionKind::from_u8(self.kind.load(Ordering::Relaxed));
         if kind == DefinitionKind::Undefined {
             return Definition::undefined();
         }
         Definition {
             kind,
-            file: FileId::from_u32(self.file[index].load(Ordering::Relaxed)),
-            index: self.index[index].load(Ordering::Relaxed),
-            position: InputPosition::from_raw(self.position[index].load(Ordering::Relaxed)),
-            aux: self.aux[index].load(Ordering::Relaxed),
+            file: FileId::from_u32(self.file.load(Ordering::Relaxed)),
+            index: self.index.load(Ordering::Relaxed),
+            position: InputPosition::from_raw(self.position.load(Ordering::Relaxed)),
+            aux: self.aux.load(Ordering::Relaxed),
         }
+    }
+
+    #[inline]
+    fn store(&self, definition: &Definition) {
+        self.file.store(definition.file.as_u32(), Ordering::Relaxed);
+        self.index.store(definition.index, Ordering::Relaxed);
+        self.position
+            .store(definition.position.raw(), Ordering::Relaxed);
+        self.aux.store(definition.aux, Ordering::Relaxed);
+        self.kind.store(definition.kind as u8, Ordering::Relaxed);
     }
 }
 

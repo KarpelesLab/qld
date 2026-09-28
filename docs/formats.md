@@ -62,6 +62,7 @@ survive GC.
 | x32 | `elf32_x86_64` | M4 | ILP32 on x86-64 |
 | PowerPC64 | `elf64lppc`, `elf64ppc` | M4 | TOC, ELFv1 OPD, long-branch stubs |
 | LoongArch64 | `elf64loongarch` | M4 | relaxation |
+| PowerPC64 BE | `elf64ppc` | M4 | big-endian ELFv1, static output |
 | s390x | `elf64_s390` | M4 | big-endian 64-bit |
 
 ### DWARF and debug information
@@ -122,6 +123,13 @@ every output format:
 | Headers | subsystem, OS/image versions, `--dynamicbase`, `--nxcompat`, `--high-entropy-va`, `--no-seh`, `--image-base` |
 | Determinism | fixed timestamp unless `--insert-timestamp` is given |
 | Resources | `.rsrc` from GNU windres objects, `.rsrc$01`/`.rsrc$02` from `cvtres`/`llvm-windres` |
+
+## Relocatable output
+
+`-r` writes records in the output's class and byte order, with the
+architecture's relocation form (`SHT_REL` for i386 and 32-bit Arm,
+`SHT_RELA` elsewhere). Code gaps between members are padded with NOPs, as
+GNU ld does.
 
 ## ELF32 output
 

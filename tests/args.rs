@@ -161,6 +161,8 @@ const SETS_DEFAULT: &[&str] = &[
     "no-nmagic",
     "relax",
     "merge-exidx-entries",
+    "gnu-tls-tag",
+    "gnu2-tls-tag",
     "no-apply-dynamic-relocs",
     "Bno-symbolic",
     "no-export-dynamic",

@@ -41,12 +41,20 @@
 //!
 //! # Relocations
 //!
-//! Each output section gets one `.rela` section holding its members'
+//! Each output section gets one relocation section holding its members'
 //! relocations with offsets moved by the member's position. References to
 //! section symbols become references to the output section's symbol with
 //! the member offset added to the addend. As GNU ld does, a relocation whose
-//! target lies in a discarded section becomes `R_X86_64_NONE` against symbol
+//! target lies in a discarded section becomes a `R_*_NONE` against symbol
 //! 0, and is removed altogether from non-allocated (debug) sections.
+//!
+//! The records are the output class's and byte order's, and the relocations
+//! keep the form the architecture's inputs use: `.rela` sections of
+//! `Elf_Rela` everywhere except i386 and 32-bit Arm, which get `.rel`
+//! sections of `Elf_Rel`. A `SHT_REL` relocation has no addend field, so
+//! the member offset a redirected section reference needs goes into the
+//! field the relocation patches instead, as GNU ld's
+//! `_bfd_relocate_contents` does.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -56,7 +64,6 @@ use rayon::prelude::*;
 
 use crate::args::{DiscardMode, LinkOptions, StripMode};
 use crate::elf::read::consts::STT_FILE;
-use crate::elf::read::consts::x86_64::R_X86_64_NONE;
 use crate::elf::read::consts::{
     ELFOSABI_GNU, ET_REL, GRP_COMDAT, SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP, SHF_INFO_LINK,
     SHF_LINK_ORDER, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_LORESERVE,
@@ -65,7 +72,9 @@ use crate::elf::read::consts::{
     STB_LOCAL, STB_WEAK, STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT, STV_HIDDEN,
     STV_INTERNAL, STV_PROTECTED,
 };
-use crate::elf::read::{RawSymbol, Relocation, Relocations, SectionIndex};
+use crate::elf::read::{
+    ElfFormat, Endian, RawRecord, RawSymbol, Relocation, Relocations, SectionHeader, SectionIndex,
+};
 use crate::error::{Error, Result};
 use crate::ids::SymbolId;
 use crate::output::{ChunkRange, FileMode, OutputFile, OutputOptions};
@@ -83,14 +92,6 @@ use super::synth::plan_property_note;
 /// Kept COMDAT group copies by signature: `(file, group index)`.
 type KeptGroups<'a> = HashMap<&'a [u8], (u32, u32), foldhash::fast::FixedState>;
 
-/// Size of a symbol table entry.
-const SYM_SIZE: u64 = 24;
-/// Size of an `Elf64_Rela`.
-const RELA_SIZE: u64 = 24;
-/// Size of a section header.
-const SHDR_SIZE: u64 = 64;
-/// Size of the ELF header.
-const EHDR_SIZE: u64 = 64;
 /// Largest alignment a section's file offset is padded to.
 ///
 /// A relocatable output has no addresses, so `sh_addralign` constrains
@@ -99,6 +100,31 @@ const EHDR_SIZE: u64 = 64;
 /// Without the cap, one input section with an absurd `sh_addralign` — a
 /// corrupt object's 2 GiB, say — would inflate the output by that much.
 const MAX_FILE_ALIGN: u64 = 1 << 16;
+
+/// Size of a symbol table entry of the output class.
+fn sym_size<F: ElfFormat>() -> u64 {
+    <F::Sym as RawRecord>::SIZE as u64
+}
+
+/// Size of a section header of the output class.
+fn shdr_size<F: ElfFormat>() -> u64 {
+    <F::Shdr as RawRecord>::SIZE as u64
+}
+
+/// Size of the ELF header of the output class.
+fn ehdr_size<F: ElfFormat>() -> u64 {
+    <F::Ehdr as RawRecord>::SIZE as u64
+}
+
+/// Size of one output relocation, `Elf_Rel` when the architecture's
+/// relocations are `SHT_REL` and `Elf_Rela` otherwise.
+fn reloc_size<F: ElfFormat>(use_rel: bool) -> u64 {
+    if use_rel {
+        <F::Rel as RawRecord>::SIZE as u64
+    } else {
+        <F::Rela as RawRecord>::SIZE as u64
+    }
+}
 
 /// Whether relocatable output keeps a section that final links consume
 /// ([`SectionKind::Ignored`] sections other than the tables a relocatable
@@ -263,6 +289,9 @@ struct Member {
     relocs: u64,
     /// Offset of its relocations in the output `.rela` section.
     rela_offset: u64,
+    /// Bytes of `nop` padding before it that a synthesized
+    /// `R_LARCH_ALIGN` covers (LoongArch; 0 otherwise).
+    align_pad: u64,
 }
 
 #[derive(Debug)]
@@ -378,6 +407,9 @@ enum SymRef {
     Global(SymbolId),
 }
 
+/// The `R_*_NONE` relocation type, 0 on every architecture.
+const R_NONE: u32 = 0;
+
 /// What happens to one input relocation.
 #[derive(Clone, Copy, Debug)]
 enum Rewritten {
@@ -452,22 +484,34 @@ struct Plan<'a> {
     /// `e_flags` of the output, taken from the inputs (RISC-V: the merged
     /// ABI flags).
     flags: u32,
-    /// RISC-V: the merged `.riscv.attributes`, written in place of the
-    /// first input section (the others become empty).
-    riscv_attributes: Option<crate::elf::arch::riscv::attributes::Output>,
+    /// The merged `.riscv.attributes` or `.ARM.attributes`, written in
+    /// place of the first input section (the others become empty).
+    attributes: Option<MergedAttributes>,
+    /// Whether the relocation sections are `SHT_REL` (i386, Arm).
+    use_rel: bool,
+    /// Size of one output relocation.
+    reloc_size: u64,
+    /// The architecture, for `SHT_REL` in-place addends.
+    arch_for_addends: Option<crate::elf::arch::Arch>,
+}
+
+/// The merged build attributes of a link: the section type they live in,
+/// the input section whose place holds them, and the merged bytes.
+struct MergedAttributes {
+    sh_type: u32,
+    first: crate::ids::SectionId,
+    bytes: Vec<u8>,
 }
 
 /// The bytes input section `section` (`id`) contributes: its size, except
-/// for RISC-V attributes, merged into the first section.
+/// for build attributes, merged into the first section.
 fn member_size(
-    riscv_attributes: Option<&crate::elf::arch::riscv::attributes::Output>,
+    attributes: Option<&MergedAttributes>,
     id: Option<crate::ids::SectionId>,
     section: &crate::elf::object::InputSection<'_>,
 ) -> u64 {
-    match riscv_attributes {
-        Some(merged)
-            if section.header.sh_type == crate::elf::read::consts::SHT_RISCV_ATTRIBUTES =>
-        {
+    match attributes {
+        Some(merged) if section.header.sh_type == merged.sh_type => {
             if id == Some(merged.first) {
                 u64::try_from(merged.bytes.len()).unwrap_or(u64::MAX)
             } else {
@@ -475,6 +519,85 @@ fn member_size(
             }
         }
         _ => section.header.sh_size,
+    }
+}
+
+/// Merges the build attribute sections the architecture carries:
+/// `.riscv.attributes` (RISC-V) and `.ARM.attributes` (32-bit Arm). Both
+/// are concatenated by a final link too, so `-r` must merge them rather
+/// than copy each input's copy.
+fn merged_attributes<F: ElfFormat>(
+    arch: crate::elf::arch::Arch,
+    refs: &Refs<'_, '_, F>,
+) -> Option<MergedAttributes> {
+    if arch.is_riscv() {
+        let merged = crate::elf::arch::riscv::attributes::collect(refs)?;
+        return Some(MergedAttributes {
+            sh_type: crate::elf::read::consts::SHT_RISCV_ATTRIBUTES,
+            first: merged.first,
+            bytes: merged.bytes,
+        });
+    }
+    if arch == crate::elf::arch::Arch::Arm {
+        let merged = crate::elf::arch::arm::attributes::collect(refs)?;
+        return Some(MergedAttributes {
+            sh_type: crate::elf::arch::arm::SHT_ARM_ATTRIBUTES,
+            first: merged.first,
+            bytes: merged.bytes,
+        });
+    }
+    None
+}
+
+/// Adds `delta` to the field `SHT_REL` relocation `r_type` patches at
+/// `offset` of `data` — the implicit addend, which is where a relocation
+/// with no addend field keeps it (GNU ld's `_bfd_relocate_contents` in a
+/// relocatable link).
+///
+/// Nothing happens when the relocation patches no field, when the field is
+/// out of range, or when the new value does not fit it; GNU ld reports the
+/// last as an overflow, and a copy that keeps the old value is a better
+/// answer here than a panic.
+///
+/// Data fields are written little-endian, as the two architectures that
+/// use `SHT_REL` are little-endian and
+/// [`Arch::implicit_addend`](crate::elf::arch::Arch::implicit_addend) reads
+/// them that way. A big-endian `SHT_REL` target (Arm BE32, PowerPC 32)
+/// would need both to follow the output's byte order.
+fn adjust_in_place(arch: crate::elf::arch::Arch, rel: &Relocation, delta: i64, data: &mut [u8]) {
+    use crate::elf::arch::Arch;
+    if delta == 0 {
+        return;
+    }
+    let Ok(at) = usize::try_from(rel.offset) else {
+        return;
+    };
+    let old = arch.implicit_addend(rel.r_type, data, rel.offset);
+    let new = old.wrapping_add(delta);
+    let put = |data: &mut [u8], size: usize| {
+        let bytes = new.to_le_bytes();
+        if let Some(dest) = at
+            .checked_add(size)
+            .and_then(|end| data.get_mut(at..end))
+            .filter(|_| size <= 8)
+        {
+            dest.copy_from_slice(bytes.get(..size).unwrap_or_default());
+        }
+    };
+    match arch {
+        Arch::I386 => put(data, crate::elf::arch::i386::field_size(rel.r_type)),
+        Arch::Arm => match crate::elf::arch::arm::patch_of(rel.r_type) {
+            crate::elf::arch::arm::Patch::None => {}
+            crate::elf::arch::arm::Patch::Data(size) => put(data, usize::from(size)),
+            crate::elf::arch::arm::Patch::Insn(field) => {
+                if let Some(insn) = field.read(data, at)
+                    && let Ok(patched) = field.encode(insn, new)
+                {
+                    let _ = field.write(data, at, patched);
+                }
+            }
+        },
+        _ => {}
     }
 }
 
@@ -508,8 +631,9 @@ fn slot<T: Copy + Default>(table: &[T], index: usize) -> T {
 /// # Errors
 ///
 /// Returns I/O errors, [`Error::Malformed`] for broken relocations,
-/// [`Error::Unimplemented`] for `SHT_REL` inputs, and [`Error::Limit`] when
-/// the output does not fit the ELF format.
+/// [`Error::Unimplemented`] for an input whose relocations are not in the
+/// form the architecture writes, and [`Error::Limit`] when the output does
+/// not fit the ELF format.
 pub fn write<F: crate::elf::read::ElfFormat>(input: &RelocatableInput<'_, '_, F>) -> Result<()> {
     let plan = plan(input)?;
     write_file(input, &plan)
@@ -534,10 +658,11 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     let arch = crate::elf::arch::Arch::of(input.options, files);
     let machine = arch.machine();
     let flags = arch.output_flags(files);
-    let riscv_attributes = arch
-        .is_riscv()
-        .then(|| crate::elf::arch::riscv::attributes::collect(refs))
-        .flatten();
+    let attributes = merged_attributes(arch, refs);
+    // i386 and Arm inputs carry their addends in the fields they patch, and
+    // GNU ld writes them back the same way.
+    let use_rel = arch.uses_rel();
+    let reloc_size = reloc_size::<F>(use_rel);
     let mut kept: KeptGroups<'a> =
         HashMap::with_hasher(foldhash::fast::FixedState::with_seed(0x6b65_7074));
     for (file_index, file) in files.iter().enumerate() {
@@ -661,6 +786,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                     offset: member.offset,
                     relocs: 0,
                     rela_offset: 0,
+                    align_pad: member.align_pad,
                 });
                 if let Some(id) = sections.id(member.file as usize, member.section)
                     && let Some(slot) = assign.get_mut(id.index())
@@ -800,6 +926,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                 offset: 0,
                 relocs: 0,
                 rela_offset: 0,
+                align_pad: 0,
             });
             if let Some(slot) = assign.get_mut(id.index()) {
                 *slot = out_index;
@@ -912,22 +1039,51 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
             out.flags |= SHF_GROUP;
         }
         let mut size = 0u64;
+        // LoongArch: the assembler writes `R_LARCH_ALIGN` only for a
+        // section it marked relaxable, so a later relaxing link would not
+        // know that the sections after one have to stay aligned. As lld
+        // does, reserve `2^n - 4` bytes of `nop` padding before each of
+        // them and synthesize the relocation that covers it.
+        let synthesize_align =
+            arch == crate::elf::arch::Arch::LoongArch64 && out.flags & SHF_EXECINSTR != 0;
+        let mut relaxable_seen = false;
         for member in &mut out.members {
-            let Some(section) = files
+            let Some(object) = files
                 .get(member.file as usize)
                 .and_then(|f| f.object.as_ref())
-                .and_then(|o| o.section(member.section))
             else {
                 continue;
             };
+            let Some(section) = object.section(member.section) else {
+                continue;
+            };
+            let mut pad = member.align_pad;
+            if synthesize_align && !keep_offsets {
+                let align = section.header.sh_addralign;
+                // LoongArch relocations are always `SHT_RELA`.
+                let need = match relocations_of(object, section, false)? {
+                    Some(crate::elf::read::Relocations::Rela(relocs)) => {
+                        crate::elf::arch::loongarch::relax::section_align(&relocs, align)
+                    }
+                    _ => crate::elf::arch::loongarch::relax::SectionAlign::default(),
+                };
+                if !relaxable_seen {
+                    relaxable_seen = need.relaxes;
+                } else if align > 4 && !need.covered {
+                    pad = align.saturating_sub(4);
+                }
+            }
+            member.align_pad = pad;
             let offset = if keep_offsets {
                 member.offset
+            } else if pad != 0 {
+                add(size, pad)?
             } else {
                 align_to(size, section.header.sh_addralign)?
             };
             member.offset = offset;
             let id = sections.id(member.file as usize, member.section);
-            size = add(offset, member_size(riscv_attributes.as_ref(), id, section))?;
+            size = add(offset, member_size(attributes.as_ref(), id, section))?;
             if let Some(id) = sections.id(member.file as usize, member.section)
                 && let Some(slot) = offsets.get_mut(id.index())
             {
@@ -962,6 +1118,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
         offsets: &offsets,
         kept: &kept,
         script_outs: &script_outs,
+        use_rel,
     };
     let scanned: Vec<Result<ScanOutput>> = files
         .par_iter()
@@ -985,9 +1142,11 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
                         .and_then(|at| p.counts.get(at))
                 })
                 .map_or(0, |(_, c)| *c);
-            member.relocs = count;
-            member.rela_offset = mul(total, RELA_SIZE)?;
-            total = add(total, count)?;
+            // A LoongArch `-r` member that needs `nop` padding also carries
+            // the synthesized `R_LARCH_ALIGN` covering it.
+            member.relocs = add(count, u64::from(member.align_pad != 0))?;
+            member.rela_offset = mul(total, reloc_size)?;
+            total = add(total, member.relocs)?;
         }
         out.relocs = total;
     }
@@ -1117,7 +1276,8 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     for out in &mut outs {
         out.name_offset = put_name(&[out.name])?;
         if out.relocs > 0 {
-            out.rela_name_offset = put_name(&[b".rela", out.name])?;
+            let prefix: &[u8] = if use_rel { b".rel" } else { b".rela" };
+            out.rela_name_offset = put_name(&[prefix, out.name])?;
         }
     }
     let symtab_name = put_name(&[b".symtab"])?;
@@ -1130,8 +1290,10 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     let shstrtab_name = put_name(&[b".shstrtab"])?;
     let trailer_names = [symtab_name, shndx_name, strtab_name, shstrtab_name];
 
-    // File offsets.
-    let mut offset = EHDR_SIZE;
+    // File offsets. The tables are aligned to the class's word size, as
+    // GNU ld aligns them.
+    let word = F::WORD_SIZE as u64;
+    let mut offset = ehdr_size::<F>();
     for out in &mut outs {
         if out.has_file_bytes() {
             offset = align_to(offset, out.align.min(MAX_FILE_ALIGN))?;
@@ -1141,13 +1303,13 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
             out.offset = offset;
         }
         if out.relocs > 0 {
-            offset = align_to(offset, 8)?;
+            offset = align_to(offset, word)?;
             out.rela_offset = offset;
-            offset = add(offset, mul(out.relocs, RELA_SIZE)?)?;
+            offset = add(offset, mul(out.relocs, reloc_size)?)?;
         }
     }
-    let symtab_offset = align_to(offset, 8)?;
-    offset = add(symtab_offset, mul(next_symbol, SYM_SIZE)?)?;
+    let symtab_offset = align_to(offset, word)?;
+    offset = add(symtab_offset, mul(next_symbol, sym_size::<F>())?)?;
     let shndx_offset = align_to(offset, 4)?;
     if extended {
         offset = add(shndx_offset, mul(next_symbol, 4)?)?;
@@ -1156,8 +1318,8 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     offset = add(offset, names)?;
     let shstrtab_offset = offset;
     offset = add(offset, shstrtab.len() as u64)?;
-    let shoff = align_to(offset, 8)?;
-    let file_size = add(shoff, mul(u64::from(section_count), SHDR_SIZE)?)?;
+    let shoff = align_to(offset, word)?;
+    let file_size = add(shoff, mul(u64::from(section_count), shdr_size::<F>())?)?;
 
     Ok(Plan {
         outs,
@@ -1190,7 +1352,10 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
         arch,
         script_outs,
         flags,
-        riscv_attributes,
+        attributes,
+        use_rel,
+        reloc_size,
+        arch_for_addends: use_rel.then_some(arch),
     })
 }
 
@@ -1229,6 +1394,8 @@ struct Context<'c, 'r, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::El
     kept: &'c KeptGroups<'a>,
     /// The output section list index of each linker script output.
     script_outs: &'c [u32],
+    /// Whether the output relocation sections are `SHT_REL`.
+    use_rel: bool,
 }
 
 impl<F: crate::elf::read::ElfFormat> Context<'_, '_, '_, F> {
@@ -1266,12 +1433,13 @@ fn rewrite<F: crate::elf::read::ElfFormat>(
     rel: &Relocation,
     relocated: &InputSection<'_>,
 ) -> Result<Rewritten> {
+    // `R_*_NONE` is 0 on every architecture.
     let discarded = if !relocated.is_alloc() {
         Rewritten::Drop
     } else {
         Rewritten::Keep {
             symbol: SymRef::Null,
-            r_type: R_X86_64_NONE,
+            r_type: R_NONE,
             addend: 0,
         }
     };
@@ -1335,11 +1503,17 @@ fn rewrite<F: crate::elf::read::ElfFormat>(
     })
 }
 
-/// The relocations of a copied section.
-fn relocations_of<'a, F: crate::elf::read::ElfFormat>(
+/// The relocations of a copied section, in the form the output uses.
+///
+/// The output form is the architecture's (`SHT_REL` for i386 and Arm,
+/// `SHT_RELA` elsewhere), as GNU ld's `default_use_rela_p`; an input that
+/// disagrees would need its addends moved into or out of the fields they
+/// patch, which is not implemented.
+fn relocations_of<'a, F: ElfFormat>(
     object: &ObjectInput<'a, F>,
     section: &InputSection<'a>,
-) -> Result<Option<crate::elf::read::RelaSlice<'a, F>>> {
+    use_rel: bool,
+) -> Result<Option<Relocations<'a, F>>> {
     if section.relocs == 0 {
         return Ok(None);
     }
@@ -1347,13 +1521,17 @@ fn relocations_of<'a, F: crate::elf::read::ElfFormat>(
         return Ok(None);
     };
     match object.elf.relocation_section(section.relocs, &header)? {
-        Some(r) => match r.relocations {
-            Relocations::Rela(rela) => Ok(Some(rela)),
-            Relocations::Rel(_) => Err(Error::Unimplemented(format!(
-                "SHT_REL relocations in relocatable output from {}",
-                object.source().path.display()
-            ))),
-        },
+        Some(r) if r.relocations.is_rela() == !use_rel => Ok(Some(r.relocations)),
+        Some(r) => Err(Error::Unimplemented(format!(
+            "{} relocations in relocatable output from {} (the output uses {})",
+            if r.relocations.is_rela() {
+                "SHT_RELA"
+            } else {
+                "SHT_REL"
+            },
+            object.source().path.display(),
+            if use_rel { "SHT_REL" } else { "SHT_RELA" },
+        ))),
         None => Ok(None),
     }
 }
@@ -1378,11 +1556,11 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
         if context.placed(file_index, index).is_none() {
             continue;
         }
-        let Some(relas) = relocations_of(object, section)? else {
+        let Some(relas) = relocations_of(object, section, context.use_rel)? else {
             continue;
         };
         let mut count = 0u64;
-        for rel in relas.iter() {
+        for rel in (0..relas.len()).filter_map(|i| relas.get(i)) {
             match rewrite(context, file_index, object, &rel, section)? {
                 Rewritten::Drop => {}
                 Rewritten::Keep { symbol, .. } => {
@@ -1805,7 +1983,8 @@ fn write_file<'a, F: crate::elf::read::ElfFormat>(
     input: &RelocatableInput<'_, 'a, F>,
     plan: &Plan<'a>,
 ) -> Result<()> {
-    let mut chunks: Vec<(ChunkRange, Chunk)> = vec![(ChunkRange::new(0, EHDR_SIZE), Chunk::Header)];
+    let mut chunks: Vec<(ChunkRange, Chunk)> =
+        vec![(ChunkRange::new(0, ehdr_size::<F>()), Chunk::Header)];
     for (out_index, out) in plan.outs.iter().enumerate() {
         let out_u32 = index_u32(out_index)?;
         match out.kind {
@@ -1849,7 +2028,7 @@ fn write_file<'a, F: crate::elf::read::ElfFormat>(
                             .and_then(|o| o.section(member.section));
                         let id = input.refs.sections.id(member.file as usize, member.section);
                         let size = section.map_or(0, |section| {
-                            member_size(plan.riscv_attributes.as_ref(), id, section)
+                            member_size(plan.attributes.as_ref(), id, section)
                         });
                         if let Some(section) = section
                             && !section.is_nobits()
@@ -1866,7 +2045,7 @@ fn write_file<'a, F: crate::elf::read::ElfFormat>(
                         chunks.push((
                             ChunkRange::new(
                                 add(out.rela_offset, member.rela_offset)?,
-                                mul(member.relocs, RELA_SIZE)?,
+                                mul(member.relocs, plan.reloc_size)?,
                             ),
                             Chunk::Rela(out_u32, member_u32),
                         ));
@@ -1896,7 +2075,7 @@ fn write_file<'a, F: crate::elf::read::ElfFormat>(
         }
     }
     chunks.push((
-        ChunkRange::new(plan.symtab_offset, mul(plan.symbol_count, SYM_SIZE)?),
+        ChunkRange::new(plan.symtab_offset, mul(plan.symbol_count, sym_size::<F>())?),
         Chunk::Symtab,
     ));
     if plan.shndx_index != 0 {
@@ -1914,7 +2093,10 @@ fn write_file<'a, F: crate::elf::read::ElfFormat>(
         Chunk::Shstrtab,
     ));
     chunks.push((
-        ChunkRange::new(plan.shoff, mul(u64::from(plan.section_count), SHDR_SIZE)?),
+        ChunkRange::new(
+            plan.shoff,
+            mul(u64::from(plan.section_count), shdr_size::<F>())?,
+        ),
         Chunk::SectionHeaders,
     ));
     chunks.sort_by_key(|(range, _)| range.offset);
@@ -1955,7 +2137,7 @@ fn write_chunk<'a, F: crate::elf::read::ElfFormat>(
 ) -> Result<()> {
     match chunk {
         Chunk::Header => {
-            write_header(plan, out);
+            write_header::<F>(plan, out);
             Ok(())
         }
         Chunk::Group(index) => {
@@ -1964,7 +2146,7 @@ fn write_chunk<'a, F: crate::elf::read::ElfFormat>(
             };
             let words = std::iter::once(GRP_COMDAT).chain(section.group_members.iter().copied());
             for (word, dest) in words.zip(out.as_chunks_mut::<4>().0.iter_mut()) {
-                *dest = word.to_le_bytes();
+                *dest = F::Endian::put_u32(word);
             }
             Ok(())
         }
@@ -1996,8 +2178,8 @@ fn write_chunk<'a, F: crate::elf::read::ElfFormat>(
                 return Ok(());
             };
             let mut data = object.section_data(section)?;
-            if section.header.sh_type == crate::elf::read::consts::SHT_RISCV_ATTRIBUTES
-                && let Some(merged) = &plan.riscv_attributes
+            if let Some(merged) = &plan.attributes
+                && section.header.sh_type == merged.sh_type
             {
                 let id = input.refs.sections.id(member.file as usize, member.section);
                 data = if id == Some(merged.first) {
@@ -2006,8 +2188,14 @@ fn write_chunk<'a, F: crate::elf::read::ElfFormat>(
                     &[]
                 };
             }
-            if let Some(dest) = out.get_mut(..data.len()) {
-                dest.copy_from_slice(data);
+            let Some(dest) = out.get_mut(..data.len()) else {
+                return Ok(());
+            };
+            dest.copy_from_slice(data);
+            // `SHT_REL` output: the addend lives in the field, so a
+            // redirected section reference moves it there.
+            if let Some(arch) = plan.arch_for_addends {
+                adjust_member(input, plan, member, section, dest, arch)?;
             }
             Ok(())
         }
@@ -2060,23 +2248,41 @@ fn write_chunk<'a, F: crate::elf::read::ElfFormat>(
     }
 }
 
-fn write_header(plan: &Plan<'_>, out: &mut [u8]) {
-    let Some(header) = out.first_chunk_mut::<64>() else {
-        return;
+/// Moves the addends of one member's `SHT_REL` relocations into the fields
+/// they patch, for the references [`rewrite`] redirects to an output
+/// section's symbol. `data` is the member's copy in the output.
+fn adjust_member<'a, F: ElfFormat>(
+    input: &RelocatableInput<'_, 'a, F>,
+    plan: &Plan<'a>,
+    member: &Member,
+    section: &InputSection<'a>,
+    data: &mut [u8],
+    arch: crate::elf::arch::Arch,
+) -> Result<()> {
+    let file = member.file as usize;
+    let Some(object) = input.refs.files.get(file).and_then(|f| f.object.as_ref()) else {
+        return Ok(());
     };
-    header.fill(0);
-    header[..4].copy_from_slice(b"\x7fELF");
-    header[4] = 2; // ELFCLASS64
-    header[5] = 1; // ELFDATA2LSB
-    header[6] = 1; // EV_CURRENT
-    header[7] = plan.os_abi;
-    header[16..18].copy_from_slice(&ET_REL.to_le_bytes());
-    header[18..20].copy_from_slice(&plan.machine.to_le_bytes());
-    header[20..24].copy_from_slice(&1u32.to_le_bytes());
-    header[40..48].copy_from_slice(&plan.shoff.to_le_bytes());
-    header[48..52].copy_from_slice(&plan.flags.to_le_bytes());
-    header[52..54].copy_from_slice(&64u16.to_le_bytes());
-    header[58..60].copy_from_slice(&64u16.to_le_bytes());
+    let Some(relocations) = relocations_of(object, section, plan.use_rel)? else {
+        return Ok(());
+    };
+    let context = Context {
+        refs: &input.refs,
+        assign: &plan.assign,
+        offsets: &plan.offsets,
+        kept: &plan.kept,
+        script_outs: &plan.script_outs,
+        use_rel: plan.use_rel,
+    };
+    for rel in (0..relocations.len()).filter_map(|i| relocations.get(i)) {
+        if let Rewritten::Keep { addend, .. } = rewrite(&context, file, object, &rel, section)? {
+            adjust_in_place(arch, &rel, addend, data);
+        }
+    }
+    Ok(())
+}
+
+fn write_header<F: ElfFormat>(plan: &Plan<'_>, out: &mut [u8]) {
     let (shnum, shstrndx) = if plan.section_count >= u32::from(SHN_LORESERVE) {
         (0, SHN_XINDEX)
     } else {
@@ -2085,12 +2291,34 @@ fn write_header(plan: &Plan<'_>, out: &mut [u8]) {
             u16::try_from(plan.shstrtab_index).unwrap_or(SHN_XINDEX),
         )
     };
-    header[60..62].copy_from_slice(&shnum.to_le_bytes());
-    header[62..64].copy_from_slice(&shstrndx.to_le_bytes());
+    let header = crate::elf::read::FileHeader {
+        class: F::CLASS,
+        data: <F::Endian as Endian>::ELF_DATA,
+        ident_version: 1,
+        os_abi: plan.os_abi,
+        abi_version: 0,
+        e_type: ET_REL,
+        e_machine: plan.machine,
+        e_version: 1,
+        e_entry: 0,
+        e_phoff: 0,
+        e_shoff: plan.shoff,
+        e_flags: plan.flags,
+        e_ehsize: 0,
+        e_phentsize: 0,
+        e_phnum: 0,
+        e_shentsize: 0,
+        e_shnum: shnum,
+        e_shstrndx: shstrndx,
+    };
+    let raw = F::encode_ehdr(&header);
+    if let Some(dest) = out.get_mut(..<F::Ehdr as RawRecord>::SIZE) {
+        dest.copy_from_slice(raw.as_bytes());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn put_shdr(
+fn put_shdr<F: ElfFormat>(
     out: &mut [u8],
     name: u32,
     sh_type: u32,
@@ -2102,19 +2330,22 @@ fn put_shdr(
     align: u64,
     entsize: u64,
 ) {
-    let Some(entry) = out.first_chunk_mut::<64>() else {
-        return;
+    let header = SectionHeader {
+        sh_name: name,
+        sh_type,
+        sh_flags: flags,
+        sh_addr: 0,
+        sh_offset: offset,
+        sh_size: size,
+        sh_link: link,
+        sh_info: info,
+        sh_addralign: align,
+        sh_entsize: entsize,
     };
-    entry[0..4].copy_from_slice(&name.to_le_bytes());
-    entry[4..8].copy_from_slice(&sh_type.to_le_bytes());
-    entry[8..16].copy_from_slice(&flags.to_le_bytes());
-    entry[16..24].fill(0);
-    entry[24..32].copy_from_slice(&offset.to_le_bytes());
-    entry[32..40].copy_from_slice(&size.to_le_bytes());
-    entry[40..44].copy_from_slice(&link.to_le_bytes());
-    entry[44..48].copy_from_slice(&info.to_le_bytes());
-    entry[48..56].copy_from_slice(&align.to_le_bytes());
-    entry[56..64].copy_from_slice(&entsize.to_le_bytes());
+    let raw = F::encode_shdr(&header);
+    if let Some(dest) = out.get_mut(..<F::Shdr as RawRecord>::SIZE) {
+        dest.copy_from_slice(raw.as_bytes());
+    }
 }
 
 /// The output symbol index of a group's signature.
@@ -2175,12 +2406,24 @@ fn write_section_headers<'a, F: crate::elf::read::ElfFormat>(
     out: &mut [u8],
 ) {
     out.fill(0);
-    let mut entries = out.as_chunks_mut::<64>().0.iter_mut();
+    let mut entries = out.chunks_mut(<F::Shdr as RawRecord>::SIZE);
     if let Some(first) = entries.next()
         && plan.section_count >= u32::from(SHN_LORESERVE)
     {
-        first[32..40].copy_from_slice(&u64::from(plan.section_count).to_le_bytes());
-        first[40..44].copy_from_slice(&plan.shstrtab_index.to_le_bytes());
+        // The null header carries the real section count and `.shstrtab`
+        // index (`SHN_XINDEX`).
+        put_shdr::<F>(
+            first,
+            0,
+            SHT_NULL,
+            0,
+            0,
+            u64::from(plan.section_count),
+            plan.shstrtab_index,
+            0,
+            0,
+            0,
+        );
     }
     for out_section in &plan.outs {
         let Some(entry) = entries.next() else {
@@ -2202,7 +2445,7 @@ fn write_section_headers<'a, F: crate::elf::read::ElfFormat>(
                 (link, 0)
             }
         };
-        put_shdr(
+        put_shdr::<F>(
             entry,
             out_section.name_offset,
             out_section.sh_type,
@@ -2223,39 +2466,39 @@ fn write_section_headers<'a, F: crate::elf::read::ElfFormat>(
             } else {
                 SHF_GROUP
             };
-            put_shdr(
+            put_shdr::<F>(
                 entry,
                 out_section.rela_name_offset,
-                SHT_RELA,
+                if plan.use_rel { SHT_REL } else { SHT_RELA },
                 SHF_INFO_LINK | group,
                 out_section.rela_offset,
-                out_section.relocs.saturating_mul(RELA_SIZE),
+                out_section.relocs.saturating_mul(plan.reloc_size),
                 plan.symtab_index,
                 out_section.index,
-                8,
-                RELA_SIZE,
+                F::WORD_SIZE as u64,
+                plan.reloc_size,
             );
         }
     }
     let [symtab_name, shndx_name, strtab_name, shstrtab_name] = plan.trailer_names;
     if let Some(entry) = entries.next() {
-        put_shdr(
+        put_shdr::<F>(
             entry,
             symtab_name,
             SHT_SYMTAB,
             0,
             plan.symtab_offset,
-            plan.symbol_count.saturating_mul(SYM_SIZE),
+            plan.symbol_count.saturating_mul(sym_size::<F>()),
             plan.strtab_index,
             plan.first_global,
-            8,
-            SYM_SIZE,
+            F::WORD_SIZE as u64,
+            sym_size::<F>(),
         );
     }
     if plan.shndx_index != 0
         && let Some(entry) = entries.next()
     {
-        put_shdr(
+        put_shdr::<F>(
             entry,
             shndx_name,
             SHT_SYMTAB_SHNDX,
@@ -2269,7 +2512,7 @@ fn write_section_headers<'a, F: crate::elf::read::ElfFormat>(
         );
     }
     if let Some(entry) = entries.next() {
-        put_shdr(
+        put_shdr::<F>(
             entry,
             strtab_name,
             SHT_STRTAB,
@@ -2283,7 +2526,7 @@ fn write_section_headers<'a, F: crate::elf::read::ElfFormat>(
         );
     }
     if let Some(entry) = entries.next() {
-        put_shdr(
+        put_shdr::<F>(
             entry,
             shstrtab_name,
             SHT_STRTAB,
@@ -2320,7 +2563,19 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
     let Some(section) = object.section(member.section) else {
         return Ok(());
     };
-    let Some(relas) = relocations_of(object, section)? else {
+    // The synthesized `R_LARCH_ALIGN` of the `nop` padding before this
+    // member (LoongArch `-r`): no symbol, and the padding as its addend.
+    // A section with no relocations of its own has only this one.
+    let synthesized = (member.align_pad != 0).then(|| Relocation {
+        offset: member.offset.wrapping_sub(member.align_pad),
+        symbol: 0,
+        r_type: crate::elf::arch::loongarch::R_LARCH_ALIGN,
+        addend: member.align_pad as i64,
+    });
+    let Some(relas) = relocations_of(object, section, plan.use_rel)? else {
+        if let Some(rel) = synthesized {
+            write_one_reloc::<F>(out, plan, &rel);
+        }
         return Ok(());
     };
     let context = Context {
@@ -2329,12 +2584,13 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
         offsets: &plan.offsets,
         kept: &plan.kept,
         script_outs: &plan.script_outs,
+        use_rel: plan.use_rel,
     };
     // GNU ld sorts each output relocation section by offset, keeping the
     // order of equal offsets (`elf_link_adjust_relocs`); members do not
     // overlap, so sorting each member's relocations is enough.
-    let mut sorted: Vec<(u64, u64, i64)> = Vec::with_capacity(relas.len());
-    for rel in relas.iter() {
+    let mut sorted: Vec<Relocation> = Vec::with_capacity(relas.len());
+    for rel in (0..relas.len()).filter_map(|i| relas.get(i)) {
         let Rewritten::Keep {
             symbol,
             r_type,
@@ -2351,25 +2607,50 @@ fn write_rela<'a, F: crate::elf::read::ElfFormat>(
         };
         let (index, r_type, addend) = match index {
             Some(index) => (index, r_type, addend),
-            None => (0, R_X86_64_NONE, 0),
+            None => (0, R_NONE, 0),
         };
-        let offset = rel.offset.wrapping_add(member.offset);
-        let info = (u64::from(index) << 32) | u64::from(r_type);
-        sorted.push((offset, info, addend));
+        sorted.push(Relocation {
+            offset: rel.offset.wrapping_add(member.offset),
+            symbol: index,
+            r_type,
+            // `SHT_REL` keeps the addend in the field the relocation
+            // patches; `adjust_member` put it there.
+            addend: if plan.use_rel { 0 } else { addend },
+        });
     }
-    sorted.sort_by_key(|&(offset, ..)| offset);
-    let entries = out.as_chunks_mut::<24>().0;
+    sorted.extend(synthesized);
+    sorted.sort_by_key(|rel| rel.offset);
+    let size = usize::try_from(plan.reloc_size).unwrap_or(usize::MAX);
+    let entries = out.chunks_mut(size.max(1));
     if sorted.len() as u64 != member.relocs || entries.len() < sorted.len() {
         return Err(Error::Internal(
             "relocatable output: relocation count changed after planning".into(),
         ));
     }
-    for (entry, (offset, info, addend)) in entries.iter_mut().zip(sorted) {
-        entry[0..8].copy_from_slice(&offset.to_le_bytes());
-        entry[8..16].copy_from_slice(&info.to_le_bytes());
-        entry[16..24].copy_from_slice(&addend.to_le_bytes());
+    for (entry, rel) in entries.zip(sorted) {
+        write_one_reloc::<F>(entry, plan, &rel);
     }
     Ok(())
+}
+
+/// Writes one relocation entry in the output's class, byte order and
+/// relocation form.
+fn write_one_reloc<F: crate::elf::read::ElfFormat>(
+    entry: &mut [u8],
+    plan: &Plan<'_>,
+    rel: &Relocation,
+) {
+    if plan.use_rel {
+        let encoded = F::encode_rel(rel);
+        if let Some(dest) = entry.get_mut(..<F::Rel as RawRecord>::SIZE) {
+            dest.copy_from_slice(encoded.as_bytes());
+        }
+    } else {
+        let encoded = F::encode_rela(rel);
+        if let Some(dest) = entry.get_mut(..<F::Rela as RawRecord>::SIZE) {
+            dest.copy_from_slice(encoded.as_bytes());
+        }
+    }
 }
 
 /// The 16-bit section index field for output section list index `out`.
@@ -2388,17 +2669,27 @@ fn shndx_of(plan: &Plan<'_>, place: Place) -> (u16, u32) {
     }
 }
 
-fn put_sym(out: &mut [u8], name: u64, info: u8, other: u8, shndx: u16, value: u64, size: u64) {
-    let Some(entry) = out.first_chunk_mut::<24>() else {
-        return;
+fn put_sym<F: ElfFormat>(
+    out: &mut [u8],
+    name: u64,
+    info: u8,
+    other: u8,
+    shndx: u16,
+    value: u64,
+    size: u64,
+) {
+    let symbol = RawSymbol {
+        st_name: u32::try_from(name).unwrap_or(0),
+        st_info: info,
+        st_other: other,
+        st_shndx: shndx,
+        st_value: value,
+        st_size: size,
     };
-    let name = u32::try_from(name).unwrap_or(0);
-    entry[0..4].copy_from_slice(&name.to_le_bytes());
-    entry[4] = info;
-    entry[5] = other;
-    entry[6..8].copy_from_slice(&shndx.to_le_bytes());
-    entry[8..16].copy_from_slice(&value.to_le_bytes());
-    entry[16..24].copy_from_slice(&size.to_le_bytes());
+    let raw = F::encode_sym(&symbol);
+    if let Some(dest) = out.get_mut(..<F::Sym as RawRecord>::SIZE) {
+        dest.copy_from_slice(raw.as_bytes());
+    }
 }
 
 /// Splits `out` into the null symbol and section symbols, one slice per
@@ -2436,9 +2727,11 @@ fn write_symtab<'a, F: crate::elf::read::ElfFormat>(
         offsets: &plan.offsets,
         kept: &plan.kept,
         script_outs: &plan.script_outs,
+        use_rel: plan.use_rel,
     };
-    let (head, files, globals) = split_symbols(plan, out, 24);
-    let mut entries = head.as_chunks_mut::<24>().0.iter_mut();
+    let width = <F::Sym as RawRecord>::SIZE;
+    let (head, files, globals) = split_symbols(plan, out, width);
+    let mut entries = head.chunks_mut(width);
     if let Some(null) = entries.next() {
         null.fill(0);
     }
@@ -2447,7 +2740,7 @@ fn write_symtab<'a, F: crate::elf::read::ElfFormat>(
             .ok()
             .filter(|&i| i < SHN_LORESERVE)
             .unwrap_or(SHN_XINDEX);
-        put_sym(entry, 0, (STB_LOCAL << 4) | STT_SECTION, 0, shndx, 0, 0);
+        put_sym::<F>(entry, 0, (STB_LOCAL << 4) | STT_SECTION, 0, shndx, 0, 0);
     }
     files.into_par_iter().enumerate().zip(&plan.files).for_each(
         |((file_index, out), file_plan)| {
@@ -2461,11 +2754,11 @@ fn write_symtab<'a, F: crate::elf::read::ElfFormat>(
             };
             let symbols = object.elf.symbols();
             let mut name = file_plan.names;
-            let mut entries = out.as_chunks_mut::<24>().0.iter_mut();
+            let mut entries = out.chunks_mut(width);
             if let Some(file_name) = &file_plan.file_name
                 && let Some(entry) = entries.next()
             {
-                put_sym(entry, name, (STB_LOCAL << 4) | STT_FILE, 0, SHN_ABS, 0, 0);
+                put_sym::<F>(entry, name, (STB_LOCAL << 4) | STT_FILE, 0, SHN_ABS, 0, 0);
                 name = name
                     .saturating_add(file_name.len() as u64)
                     .saturating_add(1);
@@ -2485,7 +2778,7 @@ fn write_symtab<'a, F: crate::elf::read::ElfFormat>(
                 )
                 .unwrap_or((Place::Absolute, 0));
                 let (shndx, _) = shndx_of(plan, place);
-                put_sym(
+                put_sym::<F>(
                     entry,
                     name,
                     raw.st_info,
@@ -2499,9 +2792,9 @@ fn write_symtab<'a, F: crate::elf::read::ElfFormat>(
         },
     );
     let mut name = plan.global_names;
-    for (global, entry) in plan.globals.iter().zip(globals.as_chunks_mut::<24>().0) {
+    for (global, entry) in plan.globals.iter().zip(globals.chunks_mut(width)) {
         let (shndx, _) = shndx_of(plan, global.place);
-        put_sym(
+        put_sym::<F>(
             entry,
             name,
             global.info,
@@ -2527,6 +2820,7 @@ fn write_shndx<'a, F: crate::elf::read::ElfFormat>(
         offsets: &plan.offsets,
         kept: &plan.kept,
         script_outs: &plan.script_outs,
+        use_rel: plan.use_rel,
     };
     let (head, files, globals) = split_symbols(plan, out, 4);
     for (out_section, entry) in plan
@@ -2535,7 +2829,7 @@ fn write_shndx<'a, F: crate::elf::read::ElfFormat>(
         .zip(head.as_chunks_mut::<4>().0.iter_mut().skip(1))
     {
         if out_section.index >= u32::from(SHN_LORESERVE) {
-            *entry = out_section.index.to_le_bytes();
+            *entry = F::Endian::put_u32(out_section.index);
         }
     }
     files.into_par_iter().enumerate().zip(&plan.files).for_each(
@@ -2567,14 +2861,14 @@ fn write_shndx<'a, F: crate::elf::read::ElfFormat>(
                     &raw,
                 ) {
                     let (_, extended) = shndx_of(plan, place);
-                    *entry = extended.to_le_bytes();
+                    *entry = F::Endian::put_u32(extended);
                 }
             }
         },
     );
     for (global, entry) in plan.globals.iter().zip(globals.as_chunks_mut::<4>().0) {
         let (_, extended) = shndx_of(plan, global.place);
-        *entry = extended.to_le_bytes();
+        *entry = F::Endian::put_u32(extended);
     }
 }
 

@@ -1252,6 +1252,56 @@ fn toc_accesses_and_calls_match() {
     );
 }
 
+/// GNU ld's `elf64lppc` script puts `.toc` inside the output `.got`
+/// (`*(.got .toc)`), so both stay within reach of the TOC pointer; lld
+/// leaves `.toc` as a separate orphan.
+#[test]
+fn toc_goes_into_the_got_section() {
+    let tools = require!();
+    let dir = scratch("toc-placement");
+    compile(tools, &dir, "toc.s", TOC_ASM, &[]);
+    let ours = link_and_compare(tools, &dir, "exe", &["-static", "-e", "get", "toc.o"]);
+    assert!(
+        ours.section(".toc").is_none(),
+        "`.toc` should have been merged into `.got`"
+    );
+    let got = ours.section(".got").expect(".got");
+    assert!(
+        got.size >= 16,
+        "`.got` should hold the reserved word and the `.toc` entry, not {}",
+        got.size
+    );
+    // The `.toc` entry stays within reach of the TOC pointer.
+    let toc = ours.toc();
+    let end = got.addr + got.size;
+    assert!(
+        end > toc.wrapping_sub(0x8000) && end <= toc.wrapping_add(0x8000),
+        "`.toc` is out of reach of the TOC pointer"
+    );
+}
+
+const TOC_ASM: &str = r#"
+	.abiversion 2
+	.text
+	.globl	get
+	.type	get,@function
+get:
+	addis	3, 2, .LC0@toc@ha
+	ld	3, .LC0@toc@l(3)
+	lwz	3, 0(3)
+	blr
+	.size	get, .-get
+
+	.section	.toc,"aw",@progbits
+.LC0:
+	.tc	counter[TC],counter
+
+	.data
+	.globl	counter
+counter:
+	.long	7
+"#;
+
 const LIBRARY: &str = r#"
 int lib_var = 42;
 int lib_func(int x) { return x + lib_var; }

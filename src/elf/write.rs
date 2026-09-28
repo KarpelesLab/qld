@@ -489,7 +489,7 @@ fn write_chunk<F: crate::elf::read::ElfFormat>(
             Ok(())
         }
         Chunk::Symtab => {
-            write_symtab(input.symtab, addresses, input.linker, out);
+            write_symtab(input.symtab, addresses, input.linker, input.options, out);
             Ok(())
         }
         Chunk::Strtab => {
@@ -578,10 +578,10 @@ fn write_headers_as<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [
         class: F::CLASS,
         data: <F::Endian as Endian>::ELF_DATA,
         ident_version: 1, // EV_CURRENT
-        os_abi: if input.addresses.synth.iplt.is_empty() {
-            0
+        os_abi: if super::synth::gnu_osabi(input.addresses.refs.files, input.addresses.synth) {
+            crate::elf::read::consts::ELFOSABI_GNU
         } else {
-            3 // ELFOSABI_GNU
+            crate::elf::read::consts::ELFOSABI_NONE
         },
         abi_version: 0,
         e_type: if pic { ET_DYN } else { ET_EXEC },
@@ -1370,13 +1370,16 @@ fn section_dyn_relocs<F: crate::elf::read::ElfFormat>(
     };
     let arch = context.arch;
     let base = addresses.section_address(id).unwrap_or(0);
+    let Some(targets) = refs.for_file(file_index) else {
+        return out;
+    };
     let mut skip = false;
     arch::for_each_relocation!(arch, relocations.relocations, data, |rel| {
         if skip {
             skip = false;
             continue;
         }
-        let Some(target) = refs.target(file_index, rel.symbol as usize) else {
+        let Some(target) = targets.target(rel.symbol as usize) else {
             continue;
         };
         let flags = target
@@ -1692,8 +1695,23 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         return super::arch::riscv::apply::write_section(input, section, out);
     }
 
-    if let Some(dest) = out.get_mut(..data.len()) {
-        dest.copy_from_slice(data);
+    // LoongArch linker relaxation deletes and replaces instructions: the
+    // section is copied with those edits applied, and each relocation then
+    // writes where its instruction ended up ([`super::arch::shrink`]).
+    let relax = if input.context.arch == Arch::LoongArch64 {
+        addresses.layout.relax.section(id)
+    } else {
+        None
+    };
+    match relax {
+        Some(edits) => {
+            super::arch::shrink::copy(data, edits, out, super::arch::loongarch::write_nops)
+        }
+        None => {
+            if let Some(dest) = out.get_mut(..data.len()) {
+                dest.copy_from_slice(data);
+            }
+        }
     }
     if section.relocs == 0 {
         return Ok(());
@@ -1724,11 +1742,30 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
     // check is hoisted out of the loop: the call alone cost 0.7% of the
     // link's instructions on every relocation of every link.
     let nocrossrefs = !addresses.layout.nocrossrefs.is_empty();
+    let Some(targets) = refs.for_file(file_index) else {
+        return Ok(());
+    };
     let mut skip = false;
+    let mut index = 0u32;
     arch::for_each_relocation!(arch, relocations, data, |rel| {
         if skip {
             skip = false;
             continue;
+        }
+        // Where the relocation's instruction is in the output, and the
+        // relocation a relaxed one takes: its place in the input, which the
+        // classification reads, does not move.
+        let mut at = rel.offset;
+        let mut rel = rel;
+        if let Some(edits) = relax {
+            at = edits.map(at);
+            let edit = edits.edit_of_index(index);
+            index = index.wrapping_add(1);
+            match edit.map(|e| e.rewrite) {
+                Some(super::arch::shrink::Rewrite::Delete) => continue,
+                Some(super::arch::shrink::Rewrite::Replace { r_type, .. }) => rel.r_type = r_type,
+                _ => {}
+            }
         }
         let report = |message: String| {
             input.diagnostics.emit(
@@ -1737,7 +1774,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                     .order(order),
             );
         };
-        let Some(target) = refs.target(file_index, rel.symbol as usize) else {
+        let Some(target) = targets.target(rel.symbol as usize) else {
             continue;
         };
         if nocrossrefs && let Some((from, to)) = prohibited_cross_reference(input, id, &target) {
@@ -1764,7 +1801,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         if class.kind == Kind::None || (alloc && decision.problem.is_some()) {
             continue;
         }
-        let place = base.wrapping_add(rel.offset);
+        let place = base.wrapping_add(at);
         let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
         if !alloc
             && matches!(class.kind, Kind::Abs | Kind::DtpOff)
@@ -1772,7 +1809,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             && let Some(value) = tombstone.get(dead)
         {
             let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-            let _ = arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value);
+            let _ = arch::write_value_as::<F::Endian>(out, at, class.width, value);
             continue;
         }
         let resolved = addresses.symbol_address(&target, rel.addend);
@@ -1789,12 +1826,12 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 // Both labels of a difference in a discarded section count
                 // from zero, which keeps the difference (lld does the same).
                 if let Some(delta) = add_delta(class.kind, rel.addend as u64) {
-                    let _ = arch::add_value_as::<F::Endian>(out, rel.offset, class.width, delta);
+                    let _ = arch::add_value_as::<F::Endian>(out, at, class.width, delta);
                     continue;
                 }
                 let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
                 let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-                let _ = arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value);
+                let _ = arch::write_value_as::<F::Endian>(out, at, class.width, value);
                 continue;
             }
         };
@@ -1802,6 +1839,13 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             if target.is_ifunc()
                 && let Some(stub) = addresses.iplt_address(owner)
             {
+                // The ELFv1 ABI's canonical address of a function is its
+                // descriptor, and qld's IFUNC stub is code, so taking one's
+                // address is refused rather than written wrong (M4).
+                if arch == super::arch::Arch::Ppc64Be && class.kind != Kind::Pc {
+                    report(ppc64_opd_ifunc_address(refs, file_index, rel.symbol));
+                    continue;
+                }
                 s = stub;
             }
             if flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
@@ -1819,7 +1863,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 .ok_or(ApplyError::BadInstruction)
         };
         let put = |out: &mut [u8], value: u64| {
-            arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value)
+            arch::write_value_as::<F::Endian>(out, at, class.width, value)
         };
         let page = crate::arch::aarch64::page;
         let page_delta = |target: u64| arch.page_delta(target, place, rel.r_type);
@@ -1833,7 +1877,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 if matches!(target.def, super::refs::Def::Undefined { .. })
                     && sa == 0
                     && arch
-                        .nop_undefined_branch(out, rel.offset, rel.r_type)
+                        .nop_undefined_branch(out, at, rel.r_type)
                         .unwrap_or(false) =>
             {
                 Ok(())
@@ -1851,7 +1895,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                             .get(id.index())
                             .copied()
                             .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
-                        && let Some(thunk) = addresses.layout.thunk_for(output, sa)
+                        && let Some(thunk) = addresses.layout.thunk_for(output, sa, place)
                     {
                         sa = thunk;
                     }
@@ -1859,24 +1903,34 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 }
                 // PowerPC64 calls: local entry points, stubs and TOC
                 // restores.
-                Width::Ppc(crate::arch::ppc64::Field::Rel24) => ppc64_branch(
-                    out,
-                    addresses,
-                    id,
-                    &rel,
-                    PpcBranch {
-                        place,
-                        target: sa,
-                        st_other: target.raw.map_or(0, |raw| raw.st_other),
-                        via_stub: alloc
-                            && ((target.is_ifunc() && addresses.iplt_address(owner).is_some())
-                                || (flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
-                                    && arch.is_branch(rel.r_type)
-                                    && addresses.plt_address(owner).is_some())),
-                        owner,
-                        width: class.width,
-                    },
-                ),
+                Width::Ppc(crate::arch::ppc64::Field::Rel24) => {
+                    let via_stub = alloc
+                        && ((target.is_ifunc() && addresses.iplt_address(owner).is_some())
+                            || (flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
+                                && arch.is_branch(rel.r_type)
+                                && addresses.plt_address(owner).is_some()));
+                    // ELFv1: the symbol names a function descriptor, the
+                    // call has to reach the code it points at.
+                    let call_target = if arch == super::arch::Arch::Ppc64Be && !via_stub {
+                        ppc64_opd_target(addresses, &target, a).unwrap_or(sa)
+                    } else {
+                        sa
+                    };
+                    ppc64_branch(
+                        out,
+                        addresses,
+                        id,
+                        &rel,
+                        PpcBranch {
+                            place,
+                            target: call_target,
+                            st_other: target.raw.map_or(0, |raw| raw.st_other),
+                            via_stub,
+                            owner,
+                            width: class.width,
+                        },
+                    )
+                }
                 _ => put(out, sa.wrapping_sub(place)),
             },
             Kind::Page => put(out, page_delta(sa)),
@@ -1889,13 +1943,13 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             Kind::PageOff => put(out, sa),
             Kind::Add | Kind::Sub => {
                 let delta = add_delta(class.kind, sa).unwrap_or_default();
-                arch::add_value_as::<F::Endian>(out, rel.offset, class.width, delta)
+                arch::add_value_as::<F::Endian>(out, at, class.width, delta)
             }
-            Kind::Relax => arch.relax(out, rel.offset, rel.r_type, sa, place),
+            Kind::Relax => arch.relax(out, at, rel.r_type, sa, place),
             Kind::GotRelax => slot_address().and_then(|g| {
                 arch.relax_got_load(
                     out,
-                    rel.offset,
+                    at,
                     rel.r_type,
                     s,
                     RelaxValues {
@@ -1929,7 +1983,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 .and_then(|g| {
                     arch.relax_tls(
                         out,
-                        rel.offset,
+                        at,
                         class.kind,
                         rel.r_type,
                         RelaxValues {
@@ -1941,13 +1995,11 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                         },
                     )
                 }),
-            Kind::RelaxGotPc => {
-                arch.relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
-            }
-            Kind::RelaxGotPcNoPic => arch.relax_got(out, rel.offset, class.kind, sa as i64),
+            Kind::RelaxGotPc => arch.relax_got(out, at, class.kind, sa.wrapping_sub(place) as i64),
+            Kind::RelaxGotPcNoPic => arch.relax_got(out, at, class.kind, sa as i64),
             Kind::RelaxGotOff => arch.relax_got(
                 out,
-                rel.offset,
+                at,
                 class.kind,
                 sa.wrapping_sub(addresses.got_base()) as i64,
             ),
@@ -1982,6 +2034,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                     .wrapping_add_signed(a)
                     .wrapping_sub(place),
             ),
+            Kind::GotBase => put(out, addresses.got_base().wrapping_add_signed(a)),
             Kind::Size => {
                 let size = target.raw.map_or(0, |r| r.st_size);
                 put(out, size.wrapping_add_signed(a))
@@ -2024,7 +2077,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 };
                 arch.relax_tls(
                     out,
-                    rel.offset,
+                    at,
                     class.kind,
                     rel.r_type,
                     RelaxValues {
@@ -2092,6 +2145,41 @@ fn add_delta(kind: Kind, value: u64) -> Option<u64> {
     }
 }
 
+/// The diagnostic for taking the address of an ELFv1 IFUNC, which needs
+/// the function descriptor GNU ld's `.iplt` entry is; qld's IFUNC stub is
+/// code, so the address is refused rather than written wrong.
+#[cold]
+#[inline(never)]
+fn ppc64_opd_ifunc_address<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    symbol: u32,
+) -> String {
+    let name = symbol_name(refs, file, symbol);
+    format!(
+        "taking the address of the ifunc `{name}' is not implemented for the \
+         PowerPC64 ELFv1 ABI: it needs a function descriptor"
+    )
+}
+
+/// The code a PowerPC64 ELFv1 call reaches: the symbol names a function
+/// descriptor in `.opd`, whose first doubleword holds the entry point, so
+/// the descriptor's `R_PPC64_ADDR64` is resolved in its place. The call's
+/// own addend `a` still applies. `None` when the symbol is not a
+/// descriptor (an old compiler's "dot" symbol, say), and the caller keeps
+/// the symbol's own address.
+#[inline(never)]
+fn ppc64_opd_target<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    target: &super::refs::Target,
+    a: i64,
+) -> Option<u64> {
+    let (file, entry) = super::arch::ppc64_elfv1::descriptor(&addresses.refs, target, a)?;
+    let code = addresses.refs.target(file, entry.symbol as usize)?;
+    let (s, addend) = addresses.symbol_address(&code, entry.addend)?;
+    Some(s.wrapping_add_signed(addend))
+}
+
 /// What [`ppc64_branch`] needs to know about a call besides the relocation.
 struct PpcBranch {
     place: u64,
@@ -2115,7 +2203,7 @@ fn ppc64_branch<F: crate::elf::read::ElfFormat>(
     rel: &crate::elf::read::Relocation,
     call: PpcBranch,
 ) -> std::result::Result<(), ApplyError> {
-    let arch = super::arch::Arch::Ppc64;
+    let arch = addresses.synth.arch;
     let slot = if call.via_stub {
         super::values::plt_slot_address(addresses.synth, addresses.layout, call.owner)
     } else {
@@ -2137,12 +2225,12 @@ fn ppc64_branch<F: crate::elf::read::ElfFormat>(
             .get(id.index())
             .copied()
             .and_then(|shndx| addresses.layout.output_of_shndx(shndx))
-        && let Some(thunk) = addresses.layout.thunk_for(output, destination)
+        && let Some(thunk) = addresses.layout.thunk_for(output, destination, call.place)
     {
         sa = thunk;
     }
     arch.finish_call(out, rel.offset, branch)?;
-    arch::write_value(out, rel.offset, call.width, sa.wrapping_sub(call.place))
+    arch::write_value_as::<F::Endian>(out, rel.offset, call.width, sa.wrapping_sub(call.place))
 }
 
 /// Writes a PowerPC64 TOC-relative access, relaxing it to address the
@@ -2170,7 +2258,7 @@ fn ppc64_toc_access<F: crate::elf::read::ElfFormat>(
             Some((address, field)) => (address, Width::Ppc(field)),
             None => (sa, width),
         };
-    arch::write_value(
+    arch::write_value_as::<F::Endian>(
         out,
         rel.offset,
         width,

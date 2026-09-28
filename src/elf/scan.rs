@@ -233,6 +233,9 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
     let Some(object) = &file.object else {
         return result;
     };
+    let Some(targets) = refs.for_file(file_index) else {
+        return result;
+    };
     let order = file.position.raw();
     if let Some(error) = context.arch.incompatible(refs.files, file_index) {
         result.errors.push(Diagnostic::error(error).order(order));
@@ -296,7 +299,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                 // The call a TLS relaxation removed still counts as a use
                 // (GNU ld keeps `__tls_get_addr` in the dynamic symbols).
                 skip = false;
-                if let Some(id) = refs.global_id(file_index, rel.symbol as usize) {
+                if let Some(id) = targets.global_id(rel.symbol as usize) {
                     refs.symbols.set_flags(id, REF_LIVE);
                     if F::WORD_SIZE == 4 && matches!(context.arch, Arch::I386 | Arch::X32) {
                         removed_tls_call(refs, context, id, rel.r_type);
@@ -304,7 +307,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                 }
                 continue;
             }
-            let Some(target) = refs.target(file_index, rel.symbol as usize) else {
+            let Some(target) = targets.target(rel.symbol as usize) else {
                 result.errors.push(
                     Diagnostic::error(format!(
                         "{}: relocation refers to invalid symbol index {}",

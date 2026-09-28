@@ -540,7 +540,7 @@ impl<'w, 'x, 'a, F: crate::elf::read::ElfFormat> Writer<'_, 'w, 'x, 'a, F> {
             .copied()
             .unwrap_or(0);
         let output = layout.output_of_shndx(shndx)?;
-        layout.thunk_for(output, key)
+        layout.thunk_for(output, key, branch.place)
     }
 }
 

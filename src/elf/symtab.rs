@@ -26,7 +26,7 @@ use crate::elf::read::{ElfFormat, ElfKind, RawRecord, RawSymbol, SectionIndex};
 use crate::ids::SymbolId;
 use crate::symbols::{DefinitionKind, SymbolFlags};
 
-use super::defined::{LinkerSymbols, is_hidden};
+use super::defined::LinkerSymbols;
 use super::dso::{REF_REGULAR, REF_REGULAR_STRONG};
 use super::dynsym::shndx_of_address;
 use super::export::PREEMPTIBLE;
@@ -69,6 +69,11 @@ pub struct SymtabPlan {
     pub strtab_size: usize,
     /// Section symbols at the start of the table (`--emit-relocs`).
     pub section_symbols: usize,
+    /// Arm mapping symbols for linker-generated code, after the section
+    /// symbols ([`crate::elf::arch::arm::mapping`]).
+    pub mapping_symbols: usize,
+    /// String table offset of the block the mapping symbols' names share.
+    mapping_names: usize,
     /// The ELF class and byte order entries are written in.
     pub kind: ElfKind,
 }
@@ -87,13 +92,14 @@ fn keep_local(name: &[u8], raw: &RawSymbol, discard: DiscardMode) -> bool {
 fn global_visibility<F: crate::elf::read::ElfFormat>(
     refs: &Refs<'_, '_, F>,
     linker: &LinkerSymbols,
+    options: &LinkOptions,
     id: SymbolId,
 ) -> u8 {
     let target = refs.global_target(id, true);
     if let Def::Linker(_) = target.def {
         return match linker.entries.iter().find(|(i, _)| *i == id) {
-            Some((_, value)) if is_hidden(*value) => STV_HIDDEN,
-            _ => STV_DEFAULT,
+            Some((_, value)) => super::defined::visibility(*value, options),
+            None => STV_DEFAULT,
         };
     }
     target.raw.map_or(STV_DEFAULT, |raw| raw.visibility())
@@ -290,7 +296,7 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
             if !emit {
                 return None;
             }
-            let visibility = global_visibility(refs, linker, id);
+            let visibility = global_visibility(refs, linker, options, id);
             // GNU ld makes a hidden symbol local when it hides it itself:
             // the linker's and scripts' hidden symbols always, and every
             // hidden symbol of a shared object output. (In a PIE it also
@@ -371,6 +377,27 @@ impl SymtabPlan {
         self.first_global = self.first_global.saturating_add(count);
         self.count = self.count.saturating_add(count);
         self.section_symbols = self.section_symbols.saturating_add(count);
+    }
+
+    /// Puts `count` Arm mapping symbols after the section symbols, moving
+    /// every other symbol up, and reserves the block their three names
+    /// share at the end of `.strtab`. Layout sized both tables for them
+    /// ([`crate::elf::layout::Layout::mapping_symbols`]).
+    pub fn add_mapping_symbols(&mut self, count: usize) {
+        if self.is_empty() || count == 0 {
+            return;
+        }
+        for base in &mut self.local_base {
+            *base = base.saturating_add(count);
+        }
+        self.hidden_base = self.hidden_base.saturating_add(count);
+        self.first_global = self.first_global.saturating_add(count);
+        self.count = self.count.saturating_add(count);
+        self.mapping_symbols = self.mapping_symbols.saturating_add(count);
+        self.mapping_names = self.strtab_size;
+        self.strtab_size = self
+            .strtab_size
+            .saturating_add(crate::elf::arch::arm::mapping::NAMES.len());
     }
 
     /// The table index of local symbol `symbol` of `file`, if it is kept.
@@ -519,16 +546,18 @@ pub fn write_symtab<F: crate::elf::read::ElfFormat>(
     plan: &SymtabPlan,
     addresses: &Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
+    options: &LinkOptions,
     out: &mut [u8],
 ) {
     // The link's input format is its output format.
-    write_symtab_as::<F>(plan, addresses, linker, out);
+    write_symtab_as::<F>(plan, addresses, linker, options, out);
 }
 
 fn write_symtab_as<F: ElfFormat>(
     plan: &SymtabPlan,
     addresses: &Addresses<'_, '_, F>,
     linker: &LinkerSymbols,
+    options: &LinkOptions,
     out: &mut [u8],
 ) {
     /// Splits `out` after `count` entries, clamped to what it holds.
@@ -559,10 +588,29 @@ fn write_symtab_as<F: ElfFormat>(
             0,
         );
     }
+    // Arm mapping symbols for the PLT and the thunk pools, in one block
+    // after the section symbols; their names share one block of `.strtab`.
+    let (marks, rest) = split::<F>(rest, plan.mapping_symbols);
+    for (entry, mark) in marks
+        .chunks_exact_mut(entry_size)
+        .zip(&addresses.layout.mapping_symbols)
+    {
+        put_sym::<F>(
+            entry,
+            plan.mapping_names
+                .saturating_add(mark.name.try_into().unwrap_or(0)),
+            (STB_LOCAL << 4) | STT_NOTYPE,
+            0,
+            mark.shndx,
+            mark.address,
+            0,
+        );
+    }
     let local_count = plan
         .hidden_base
         .saturating_sub(1)
-        .saturating_sub(plan.section_symbols);
+        .saturating_sub(plan.section_symbols)
+        .saturating_sub(plan.mapping_symbols);
     let (locals, rest) = split::<F>(rest, local_count);
     let (hidden_file, rest) = split::<F>(rest, usize::from(plan.hidden_file));
     for entry in hidden_file.chunks_exact_mut(entry_size) {
@@ -676,7 +724,7 @@ fn write_symtab_as<F: ElfFormat>(
                 )
             }
             Def::Linker(_) => {
-                let visibility = global_visibility(refs, linker, id);
+                let visibility = global_visibility(refs, linker, options, id);
                 let absolute = refs.symbols.flags(id).contains(super::defined::ABSOLUTE);
                 (
                     STB_GLOBAL,
@@ -759,6 +807,19 @@ pub fn write_strtab<F: crate::elf::read::ElfFormat>(
 ) {
     /// Globals whose names one task writes.
     const NAMES_PER_TASK: usize = 4096;
+    // The Arm mapping symbols' three names, in the block the plan
+    // reserved after every other name.
+    let mut out = out;
+    if plan.mapping_symbols != 0 {
+        let at = plan.mapping_names.min(out.len());
+        let (head, block) = std::mem::take(&mut out).split_at_mut(at);
+        let marks = crate::elf::arch::arm::mapping::NAMES;
+        let len = marks.len().min(block.len());
+        if let (Some(block), Some(marks)) = (block.get_mut(..len), marks.get(..len)) {
+            block.copy_from_slice(marks);
+        }
+        out = head;
+    }
     enum Task<'p> {
         /// Local names of a file.
         Locals(usize),

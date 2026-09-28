@@ -86,12 +86,12 @@ can work at the same time without colliding.
 | W45 | s390x, the first big-endian target (M4) | `src/elf/arch/s390x*`, `src/arch/s390x*`, big-endian enablement in the ELF format layer, `tests/s390x*`, `tests/fixtures/s390x-*` | W40 | in progress |
 | W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | merged |
 | W47 | Single-thread speed and scaling (M5) | hot paths in `src/elf/{write,scan,reloc,object,inputs,layout}*`, `src/symbols/**`, `src/input/**`, `src/main.rs` (allocator tuning, agreed), `benches/**`, `tests/projects/bench*` | W42 | in progress |
-| W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | in progress |
-| W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | in progress |
-| W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | in progress |
+| W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | merged |
+| W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | merged |
+| W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | merged |
 | W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | in progress |
-| W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | in progress |
-| W53 | Option coverage and GNU differences | `src/args/**`, the x86-64 difference fixes in `src/elf/{defined,dynsym,synth}*`, `tests/args*` | W22, W43 | in progress |
+| W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | merged |
+| W53 | Option coverage and GNU differences | `src/args/**`, the x86-64 difference fixes in `src/elf/{defined,dynsym,synth}*`, `tests/args*` | W22, W43 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -628,24 +628,40 @@ remaining option and GNU-difference gaps.
 
 ## Integration follow-ups
 
-- **W43 (x32):** differences from GNU ld that are x86-64-wide, found while
-  comparing x32: a GOT slot for a symbol weak-undefined in the inputs but
-  defined by the linker (`_DYNAMIC`) holds the link-time address **with no
-  `RELATIVE` relocation in a PIE** — a correctness bug worth its own fix;
-  `__ehdr_start` is `SHN_ABS` where GNU makes it section-relative; no
-  `ELFOSABI_GNU` for a shared object whose only IFUNC needs no stub; in
-  position-dependent output GNU turns a `GOTPCRELX` load into `mov $foo`
-  where qld writes `lea` (matched on x32 only); ELF32 `.symtab` is 8-aligned
-  and `.eh_frame` carries a terminator GNU omits.
-- **W44 (RV32):** `-r` for ELF32 output (`relocatable.rs` writes 64-bit
-  records) blocks partial links for RV32, i386 and x32;
+- **W53 (options):** `--print-sysroot` and `--print-output-format` need new
+  `ParseOutcome` variants and a line in the frozen `src/main.rs`. Left
+  unsupported with reasons: `--unique` (needs per-input output sections),
+  `--execute-only` (AArch64 segment splitting), `--no-define-common`,
+  `--no-fortran-common`. `extern "C++"` version-script patterns are still
+  matched against mangled names.
+
+- **W48 (PowerPC64 BE):** dynamic ELFv1 output is the big one — `DT_PLTGOT`
+  names a `.plt` of 24-byte descriptors the dynamic linker fills, with
+  `.glink` holding the code, which does not fit qld's "code in `.plt`,
+  words in `.got.plt`" model and needs `synth.rs`/`rules.rs`/`layout.rs`
+  rather than an arch hook. Then `.opd` splitting for `--gc-sections`,
+  IFUNC addresses, and `.gnu.attributes` merging.
+- **`.toc` folded into `.got`** is done for PowerPC64 LE (W52) and still
+  open for BE (`rules.rs`).
+
+- **W52 (PowerPC64 LE):** still open, with notes on the size of each:
+  `_savegpr*`/`_restgpr*` (lld implements these, so they are verifiable
+  locally; needs a new synthetic section), inline PLT
+  (`PLTSEQ`/`PLTCALL`/`PLT16_*`, GNU ld only), `R_PPC64_TOC` (overlaps
+  W48's ELFv1 work), `ADDR64_LOCAL`, `GOT_DTPREL*` (needs a new `GotKind`),
+  `DT_PPC64_OPT`, multi-TOC.
+- **Thunks under linker-script layout** are missing generically: the script
+  path returns before the thunk fixpoint (`layout.rs`) and
+  `script_layout/engine.rs` hard-codes an empty thunk list. Fixing it there
+  fixes AArch64, PowerPC64 and Arm at once.
+
+- **W44 (RV32):** 
   `target.rs::default_target()` has no riscv32 host case;
   `__rela_iplt_end` takes the following section's index at a boundary;
   `tests/riscv32.rs` duplicates ~600 lines of the RV64 symbolizer.
 
-- **W32 (LoongArch64):** shrinking relaxation on W30's framework;
-  `ClassifyContext::tls_symbol` (extreme-model GD); `R_LARCH_ALIGN` synthesis
-  in `-r`; move the `R_LARCH_*` constants to `src/elf/read/consts/`; remove
+- **W32/W52 (LoongArch64):** open: move the `R_LARCH_*` constants to
+  `src/elf/read/consts/`; remove
   the per-relocation lookahead cost on x86-64/AArch64 (in progress).
 - **W40 (ELF32/big-endian):** next architectures, smallest first: x32 (the
   x86-64 PLT and 8-byte GOT with 4-byte `RELATIVE`, its own TLS forms), RV32
@@ -658,8 +674,7 @@ remaining option and GNU-difference gaps.
   clang but needs an `unsafe extern` call and a frozen-file change; slimmer
   `ObjectInput`/`InputSection`; COMDAT slots keyed by symbol ID.
 - **W29 (debug indexes):** `.debug_names` built from DIEs for objects with no
-  index; section ordering with `-r`; PE links accept `--gdb-index` and the
-  other new options silently (W33 should reject them).
+  index; section ordering with `-r`.
 - **W38 (scripts):** `-r` `.eh_frame` editing; `.dynstr` tail merging; GNU's
   spare `.dynamic` slots and tag order; version-definition symbols in
   `.symtab`; a built-in `-r` layout for architectures other than x86-64.

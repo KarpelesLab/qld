@@ -41,6 +41,7 @@ jobs:
             binutils-loongarch64-linux-gnu libc6-dev-loong64-cross \
             gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu \
             binutils-powerpc64le-linux-gnu \
+            gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu \
             gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu \
             gcc-s390x-linux-gnu g++-s390x-linux-gnu binutils-s390x-linux-gnu \
             gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
@@ -67,6 +68,27 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - run: cargo test --all-features --test i386 -- --nocapture
 
+  relocatable:
+    name: -r and --emit-relocs on every ELF class, compared with lld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+      QLD_TEST_LLD: ld.lld-22
+      RAYON_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # one clang builds every architecture's objects (the test sources
+      # include no header, so no cross sysroot is needed); lld is the oracle,
+      # and gcc-multilib lets the i386 combined object be linked and run
+      - run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 22
+          sudo apt-get install -y clang-22 lld-22 llvm-22 gcc-multilib g++-multilib
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+      - run: cargo test --all-features --test relocatable -- --test-threads=2 --nocapture
+
   debug-indexes:
     name: Debug indexes and section ordering compared with lld
     runs-on: ubuntu-24.04
@@ -82,7 +104,7 @@ jobs:
       - run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh 22
-          sudo apt-get install -y lld-22 llvm-22 gdb
+          sudo apt-get install -y clang-22 lld-22 llvm-22 gdb
           echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
       - run: cargo test --all-features --test ordering --test debug_index -- --test-threads=2
 
@@ -124,6 +146,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       QLD_REQUIRE_ARM_TOOLS: "1"
+      QLD_REQUIRE_ARM_GNU_TOOLS: "1"
       QLD_LLD: ld.lld-22
       QLD_ARM_CC: clang-22
       QLD_LLVM_OBJDUMP: llvm-objdump-22
@@ -138,6 +161,9 @@ jobs:
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh 22
           sudo apt-get install -y lld-22 llvm-22
+      # the GNU assembler writes the group relocations clang's cannot, and
+      # GNU ld is their oracle: lld does not link them
+      - run: sudo apt-get install -y binutils-arm-linux-gnueabihf
       - run: cargo test --all-features --test arm32 -- --nocapture
 
   arm32-fixtures:
@@ -156,6 +182,26 @@ jobs:
             binutils-arm-linux-gnueabihf qemu-user-static
       # linked by qld, run under qemu-arm
       - run: cargo test --all-features --test fixtures -- --nocapture
+
+  ppc64be:
+    name: PowerPC64 BE (ELFv1) links compared with GNU ld
+    runs-on: ubuntu-24.04
+    env:
+      QLD_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # GNU ld is the reference: lld has no ELFv1 support
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu \
+            binutils-powerpc64-linux-gnu qemu-user-static
+      - run: cargo test --all-features --test ppc64be -- --nocapture
+      # the ppc64-* fixtures, linked with qld and run under qemu-ppc64
+      - run: cargo test --all-features --test fixtures -- --nocapture
+        env:
+          QLD_FIXTURE: ppc64-
 
   s390x:
     name: s390x links compared with GNU ld
