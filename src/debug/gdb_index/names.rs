@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use super::input::{DebugObject, Malformed, Reader, Section};
+use super::input::{DebugObject, Malformed, Section};
 
 /// A name with its GDB hash and its CU vector value within its object:
 /// `(kind and static bits) << 24 | CU index in the object`.
@@ -60,14 +60,14 @@ fn pub_section<'a, F: crate::elf::read::ElfFormat>(
     let data = section.data;
     let mut offset = 0usize;
     while offset < data.len() {
-        let mut r = Reader::at(data, offset);
+        let mut r = section.reader(offset);
         let (length, offset_size) = r.initial_length()?;
         let next = usize::try_from(length)
             .ok()
             .and_then(|l| r.pos().checked_add(l))
             .ok_or_else(|| r.error("name set length"))?;
         let set = data.get(..next.min(data.len())).unwrap_or_default();
-        let mut r = Reader::at(set, r.pos());
+        let mut r = r.like(set, r.pos());
         let _version = r.u16()?;
         let pos = r.pos();
         let raw = r.uint(offset_size)?;
