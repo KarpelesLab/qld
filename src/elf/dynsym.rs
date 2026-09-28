@@ -29,11 +29,11 @@ use rayon::prelude::*;
 use crate::args::{HashStyle, LinkOptions};
 use crate::elf::read::VersionKind;
 use crate::elf::read::consts::{
-    DF_1_GLOBAL, DF_1_INITFIRST, DF_1_INTERPOSE, DF_1_LOADFLTR, DF_1_NODEFLIB, DF_1_NODELETE,
-    DF_1_NODUMP, DF_1_NOOPEN, DF_1_NOW, DF_1_ORIGIN, DF_1_PIE, DF_1_SINGLETON, DF_BIND_NOW,
-    DF_ORIGIN, DF_STATIC_TLS, DF_SYMBOLIC, DF_TEXTREL, DT_AUXILIARY, DT_DEBUG, DT_FILTER, DT_FINI,
-    DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT,
-    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL,
+    DF_1_GLOBAL, DF_1_GROUP, DF_1_INITFIRST, DF_1_INTERPOSE, DF_1_LOADFLTR, DF_1_NODEFLIB,
+    DF_1_NODELETE, DF_1_NODUMP, DF_1_NOOPEN, DF_1_NOW, DF_1_ORIGIN, DF_1_PIE, DF_1_SINGLETON,
+    DF_BIND_NOW, DF_ORIGIN, DF_STATIC_TLS, DF_SYMBOLIC, DF_TEXTREL, DT_AUXILIARY, DT_DEBUG,
+    DT_FILTER, DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH,
+    DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL,
     DT_PLTRELSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELA, DT_RELACOUNT, DT_RELAENT,
     DT_RELASZ, DT_RELR, DT_RELRENT, DT_RELRSZ, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ,
     DT_STRTAB, DT_SYMBOLIC, DT_SYMENT, DT_SYMTAB, DT_TEXTREL, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED,
@@ -442,10 +442,21 @@ pub fn import_version<'a, F: crate::elf::read::ElfFormat>(
 /// The version glibc requires of objects that use `DT_RELR`.
 pub const GLIBC_ABI_DT_RELR: &[u8] = b"GLIBC_ABI_DT_RELR";
 
-/// The needed shared library that defines the `GLIBC_ABI_DT_RELR` version.
-fn relr_version_provider<F: crate::elf::read::ElfFormat>(
+/// The version glibc requires of objects that keep GNU general-dynamic or
+/// local-dynamic TLS (`--gnu-tls-tag`).
+pub const GLIBC_ABI_GNU_TLS: &[u8] = b"GLIBC_ABI_GNU_TLS";
+
+/// The version glibc requires of objects that keep TLS descriptors, GCC's
+/// `-mtls-dialect=gnu2` (`--gnu2-tls-tag`).
+pub const GLIBC_ABI_GNU2_TLS: &[u8] = b"GLIBC_ABI_GNU2_TLS";
+
+/// The needed shared library that defines `version`, for the
+/// `GLIBC_ABI_*` dependencies glibc uses to refuse an object its loader is
+/// too old for.
+fn version_provider<F: crate::elf::read::ElfFormat>(
     refs: &Refs<'_, '_, F>,
     needed: &Needed,
+    version: &[u8],
 ) -> Option<usize> {
     refs.files.iter().enumerate().find_map(|(index, file)| {
         let shared = file.shared.as_ref()?;
@@ -455,9 +466,38 @@ fn relr_version_provider<F: crate::elf::read::ElfFormat>(
                 .versions()
                 .iter()
                 .flatten()
-                .any(|v| v.name == GLIBC_ABI_DT_RELR && v.kind == VersionKind::Defined))
+                .any(|v| v.name == version && v.kind == VersionKind::Defined))
         .then_some(index)
     })
+}
+
+/// The `GLIBC_ABI_*` versions the output depends on, as GNU ld 2.46 adds
+/// them: `DT_RELR` needs a loader that applies it, GNU TLS and TLS
+/// descriptors need one whose `__tls_get_addr` and descriptor resolvers
+/// are fixed. Each is added only when a needed library defines it, so a
+/// link against an older libc is unaffected.
+fn glibc_abi_versions<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    needed: &Needed,
+    synth: &Synth,
+    options: &LinkOptions,
+) -> Vec<(usize, &'static [u8])> {
+    let mut found = Vec::new();
+    let mut want = |used: bool, version: &'static [u8]| {
+        if used && let Some(file) = version_provider(refs, needed, version) {
+            found.push((file, version));
+        }
+    };
+    want(synth.relr_count() > 0, GLIBC_ABI_DT_RELR);
+    want(
+        options.gnu_tls_tag && (!synth.tlsgd.is_empty() || synth.tlsld),
+        GLIBC_ABI_GNU_TLS,
+    );
+    want(
+        options.gnu2_tls_tag && !synth.tlsdesc.is_empty(),
+        GLIBC_ABI_GNU2_TLS,
+    );
+    found
 }
 
 /// Whether a defined symbol's section made it into the output.
@@ -742,12 +782,12 @@ pub fn plan_chosen<F: crate::elf::read::ElfFormat>(
     // Versions needed: (file, version name) in file order, then name.
     let mut need_list: Vec<(usize, &[u8])> = imported.iter().flatten().copied().collect();
     need_list.sort_unstable();
-    // glibc refuses DT_RELR without this version need, which its libc.so
+    // glibc refuses an object whose loader is too old for it unless the
+    // output names the matching `GLIBC_ABI_*` version, which its libc.so
     // defines for that purpose.
-    if input.synth.relr_count() > 0
-        && let Some(libc) = relr_version_provider(refs, input.needed)
-    {
-        need_list.push((libc, GLIBC_ABI_DT_RELR));
+    let glibc_abi = glibc_abi_versions(refs, input.needed, input.synth, options);
+    if !glibc_abi.is_empty() {
+        need_list.extend(glibc_abi);
         need_list.sort_unstable();
     }
     need_list.dedup();
@@ -1312,6 +1352,7 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
         (z.loadfltr, DF_1_LOADFLTR),
         (z.origin, DF_1_ORIGIN),
         (z.singleton, DF_1_SINGLETON),
+        (z.group, DF_1_GROUP),
     ] {
         if on {
             flags_1 |= bit;

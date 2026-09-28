@@ -231,6 +231,9 @@ pub struct DynamicFlags {
     pub origin: bool,
     /// `-z unique` (`DF_1_SINGLETON`).
     pub singleton: bool,
+    /// `-Bgroup` (`DF_1_GROUP`): resolve references within this object's
+    /// dependency group first.
+    pub group: bool,
 }
 
 /// x86 control-flow enforcement options (`-z ibt`, `-z shstk`, …).
@@ -1168,6 +1171,15 @@ pub struct LinkOptions {
     pub export_dynamic_symbol_lists: Vec<PathBuf>,
     /// `--dynamic-list` files.
     pub dynamic_lists: Vec<PathBuf>,
+    /// `--dynamic-list-data`: add every defined data symbol to the dynamic
+    /// list.
+    pub dynamic_list_data: bool,
+    /// `--dynamic-list-cpp-new`: add `operator new` and `operator delete`
+    /// to the dynamic list.
+    pub dynamic_list_cpp_new: bool,
+    /// `--dynamic-list-cpp-typeinfo`: add the C++ type information symbols
+    /// to the dynamic list.
+    pub dynamic_list_cpp_typeinfo: bool,
     /// `--exclude-libs` archive names (`ALL` is kept as a name).
     pub exclude_libs: Vec<String>,
     /// `--version-script` files.
@@ -1228,6 +1240,14 @@ pub struct LinkOptions {
     pub combine_relocs: bool,
     /// `-z pack-relative-relocs` or `--pack-dyn-relocs=relr`: emit `DT_RELR`.
     pub pack_relative_relocs: bool,
+    /// `--gnu-tls-tag` (default) / `--no-gnu-tls-tag`: add the
+    /// `GLIBC_ABI_GNU_TLS` version dependency to an output that keeps GNU
+    /// general-dynamic or local-dynamic TLS, when a needed library defines
+    /// that version.
+    pub gnu_tls_tag: bool,
+    /// `--gnu2-tls-tag` (default) / `--no-gnu2-tls-tag`: the same for
+    /// `GLIBC_ABI_GNU2_TLS` and TLS descriptors.
+    pub gnu2_tls_tag: bool,
     /// `--apply-dynamic-relocs`: also write addends into the output.
     pub apply_dynamic_relocs: bool,
     /// `DT_FLAGS` / `DT_FLAGS_1` bits from `-z` keywords.
@@ -1463,6 +1483,8 @@ impl LinkOptions {
             section_header: true,
             relax: true,
             merge_exidx_entries: true,
+            gnu_tls_tag: true,
+            gnu2_tls_tag: true,
             relax_gp: false,
             dependent_libraries: true,
             fork: true,
@@ -1525,6 +1547,9 @@ impl LinkOptions {
             export_dynamic_symbols: Default::default(),
             export_dynamic_symbol_lists: Default::default(),
             dynamic_lists: Default::default(),
+            dynamic_list_data: Default::default(),
+            dynamic_list_cpp_new: Default::default(),
+            dynamic_list_cpp_typeinfo: Default::default(),
             exclude_libs: Default::default(),
             version_scripts: Default::default(),
             undefined_version: Default::default(),
@@ -1553,6 +1578,8 @@ impl LinkOptions {
             copy_relocs: Default::default(),
             combine_relocs: Default::default(),
             pack_relative_relocs: Default::default(),
+            gnu_tls_tag: Default::default(),
+            gnu2_tls_tag: Default::default(),
             apply_dynamic_relocs: Default::default(),
             dynamic_flags: Default::default(),
             start_stop_gc: Default::default(),

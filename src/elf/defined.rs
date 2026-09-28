@@ -85,11 +85,16 @@ pub enum Value {
 }
 
 /// Whether a symbol gets hidden visibility (`PROVIDE_HIDDEN`).
+///
+/// `__executable_start` is per-module like `__ehdr_start`, so it is hidden
+/// as lld makes it; GNU ld's shared-object script does not define it at
+/// all.
 #[must_use]
 pub fn is_hidden(value: Value) -> bool {
     matches!(
         value,
         Value::EhdrStart
+            | Value::ExecutableStart
             | Value::SectionStart(_)
             | Value::SectionEnd(_)
             | Value::RelaIpltStart
@@ -470,6 +475,13 @@ fn symbol_def<F: crate::elf::read::ElfFormat>(
 /// value alone does not tell: a script symbol assigned relative to an
 /// output section, or `__start_SEC`/`__stop_SEC`, belongs to that section
 /// even at its end, where the next section may start.
+///
+/// `__ehdr_start` and `__executable_start` name the ELF header, which is
+/// before every section, so no section covers their address. GNU ld and
+/// lld both make them relative to the first allocated section, and so does
+/// qld: an `SHN_ABS` symbol is not relocated in a position-independent
+/// output, which would leave a GOT slot for it holding a link-time
+/// address.
 #[must_use]
 pub fn linker_shndx<F: crate::elf::read::ElfFormat>(
     addresses: &super::values::Addresses<'_, '_, F>,
@@ -484,11 +496,41 @@ pub fn linker_shndx<F: crate::elf::read::ElfFormat>(
             let position = layout.output_places.get(output as usize)?.2;
             (position != super::sections::NONE).then_some(position)?
         }
+        Value::EhdrStart | Value::ExecutableStart => {
+            let first = layout.sections.iter().position(|s| s.is_alloc())?;
+            u32::try_from(first).ok()?
+        }
         _ => return None,
     };
     u16::try_from(position.checked_add(1)?)
         .ok()
         .filter(|&i| i < crate::elf::read::consts::SHN_LORESERVE)
+}
+
+/// The visibility of a linker-defined symbol.
+///
+/// `PROVIDE_HIDDEN` symbols ([`is_hidden`]) are per-module and hidden.
+/// `__start_SEC` and `__stop_SEC` are `STV_PROTECTED`, as in GNU ld and
+/// lld: a module's own references to the bounds of its own output section
+/// must not be preempted. `-z start-stop-visibility=` overrides that.
+/// Everything else keeps default visibility, so a shared object exports
+/// `_end`, `_edata`, `__bss_start` and `--defsym` symbols as both
+/// reference linkers do.
+#[must_use]
+pub fn visibility(value: Value, options: &LinkOptions) -> u8 {
+    use crate::elf::read::consts::{STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED};
+    if is_hidden(value) {
+        return STV_HIDDEN;
+    }
+    if matches!(value, Value::OutputStart(_) | Value::OutputEnd(_)) {
+        return match options.start_stop_visibility {
+            None | Some(crate::args::Visibility::Protected) => STV_PROTECTED,
+            Some(crate::args::Visibility::Default) => STV_DEFAULT,
+            Some(crate::args::Visibility::Hidden) => STV_HIDDEN,
+            Some(crate::args::Visibility::Internal) => STV_INTERNAL,
+        };
+    }
+    STV_DEFAULT
 }
 
 /// Backend flag: the symbol's value is an absolute number, not an address
