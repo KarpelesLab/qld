@@ -1268,20 +1268,41 @@ fn dwarf_sections_survive() {
 /// A section name longer than the eight bytes of the header field.
 ///
 /// `.eh_frame` is an ordinary allocated section -- it is the one a MinGW
-/// C++ program brings in -- so an image truncates it to `.eh_fram`; a `-g`
-/// build keeps it whole, because GNU `ld` turns on long section names for
-/// the whole image as soon as the link carries DWARF, which is how GDB
-/// finds `.debug_*` in a PE image.
+/// C++ program brings in -- so an image truncates it to `.eh_fram`. It
+/// keeps its full name once the link carries DWARF, because GNU `ld` then
+/// turns on long section names for the whole image, which is how GDB finds
+/// `.debug_*` in a PE image. Reading the name back therefore says which of
+/// the two rules the linker applied.
 const LONG_SECTION: &str = r#"
 int __attribute__((section(".eh_frame"))) tagged = 0x5678;
 int main(void) { return tagged - 0x5678; }
 "#;
+
+/// Whether long section names are on or off in a section-name list, judged
+/// by the name of the fixture's `.eh_frame`. `None` means neither spelling
+/// is there, which the caller reports as a broken image.
+fn long_names_on(names: &[String]) -> Option<bool> {
+    match (
+        names.iter().any(|name| name == ".eh_frame"),
+        names.iter().any(|name| name == ".eh_fram"),
+    ) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
 
 /// The section-table `Name` field is eight bytes and a PE image has no
 /// string table of its own, so long names are truncated -- unless the image
 /// carries DWARF, where GNU `ld` writes them through the symbol table's
 /// string table for GDB's sake. qld follows GNU `ld` in both directions,
 /// and `--enable`/`--disable-long-section-names` decide when given.
+///
+/// Whether a link carries DWARF is a property of the toolchain, not of the
+/// `-g` on the command line: MSYS2's MinGW ships a C runtime built with
+/// debugging information, so even a `-g`-less link has `.debug_*` sections
+/// and keeps its long names, while a cross toolchain's does not. The test
+/// reads which rule applied out of the image rather than assuming one.
 #[test]
 fn long_section_names_match_gnu_ld() {
     if tool(&mingw("gcc")).is_none() {
@@ -1300,11 +1321,13 @@ fn long_section_names_match_gnu_ld() {
     };
     // `flags` go to both the compiler and the link line, so each case
     // compares qld with the GNU ld the same command line would have run.
-    let case = |name: &str, flags: &[&str]| -> Option<Vec<String>> {
+    // `extra` names objects to link in that were built another way.
+    let case = |name: &str, flags: &[&str], extra: &[&str]| -> Option<(Vec<String>, bool)> {
         let object = compile(&dir, name, LONG_SECTION, flags)?;
         let gnu = format!("{name}-gnu.exe");
         let qld = format!("{name}-qld.exe");
         let mut args = vec![object.as_str(), "-o", gnu.as_str(), "-fno-lto"];
+        args.extend_from_slice(extra);
         args.extend_from_slice(flags);
         let argv = link_argv(&dir, &args)?;
         let options = options_from(&argv, &dir.join(&qld));
@@ -1314,29 +1337,69 @@ fn long_section_names_match_gnu_ld() {
         }
         run(&mingw("gcc"), &args, &dir)?;
         let (qld, gnu) = (names(&qld)?, names(&gnu)?);
-        assert_eq!(qld, gnu, "sections differ from GNU ld for {name}");
-        Some(qld)
+        // The real invariant: whatever the toolchain does, qld spells the
+        // section table the way the GNU ld of the same command line did.
+        assert_eq!(
+            qld, gnu,
+            "{name}: sections differ from GNU ld\n  qld: {qld:?}\n  gnu: {gnu:?}"
+        );
+        let on = long_names_on(&qld).unwrap_or_else(|| {
+            panic!("{name}: neither .eh_frame nor .eh_fram in the image\n  qld: {qld:?}")
+        });
+        Some((qld, on))
     };
+    // A `.debug` prefix survives truncation (`.debug_info` becomes
+    // `.debug_i`), so this sees the DWARF either way.
+    let has_dwarf = |names: &[String]| names.iter().any(|name| name.starts_with(".debug"));
 
-    // No debugging information: the image truncates, as the PE/COFF
-    // specification requires of an executable.
-    if let Some(plain) = case("plain", &[]) {
-        assert!(plain.contains(&".eh_fram".to_owned()), "{plain:?}");
-        assert!(!plain.contains(&".eh_frame".to_owned()), "{plain:?}");
+    // A `-g` object nothing on the command line asked for: this is what
+    // MSYS2's MinGW runtime looks like to the link, and it is the case
+    // where GNU ld's input-side rule and qld's output-side rule could see
+    // different things.
+    let Some(object) = compile(&dir, "library", "int helper(void) { return 7; }\n", &["-g"]) else {
+        return;
+    };
+    let library: &[&str] = &[object.as_str()];
+    // Without an explicit choice, long names follow the debugging
+    // information, wherever in the link it came from.
+    for (variant, flags, extra) in [
+        ("plain", &[] as &[&str], &[] as &[&str]),
+        ("debug", &["-g"], &[]),
+        ("borrowed", &[], library),
+    ] {
+        let Some((names, on)) = case(variant, flags, extra) else {
+            continue;
+        };
+        if variant != "plain" {
+            assert!(
+                has_dwarf(&names),
+                "{variant}: no DWARF in the image: {names:?}"
+            );
+        }
+        assert_eq!(
+            on,
+            has_dwarf(&names),
+            "{variant}: long section names {}, DWARF {}: {names:?}",
+            if on { "on" } else { "off" },
+            if has_dwarf(&names) {
+                "present"
+            } else {
+                "absent"
+            }
+        );
     }
-    // With DWARF, every long name survives, the tagged section included.
-    if let Some(debug) = case("debug", &["-g"]) {
-        assert!(debug.contains(&".eh_frame".to_owned()), "{debug:?}");
-        assert!(debug.contains(&".debug_info".to_owned()), "{debug:?}");
+    // An explicit choice does not depend on the toolchain. Truncation
+    // applies to every long name, the DWARF sections included.
+    if let Some((names, on)) = case("off", &["-g", "-Wl,--disable-long-section-names"], &[]) {
+        assert!(
+            !on,
+            "--disable-long-section-names kept long names: {names:?}"
+        );
+        let long: Vec<&String> = names.iter().filter(|name| name.len() > 8).collect();
+        assert!(long.is_empty(), "names left untruncated: {long:?}");
     }
-    // `--disable-long-section-names` truncates a `-g` build too.
-    if let Some(off) = case("off", &["-g", "-Wl,--disable-long-section-names"]) {
-        assert!(off.contains(&".eh_fram".to_owned()), "{off:?}");
-        assert!(off.contains(&".debug_i".to_owned()), "{off:?}");
-    }
-    // `--enable-long-section-names` keeps them without DWARF.
-    if let Some(on) = case("on", &["-Wl,--enable-long-section-names"]) {
-        assert!(on.contains(&".eh_frame".to_owned()), "{on:?}");
+    if let Some((names, on)) = case("on", &["-Wl,--enable-long-section-names"], &[]) {
+        assert!(on, "--enable-long-section-names truncated: {names:?}");
     }
 }
 
