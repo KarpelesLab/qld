@@ -615,6 +615,7 @@ mod tests {
             tls,
             tls_ld: tls,
             code: true,
+            tls_symbol: false,
         }
     }
 

@@ -323,6 +323,11 @@ pub struct ClassifyContext {
     pub tls_ld: TlsMode,
     /// The relocated section holds code (`SHF_EXECINSTR`).
     pub code: bool,
+    /// The relocation's symbol is a thread-local variable (`STT_TLS`).
+    /// LoongArch's extreme code model reuses the GOT relocations of an
+    /// ordinary address for a general-dynamic access, and only the symbol
+    /// tells the two apart.
+    pub tls_symbol: bool,
 }
 
 impl ClassifyContext {
@@ -335,6 +340,7 @@ impl ClassifyContext {
             tls: TlsMode::LocalExec,
             tls_ld: TlsMode::LocalExec,
             code: false,
+            tls_symbol: false,
         }
     }
 }

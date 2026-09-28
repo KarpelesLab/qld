@@ -24,7 +24,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use crate::elf::read::Relocation;
-use crate::elf::read::consts::{SHF_ALLOC, SHF_WRITE, STT_FUNC, STT_GNU_IFUNC};
+use crate::elf::read::consts::{SHF_ALLOC, SHF_WRITE, STT_FUNC, STT_GNU_IFUNC, STT_TLS};
 use crate::symbols::SymbolFlags;
 
 use super::arch::{
@@ -141,6 +141,7 @@ struct Props {
     function: bool,
     local_ifunc: bool,
     undefined_weak: bool,
+    tls: bool,
 }
 
 fn props(target: &Target, flags: SymbolFlags) -> Props {
@@ -159,6 +160,7 @@ fn props(target: &Target, flags: SymbolFlags) -> Props {
         function: kind == STT_FUNC || kind == STT_GNU_IFUNC,
         local_ifunc: target.is_ifunc() && !preemptible,
         undefined_weak: matches!(target.def, Def::Undefined { weak: true }),
+        tls: kind == STT_TLS,
     }
 }
 
@@ -190,6 +192,7 @@ pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) 
             TlsMode::LocalExec
         },
         code: false,
+        tls_symbol: p.tls,
     }
 }
 

@@ -1,5 +1,5 @@
 //! LoongArch64 (LP64, little-endian) relocations: classification, TLS and
-//! GOT relaxation, linker relaxation without shrinking, and the PLT.
+//! GOT relaxation, linker relaxation with section shrinking, and the PLT.
 //!
 //! [`classify`] turns a relocation type into a [`Class`], as for the other
 //! architectures. Most of the psABI maps onto the shared kinds: a
@@ -32,11 +32,11 @@
 //!   a relaxable GOT load) within ±2 MiB becomes `nop` + `pcaddi`,
 //!   `pcaddu18i` + `jirl` within ±128 MiB becomes `bl` (or `b`) + `nop`,
 //!   and a local-exec `lu12i.w`/`add.d`/`addi.d` whose offset fits 12 bits
-//!   becomes `nop`/`nop`/`addi.d rd, $tp, off`. Deleting the `nop`s, and the
-//!   excess padding an `R_LARCH_ALIGN` marks, needs section shrinking,
-//!   which qld does not do yet: the padding stays in place as `nop`s, so
-//!   the code is correct but the aligned label is not moved onto its
-//!   boundary.
+//!   becomes `nop`/`nop`/`addi.d rd, $tp, off`. Layout then deletes those
+//!   `nop`s and trims the padding an `R_LARCH_ALIGN` marks ([`relax`], on
+//!   the shrinking framework of [`super::shrink`]), so the rewrites above
+//!   are what the writer falls back to when a sequence turns out not to
+//!   shrink.
 //!
 //! Whether `R_LARCH_RELAX` follows is not part of the relocation, so the
 //! relocation loops mark it in the type ([`RELAX_HINT`], through
@@ -57,6 +57,8 @@ use crate::arch::loongarch::{
 use super::{
     ApplyError, Class, ClassifyContext, ClassifyError, GotKind, Kind, RelaxValues, TlsMode, Width,
 };
+
+pub mod relax;
 
 /// Declares relocation type constants and a name lookup function.
 macro_rules! relocation_types {
@@ -261,6 +263,18 @@ fn pair_at(data: &[u8], offset: u64, second: fn(u32) -> bool) -> bool {
         && insn::rj(lo) == insn::rd(lo)
 }
 
+/// The register an adjacent `pcalau12i rd` + `op rd, rd, …` pair at
+/// `offset` uses, when there is one: the shape linker relaxation folds
+/// into a single `pcaddi` ([`relax`]).
+pub(crate) fn pair_register(data: &[u8], offset: u64) -> Option<u32> {
+    let (hi, lo) = (
+        insn_at(data, offset)?,
+        offset.checked_add(4).and_then(|o| insn_at(data, o))?,
+    );
+    (insn::is_pcalau12i(hi) && insn::rd(hi) == insn::rj(lo) && insn::rj(lo) == insn::rd(lo))
+        .then(|| insn::rd(lo))
+}
+
 /// The same pair, seen from its second instruction at `offset`.
 fn pair_before(data: &[u8], offset: u64, second: fn(u32) -> bool) -> bool {
     offset
@@ -297,6 +311,15 @@ pub fn classify(
     // A GOT load of a symbol resolved here, as an adjacent pair the GOT
     // indirection can be taken out of.
     let got_relaxable = context.relax_got && addend == 0;
+    // The extreme code model reaches a general-dynamic descriptor through
+    // the GOT relocations of an ordinary address (`addi.d rd, $zero,
+    // %got_pc_lo12` and the `lu32i.d`/`lu52i.d` after it); only the
+    // symbol's type tells the two apart, as in lld.
+    let slot = if context.tls_symbol {
+        GotKind::TlsGd
+    } else {
+        GotKind::Address
+    };
     Ok(match base_type(r_type) {
         R_LARCH_NONE
         | R_LARCH_MARK_LA
@@ -364,30 +387,31 @@ pub fn classify(
         R_LARCH_GOT_PC_HI20 if got_relaxable && pair_at(data, offset, insn::is_ld_word) => {
             class(K::Relax, W::None)
         }
-        R_LARCH_GOT_PC_HI20 => got(K::GotPage, field(F::Hi20), GotKind::Address),
+        R_LARCH_GOT_PC_HI20 => got(K::GotPage, field(F::Hi20), slot),
         R_LARCH_GOT_PC_LO12 => match insn_at(data, offset) {
             Some(word) if insn::is_ld_word(word) => {
                 if got_relaxable && pair_before(data, offset, insn::is_ld_word) {
                     class(K::Relax, W::None)
                 } else {
-                    got(K::GotAbs, field(F::Lo12), GotKind::Address)
+                    got(K::GotAbs, field(F::Lo12), slot)
                 }
             }
             // An `addi.d` computes the address of the entry rather than
             // loading it: the second half of a general- or local-dynamic
-            // sequence, which reuses this type. (The extreme code model's
-            // `addi.d rd, $zero` is ambiguous and taken as a GOT load.)
+            // sequence, which reuses this type. The extreme code model's
+            // `addi.d rd, $zero` is one too when the symbol is a thread-local
+            // variable.
             Some(word) if insn::is_addi(word) && insn::rj(word) != R_ZERO => {
                 got(K::GotAbs, field(F::Lo12), GotKind::TlsGd)
             }
-            _ => got(K::GotAbs, field(F::Lo12), GotKind::Address),
+            _ => got(K::GotAbs, field(F::Lo12), slot),
         },
-        R_LARCH_GOT64_PC_LO20 => got(K::GotPage, field(F::Lo20), GotKind::Address),
-        R_LARCH_GOT64_PC_HI12 => got(K::GotPage, field(F::Hi12), GotKind::Address),
-        R_LARCH_GOT_HI20 => got(K::GotAbs, field(F::Hi20), GotKind::Address),
-        R_LARCH_GOT_LO12 => got(K::GotAbs, field(F::Lo12), GotKind::Address),
-        R_LARCH_GOT64_LO20 => got(K::GotAbs, field(F::Lo20), GotKind::Address),
-        R_LARCH_GOT64_HI12 => got(K::GotAbs, field(F::Hi12), GotKind::Address),
+        R_LARCH_GOT64_PC_LO20 => got(K::GotPage, field(F::Lo20), slot),
+        R_LARCH_GOT64_PC_HI12 => got(K::GotPage, field(F::Hi12), slot),
+        R_LARCH_GOT_HI20 => got(K::GotAbs, field(F::Hi20), slot),
+        R_LARCH_GOT_LO12 => got(K::GotAbs, field(F::Lo12), slot),
+        R_LARCH_GOT64_LO20 => got(K::GotAbs, field(F::Lo20), slot),
+        R_LARCH_GOT64_HI12 => got(K::GotAbs, field(F::Hi12), slot),
 
         // Local-exec.
         R_LARCH_TLS_LE_HI20 => class(K::TpOff, field(F::Hi20)),
@@ -907,6 +931,7 @@ mod tests {
             tls: TlsMode::Dynamic,
             tls_ld: TlsMode::Dynamic,
             code: true,
+            tls_symbol: false,
         }
     }
 

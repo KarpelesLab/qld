@@ -14,9 +14,9 @@
 //!
 //! Objects built with `-mno-relax` are compared with `ld.lld --no-relax`
 //! instruction for instruction. Objects built with linker relaxation are
-//! compared with lld's relaxed output with `nop`s ignored: qld performs the
-//! same rewrites but does not delete the bytes they free (see
-//! `src/elf/arch/loongarch.rs`).
+//! compared with lld's relaxed output the same way, `nop`s included: qld
+//! deletes the bytes its rewrites free and trims `R_LARCH_ALIGN` padding as
+//! lld does (see `src/elf/arch/loongarch/relax.rs`).
 //!
 //! Tests that need libc and qemu are fixtures (`tests/fixtures/loongarch64-*`).
 //!
@@ -1355,10 +1355,11 @@ fn every_relocation_form_matches_lld() {
     }
 }
 
-/// With linker relaxation (`-mrelax`, clang's default): qld rewrites what
-/// lld relaxes, leaving `nop`s where lld deletes bytes.
+/// With linker relaxation (`-mrelax`, clang's default): qld makes the same
+/// rewrites as lld and deletes the same bytes, so the code matches
+/// instruction for instruction and the sections have the same size.
 #[test]
-fn relaxation_matches_lld_without_the_deleted_bytes() {
+fn relaxation_shrinks_sections_as_lld_does() {
     let tools = require!();
     for (variant, flags, link) in [
         ("static", &["-O2", "-fPIE", "-mrelax"][..], &["-static"][..]),
@@ -1389,9 +1390,127 @@ fn relaxation_matches_lld_without_the_deleted_bytes() {
         let mut args = link.to_vec();
         args.extend_from_slice(&["main.o", "other.o"]);
         link_both(&tools, &dir, "out", &args, &[]);
-        assert_same_code(&dir, "out", true);
+        assert_same_code(&dir, "out", false);
+        assert_same_sizes(&dir, "out", &[".text"]);
     }
 }
+
+/// The sizes of `sections` in both outputs, which linker relaxation decides.
+fn assert_same_sizes(dir: &Path, name: &str, sections: &[&str]) {
+    let theirs = Elf::read(&dir.join(format!("{name}.lld")));
+    let ours = Elf::read(&dir.join(format!("{name}.qld")));
+    for section in sections {
+        let (Some(a), Some(b)) = (theirs.section(section), ours.section(section)) else {
+            continue;
+        };
+        assert_eq!(a.size, b.size, "{name}: {section} size");
+    }
+}
+
+/// `R_LARCH_ALIGN`: the padding an alignment directive reserves is trimmed
+/// to what the final address needs, and dropped altogether when reaching
+/// the boundary would cost more than the relocation's maximum.
+#[test]
+fn alignment_padding_is_trimmed_like_lld() {
+    let tools = require!();
+    let dir = scratch("align");
+    compile(&tools, &dir, "align", ALIGN_ASM, &["-mrelax"]);
+    link_both(
+        &tools,
+        &dir,
+        "out",
+        &["-static", "-e", "_start", "align.o"],
+        &[],
+    );
+    assert_same_code(&dir, "out", false);
+    assert_same_sizes(&dir, "out", &[".text"]);
+    // The aligned labels really are on their boundaries.
+    let ours = Elf::read(&dir.join("out.qld"));
+    for (name, align) in [("aligned16", 16u64), ("aligned32", 32)] {
+        let symbol = ours
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no {name}"));
+        assert_eq!(symbol.value % align, 0, "{name} is not {align}-aligned");
+    }
+}
+
+/// An assembly source whose alignment directives the assembler turns into
+/// `R_LARCH_ALIGN`: plain ones, and one with a maximum-bytes limit that the
+/// padding exceeds (so all of it goes).
+const ALIGN_ASM: &str = r#"
+	.text
+	.globl	_start
+	.type	_start,@function
+_start:
+	nop
+	nop
+	.p2align 4
+aligned16:
+	nop
+	.p2align 5
+aligned32:
+	nop
+	.p2align 4, , 4
+capped:
+	nop
+	la.pcrel $a0, data
+	la.got	 $a1, data
+	bl	far
+	pcaddu18i $ra, %call36(far)
+	jirl	$ra, $ra, 0
+	ret
+	.size	_start, .-_start
+
+	.globl	far
+	.type	far,@function
+far:
+	ret
+	.size	far, .-far
+
+	.data
+	.globl	data
+data:
+	.word	1
+"#;
+
+/// The extreme code model's general-dynamic sequence reaches the GOT pair
+/// through the relocations of an ordinary address, which only the symbol's
+/// `STT_TLS` tells apart: qld must not reserve a second entry for it.
+#[test]
+fn extreme_model_general_dynamic_matches_lld() {
+    let tools = require!();
+    for (variant, flags) in [
+        ("gd", &["-O2", "-fPIC", "-mrelax", "-mcmodel=extreme"][..]),
+        (
+            "desc",
+            &[
+                "-O2",
+                "-fPIC",
+                "-mrelax",
+                "-mcmodel=extreme",
+                "-mtls-dialect=desc",
+            ][..],
+        ),
+    ] {
+        let dir = scratch(&format!("extreme-{variant}"));
+        compile(&tools, &dir, "tls", EXTREME_TLS, flags);
+        link_both(&tools, &dir, "lib.so", &["-shared", "tls.o"], &[]);
+        assert_same_code(&dir, "lib.so", false);
+        assert_same_dynamic(&dir, "lib.so");
+    }
+}
+
+const EXTREME_TLS: &str = r#"
+__thread int gd_var;
+extern __thread int ext_var;
+static __thread int ld_var;
+int *get_gd(void) { return &gd_var; }
+int *get_ext(void) { return &ext_var; }
+int *get_ld(void) { return &ld_var; }
+int sum(void) { return gd_var + ext_var + ld_var; }
+"#;
 
 /// `.eh_frame` and DWARF, whose label differences clang emits as
 /// `R_LARCH_ADD*`/`R_LARCH_SUB*` pairs when the code may relax.

@@ -787,6 +787,7 @@ mod tests {
             tls: TlsMode::Dynamic,
             tls_ld: TlsMode::Dynamic,
             code: true,
+            tls_symbol: false,
         }
     }
 
