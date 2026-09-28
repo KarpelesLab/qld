@@ -1378,6 +1378,142 @@ fn thunk_pools_are_spread_through_a_large_text() {
     );
 }
 
+/// Group relocations, which build an address one instruction at a time,
+/// each taking the most significant eight bits of what is left. Only the
+/// GNU assembler writes them (`#:pc_g0_nc:` and friends), and lld does not
+/// link them, so GNU ld is the oracle.
+const GROUP_S: &str = r#"
+	.syntax unified
+	.text
+	.arm
+	.globl _start
+	.type _start, %function
+_start:
+	add r0, pc, #:pc_g0_nc:(sym_a)
+	add r0, r0, #:pc_g1_nc:(sym_a)
+	ldr r1, [r0, #:pc_g2:(sym_a)]
+	add r2, pc, #:pc_g0_nc:(sym_b)
+	add r2, r2, #:pc_g1_nc:(sym_b)
+	add r3, r2, #:pc_g2:(sym_b)
+	add r4, pc, #:pc_g0_nc:(sym_c)
+	ldrh r5, [r4, #:pc_g1:(sym_c)]
+	add r6, pc, #:pc_g0:(sym_d)
+	ldr r7, [pc, #:pc_g0:(sym_e)]
+	ldrh r8, [pc, #:pc_g0:(sym_f)]
+	add r9, pc, #:pc_g0_nc:(sym_g)
+	add r9, r9, #:pc_g1:(sym_g)
+	bx lr
+	.size _start, .-_start
+"#;
+
+/// The destinations of [`GROUP_S`], chosen so that each sequence splits
+/// exactly: `.text` starts at 0x10000 and the value of a group relocation
+/// is `S + A - P`, with no PC bias.
+const GROUP_DEFS_S: &str = r#"
+	.syntax unified
+	.globl sym_a
+	.set sym_a, 0xabddef
+	.globl sym_b
+	.set sym_b, 0xabddfb
+	.globl sym_c
+	.set sym_c, 0x1abe5
+	.globl sym_d
+	.set sym_d, 0x1ab20
+	.globl sym_e
+	.set sym_e, 0x10ae0
+	.globl sym_f
+	.set sym_f, 0x100d3
+	.globl sym_g
+	.set sym_g, 0x1abf9
+"#;
+
+/// The GNU cross assembler and linker, which write and link what clang's
+/// assembler cannot. `None` when they are not installed.
+fn gnu_arm() -> Option<(PathBuf, PathBuf)> {
+    let assembler = tool("QLD_ARM_GNU_AS", "arm-linux-gnueabihf-as")?;
+    let linker = tool("QLD_ARM_GNU_LD", "arm-linux-gnueabihf-ld.bfd")?;
+    Some((assembler, linker))
+}
+
+/// The bytes of `section` in `file`, as `llvm-readelf -x` prints them.
+fn section_bytes(tools: &Tools, dir: &Path, file: &str, section: &str) -> Vec<u8> {
+    let dump = run_ok(dir, &tools.readelf, &["-x", section, file]);
+    let mut out = Vec::new();
+    for line in dump.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("0x") else {
+            continue;
+        };
+        for word in rest.split_whitespace().skip(1).take(4) {
+            let Some(bytes) = word.as_bytes().chunks(2).map(std::str::from_utf8).try_fold(
+                Vec::new(),
+                |mut acc, pair| {
+                    acc.push(u8::from_str_radix(pair.ok()?, 16).ok()?);
+                    Some(acc)
+                },
+            ) else {
+                continue;
+            };
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
+}
+
+#[test]
+fn group_relocations_match_gnu_ld() {
+    let tools = require!();
+    let Some((assembler, linker)) = gnu_arm() else {
+        let required = std::env::var_os("QLD_REQUIRE_ARM_GNU_TOOLS")
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "QLD_REQUIRE_ARM_GNU_TOOLS is set but no GNU Arm tools"
+        );
+        println!("SKIPPED: no arm-linux-gnueabihf-as");
+        return;
+    };
+    let dir = scratch("group-relocations");
+    for (name, source, object) in [
+        ("group.s", GROUP_S, "group.o"),
+        ("groupdefs.s", GROUP_DEFS_S, "groupdefs.o"),
+    ] {
+        fs::write(dir.join(name), source).unwrap();
+        run_ok(
+            dir.as_path(),
+            &assembler,
+            &["-mcpu=cortex-a9", "-o", object, name],
+        );
+    }
+    let args = [
+        "-e",
+        "_start",
+        "--section-start=.text=0x10000",
+        "group.o",
+        "groupdefs.o",
+    ];
+    let mut gnu_args = args.to_vec();
+    gnu_args.extend_from_slice(&["-o", "group.gnu"]);
+    run_ok(dir.as_path(), &linker, &gnu_args);
+    let mut our_args = vec!["-m", "armelf_linux_eabi", "--threads=2"];
+    our_args.extend_from_slice(&args);
+    our_args.extend_from_slice(&["-o", "group.qld"]);
+    run_ok(
+        dir.as_path(),
+        Path::new(env!("CARGO_BIN_EXE_qld")),
+        &our_args,
+    );
+    let gnu = section_bytes(tools, &dir, "group.gnu", ".text");
+    let ours = section_bytes(tools, &dir, "group.qld", ".text");
+    assert!(!gnu.is_empty());
+    assert_eq!(
+        ours,
+        gnu,
+        "\nqld {:02x?}\ngnu {:02x?}",
+        &ours[..ours.len().min(64)],
+        &gnu[..gnu.len().min(64)]
+    );
+}
+
 const LIB_C: &str = r#"
 __thread int lib_tls = 1;
 static __thread int lib_tls_local = 2;

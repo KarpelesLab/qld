@@ -24,6 +24,10 @@
 //!   PIE or shared object) and `bx`s to it.
 //! - **Undefined weak** branch targets without a PLT entry become `nop`s,
 //!   as in GNU ld.
+//! - **Group relocations** (`ALU_PC_G0` … `LDRS_PC_G2`) build an address
+//!   one instruction at a time, each taking the most significant eight
+//!   bits of what is left ([`crate::arch::arm::group_residual`]). Only the
+//!   GNU assembler writes them.
 //!
 //! Input mapping symbols (`$a`, `$t`, `$d`) are kept as they are, and the
 //! code qld writes itself — the PLT and the thunk pools — gets its own
@@ -73,6 +77,8 @@ pub const R_ARM_ABS16: u32 = 5;
 pub const R_ARM_ABS8: u32 = 8;
 /// Thumb `bl`/`blx`.
 pub const R_ARM_THM_CALL: u32 = 10;
+/// Thumb-1 `ldr`/`add` from the word-aligned PC.
+pub const R_ARM_THM_PC8: u32 = 11;
 /// Dynamic: a TLS descriptor.
 pub const R_ARM_TLS_DESC: u32 = 13;
 /// Dynamic: the TLS module ID.
@@ -132,6 +138,8 @@ pub const R_ARM_THM_MOVW_PREL_NC: u32 = 49;
 pub const R_ARM_THM_MOVT_PREL: u32 = 50;
 /// Thumb-2 `b<cond>.w`.
 pub const R_ARM_THM_JUMP19: u32 = 51;
+/// Thumb-1 `cbz`/`cbnz`.
+pub const R_ARM_THM_JUMP6: u32 = 52;
 /// Thumb-2 `adr.w`.
 pub const R_ARM_THM_ALU_PREL_11_0: u32 = 53;
 /// Thumb-2 `ldr.w` from a literal.
@@ -140,10 +148,26 @@ pub const R_ARM_THM_PC12: u32 = 54;
 pub const R_ARM_ABS32_NOI: u32 = 55;
 /// `S + A - P`, 32 bits, likewise.
 pub const R_ARM_REL32_NOI: u32 = 56;
-/// A32 `add`/`sub` from the PC, unchecked.
+/// A32 `add`/`sub` from the PC, group 0, unchecked.
 pub const R_ARM_ALU_PC_G0_NC: u32 = 57;
-/// A32 `add`/`sub` from the PC.
+/// A32 `add`/`sub` from the PC, group 0.
 pub const R_ARM_ALU_PC_G0: u32 = 58;
+/// A32 `add`/`sub` from the PC, group 1, unchecked.
+pub const R_ARM_ALU_PC_G1_NC: u32 = 59;
+/// A32 `add`/`sub` from the PC, group 1.
+pub const R_ARM_ALU_PC_G1: u32 = 60;
+/// A32 `add`/`sub` from the PC, group 2.
+pub const R_ARM_ALU_PC_G2: u32 = 61;
+/// A32 `ldr`/`str` from the PC, after one group.
+pub const R_ARM_LDR_PC_G1: u32 = 62;
+/// A32 `ldr`/`str` from the PC, after two groups.
+pub const R_ARM_LDR_PC_G2: u32 = 63;
+/// A32 `ldrd`/`ldrh`/`ldrsb` from the PC, group 0.
+pub const R_ARM_LDRS_PC_G0: u32 = 64;
+/// A32 `ldrd`/`ldrh`/`ldrsb` from the PC, after one group.
+pub const R_ARM_LDRS_PC_G1: u32 = 65;
+/// A32 `ldrd`/`ldrh`/`ldrsb` from the PC, after two groups.
+pub const R_ARM_LDRS_PC_G2: u32 = 66;
 /// A TLS descriptor's GOT entry (GNU descriptors).
 pub const R_ARM_TLS_GOTDESC: u32 = 90;
 /// A32 call to a TLS descriptor's resolver.
@@ -156,6 +180,13 @@ pub const R_ARM_THM_TLS_CALL: u32 = 93;
 pub const R_ARM_GOT_ABS: u32 = 95;
 /// `GOT(S) + A - P`.
 pub const R_ARM_GOT_PREL: u32 = 96;
+/// `GOT(S) + A - GOT_ORG`, in an A32 `ldr`'s 12-bit offset.
+pub const R_ARM_GOT_BREL12: u32 = 97;
+/// `S + A - GOT_ORG`, in an A32 `ldr`'s 12-bit offset.
+pub const R_ARM_GOTOFF12: u32 = 98;
+/// `GOT(S) + A - GOT_ORG`, marked as relaxable (qld links it as it is,
+/// like `R_ARM_GOT_BREL`, which is what GNU ld does).
+pub const R_ARM_GOTRELAX: u32 = 99;
 /// C++ virtual table garbage collection marker.
 pub const R_ARM_GNU_VTENTRY: u32 = 100;
 /// C++ virtual table garbage collection marker.
@@ -174,6 +205,14 @@ pub const R_ARM_TLS_LDO32: u32 = 106;
 pub const R_ARM_TLS_IE32: u32 = 107;
 /// `S + A - TP`: local-exec.
 pub const R_ARM_TLS_LE32: u32 = 108;
+/// `S + A - TLS`, in an A32 `ldr`'s 12-bit offset.
+pub const R_ARM_TLS_LDO12: u32 = 109;
+/// `S + A - TP`, in an A32 `ldr`'s 12-bit offset.
+pub const R_ARM_TLS_LE12: u32 = 110;
+/// `GOT_TPOFF(S) + A - GOT_ORG`, in an A32 `ldr`'s 12-bit offset.
+pub const R_ARM_TLS_IE12GP: u32 = 111;
+/// `GOT(S) + A - GOT_ORG`, in a Thumb-2 `ldr.w`'s 12-bit offset.
+pub const R_ARM_THM_GOT_BREL12: u32 = 131;
 /// Thumb TLS descriptor sequence marker (16-bit).
 pub const R_ARM_THM_TLS_DESCSEQ16: u32 = 129;
 /// Thumb TLS descriptor sequence marker (32-bit).
@@ -217,7 +256,7 @@ pub fn reloc_name(r_type: u32) -> Option<&'static str> {
         R_ARM_ABS8 => "R_ARM_ABS8",
         9 => "R_ARM_SBREL32",
         R_ARM_THM_CALL => "R_ARM_THM_CALL",
-        11 => "R_ARM_THM_PC8",
+        R_ARM_THM_PC8 => "R_ARM_THM_PC8",
         12 => "R_ARM_BREL_ADJ",
         R_ARM_TLS_DESC => "R_ARM_TLS_DESC",
         R_ARM_TLS_DTPMOD32 => "R_ARM_TLS_DTPMOD32",
@@ -249,21 +288,21 @@ pub fn reloc_name(r_type: u32) -> Option<&'static str> {
         R_ARM_THM_MOVW_PREL_NC => "R_ARM_THM_MOVW_PREL_NC",
         R_ARM_THM_MOVT_PREL => "R_ARM_THM_MOVT_PREL",
         R_ARM_THM_JUMP19 => "R_ARM_THM_JUMP19",
-        52 => "R_ARM_THM_JUMP6",
+        R_ARM_THM_JUMP6 => "R_ARM_THM_JUMP6",
         R_ARM_THM_ALU_PREL_11_0 => "R_ARM_THM_ALU_PREL_11_0",
         R_ARM_THM_PC12 => "R_ARM_THM_PC12",
         R_ARM_ABS32_NOI => "R_ARM_ABS32_NOI",
         R_ARM_REL32_NOI => "R_ARM_REL32_NOI",
         R_ARM_ALU_PC_G0_NC => "R_ARM_ALU_PC_G0_NC",
         R_ARM_ALU_PC_G0 => "R_ARM_ALU_PC_G0",
-        59 => "R_ARM_ALU_PC_G1_NC",
-        60 => "R_ARM_ALU_PC_G1",
-        61 => "R_ARM_ALU_PC_G2",
-        62 => "R_ARM_LDR_PC_G1",
-        63 => "R_ARM_LDR_PC_G2",
-        64 => "R_ARM_LDRS_PC_G0",
-        65 => "R_ARM_LDRS_PC_G1",
-        66 => "R_ARM_LDRS_PC_G2",
+        R_ARM_ALU_PC_G1_NC => "R_ARM_ALU_PC_G1_NC",
+        R_ARM_ALU_PC_G1 => "R_ARM_ALU_PC_G1",
+        R_ARM_ALU_PC_G2 => "R_ARM_ALU_PC_G2",
+        R_ARM_LDR_PC_G1 => "R_ARM_LDR_PC_G1",
+        R_ARM_LDR_PC_G2 => "R_ARM_LDR_PC_G2",
+        R_ARM_LDRS_PC_G0 => "R_ARM_LDRS_PC_G0",
+        R_ARM_LDRS_PC_G1 => "R_ARM_LDRS_PC_G1",
+        R_ARM_LDRS_PC_G2 => "R_ARM_LDRS_PC_G2",
         67 => "R_ARM_LDC_PC_G0",
         68 => "R_ARM_LDC_PC_G1",
         69 => "R_ARM_LDC_PC_G2",
@@ -274,9 +313,9 @@ pub fn reloc_name(r_type: u32) -> Option<&'static str> {
         94 => "R_ARM_PLT32_ABS",
         R_ARM_GOT_ABS => "R_ARM_GOT_ABS",
         R_ARM_GOT_PREL => "R_ARM_GOT_PREL",
-        97 => "R_ARM_GOT_BREL12",
-        98 => "R_ARM_GOTOFF12",
-        99 => "R_ARM_GOTRELAX",
+        R_ARM_GOT_BREL12 => "R_ARM_GOT_BREL12",
+        R_ARM_GOTOFF12 => "R_ARM_GOTOFF12",
+        R_ARM_GOTRELAX => "R_ARM_GOTRELAX",
         R_ARM_GNU_VTENTRY => "R_ARM_GNU_VTENTRY",
         R_ARM_GNU_VTINHERIT => "R_ARM_GNU_VTINHERIT",
         R_ARM_THM_JUMP11 => "R_ARM_THM_JUMP11",
@@ -286,9 +325,10 @@ pub fn reloc_name(r_type: u32) -> Option<&'static str> {
         R_ARM_TLS_LDO32 => "R_ARM_TLS_LDO32",
         R_ARM_TLS_IE32 => "R_ARM_TLS_IE32",
         R_ARM_TLS_LE32 => "R_ARM_TLS_LE32",
-        109 => "R_ARM_TLS_LDO12",
-        110 => "R_ARM_TLS_LE12",
-        111 => "R_ARM_TLS_IE12GP",
+        R_ARM_TLS_LDO12 => "R_ARM_TLS_LDO12",
+        R_ARM_TLS_LE12 => "R_ARM_TLS_LE12",
+        R_ARM_TLS_IE12GP => "R_ARM_TLS_IE12GP",
+        R_ARM_THM_GOT_BREL12 => "R_ARM_THM_GOT_BREL12",
         R_ARM_THM_TLS_DESCSEQ16 => "R_ARM_THM_TLS_DESCSEQ16",
         R_ARM_THM_TLS_DESCSEQ32 => "R_ARM_THM_TLS_DESCSEQ32",
         R_ARM_IRELATIVE => "R_ARM_IRELATIVE",
@@ -328,12 +368,52 @@ pub fn patch_of(r_type: u32) -> Patch {
         R_ARM_THM_MOVW_ABS_NC | R_ARM_THM_MOVW_PREL_NC => Patch::Insn(Field::ThumbMovw),
         R_ARM_THM_MOVT_ABS | R_ARM_THM_MOVT_PREL => Patch::Insn(Field::ThumbMovt),
         R_ARM_THM_ALU_PREL_11_0 => Patch::Insn(Field::ThumbAdr),
-        R_ARM_THM_PC12 => Patch::Insn(Field::ThumbLdrLiteral),
-        R_ARM_LDR_PC_G0 => Patch::Insn(Field::LdrLiteral),
-        R_ARM_ALU_PC_G0 => Patch::Insn(Field::AluPc { checked: true }),
-        R_ARM_ALU_PC_G0_NC => Patch::Insn(Field::AluPc { checked: false }),
-        _ => Patch::None,
+        R_ARM_THM_PC12 | R_ARM_THM_GOT_BREL12 => Patch::Insn(Field::ThumbLdrLiteral),
+        R_ARM_THM_PC8 => Patch::Insn(Field::ThumbPc8),
+        R_ARM_THM_JUMP6 => Patch::Insn(Field::ThumbJump6),
+        _ => match group_field(r_type) {
+            Some(field) => Patch::Insn(field),
+            None => Patch::None,
+        },
     }
+}
+
+/// The field of a group relocation, of the 12-bit GOT and TLS forms, or
+/// of anything else that uses an A32 `add` or `ldr` immediate.
+#[must_use]
+fn group_field(r_type: u32) -> Option<Field> {
+    Some(match r_type {
+        R_ARM_ALU_PC_G0_NC => Field::AluGroup {
+            group: 0,
+            checked: false,
+        },
+        R_ARM_ALU_PC_G0 => Field::AluGroup {
+            group: 0,
+            checked: true,
+        },
+        R_ARM_ALU_PC_G1_NC => Field::AluGroup {
+            group: 1,
+            checked: false,
+        },
+        R_ARM_ALU_PC_G1 => Field::AluGroup {
+            group: 1,
+            checked: true,
+        },
+        R_ARM_ALU_PC_G2 => Field::AluGroup {
+            group: 2,
+            checked: true,
+        },
+        // The 12-bit GOT and TLS forms are a plain `ldr` offset, which is
+        // what group 0 of an `ldr` is.
+        R_ARM_LDR_PC_G0 | R_ARM_GOT_BREL12 | R_ARM_GOTOFF12 | R_ARM_TLS_LDO12 | R_ARM_TLS_LE12
+        | R_ARM_TLS_IE12GP => Field::LdrGroup { group: 0 },
+        R_ARM_LDR_PC_G1 => Field::LdrGroup { group: 1 },
+        R_ARM_LDR_PC_G2 => Field::LdrGroup { group: 2 },
+        R_ARM_LDRS_PC_G0 => Field::LdrsGroup { group: 0 },
+        R_ARM_LDRS_PC_G1 => Field::LdrsGroup { group: 1 },
+        R_ARM_LDRS_PC_G2 => Field::LdrsGroup { group: 2 },
+        _ => return None,
+    })
 }
 
 /// The addend of `SHT_REL` relocation `r_type` at `offset` in section
@@ -364,13 +444,25 @@ const fn got(kind: Kind, slot: GotKind) -> Class {
     Class::new(kind, Width::Any32).through(slot)
 }
 
+/// The 12-bit offset of an A32 `ldr`, which the `…12` forms patch.
+const LDR12: Field = Field::LdrGroup { group: 0 };
+
+const fn ldr(kind: Kind) -> Class {
+    Class::new(kind, Width::Arm(LDR12))
+}
+
+const fn ldr_got(kind: Kind, slot: GotKind) -> Class {
+    Class::new(kind, Width::Arm(LDR12)).through(slot)
+}
+
 /// Classifies relocation `r_type`.
 ///
 /// # Errors
 ///
-/// [`ClassifyError::Unsupported`] for types qld does not link (dynamic
-/// ones, the Sun-style TLS, GNU TLS descriptors, group relocations past
-/// `G0`, and the obsolete ones).
+/// [`ClassifyError::Unsupported`] for types qld does not link: the
+/// dynamic ones, GNU TLS descriptors, the RWPI static-base forms
+/// (`R_ARM_SBREL32` and the `_SB_`/`_BREL` families, which GNU ld reports
+/// as "dangerous relocation" too), and the obsolete ones.
 pub fn classify(r_type: u32, context: ClassifyContext) -> Result<Class, ClassifyError> {
     let _ = context;
     use Kind as K;
@@ -399,19 +491,38 @@ pub fn classify(r_type: u32, context: ClassifyContext) -> Result<Class, Classify
         R_ARM_THM_MOVT_PREL => field(K::Pc, Field::ThumbMovt),
         R_ARM_THM_ALU_PREL_11_0 => field(K::Pc, Field::ThumbAdr),
         R_ARM_THM_PC12 => field(K::Pc, Field::ThumbLdrLiteral),
-        R_ARM_LDR_PC_G0 => field(K::Pc, Field::LdrLiteral),
-        R_ARM_ALU_PC_G0 => field(K::Pc, Field::AluPc { checked: true }),
-        R_ARM_ALU_PC_G0_NC => field(K::Pc, Field::AluPc { checked: false }),
+        R_ARM_THM_PC8 => field(K::Pc, Field::ThumbPc8),
+        R_ARM_THM_JUMP6 => field(K::Pc, Field::ThumbJump6),
+        // Group relocations: `S + A - P` split over several instructions,
+        // each taking the next eight bits ([`insn::group_residual`]).
+        R_ARM_LDR_PC_G0 | R_ARM_LDR_PC_G1 | R_ARM_LDR_PC_G2 | R_ARM_LDRS_PC_G0
+        | R_ARM_LDRS_PC_G1 | R_ARM_LDRS_PC_G2 | R_ARM_ALU_PC_G0 | R_ARM_ALU_PC_G0_NC
+        | R_ARM_ALU_PC_G1 | R_ARM_ALU_PC_G1_NC | R_ARM_ALU_PC_G2 => field(
+            K::Pc,
+            group_field(r_type).ok_or(ClassifyError::Unsupported)?,
+        ),
         R_ARM_BASE_PREL => class(K::GotBasePc, W::Any32),
         R_ARM_GOTOFF32 => class(K::GotRel, W::Any32),
         R_ARM_GOT_BREL => got(K::GotSlotRel, GotKind::Address),
         R_ARM_GOT_PREL | R_ARM_TARGET2 => got(K::Got, GotKind::Address),
         R_ARM_GOT_ABS => got(K::GotAbs, GotKind::Address),
+        // `R_ARM_GOTRELAX` marks a GOT load that could be relaxed to a
+        // direct reference; GNU ld links it as `R_ARM_GOT_BREL`.
+        R_ARM_GOTRELAX => got(K::GotSlotRel, GotKind::Address),
         R_ARM_TLS_GD32 => got(K::Got, GotKind::TlsGd),
         R_ARM_TLS_LDM32 => got(K::Got, GotKind::TlsLd),
         R_ARM_TLS_IE32 => got(K::Got, GotKind::TpOff),
         R_ARM_TLS_LDO32 => class(K::DtpOff, W::Any32),
         R_ARM_TLS_LE32 => class(K::TpOff, W::Any32),
+        // The 12-bit forms of the same, in an `ldr` offset.
+        R_ARM_GOT_BREL12 => ldr_got(K::GotSlotRel, GotKind::Address),
+        R_ARM_THM_GOT_BREL12 => {
+            Class::new(K::GotSlotRel, W::Arm(Field::ThumbLdrLiteral)).through(GotKind::Address)
+        }
+        R_ARM_TLS_IE12GP => ldr_got(K::GotSlotRel, GotKind::TpOff),
+        R_ARM_GOTOFF12 => ldr(K::GotRel),
+        R_ARM_TLS_LDO12 => ldr(K::DtpOff),
+        R_ARM_TLS_LE12 => ldr(K::TpOff),
         _ => return Err(ClassifyError::Unsupported),
     })
 }
@@ -671,6 +782,59 @@ mod tests {
         assert!(classify(R_ARM_TLS_GOTDESC, context()).is_err());
         assert!(classify(R_ARM_RELATIVE, context()).is_err());
         assert_eq!(reloc_name(R_ARM_THM_JUMP24), Some("R_ARM_THM_JUMP24"));
+    }
+
+    #[test]
+    fn classifies_the_group_and_twelve_bit_relocations() {
+        let c = |r| classify(r, context()).unwrap();
+        let alu = |group, checked| Width::Arm(Field::AluGroup { group, checked });
+        assert_eq!(c(R_ARM_ALU_PC_G0_NC).width, alu(0, false));
+        assert_eq!(c(R_ARM_ALU_PC_G0).width, alu(0, true));
+        assert_eq!(c(R_ARM_ALU_PC_G1_NC).width, alu(1, false));
+        assert_eq!(c(R_ARM_ALU_PC_G1).width, alu(1, true));
+        assert_eq!(c(R_ARM_ALU_PC_G2).width, alu(2, true));
+        for (r_type, group) in [
+            (R_ARM_LDR_PC_G0, 0),
+            (R_ARM_LDR_PC_G1, 1),
+            (R_ARM_LDR_PC_G2, 2),
+        ] {
+            assert_eq!(c(r_type).width, Width::Arm(Field::LdrGroup { group }));
+        }
+        for (r_type, group) in [
+            (R_ARM_LDRS_PC_G0, 0),
+            (R_ARM_LDRS_PC_G1, 1),
+            (R_ARM_LDRS_PC_G2, 2),
+        ] {
+            assert_eq!(c(r_type).width, Width::Arm(Field::LdrsGroup { group }));
+        }
+        assert!(c(R_ARM_ALU_PC_G2).kind == Kind::Pc);
+        // The group relocations patch the fields the writer reads the
+        // implicit addend from.
+        assert_eq!(
+            patch_of(R_ARM_LDRS_PC_G2),
+            Patch::Insn(Field::LdrsGroup { group: 2 })
+        );
+        // Thumb-1 `ldr`/`add` and `cbz`.
+        assert_eq!(c(R_ARM_THM_PC8).width, Width::Arm(Field::ThumbPc8));
+        assert_eq!(c(R_ARM_THM_JUMP6).width, Width::Arm(Field::ThumbJump6));
+        // The 12-bit GOT and TLS forms go through the same GOT slots as
+        // their 32-bit counterparts.
+        assert_eq!(c(R_ARM_GOT_BREL12).kind, c(R_ARM_GOT_BREL).kind);
+        assert_eq!(c(R_ARM_GOT_BREL12).slot, GotKind::Address);
+        assert_eq!(c(R_ARM_GOTRELAX).kind, c(R_ARM_GOT_BREL).kind);
+        assert_eq!(c(R_ARM_TLS_IE12GP).slot, GotKind::TpOff);
+        assert_eq!(c(R_ARM_GOTOFF12).kind, Kind::GotRel);
+        assert_eq!(c(R_ARM_TLS_LDO12).kind, Kind::DtpOff);
+        assert_eq!(c(R_ARM_TLS_LE12).kind, Kind::TpOff);
+        assert_eq!(
+            c(R_ARM_THM_GOT_BREL12).width,
+            Width::Arm(Field::ThumbLdrLiteral)
+        );
+        // RWPI is not linked: GNU ld reports "dangerous relocation" for
+        // these too.
+        for r_type in [9, 39, 35, 36, 37, 70, 75, 84] {
+            assert!(classify(r_type, context()).is_err(), "{r_type}");
+        }
     }
 
     #[test]
