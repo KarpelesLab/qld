@@ -1,0 +1,3 @@
+objects main.o far.o
+error relocation R_68K_PC16 out of range
+vlink accepts

@@ -621,6 +621,14 @@ mod tests {
                 symbols: Vec::new(),
             },
             Hunk {
+                kind: Kind::Data,
+                alloc: 12,
+                data: vec![9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0],
+                memory: MemFlags::Fast,
+                relocs: Vec::new(),
+                symbols: Vec::new(),
+            },
+            Hunk {
                 kind: Kind::Bss,
                 alloc: 16,
                 data: Vec::new(),
@@ -635,19 +643,23 @@ mod tests {
     fn round_trip() {
         let bytes = write(&sample(), RelocForm::Long).expect("write");
         let file = read(&bytes, Path::new("test.hunk")).expect("read");
-        assert_eq!(file.sizes.len(), 3);
+        assert_eq!(file.sizes.len(), 4);
         assert_eq!(file.first, 0);
-        assert_eq!(file.last, 2);
+        assert_eq!(file.last, 3);
         assert_eq!(file.sizes[0], (12, MemFlags::Any));
         assert_eq!(file.sizes[1], (8, MemFlags::Chip));
-        assert_eq!(file.sizes[2], (16, MemFlags::Any));
-        // Trailing zero longwords are left out of the block.
-        assert_eq!(file.hunks[0].data, vec![0x4e, 0x75, 0, 0]);
+        assert_eq!(file.sizes[2], (12, MemFlags::Fast));
+        assert_eq!(file.sizes[3], (16, MemFlags::Any));
+        // Trailing zero longwords are left out of the block, except that
+        // a longword a relocation names is always written.
+        assert_eq!(file.hunks[0].data, vec![0x4e, 0x75, 0, 0, 0, 0, 0, 0]);
         assert_eq!(file.hunks[0].relocs, vec![(1, vec![4])]);
         assert_eq!(file.hunks[0].symbols, vec![(b"_start".to_vec(), 0)]);
         assert_eq!(file.hunks[1].data, vec![1, 2, 3, 4]);
-        assert_eq!(file.hunks[2].kind, Kind::Bss);
-        assert_eq!(file.hunks[2].symbols, vec![(b"buffer".to_vec(), 0)]);
+        // Nothing names the trailing zeros of hunk 2, so they go.
+        assert_eq!(file.hunks[2].data, vec![9, 9, 9, 9]);
+        assert_eq!(file.hunks[3].kind, Kind::Bss);
+        assert_eq!(file.hunks[3].symbols, vec![(b"buffer".to_vec(), 0)]);
     }
 
     #[test]

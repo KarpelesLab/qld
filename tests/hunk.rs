@@ -54,8 +54,11 @@ struct Case {
     flags: Vec<String>,
     /// Archives to build before linking: (archive, members).
     archives: Vec<(String, Vec<String>)>,
-    /// Why both linkers must reject this case, when they must.
+    /// What qld's diagnostic must say, for a case qld rejects.
     error: Option<String>,
+    /// Whether vlink accepts the case qld rejects: a documented
+    /// difference, not a corpus error.
+    vlink_accepts: bool,
 }
 
 fn cases() -> Vec<Case> {
@@ -79,6 +82,7 @@ fn cases() -> Vec<Case> {
             flags: Vec::new(),
             archives: Vec::new(),
             error: None,
+            vlink_accepts: false,
         };
         for line in text.lines() {
             let mut words = line.split_whitespace();
@@ -94,6 +98,7 @@ fn cases() -> Vec<Case> {
                     }
                 }
                 "error" => case.error = Some(rest.join(" ")),
+                "vlink" => case.vlink_accepts = rest.first().map(String::as_str) == Some("accepts"),
                 _ => {}
             }
         }
@@ -231,17 +236,22 @@ fn matches_vlink_reference() {
 }
 
 #[test]
-fn rejects_cross_hunk_pcrel() {
+fn rejects_what_a_load_file_cannot_hold() {
     let mut checked = 0;
     for case in cases() {
-        let Some(why) = &case.error else { continue };
+        let Some(expected) = &case.error else {
+            continue;
+        };
         let out = scratch(&case.name, "error").join("out.hunk");
         match qld_link(&case, &case.dir, &out, "2") {
-            Ok(_) => panic!("{}: qld accepted a link vlink rejects ({why})", case.name),
+            Ok(_) => panic!(
+                "{}: qld accepted a link it must reject ({expected})",
+                case.name
+            ),
             Err(message) => {
                 assert!(
-                    message.contains("PC-relative") && message.contains("hunk"),
-                    "{}: unexpected diagnostic for {why}:\n{message}",
+                    message.contains(expected.as_str()),
+                    "{}: the diagnostic does not say {expected:?}:\n{message}",
                     case.name
                 );
                 checked += 1;
@@ -377,9 +387,11 @@ fn live_tools_agree() {
             .output()
             .unwrap_or_else(|e| panic!("cannot run {}: {e}", vlink.display()));
         if let Some(why) = &case.error {
-            assert!(
-                !output.status.success(),
-                "{}: vlink accepted {why}, which qld rejects",
+            assert_eq!(
+                output.status.success(),
+                case.vlink_accepts,
+                "{}: vlink's verdict on {why:?} changed; \
+                 update `vlink accepts` in link.txt if that is intended",
                 case.name
             );
             continue;

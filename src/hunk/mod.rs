@@ -63,7 +63,7 @@ pub fn wanted(options: &LinkOptions) -> bool {
 ///
 /// [`Error::Unimplemented`] for output kinds a load file cannot hold
 /// (shared objects, PIEs, Hunk object output), and anything
-/// [`crate::elf::link`] returns.
+/// [`crate::elf::link`](fn@crate::elf::link) returns.
 pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<()> {
     let mut options = options.clone();
     match options.kind {
