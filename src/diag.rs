@@ -485,7 +485,8 @@ impl Stderr {
 
     /// Creates a sink that renders exactly as [`new`](Self::new) does but
     /// writes to `writer`. Colour is off unless
-    /// [`set_color`](Self::set_color) turns it on.
+    /// [`configure`](Self::configure) sees `--color-diagnostics=always`,
+    /// because a writer that is not a terminal cannot be asked.
     pub fn with_writer(program: impl Into<String>, writer: impl Write + Send + 'static) -> Self {
         let sink = Self::with_target(program, Target::Writer(Mutex::new(Box::new(writer))));
         sink.color.store(Color::Never.code(), Ordering::Relaxed);

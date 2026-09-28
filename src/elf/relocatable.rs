@@ -91,6 +91,14 @@ const RELA_SIZE: u64 = 24;
 const SHDR_SIZE: u64 = 64;
 /// Size of the ELF header.
 const EHDR_SIZE: u64 = 64;
+/// Largest alignment a section's file offset is padded to.
+///
+/// A relocatable output has no addresses, so `sh_addralign` constrains
+/// nothing in the file; GNU ld pads no further than this, and records the
+/// real alignment in the section header for the final link to honour.
+/// Without the cap, one input section with an absurd `sh_addralign` — a
+/// corrupt object's 2 GiB, say — would inflate the output by that much.
+const MAX_FILE_ALIGN: u64 = 1 << 16;
 
 /// Whether relocatable output keeps a section that final links consume
 /// ([`SectionKind::Ignored`] sections other than the tables a relocatable
@@ -1126,7 +1134,7 @@ fn plan<'a, F: crate::elf::read::ElfFormat>(
     let mut offset = EHDR_SIZE;
     for out in &mut outs {
         if out.has_file_bytes() {
-            offset = align_to(offset, out.align)?;
+            offset = align_to(offset, out.align.min(MAX_FILE_ALIGN))?;
             out.offset = offset;
             offset = add(offset, out.size)?;
         } else {
