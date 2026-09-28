@@ -1,12 +1,138 @@
-# Benchmarks (W24, W26, W28, W42; roadmap M5)
+# Benchmarks (W24, W26, W28, W42, W47; roadmap M5)
 
 qld against GNU ld, lld, mold and wild on real links, replayed from build
 trees that already exist. The drivers are in `benches/`; this file records
-the method, the corpus and the results. W42's results (pipeline overlap)
-come first, then W28's (symbol resolution) from
+the method, the corpus and the results. W47's results (single-thread speed)
+come first, then W42's (pipeline overlap) from
+[Standing after W42](#standing-after-w42-pipeline-overlap-stated-plainly),
+then W28's (symbol resolution) from
 [Standing after W28](#standing-after-w28-symbol-resolution-stated-plainly),
 then W26's from [Standing after W26](#standing-after-w26-stated-plainly);
 W24's (the first round, with GNU ld) follow from [Standing after W24](#standing-after-w24-stated-plainly).
+
+## Standing after W47 (single-thread speed), stated plainly
+
+W47 went after the one benchmark qld lost after W42: lld is faster on one
+thread. It is still faster, but by less. The work was all in the link's
+own instruction count, plus one allocator setting in the binary; every
+output is byte-identical to its base, at 1, 2, 8 and 64 threads.
+
+**A clang link on one thread takes 9.79% fewer instructions**
+(callgrind, deterministic): 4,940,730,981 at the branch point (master
+971c253), 4,457,197,895 on this branch, same output
+(`ffad1ac52df901c0`).
+
+Measured on 2026-09-28, on the machine of [Setup](#setup) at a load
+average of 17–32 (six other agents building). "qld before" is the branch
+point, "qld after" this branch. Minimum wall times of 3 interleaved runs,
+`nice -n 10`, outputs on a tmpfs, no sync between runs:
+
+| benchmark | threads | lld | mold | wild | qld before | qld after |
+| --- | --- | --- | --- | --- | --- | --- |
+| clang | default | 265 ms | 173 ms | 71 ms | 116 ms | 117 ms |
+| clang | 1 | 413 ms | 530 ms | 431 ms | 535 ms | 497 ms |
+| clang | 8 | 265 ms | 115 ms | 85 ms | 131 ms | 129 ms |
+| clang | 64 | 288 ms | 734 ms | 68 ms | 122 ms | 117 ms |
+| libclang-cpp | default | 202 ms | 93 ms | 50 ms | 88 ms | 83 ms |
+| libclang-cpp | 1 | 272 ms | 319 ms | 267 ms | 354 ms | 340 ms |
+| libclang-cpp | 8 | 168 ms | 76 ms | 53 ms | 94 ms | 91 ms |
+| libclang-cpp | 64 | 180 ms | 310 ms | 51 ms | 86 ms | 81 ms |
+| small-count | default | 9 ms | 13 ms | 8 ms | 8 ms | 8 ms |
+| small-count | 1 | 9 ms | 10 ms | 5 ms | 8 ms | 7 ms |
+| small-count | 8 | 8 ms | 9 ms | 4 ms | 7 ms | 8 ms |
+| small-count | 64 | 8 ms | 18 ms | 7 ms | 10 ms | 10 ms |
+
+Read across the row, not against W42's table: the load was higher, and
+mold's default and 64-thread rows are outliers at this load, not a change
+in mold. (clang-debug and vmlinux were not run: their 1.2 GiB and 99 MiB
+outputs, written back to back, are what stalled the shared machine's disk
+in W28.)
+
+- **On one thread, clang is 535 → 497 ms against lld's 413**: the gap is
+  20% where W42 measured 31%. `libclang-cpp` is 354 → 340 against 272.
+- **At every other thread count qld is where W42 left it**, which is
+  ahead of lld and mold and behind wild. The instructions saved are in
+  stages that already scale, so at 16 threads they are worth 3 ms of
+  145; the allocator setting is what moves the parallel numbers, through
+  kernel time.
+
+Stage laps (`QLD_TIMING=1`, `--no-fork`, `benches/run.py --laps
+--no-sync`), min of 3 interleaved runs at load 30:
+
+| stage | clang 1 before | clang 1 after | clang 16 before | clang 16 after |
+| --- | --- | --- | --- | --- |
+| inputs | 19.9 ms | 18.9 | 6.8 | 5.6 |
+| resolution | 131.3 | 129.3 | 25.8 | 21.2 |
+| placement | 53.9 | 50.2 | 9.9 | 12.4 |
+| scan | 68.2 | 61.1 | 9.2 | 9.0 |
+| dynamic | 40.3 | 38.8 | 13.5 | 11.2 |
+| layout | 15.8 | 17.4 | 8.1 | 8.1 |
+| write | 187.0 | 184.8 | 40.9 | 41.8 |
+| wall | 542.9 | 528.4 | 148.3 | 145.2 |
+| CPU | 541.7 | 527.3 | 1241.0 | 1127.2 |
+| CPU in the kernel | 82.9 | 86.8 | 411.4 | 219.7 |
+| page faults (k) | 63.0 | 64.7 | 79.9 | 75.5 |
+
+The 16-thread placement and layout rows move by ±3 ms between runs at
+this load whichever binary goes first — an interleaved A/B with the two
+binaries swapped gave 12.0 ms for the new one and 9.4 for the old in one
+order, 10.1 and 13.0 in the other. The one-thread column is the one to
+read for this round.
+
+`libclang-cpp`, same runs: resolution 71.0 → 69.3 ms on one thread and
+14.3 → 12.2 at 16, scan 33.5 → 29.2 and 3.9 → 3.7, placement 32.7 → 30.6,
+write 113.2 → 110.6; kernel CPU at 16 threads 237.9 → 162.0 ms.
+
+### W47 changes
+
+| Commit | Change | Effect (clang, 1 thread, callgrind) |
+| --- | --- | --- |
+| f2a8bd6 | `mallopt(M_TOP_PAD, 64 MiB)` and `mallopt(M_TRIM_THRESHOLD, 128 MiB)` at the start of `main`, on glibc, in the binary only (W42 measured the same through `GLIBC_TUNABLES`, which is not an option because it reaches LTO plugins' subprocesses) | not an instruction change: clang's kernel CPU at 16 threads 410 → 261 ms, whole-link CPU 1152 → 1018, page faults 79.6k → 73.7k, on a quiet machine |
+| 79d71dd | `reloc::decide` builds `Props` once instead of twice (`classify_context` takes them), and `local_ifunc` stops re-reading `st_info` through `Target::is_ifunc` | 2.00% fewer instructions |
+| 06db43e | `RuleSet::place` indexes its patterns by the first four bytes of their literal prefix, and rejects the rest of a bucket with one masked word comparison on the next eight | 2.92% |
+| 65ce345 | `Addresses::symbol_address` looks a section's ID up once, not two or three times | 0.58% |
+| 4d45af5 | A symbol's definition lives in one 32-byte cell instead of five vectors of atomics: one bounds check and one cache line per read, where the scan and the writer read a definition per relocation | 3.12% |
+| b425690 | `Refs::for_file` hoists the per-file lookups (the input, its object, its symbol table, its symbol IDs) out of the relocation loops | 1.56% |
+
+### Tried in W47 and not kept
+
+- **Finding a symbol name's terminator and its `@` in one pass** over the
+  string table, instead of `find_nul` and then `find_byte` over the same
+  bytes: 0.09% fewer instructions. Names average about 35 bytes, so the
+  second pass is short and hits L1; not worth a hand-written word loop in
+  `src/elf/read/strtab.rs`.
+- **Flattening the placement index's buckets into one array** (they are a
+  `Vec` per bucket): 0.16% *more* instructions on one thread, and the
+  16-thread placement difference it was meant to fix turned out to follow
+  run order, not the binary.
+
+### What is left, in order of what it is worth
+
+- **The scan and the writer decide every relocation twice** — `props`,
+  `classify_context` and `arch::classify` are 8.2% of a clang link's
+  instructions between them, and about half of that is the second copy.
+  Caching the scan's `Decision` would need roughly 16 MiB for clang's two
+  million relocations, in pages that are written in the scan and read in
+  the write; at 12 k faults and two passes over 16 MiB it is close to a
+  wash against the 3.9% it saves, and it would have to agree with
+  `emit.rs` and the Arm and RISC-V appliers. Worth trying, with that
+  memory budget stated up front.
+- **`x86_64::classify` is 4.1%** and a jump table over the relocation
+  type. A `static` table of the context-independent classifications, with
+  the TLS and GOT-relaxation types falling through to the match, would
+  make `PC32`, `PLT32`, `64` and `32S` a load instead of an indirect
+  branch. It is in `src/elf/arch/`, which W47 does not own.
+- **`Layout::synthetic` is a linear scan** over about 26 entries, and the
+  writer calls it for every PLT and GOT relocation (`plt_address` alone is
+  1.2%). An index by kind needs a field on `Layout`, which the script
+  engine also builds.
+- **`InputSection` is still 112 bytes** (`name` 16, `header` 64,
+  `contents` 16, three `u32`s and a byte) × 640,000 sections for clang.
+  Moving `contents` into a side table gets it to 104; going below that
+  needs `name` as an offset and length, which touches every stage.
+- **COMDAT slots keyed by symbol ID.** `GroupSlots::slot` is 0.6% of the
+  link's instructions, and its shard tables rehash under their locks
+  during the parallel load pass. Still W28's leftover.
 
 ## Standing after W42 (pipeline overlap), stated plainly
 
