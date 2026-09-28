@@ -58,13 +58,16 @@ fn qld(dir: &Path, args: &[&str]) -> Output {
     run(dir, env!("CARGO_BIN_EXE_qld"), args)
 }
 
-/// Runs `qld`, expects it to fail, and returns its standard error.
+/// Runs `qld`, expects it to fail with status 1 — what GNU ld and lld exit
+/// with for every diagnostic these tests provoke — and returns its standard
+/// error.
 fn qld_err(dir: &Path, args: &[&str]) -> String {
     let output = qld(dir, args);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        !output.status.success(),
-        "qld {} unexpectedly succeeded:\n{stderr}",
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "qld {} should have failed with status 1:\n{stderr}",
         args.join(" ")
     );
     stderr
@@ -221,16 +224,22 @@ fn error_limit_matches_lld() {
     source.push_str(&body);
     compile(&dir, "main", &source, &[]);
 
-    let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "main.o"]);
-    let count = stderr.matches("undefined symbol: ").count();
-    assert_eq!(count, 20, "lld's default limit is 20:\n{stderr}");
-    assert!(
-        stderr.contains(
-            "qld: error: too many errors emitted, stopping now (use --error-limit=0 to see all \
-             errors)"
-        ),
-        "{stderr}"
-    );
+    // Forked (the default) and not: the two report their status by
+    // different routes, and `qld_err` pins the exit code of each.
+    for fork in [&[][..], &["--no-fork"][..]] {
+        let mut args = fork.to_vec();
+        args.extend_from_slice(&["-o", "out", "main.o"]);
+        let stderr = qld_err(&dir, &args);
+        let count = stderr.matches("undefined symbol: ").count();
+        assert_eq!(count, 20, "lld's default limit is 20:\n{stderr}");
+        assert!(
+            stderr.contains(
+                "qld: error: too many errors emitted, stopping now (use --error-limit=0 to see \
+                 all errors)"
+            ),
+            "{stderr}"
+        );
+    }
 
     let stderr = qld_err(
         &dir,
@@ -282,44 +291,77 @@ fn color_diagnostics() {
         ],
     );
     assert_eq!(never, plain);
+
+    // Forked, so the escapes go through the parent's stderr relay.
+    let forked = qld_err(&dir, &["--color-diagnostics=always", "-o", "out", "main.o"]);
+    assert_eq!(forked, colored);
+    // And `auto` stays off when stderr is a pipe, as it is here.
+    let auto = qld_err(&dir, &["--color-diagnostics=auto", "-o", "out", "main.o"]);
+    assert!(!auto.contains('\x1b'), "{auto:?}");
 }
 
-/// `--fatal-warnings` turns a link-time warning into an error and fails the
-/// link; `-w` drops warnings and cancels it, as in lld.
+/// `--fatal-warnings` turns a warning into an error and **fails the link**;
+/// `-w` drops warnings and cancels it, as in lld.
+///
+/// Run both ways round: `qld` links in a child process by default, and the
+/// child reports its status from the output-complete hook, a different path
+/// from the value `--no-fork` returns. A promoted warning has to fail the
+/// link on both, and it did not on the forking one. Both sources of warning
+/// are covered too: `-z <unknown>` comes from the option parser before the
+/// link starts, the missing entry symbol from the ELF driver during it.
 #[test]
-fn fatal_warnings_and_no_warnings() {
+fn fatal_warnings_fail_the_link() {
     require!("cc");
     let dir = scratch("fatal-warnings");
-    compile(&dir, "main", "int main(void) { return 0; }\n", &[]);
-    let args = [
-        "--no-fork",
-        "-o",
-        "out",
-        "main.o",
-        "-z",
-        "qld-bogus-keyword",
-    ];
+    // No `_start`, so the link itself warns about the entry symbol.
+    compile(&dir, "main", "int foo(void) { return 0; }\n", &[]);
 
-    let output = qld(&dir, &args);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(output.status.success(), "{stderr}");
-    assert!(stderr.contains("qld: warning: "), "{stderr}");
+    for fork in [&[][..], &["--no-fork"][..]] {
+        let how = *fork.first().unwrap_or(&"--fork");
+        for (source, extra) in [
+            ("the option parser", &["-z", "qld-bogus-keyword"][..]),
+            ("the link", &[][..]),
+        ] {
+            let mut args = fork.to_vec();
+            args.extend_from_slice(&["-o", "out", "main.o"]);
+            args.extend_from_slice(extra);
 
-    let mut fatal = args.to_vec();
-    fatal.push("--fatal-warnings");
-    let stderr = qld_err(&dir, &fatal);
-    assert!(stderr.contains("qld: error: "), "{stderr}");
-    assert!(!stderr.contains("qld: warning: "), "{stderr}");
+            let output = qld(&dir, &args);
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "{how}, {source}: a warning alone does not fail: {stderr}"
+            );
+            assert!(
+                stderr.contains("qld: warning: "),
+                "{how}, {source}: a warning is expected: {stderr}"
+            );
 
-    let mut quiet = fatal.clone();
-    quiet.push("-w");
-    let output = qld(&dir, &quiet);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
-        "-w cancels --fatal-warnings: {stderr}"
-    );
-    assert_eq!(stderr, "");
+            let mut fatal = args.clone();
+            fatal.push("--fatal-warnings");
+            let output = qld(&dir, &fatal);
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{how}, {source}: GNU ld and lld exit 1 here: {stderr}"
+            );
+            assert!(
+                stderr.contains("qld: error: ") && !stderr.contains("qld: warning: "),
+                "{how}, {source}: every warning is now an error: {stderr}"
+            );
+
+            let mut quiet = fatal.clone();
+            quiet.push("-w");
+            let output = qld(&dir, &quiet);
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "{how}, {source}: -w cancels --fatal-warnings: {stderr}"
+            );
+            assert_eq!(stderr, "", "{how}, {source}: -w prints nothing");
+        }
+    }
 }
 
 /// The five fatal-error messages qld shares with GNU ld: a missing library,

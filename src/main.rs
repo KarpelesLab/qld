@@ -127,7 +127,13 @@ fn run(args: &[OsString], launch: Launch) -> u8 {
             let sink = Arc::clone(&diagnostics);
             Some(OutputCompleteHook::new(move || {
                 sink.flush();
-                child.notify(0);
+                // The status the parent exits with, and only the first
+                // `notify` counts, so it has to be the real one here. The
+                // output is complete, so the link succeeded; what is left
+                // is `--fatal-warnings`, which promotes warnings to errors
+                // inside the sink without stopping the link, and
+                // `--noinhibit-exec`, which writes the output anyway.
+                child.notify(u8::from(sink.error_count() != 0));
             }))
         }
     };
