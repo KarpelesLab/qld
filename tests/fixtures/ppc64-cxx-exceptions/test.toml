@@ -1,0 +1,22 @@
+# M4: C++ exceptions on PowerPC64 BE. The unwinder reads `.eh_frame`
+# written big-endian, and every personality routine and landing pad it
+# reaches is called through its `.opd` descriptor, so the descriptors and
+# the calls that follow them must both be right. GCC does not pass
+# `--eh-frame-hdr` for a static link on this target, so there is no
+# `PT_GNU_EH_FRAME` to check.
+description = "C++ exceptions across two frames, for PowerPC64 BE (ELFv1)"
+compile = ["c++ -O2 -c throw.cpp"]
+driver = "c++"
+link = "-static -o out throw.o"
+run = "./out"
+expect.stdout = "caught boom 5\n"
+expect.readelf = [
+  "PowerPC64",
+  "big endian",
+  "abiv1",
+  ".eh_frame",
+  ".gcc_except_table",
+  ".opd",
+]
+targets = ["powerpc64-linux-gnu"]
+determinism = true

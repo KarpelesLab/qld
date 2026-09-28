@@ -1839,6 +1839,13 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             if target.is_ifunc()
                 && let Some(stub) = addresses.iplt_address(owner)
             {
+                // The ELFv1 ABI's canonical address of a function is its
+                // descriptor, and qld's IFUNC stub is code, so taking one's
+                // address is refused rather than written wrong (M4).
+                if arch == super::arch::Arch::Ppc64Be && class.kind != Kind::Pc {
+                    report(ppc64_opd_ifunc_address(refs, file_index, rel.symbol));
+                    continue;
+                }
                 s = stub;
             }
             if flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
@@ -1896,24 +1903,34 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 }
                 // PowerPC64 calls: local entry points, stubs and TOC
                 // restores.
-                Width::Ppc(crate::arch::ppc64::Field::Rel24) => ppc64_branch(
-                    out,
-                    addresses,
-                    id,
-                    &rel,
-                    PpcBranch {
-                        place,
-                        target: sa,
-                        st_other: target.raw.map_or(0, |raw| raw.st_other),
-                        via_stub: alloc
-                            && ((target.is_ifunc() && addresses.iplt_address(owner).is_some())
-                                || (flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
-                                    && arch.is_branch(rel.r_type)
-                                    && addresses.plt_address(owner).is_some())),
-                        owner,
-                        width: class.width,
-                    },
-                ),
+                Width::Ppc(crate::arch::ppc64::Field::Rel24) => {
+                    let via_stub = alloc
+                        && ((target.is_ifunc() && addresses.iplt_address(owner).is_some())
+                            || (flags.contains(SymbolFlags::NEEDS_PLT | PREEMPTIBLE)
+                                && arch.is_branch(rel.r_type)
+                                && addresses.plt_address(owner).is_some()));
+                    // ELFv1: the symbol names a function descriptor, the
+                    // call has to reach the code it points at.
+                    let call_target = if arch == super::arch::Arch::Ppc64Be && !via_stub {
+                        ppc64_opd_target(addresses, &target, a).unwrap_or(sa)
+                    } else {
+                        sa
+                    };
+                    ppc64_branch(
+                        out,
+                        addresses,
+                        id,
+                        &rel,
+                        PpcBranch {
+                            place,
+                            target: call_target,
+                            st_other: target.raw.map_or(0, |raw| raw.st_other),
+                            via_stub,
+                            owner,
+                            width: class.width,
+                        },
+                    )
+                }
                 _ => put(out, sa.wrapping_sub(place)),
             },
             Kind::Page => put(out, page_delta(sa)),
@@ -2017,6 +2034,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                     .wrapping_add_signed(a)
                     .wrapping_sub(place),
             ),
+            Kind::GotBase => put(out, addresses.got_base().wrapping_add_signed(a)),
             Kind::Size => {
                 let size = target.raw.map_or(0, |r| r.st_size);
                 put(out, size.wrapping_add_signed(a))
@@ -2127,6 +2145,41 @@ fn add_delta(kind: Kind, value: u64) -> Option<u64> {
     }
 }
 
+/// The diagnostic for taking the address of an ELFv1 IFUNC, which needs
+/// the function descriptor GNU ld's `.iplt` entry is; qld's IFUNC stub is
+/// code, so the address is refused rather than written wrong.
+#[cold]
+#[inline(never)]
+fn ppc64_opd_ifunc_address<F: crate::elf::read::ElfFormat>(
+    refs: &Refs<'_, '_, F>,
+    file: usize,
+    symbol: u32,
+) -> String {
+    let name = symbol_name(refs, file, symbol);
+    format!(
+        "taking the address of the ifunc `{name}' is not implemented for the \
+         PowerPC64 ELFv1 ABI: it needs a function descriptor"
+    )
+}
+
+/// The code a PowerPC64 ELFv1 call reaches: the symbol names a function
+/// descriptor in `.opd`, whose first doubleword holds the entry point, so
+/// the descriptor's `R_PPC64_ADDR64` is resolved in its place. The call's
+/// own addend `a` still applies. `None` when the symbol is not a
+/// descriptor (an old compiler's "dot" symbol, say), and the caller keeps
+/// the symbol's own address.
+#[inline(never)]
+fn ppc64_opd_target<F: crate::elf::read::ElfFormat>(
+    addresses: &Addresses<'_, '_, F>,
+    target: &super::refs::Target,
+    a: i64,
+) -> Option<u64> {
+    let (file, entry) = super::arch::ppc64_elfv1::descriptor(&addresses.refs, target, a)?;
+    let code = addresses.refs.target(file, entry.symbol as usize)?;
+    let (s, addend) = addresses.symbol_address(&code, entry.addend)?;
+    Some(s.wrapping_add_signed(addend))
+}
+
 /// What [`ppc64_branch`] needs to know about a call besides the relocation.
 struct PpcBranch {
     place: u64,
@@ -2150,7 +2203,7 @@ fn ppc64_branch<F: crate::elf::read::ElfFormat>(
     rel: &crate::elf::read::Relocation,
     call: PpcBranch,
 ) -> std::result::Result<(), ApplyError> {
-    let arch = super::arch::Arch::Ppc64;
+    let arch = addresses.synth.arch;
     let slot = if call.via_stub {
         super::values::plt_slot_address(addresses.synth, addresses.layout, call.owner)
     } else {
@@ -2177,7 +2230,7 @@ fn ppc64_branch<F: crate::elf::read::ElfFormat>(
         sa = thunk;
     }
     arch.finish_call(out, rel.offset, branch)?;
-    arch::write_value(out, rel.offset, call.width, sa.wrapping_sub(call.place))
+    arch::write_value_as::<F::Endian>(out, rel.offset, call.width, sa.wrapping_sub(call.place))
 }
 
 /// Writes a PowerPC64 TOC-relative access, relaxing it to address the
@@ -2205,7 +2258,7 @@ fn ppc64_toc_access<F: crate::elf::read::ElfFormat>(
             Some((address, field)) => (address, Width::Ppc(field)),
             None => (sa, width),
         };
-    arch::write_value(
+    arch::write_value_as::<F::Endian>(
         out,
         rel.offset,
         width,

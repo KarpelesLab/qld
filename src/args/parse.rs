@@ -262,12 +262,12 @@ pub fn usage() -> String {
     text.push_str(
         "qld: supported targets: elf64-x86-64 elf32-x86-64 elf32-i386 \
          elf64-littleaarch64 elf32-littlearm elf64-littleriscv elf32-littleriscv \
-         elf64-powerpcle elf64-loongarch elf64-s390 \
+         elf64-powerpcle elf64-powerpc elf64-loongarch elf64-s390 \
          pei-x86-64 pei-i386 pei-aarch64-little\n",
     );
     text.push_str(
         "qld: supported emulations: elf_x86_64 elf32_x86_64 elf_i386 \
-         aarch64linux armelf_linux_eabi elf64lriscv elf32lriscv elf64lppc \
+         aarch64linux armelf_linux_eabi elf64lriscv elf32lriscv elf64lppc elf64ppc \
          elf64loongarch elf64_s390 i386pep i386pe arm64pe\n",
     );
     text

@@ -199,6 +199,9 @@ pub struct Synth {
     pub verdef_count: u64,
     /// RISC-V: the merged `.riscv.attributes`.
     pub riscv_attributes: Option<super::arch::riscv::attributes::Output>,
+    /// PowerPC64: the first live `.gnu.attributes` input section, the only
+    /// one kept ([`Arch::one_gnu_attributes`]).
+    pub gnu_attributes: Option<crate::ids::SectionId>,
     /// 32-bit Arm: the merged `.ARM.attributes` and the exception index,
     /// which take the place of their first input section.
     pub arm: Option<Box<super::arch::arm::Prepared>>,
@@ -357,6 +360,9 @@ impl Synth {
         }
         if self.arch.is_riscv() {
             self.riscv_attributes = super::arch::riscv::attributes::collect(refs);
+        }
+        if self.arch.one_gnu_attributes() {
+            self.gnu_attributes = first_gnu_attributes(refs);
         }
         self.section_dyn_relocs = scan.section_dyn_relocs();
         self.section_packable = scan.section_packable();
@@ -830,6 +836,35 @@ pub enum SlotReloc {
     Symbolic(DynKind),
     /// A relocation of this kind against symbol 0 (the output itself).
     Module(DynKind),
+}
+
+/// The first live `SHT_GNU_ATTRIBUTES` input section, in input order.
+///
+/// The section is one vendor section, not a list of them, so concatenating
+/// the inputs' would leave something no reader can parse; qld keeps the
+/// first and drops the rest ([`Arch::one_gnu_attributes`]), where GNU ld
+/// merges the tag values.
+#[must_use]
+fn first_gnu_attributes<F: crate::elf::read::ElfFormat>(
+    refs: &crate::elf::refs::Refs<'_, '_, F>,
+) -> Option<crate::ids::SectionId> {
+    for (file_index, file) in refs.files.iter().enumerate() {
+        let Some(object) = file.object.as_ref() else {
+            continue;
+        };
+        for (index, section) in object.sections.iter().enumerate() {
+            let Ok(index) = u32::try_from(index) else {
+                break;
+            };
+            if section.header.sh_type == crate::elf::read::consts::SHT_GNU_ATTRIBUTES
+                && refs.sections.is_live_in(file_index, index)
+                && let Some(id) = refs.sections.id(file_index, index)
+            {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 /// The dynamic relocations of the (one or two) GOT words of `owner`'s

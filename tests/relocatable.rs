@@ -23,6 +23,8 @@
 //! Tools: a clang and clang++ with the back ends (any upstream build has
 //! them all) and `ld.lld` (`QLD_TEST_LLD`), plus `llvm-objdump`. A missing
 //! tool prints `SKIPPED:` and passes, unless `QLD_REQUIRE_TOOLS` is set.
+//! A host that does not build ELF at all — the MinGW toolchain of a
+//! Windows runner, whose `ld` only knows `i386pe` — skips every test.
 
 mod common;
 
@@ -163,6 +165,27 @@ fn qld(dir: &Path, args: &[&str]) -> Output {
     run_ok(dir, Path::new(env!("CARGO_BIN_EXE_qld")), args)
 }
 
+/// Whether the host builds the ELF objects these tests compile and links
+/// them with an ELF linker, as the other ELF-only suites ask. A toolchain
+/// that targets something else (the MinGW `cc` and `ld` of a Windows
+/// runner) skips; a missing compiler is [`suite`]'s to report, so that
+/// `QLD_REQUIRE_TOOLS` still fails on Linux.
+fn elf_host() -> bool {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        skip("host is not x86-64 Linux");
+        return false;
+    }
+    match tools().host.as_ref() {
+        Some(host) if !(host.arch == "x86_64" && host.is_linux()) => {
+            skip(format!(
+                "the C compiler builds {host} objects, not x86-64 ELF"
+            ));
+            false
+        }
+        _ => true,
+    }
+}
+
 /// The clang, clang++, lld and objdump the tests need.
 struct Suite {
     cc: PathBuf,
@@ -173,6 +196,9 @@ struct Suite {
 
 /// The tools, or `None` after printing why they are missing.
 fn suite() -> Option<Suite> {
+    if !elf_host() {
+        return None;
+    }
     let t = tools();
     let pick = |configured: &Option<PathBuf>, name: &str| {
         configured
@@ -501,8 +527,7 @@ fn emitted(dir: &Path, objdump: &Path, path: &str) -> Vec<String> {
 /// behaves like one built from the objects.
 #[test]
 fn relocatable_output_runs() {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        skip("host is not x86-64 Linux");
+    if !elf_host() {
         return;
     }
     let Some(cc) = tools().cc.clone() else {

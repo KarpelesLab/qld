@@ -1,0 +1,24 @@
+# M4: static glibc on PowerPC64 big-endian, the ELFv1 ABI. Every function
+# symbol names a three-doubleword descriptor in `.opd`, so `e_entry` is
+# `_start`'s descriptor and every `bl` is redirected to the code the
+# descriptor's `R_PPC64_ADDR64` points at; `R_PPC64_TOC` fills the
+# descriptors' TOC word. `e_flags` records ABI version 1, and the whole
+# output is big-endian, instruction fields included.
+description = "static hello world in C, for PowerPC64 BE (ELFv1)"
+compile = ["cc -O2 -c hello.c"]
+driver = "cc"
+link = "-static -o hello hello.o"
+run = "./hello"
+expect.stdout = "hello, world\n"
+expect.readelf = [
+  "PowerPC64",
+  "big endian",
+  "EXEC (Executable file)",
+  "abiv1",
+  ".opd",
+  "!INTERP",
+  "!.dynamic",
+  "!R_PPC64_JMP_SLOT",
+]
+targets = ["powerpc64-linux-gnu"]
+determinism = true
