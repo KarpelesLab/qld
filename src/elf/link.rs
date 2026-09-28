@@ -321,6 +321,7 @@ fn check_supported(options: &LinkOptions) -> Result<()> {
             format.name(),
             "elf64-x86-64" | "elf64-x86_64" | "binary" | "ihex" | "srec"
         )
+        && format.name() != crate::hunk::FORMAT_NAME
     {
         return unimplemented(&format!("--oformat {}", format.name()), "M4");
     }

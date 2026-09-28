@@ -190,6 +190,9 @@ pub fn write<F: crate::elf::read::ElfFormat>(input: &WriteInput<'_, '_, '_, F>) 
         .output_format
         .as_ref()
         .and_then(|format| super::rawout::Format::from_name(format.name()));
+    // AmigaOS Hunk output is rendered from the finished image, as the raw
+    // formats are: the image is built in memory and cut into hunks.
+    let hunk = crate::hunk::wanted(input.options);
     let mut chunks: Vec<(ChunkRange, Chunk)> = Vec::new();
     let headers = layout.phoff.max(layout.kind.ehdr_size()).saturating_add(
         layout
@@ -303,7 +306,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(input: &WriteInput<'_, '_, '_, F>) 
     let ranges: Vec<ChunkRange> = chunks.iter().map(|(range, _)| *range).collect();
 
     let path = input.options.output_path();
-    let mut file = if raw.is_some() {
+    let mut file = if raw.is_some() || hunk {
         OutputFile::in_memory(layout.file_size)?
     } else {
         OutputFile::create(
@@ -345,6 +348,17 @@ pub fn write<F: crate::elf::read::ElfFormat>(input: &WriteInput<'_, '_, '_, F>) 
     emit_collected(collected, input)?;
     if let Some(offset) = build_id {
         file.apply_build_id(&input.options.build_id, offset)?;
+    }
+    if hunk {
+        let bytes = crate::hunk::write::render(input, file.as_slice()?)?;
+        drop(file);
+        let options = crate::output::OutputOptions::for_link(input.options);
+        let size = u64::try_from(bytes.len())
+            .map_err(|_| Error::Limit("Hunk output larger than the address space".into()))?;
+        let mut out = OutputFile::create(&path, size, &options)?;
+        out.write_at(0, &bytes)?;
+        out.finish()?;
+        return Ok(());
     }
     if let Some(format) = raw {
         let name = path.as_os_str().as_encoded_bytes().to_vec();

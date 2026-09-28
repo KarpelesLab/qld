@@ -127,6 +127,7 @@ impl ElfIdent {
             (21, true) => Architecture::PowerPc64,
             (258, true) => Architecture::LoongArch64,
             (22, true) => Architecture::S390x,
+            (4, false) => Architecture::M68k,
             _ => return None,
         })
     }

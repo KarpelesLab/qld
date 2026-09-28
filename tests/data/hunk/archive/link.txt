@@ -1,0 +1,2 @@
+archive libhelp.a helper.o aligned.o
+objects main.o libhelp.a
