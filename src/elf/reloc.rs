@@ -144,20 +144,25 @@ struct Props {
 }
 
 fn props(target: &Target, flags: SymbolFlags) -> Props {
-    let preemptible = target.global.is_some() && flags.contains(PREEMPTIBLE);
+    let global = target.global.is_some();
+    let preemptible = global && flags.contains(PREEMPTIBLE);
+    // One read of `st_info` answers both questions about the symbol's type;
+    // it is in the input's symbol table, which is cold by now.
     let kind = target.raw.map_or(0, |r| r.kind());
+    let section = matches!(target.def, Def::Section { .. });
     Props {
-        global: target.global.is_some(),
+        global,
         preemptible,
         shared: matches!(target.def, Def::Shared(_)),
-        defined: matches!(
-            target.def,
-            Def::Section { .. } | Def::Absolute(_) | Def::Common(_) | Def::Linker(_)
-        ),
+        defined: section
+            || matches!(
+                target.def,
+                Def::Absolute(_) | Def::Common(_) | Def::Linker(_)
+            ),
         absolute: matches!(target.def, Def::Absolute(_))
             || flags.contains(super::defined::ABSOLUTE),
         function: kind == STT_FUNC || kind == STT_GNU_IFUNC,
-        local_ifunc: target.is_ifunc() && !preemptible,
+        local_ifunc: kind == STT_GNU_IFUNC && section && !preemptible,
         undefined_weak: matches!(target.def, Def::Undefined { weak: true }),
     }
 }
@@ -165,7 +170,11 @@ fn props(target: &Target, flags: SymbolFlags) -> Props {
 /// The classification context for a relocation against `target`.
 #[must_use]
 pub fn classify_context(context: &Context, target: &Target, flags: SymbolFlags) -> ClassifyContext {
-    let p = props(target, flags);
+    classify_context_of(context, &props(target, flags))
+}
+
+/// [`classify_context`] once the target's properties are known.
+fn classify_context_of(context: &Context, p: &Props) -> ClassifyContext {
     let mode = context.mode;
     let tls = if !mode.dynamic {
         TlsMode::LocalExec
@@ -227,7 +236,10 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
     flags: SymbolFlags,
     section_flags: u64,
 ) -> Result<Decision, ClassifyError> {
-    let mut classify = classify_context(context, target, flags);
+    // The target's properties are what both the classification context and
+    // the decision below are made of: read the symbol once.
+    let p = props(target, flags);
+    let mut classify = classify_context_of(context, &p);
     classify.code = section_flags & crate::elf::read::consts::SHF_EXECINSTR != 0;
     // Only ELF32 links can be i386 ones: for the other formats this is
     // gone at compile time, and costs their relocation loops nothing.
@@ -237,7 +249,6 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
     let class = context
         .arch
         .classify(rel.r_type, rel.addend, data, rel.offset, classify)?;
-    let p = props(target, flags);
     let mode = context.mode;
     let mut decision = Decision {
         class,
