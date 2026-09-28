@@ -56,11 +56,11 @@
 
 use crate::arch::ppc64::{
     self as insn, ADD_R3_R3_R13, ADDI_R3_R3, ADDI_R3_R3_4096, ADDIS_R3_R13, ADDIS_R13, Field,
-    LD_R2_24_R1, NOP, PADDI_R3_R13, PADDI_R3_R13_4096, PADDI_R13, read_insn, read_prefixed,
-    write_insn, write_prefixed,
+    LD_R2_24_R1, NOP, PADDI_R3_R13, PADDI_R3_R13_4096, PADDI_R13, d_offset, read_insn,
+    read_prefixed, write_insn, write_prefixed,
 };
 use crate::elf::read::consts::ppc64::*;
-use crate::elf::read::{Relocation, Relocations};
+use crate::elf::read::{Endian, Relocation, Relocations};
 
 use super::{
     ApplyError, Branch, Class, ClassifyContext, ClassifyError, GotKind, Kind, RelaxValues, TlsMode,
@@ -81,10 +81,10 @@ const fn relax(kind: Kind) -> Class {
 
 /// Whether the prefixed instruction at `offset` of `data` is a `pld`,
 /// which a GOT-indirect access can turn into a `paddi`.
-fn is_pld(data: &[u8], offset: u64) -> bool {
+fn is_pld<E: Endian>(data: &[u8], offset: u64) -> bool {
     usize::try_from(offset)
         .ok()
-        .and_then(|at| read_prefixed(data, at))
+        .and_then(|at| read_prefixed::<E>(data, at))
         .is_some_and(|insn| insn & 0xfc00_0000 == 0xe400_0000)
 }
 
@@ -102,7 +102,7 @@ fn is_pld(data: &[u8], offset: u64) -> bool {
 // Out of line: large, and not to be inlined into the other architectures'
 // relocation loops.
 #[inline(never)]
-pub fn classify(
+pub fn classify<E: Endian>(
     r_type: u32,
     data: &[u8],
     offset: u64,
@@ -173,7 +173,7 @@ pub fn classify(
         R_PPC64_GOT16_DS => got(K::GotSlotRel, F::Ds, GotKind::Address),
         R_PPC64_GOT16_LO_DS => got(K::GotSlotRel, F::LoDsToc, GotKind::Address),
         R_PPC64_GOT_PCREL34 => {
-            if context.relax_got && is_pld(data, offset) {
+            if context.relax_got && is_pld::<E>(data, offset) {
                 class(K::Pc, F::PldToPaddi)
             } else {
                 got(K::Got, F::Prefixed34, GotKind::Address)
@@ -306,20 +306,20 @@ fn at(offset: u64) -> Result<usize, ApplyError> {
     usize::try_from(offset).map_err(|_| ApplyError::OutOfBounds)
 }
 
-fn get(out: &[u8], offset: u64) -> Result<u32, ApplyError> {
-    read_insn(out, at(offset)?).ok_or(ApplyError::OutOfBounds)
+fn get<E: Endian>(out: &[u8], offset: u64) -> Result<u32, ApplyError> {
+    read_insn::<E>(out, at(offset)?).ok_or(ApplyError::OutOfBounds)
 }
 
-fn put(out: &mut [u8], offset: u64, value: u32) -> Result<(), ApplyError> {
-    write_insn(out, at(offset)?, value).ok_or(ApplyError::OutOfBounds)
+fn put<E: Endian>(out: &mut [u8], offset: u64, value: u32) -> Result<(), ApplyError> {
+    write_insn::<E>(out, at(offset)?, value).ok_or(ApplyError::OutOfBounds)
 }
 
-fn get_prefixed(out: &[u8], offset: u64) -> Result<u64, ApplyError> {
-    read_prefixed(out, at(offset)?).ok_or(ApplyError::OutOfBounds)
+fn get_prefixed<E: Endian>(out: &[u8], offset: u64) -> Result<u64, ApplyError> {
+    read_prefixed::<E>(out, at(offset)?).ok_or(ApplyError::OutOfBounds)
 }
 
-fn put_prefixed(out: &mut [u8], offset: u64, value: u64) -> Result<(), ApplyError> {
-    write_prefixed(out, at(offset)?, value).ok_or(ApplyError::OutOfBounds)
+fn put_prefixed<E: Endian>(out: &mut [u8], offset: u64, value: u64) -> Result<(), ApplyError> {
+    write_prefixed::<E>(out, at(offset)?, value).ok_or(ApplyError::OutOfBounds)
 }
 
 fn encode_error(error: insn::EncodeError) -> ApplyError {
@@ -329,8 +329,10 @@ fn encode_error(error: insn::EncodeError) -> ApplyError {
     }
 }
 
-/// Writes `field` of the instruction at `offset` with `value`.
-fn patch(
+/// Writes `field` of the instruction at `offset` with `value`. `offset` is
+/// the instruction word's, not the relocation's: the callers have already
+/// subtracted [`d_offset`] where the relocation names a halfword.
+fn patch<E: Endian>(
     out: &mut [u8],
     offset: u64,
     insn: u32,
@@ -343,7 +345,7 @@ fn patch(
     } else {
         field.encode32(insn, value).map_err(encode_error)?
     };
-    put(out, offset, encoded)
+    put::<E>(out, offset, encoded)
 }
 
 /// The ABI version the output's `e_flags` records: ELFv2.
@@ -383,7 +385,7 @@ pub fn annotate(rel: Relocation, next: Option<&Relocation>) -> Relocation {
 /// [`ApplyError`] for sequences qld cannot rewrite, and for offsets that
 /// do not fit the replacement instructions.
 #[allow(clippy::too_many_lines)]
-pub fn relax_tls(
+pub fn relax_tls<E: Endian>(
     out: &mut [u8],
     offset: u64,
     kind: Kind,
@@ -392,61 +394,67 @@ pub fn relax_tls(
 ) -> Result<(), ApplyError> {
     let tpoff = values.tpoff;
     let pcrel = r_type & PCREL_CALL_HINT != 0;
+    // The `*16*` types name a halfword, so their instruction word starts
+    // [`d_offset`] bytes earlier; the markers on a `bl` or on an X-form
+    // access name the whole instruction and need no adjustment.
+    let half = offset.wrapping_sub(d_offset::<E>());
     match (kind, base_type(r_type)) {
         (Kind::GdToLe, R_PPC64_GOT_TLSGD16_HA)
         | (Kind::LdToLe, R_PPC64_GOT_TLSLD16_HA)
-        | (Kind::IeToLe, R_PPC64_GOT_TPREL16_HA) => put(out, offset, NOP),
+        | (Kind::IeToLe, R_PPC64_GOT_TPREL16_HA) => put::<E>(out, half, NOP),
         // addi r3, r3, x@got@tlsgd@l -> addis r3, r13, x@tprel@ha
         (Kind::GdToLe, R_PPC64_GOT_TLSGD16 | R_PPC64_GOT_TLSGD16_LO) => {
-            patch(out, offset, ADDIS_R3_R13, Field::Ha, tpoff)
+            patch::<E>(out, half, ADDIS_R3_R13, Field::Ha, tpoff)
         }
         // addi r3, r3, x@got@tlsld@l -> addis r3, r13, 0
         (Kind::LdToLe, R_PPC64_GOT_TLSLD16 | R_PPC64_GOT_TLSLD16_LO) => {
-            put(out, offset, ADDIS_R3_R13)
+            put::<E>(out, half, ADDIS_R3_R13)
         }
         // paddi r3, 0, x@got@tlsgd@pcrel, 1 -> paddi r3, r13, x@tprel, 0
         (Kind::GdToLe, R_PPC64_GOT_TLSGD_PCREL34) => {
             let insn = insn::prefixed34(PADDI_R3_R13, tpoff).map_err(encode_error)?;
-            put_prefixed(out, offset, insn)
+            put_prefixed::<E>(out, offset, insn)
         }
         // paddi r3, 0, x@got@tlsld@pcrel, 1 -> paddi r3, r13, 0x1000, 0
-        (Kind::LdToLe, R_PPC64_GOT_TLSLD_PCREL34) => put_prefixed(out, offset, PADDI_R3_R13_4096),
+        (Kind::LdToLe, R_PPC64_GOT_TLSLD_PCREL34) => {
+            put_prefixed::<E>(out, offset, PADDI_R3_R13_4096)
+        }
         // bl __tls_get_addr(x@tlsgd); nop -> nop; addi r3, r3, x@tprel@l
         (Kind::GdToLe, R_PPC64_TLSGD) => {
-            put(out, offset, NOP)?;
+            put::<E>(out, offset, NOP)?;
             if pcrel {
                 return Ok(());
             }
-            patch(out, offset.wrapping_add(4), ADDI_R3_R3, Field::Lo, tpoff)
+            patch::<E>(out, offset.wrapping_add(4), ADDI_R3_R3, Field::Lo, tpoff)
         }
         // bl __tls_get_addr(x@tlsld); nop -> nop; addi r3, r3, 4096
         (Kind::LdToLe, R_PPC64_TLSLD) => {
-            put(out, offset, NOP)?;
+            put::<E>(out, offset, NOP)?;
             if pcrel {
                 return Ok(());
             }
-            put(out, offset.wrapping_add(4), ADDI_R3_R3_4096)
+            put::<E>(out, offset.wrapping_add(4), ADDI_R3_R3_4096)
         }
         // bl __tls_get_addr(x@tlsgd); nop -> nop; add r3, r3, r13
         (Kind::GdToIe, R_PPC64_TLSGD) => {
             if pcrel {
-                return put(out, offset, ADD_R3_R3_R13);
+                return put::<E>(out, offset, ADD_R3_R3_R13);
             }
-            put(out, offset, NOP)?;
-            put(out, offset.wrapping_add(4), ADD_R3_R3_R13)
+            put::<E>(out, offset, NOP)?;
+            put::<E>(out, offset.wrapping_add(4), ADD_R3_R3_R13)
         }
         // ld rT, x@got@tprel@l(rA) -> addis rT, r13, x@tprel@ha
         (Kind::IeToLe, R_PPC64_GOT_TPREL16_LO_DS | R_PPC64_GOT_TPREL16_DS) => {
-            let rt = get(out, offset)? & 0x03e0_0000;
-            patch(out, offset, ADDIS_R13 | rt, Field::Ha, tpoff)
+            let rt = get::<E>(out, half)? & 0x03e0_0000;
+            patch::<E>(out, half, ADDIS_R13 | rt, Field::Ha, tpoff)
         }
         // pld rT, x@got@tprel@pcrel -> paddi rT, r13, x@tprel, 0
         (Kind::IeToLe, R_PPC64_GOT_TPREL_PCREL34) => {
-            let rt = get_prefixed(out, offset)? & 0x03e0_0000;
+            let rt = get_prefixed::<E>(out, offset)? & 0x03e0_0000;
             let insn = insn::prefixed34(PADDI_R13 | rt, tpoff).map_err(encode_error)?;
-            put_prefixed(out, offset, insn)
+            put_prefixed::<E>(out, offset, insn)
         }
-        (Kind::IeToLe, R_PPC64_TLS) => relax_tls_marker(out, offset, tpoff),
+        (Kind::IeToLe, R_PPC64_TLS) => relax_tls_marker::<E>(out, offset, tpoff),
         _ => Err(ApplyError::BadInstruction),
     }
 }
@@ -456,17 +464,17 @@ pub fn relax_tls(
 /// D-form one with `x@tprel@l` as its displacement. The PC-relative form
 /// marks the instruction one byte before it, and needs no displacement
 /// because the `paddi` before it computed the whole address.
-fn relax_tls_marker(out: &mut [u8], offset: u64, tpoff: i64) -> Result<(), ApplyError> {
+fn relax_tls_marker<E: Endian>(out: &mut [u8], offset: u64, tpoff: i64) -> Result<(), ApplyError> {
     match offset & 3 {
         0 => {
             let (d_form, ds) =
-                insn::x_to_d_form(get(out, offset)?).ok_or(ApplyError::BadInstruction)?;
+                insn::x_to_d_form(get::<E>(out, offset)?).ok_or(ApplyError::BadInstruction)?;
             let field = if ds { Field::LoDs } else { Field::Lo };
-            patch(out, offset, d_form, field, tpoff)
+            patch::<E>(out, offset, d_form, field, tpoff)
         }
         1 => {
             let offset = offset.wrapping_sub(1);
-            let old = get(out, offset)?;
+            let old = get::<E>(out, offset)?;
             if insn::primary_opcode(old) == 31 && (old >> 1) & 0x3ff == 266 {
                 // add rT, rA, r13: the address is already in rA.
                 let rt = (old >> 21) & 0x1f;
@@ -477,10 +485,10 @@ fn relax_tls_marker(out: &mut [u8], offset: u64, tpoff: i64) -> Result<(), Apply
                     // mr rT, rA
                     0x7c00_0378 | (rt << 16) | (ra << 21) | (ra << 11)
                 };
-                return put(out, offset, replacement);
+                return put::<E>(out, offset, replacement);
             }
             let (d_form, _) = insn::x_to_d_form(old).ok_or(ApplyError::BadInstruction)?;
-            put(out, offset, d_form)
+            put::<E>(out, offset, d_form)
         }
         _ => Err(ApplyError::BadInstruction),
     }
@@ -497,21 +505,25 @@ fn relax_tls_marker(out: &mut [u8], offset: u64, tpoff: i64) -> Result<(), Apply
 ///
 /// [`ApplyError::BadInstruction`] when the second instruction has no
 /// PC-relative form.
-pub fn relax_pcrel_opt(out: &mut [u8], offset: u64, addend: i64) -> Result<(), ApplyError> {
-    let paddi = get_prefixed(out, offset)?;
+pub fn relax_pcrel_opt<E: Endian>(
+    out: &mut [u8],
+    offset: u64,
+    addend: i64,
+) -> Result<(), ApplyError> {
+    let paddi = get_prefixed::<E>(out, offset)?;
     // paddi rX, 0, sym@pcrel, 1
     if paddi & 0xff10_0000_fc1f_0000 != 0x0610_0000_3800_0000 {
         return Ok(());
     }
     let access_at = offset.wrapping_add_signed(addend);
-    let access = get(out, access_at)?;
+    let access = get::<E>(out, access_at)?;
     let form = insn::pcrel_form(access).ok_or(ApplyError::BadInstruction)?;
     let total = insn::total_displacement(paddi, access);
     let Ok(relaxed) = insn::prefixed34(form, total) else {
         return Ok(());
     };
-    put_prefixed(out, offset, relaxed)?;
-    put(out, access_at, NOP)
+    put_prefixed::<E>(out, offset, relaxed)?;
+    put::<E>(out, access_at, NOP)
 }
 
 /// The address a direct branch jumps to: a `bl` from code that keeps the
@@ -570,12 +582,16 @@ pub fn branch_thunk(branch: Branch) -> Option<u64> {
 ///
 /// [`ApplyError::BadInstruction`] for a PLT call from code without a TOC
 /// pointer whose PLT word is unknown.
-pub fn finish_call(out: &mut [u8], offset: u64, branch: Branch) -> Result<(), ApplyError> {
+pub fn finish_call<E: Endian>(
+    out: &mut [u8],
+    offset: u64,
+    branch: Branch,
+) -> Result<(), ApplyError> {
     match branch.r_type {
         R_PPC64_REL24 if branch.via_stub || insn::clobbers_toc(branch.st_other) => {
             let next = offset.wrapping_add(4);
-            if get(out, next).ok() == Some(NOP) {
-                put(out, next, LD_R2_24_R1)?;
+            if get::<E>(out, next).ok() == Some(NOP) {
+                put::<E>(out, next, LD_R2_24_R1)?;
             }
             Ok(())
         }
@@ -592,19 +608,23 @@ pub fn finish_call(out: &mut [u8], offset: u64, branch: Branch) -> Result<(), Ap
 /// # Errors
 ///
 /// [`ApplyError::OutOfBounds`] when the instruction is outside the section.
-pub fn nop_undefined_branch(out: &mut [u8], offset: u64, r_type: u32) -> Result<bool, ApplyError> {
+pub fn nop_undefined_branch<E: Endian>(
+    out: &mut [u8],
+    offset: u64,
+    r_type: u32,
+) -> Result<bool, ApplyError> {
     if !is_thunk_branch(r_type) {
         return Ok(false);
     }
-    put(out, offset, NOP)?;
+    put::<E>(out, offset, NOP)?;
     Ok(true)
 }
 
 /// Fills `out` with `nop` instructions; a partial word is zeroed.
-pub fn write_nops(out: &mut [u8]) {
+pub fn write_nops<E: Endian>(out: &mut [u8]) {
     let (words, rest) = out.as_chunks_mut::<4>();
     for word in words {
-        *word = NOP.to_le_bytes();
+        *word = E::put_u32(NOP);
     }
     rest.fill(0);
 }
@@ -615,12 +635,16 @@ pub fn write_nops(out: &mut [u8]) {
 /// # Errors
 ///
 /// [`ApplyError::OutOfBounds`] when `out` is too short.
-pub fn write_plt_header(out: &mut [u8], plt: u64, got_plt: u64) -> Result<(), ApplyError> {
+pub fn write_plt_header<E: Endian>(
+    out: &mut [u8],
+    plt: u64,
+    got_plt: u64,
+) -> Result<(), ApplyError> {
     let delta = got_plt.wrapping_sub(plt.wrapping_add(8)) as i64;
     let (words, tail) = insn::glink_header(delta);
-    insn::write_words(out, 0, &words).map_err(encode_error)?;
+    insn::write_words::<E>(out, 0, &words).map_err(encode_error)?;
     let slot = out.get_mut(52..60).ok_or(ApplyError::OutOfBounds)?;
-    slot.copy_from_slice(&tail.to_le_bytes());
+    slot.copy_from_slice(&E::put_u64(tail));
     Ok(())
 }
 
@@ -630,9 +654,9 @@ pub fn write_plt_header(out: &mut [u8], plt: u64, got_plt: u64) -> Result<(), Ap
 /// # Errors
 ///
 /// [`ApplyError`] when the resolver is out of reach.
-pub fn write_plt_entry(out: &mut [u8], entry: u64, plt: u64) -> Result<(), ApplyError> {
+pub fn write_plt_entry<E: Endian>(out: &mut [u8], entry: u64, plt: u64) -> Result<(), ApplyError> {
     let word = insn::glink_entry(entry.wrapping_sub(plt)).map_err(encode_error)?;
-    put(out, 0, word)
+    put::<E>(out, 0, word)
 }
 
 /// Writes a PLT call stub that jumps through the GOT word at `slot`,
@@ -641,9 +665,9 @@ pub fn write_plt_entry(out: &mut [u8], entry: u64, plt: u64) -> Result<(), Apply
 /// # Errors
 ///
 /// [`ApplyError`] when the slot is more than 2 GiB from the TOC pointer.
-pub fn write_call_stub(out: &mut [u8], slot: u64, toc: u64) -> Result<(), ApplyError> {
+pub fn write_call_stub<E: Endian>(out: &mut [u8], slot: u64, toc: u64) -> Result<(), ApplyError> {
     let words = insn::plt_call_stub(slot.wrapping_sub(toc) as i64).map_err(encode_error)?;
-    insn::write_words(out, 0, &words).map_err(encode_error)
+    insn::write_words::<E>(out, 0, &words).map_err(encode_error)
 }
 
 /// The TOC entries a section addresses with `R_PPC64_TOC16_LO` (an `addi`
@@ -775,6 +799,7 @@ pub fn toc_indirection<F: crate::elf::read::ElfFormat>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elf::read::Little;
 
     fn exec() -> ClassifyContext {
         ClassifyContext::static_exec(true)
@@ -804,19 +829,21 @@ mod tests {
 
     #[test]
     fn toc_and_got_types_are_classified() {
-        let toc = classify(R_PPC64_TOC16_HA, &[], 0, exec()).unwrap();
+        let toc = classify::<Little>(R_PPC64_TOC16_HA, &[], 0, exec()).unwrap();
         assert_eq!(toc.kind, Kind::GotRel);
         assert!(toc.uses_got_base());
-        let got_lo = classify(R_PPC64_GOT16_LO_DS, &[], 0, exec()).unwrap();
+        let got_lo = classify::<Little>(R_PPC64_GOT16_LO_DS, &[], 0, exec()).unwrap();
         assert_eq!(got_lo.kind, Kind::GotSlotRel);
         assert!(got_lo.needs_got());
         assert_eq!(
-            classify(R_PPC64_REL24, &[], 0, exec()).unwrap().width,
+            classify::<Little>(R_PPC64_REL24, &[], 0, exec())
+                .unwrap()
+                .width,
             Width::Ppc(Field::Rel24)
         );
         for r_type in [R_PPC64_TOC, R_PPC64_JMP_SLOT, R_PPC64_PLTCALL, 0xdead] {
             assert_eq!(
-                classify(r_type, &[], 0, exec()),
+                classify::<Little>(r_type, &[], 0, exec()),
                 Err(ClassifyError::Unsupported),
                 "type {r_type}"
             );
@@ -827,34 +854,36 @@ mod tests {
     fn got_pcrel_relaxes_only_a_pld() {
         let pld = bytes(&[0x0410_0000, 0xe460_0000]);
         let paddi = bytes(&[0x0610_0000, 0x3860_0000]);
-        let relaxed = classify(R_PPC64_GOT_PCREL34, &pld, 0, exec()).unwrap();
+        let relaxed = classify::<Little>(R_PPC64_GOT_PCREL34, &pld, 0, exec()).unwrap();
         assert_eq!(relaxed.kind, Kind::Pc);
-        let kept = classify(R_PPC64_GOT_PCREL34, &paddi, 0, exec()).unwrap();
+        let kept = classify::<Little>(R_PPC64_GOT_PCREL34, &paddi, 0, exec()).unwrap();
         assert_eq!(kept.kind, Kind::Got);
-        let shared = classify(R_PPC64_GOT_PCREL34, &pld, 0, shared()).unwrap();
+        let shared = classify::<Little>(R_PPC64_GOT_PCREL34, &pld, 0, shared()).unwrap();
         assert!(shared.needs_got());
     }
 
     #[test]
     fn tls_models_follow_the_output() {
-        let gd = classify(R_PPC64_GOT_TLSGD16_HA, &[], 0, shared()).unwrap();
+        let gd = classify::<Little>(R_PPC64_GOT_TLSGD16_HA, &[], 0, shared()).unwrap();
         assert_eq!(gd.slot, GotKind::TlsGd);
         assert_eq!(
-            classify(R_PPC64_TLSGD, &[], 0, shared()).unwrap().kind,
+            classify::<Little>(R_PPC64_TLSGD, &[], 0, shared())
+                .unwrap()
+                .kind,
             Kind::None
         );
-        let marker = classify(R_PPC64_TLSGD, &[], 0, exec()).unwrap();
+        let marker = classify::<Little>(R_PPC64_TLSGD, &[], 0, exec()).unwrap();
         assert_eq!(marker.kind, Kind::GdToLe);
         assert!(marker.skip_next);
         let ie = ClassifyContext {
             tls: TlsMode::InitialExec,
             ..exec()
         };
-        let lo = classify(R_PPC64_GOT_TLSGD16_LO, &[], 0, ie).unwrap();
+        let lo = classify::<Little>(R_PPC64_GOT_TLSGD16_LO, &[], 0, ie).unwrap();
         assert_eq!(lo.slot, GotKind::TpOff);
         assert!(lo.needs_gottpoff());
         assert_eq!(
-            classify(R_PPC64_GOT_TPREL16_HI, &[], 0, exec()),
+            classify::<Little>(R_PPC64_GOT_TPREL16_HI, &[], 0, exec()),
             Err(ClassifyError::BadTlsInstruction)
         );
     }
@@ -869,9 +898,9 @@ mod tests {
         // addis r3, r2, x@got@tlsgd@ha; addi r3, r3, x@got@tlsgd@l;
         // bl __tls_get_addr(x@tlsgd); nop
         let mut code = bytes(&[0x3c62_0000, 0x3863_0000, 0x4800_0001, NOP]);
-        relax_tls(&mut code, 0, Kind::GdToLe, R_PPC64_GOT_TLSGD16_HA, values).unwrap();
-        relax_tls(&mut code, 4, Kind::GdToLe, R_PPC64_GOT_TLSGD16_LO, values).unwrap();
-        relax_tls(&mut code, 8, Kind::GdToLe, R_PPC64_TLSGD, values).unwrap();
+        relax_tls::<Little>(&mut code, 0, Kind::GdToLe, R_PPC64_GOT_TLSGD16_HA, values).unwrap();
+        relax_tls::<Little>(&mut code, 4, Kind::GdToLe, R_PPC64_GOT_TLSGD16_LO, values).unwrap();
+        relax_tls::<Little>(&mut code, 8, Kind::GdToLe, R_PPC64_TLSGD, values).unwrap();
         assert_eq!(
             words(&code),
             [NOP, 0x3c6d_0000, NOP, 0x3863_9008],
@@ -880,14 +909,14 @@ mod tests {
 
         // To initial-exec: the pair loads the offset, the call adds r13.
         let mut code = bytes(&[0x4800_0001, NOP]);
-        relax_tls(&mut code, 0, Kind::GdToIe, R_PPC64_TLSGD, values).unwrap();
+        relax_tls::<Little>(&mut code, 0, Kind::GdToIe, R_PPC64_TLSGD, values).unwrap();
         assert_eq!(words(&code), [NOP, ADD_R3_R3_R13]);
 
         // addis r9, r2, x@got@tprel@ha; ld r9, x@got@tprel@l(r9);
         // lwzx r3, r9, x@tls
         let mut code = bytes(&[0x3d22_0000, 0xe929_0000, 0x7c69_682e]);
-        relax_tls(&mut code, 0, Kind::IeToLe, R_PPC64_GOT_TPREL16_HA, values).unwrap();
-        relax_tls(
+        relax_tls::<Little>(&mut code, 0, Kind::IeToLe, R_PPC64_GOT_TPREL16_HA, values).unwrap();
+        relax_tls::<Little>(
             &mut code,
             4,
             Kind::IeToLe,
@@ -895,7 +924,7 @@ mod tests {
             values,
         )
         .unwrap();
-        relax_tls(&mut code, 8, Kind::IeToLe, R_PPC64_TLS, values).unwrap();
+        relax_tls::<Little>(&mut code, 8, Kind::IeToLe, R_PPC64_TLS, values).unwrap();
         assert_eq!(
             words(&code),
             [NOP, 0x3d2d_0000, 0x8069_9008],
@@ -904,7 +933,7 @@ mod tests {
 
         // The local-dynamic call: addi r3, r3, 4096 after it.
         let mut code = bytes(&[0x4800_0001, NOP]);
-        relax_tls(&mut code, 0, Kind::LdToLe, R_PPC64_TLSLD, values).unwrap();
+        relax_tls::<Little>(&mut code, 0, Kind::LdToLe, R_PPC64_TLSLD, values).unwrap();
         assert_eq!(words(&code), [NOP, ADDI_R3_R3_4096]);
 
         // The PC-relative call has no nop after it to rewrite.
@@ -921,7 +950,7 @@ mod tests {
         let pcrel = annotate(marker, Some(&call)).r_type;
         assert_eq!(base_type(pcrel), R_PPC64_TLSGD);
         let mut code = bytes(&[0x4800_0001, 0x7c63_1a14]);
-        relax_tls(&mut code, 0, Kind::GdToLe, pcrel, values).unwrap();
+        relax_tls::<Little>(&mut code, 0, Kind::GdToLe, pcrel, values).unwrap();
         assert_eq!(words(&code), [NOP, 0x7c63_1a14]);
     }
 
@@ -954,7 +983,7 @@ mod tests {
         };
         assert_eq!(branch_destination(stub), 0x1000_0100);
         let mut code = bytes(&[0x4800_0001, NOP]);
-        finish_call(&mut code, 0, stub).unwrap();
+        finish_call::<Little>(&mut code, 0, stub).unwrap();
         assert_eq!(words(&code), [0x4800_0001, LD_R2_24_R1]);
 
         // PC-relative code calls through the PLT with a stub of its own
@@ -980,7 +1009,7 @@ mod tests {
             Some(0x1000_0100 | insn::THUNK_SAVE_TOC)
         );
         let mut code = bytes(&[0x4800_0001, NOP]);
-        finish_call(&mut code, 0, clobbers).unwrap();
+        finish_call::<Little>(&mut code, 0, clobbers).unwrap();
         assert_eq!(words(&code), [0x4800_0001, LD_R2_24_R1]);
         let thunk = insn::thunk(0x1000_0200, 0x1000_0100 | insn::THUNK_SAVE_TOC).unwrap();
         assert_eq!(thunk[0], insn::STD_R2_24_R1);
@@ -993,14 +1022,14 @@ mod tests {
     #[test]
     fn glink_matches_lld() {
         let mut header = [0u8; 60];
-        write_plt_header(&mut header, 0x10310, 0x20450).unwrap();
+        write_plt_header::<Little>(&mut header, 0x10310, 0x20450).unwrap();
         assert_eq!(&words(&header)[..2], [0x7c08_02a6, 0x429f_0005]);
         assert_eq!(
             u64::from_le_bytes(header[52..60].try_into().unwrap()),
             0x20450 - 0x10318
         );
         let mut entry = [0u8; 4];
-        write_plt_entry(&mut entry, 0x10310 + 64, 0x10310).unwrap();
+        write_plt_entry::<Little>(&mut entry, 0x10310 + 64, 0x10310).unwrap();
         assert_eq!(words(&entry), [0x4bff_ffc0]);
     }
 }

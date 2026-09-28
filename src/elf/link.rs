@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use crate::args::{LinkOptions, OutputKind, StripMode};
 use crate::debug::tombstone::{Style as TombstoneStyle, Tombstones};
 use crate::diag::{Diagnostic, DiagnosticSink};
-use crate::elf::read::{Elf32Le, Elf64Be, Elf64Le, ElfKind};
+use crate::elf::read::{Elf32Be, Elf32Le, Elf64Be, Elf64Le, ElfKind};
 use crate::error::{Error, Result};
 use crate::input::FileTable;
 use crate::passes::IcfMode;
@@ -91,9 +91,7 @@ pub fn link(options: &LinkOptions, diagnostics: &dyn DiagnosticSink) -> Result<(
         ElfKind::Elf64Le => link_as::<Elf64Le>(&prepared, diagnostics),
         ElfKind::Elf32Le => link_as::<Elf32Le>(&prepared, diagnostics),
         ElfKind::Elf64Be => link_as::<Elf64Be>(&prepared, diagnostics),
-        kind @ ElfKind::Elf32Be => Err(Error::Unimplemented(format!(
-            "big-endian ELF output ({kind:?}) needs a big-endian architecture (M4)"
-        ))),
+        ElfKind::Elf32Be => link_as::<Elf32Be>(&prepared, diagnostics),
     }
 }
 

@@ -290,6 +290,13 @@ fn branch_target<F: crate::elf::read::ElfFormat>(
     {
         return Some((plt, Some(slot_of(input, layout, owner)), 0));
     }
+    // PowerPC64 ELFv1: the symbol names a function descriptor, so the
+    // branch really goes to the code its first doubleword points at.
+    if input.synth.arch == Arch::Ppc64Be
+        && let Some((owner, entry)) = super::ppc64_elfv1::descriptor(refs, &target, addend)
+    {
+        return branch_target(input, layout, owner, entry.symbol, entry.addend);
+    }
     let st_other = target.raw.map_or(0, |raw| raw.st_other);
     let address = match target.def {
         Def::Section {
