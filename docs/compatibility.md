@@ -554,6 +554,23 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   unsupported relocations. RWPI `SBREL` is refused, as GNU ld refuses it
   too ("dangerous relocation: unsupported relocation").
 
+## PowerPC64 BE (ELFv1)
+
+- **Static output only.** Dynamic output needs ELFv1's `.plt` of function
+  descriptors, which qld does not build yet; `-shared`, PIE and an
+  executable that links a shared object are refused with a clear error
+  rather than written wrong.
+- Static IFUNCs use `R_PPC64_IRELATIVE` against a `.got.plt` word with a
+  seven-instruction stub; GNU ld uses `R_PPC64_JMP_IREL` against a `.iplt`
+  entry that is itself the descriptor. glibc's static startup accepts both.
+  Taking an IFUNC's address is reported as unimplemented.
+- `--gc-sections` does not split `.opd`, so a descriptor keeps its function
+  alive; GNU ld's `ppc64_elf_edit_opd` drops unreferenced ones.
+- `.gnu.attributes`: qld keeps the first input's section, where GNU ld
+  merges the tag values, so a hard-float and soft-float mix is not
+  diagnosed. (qld used to concatenate them, which produced a section
+  `readelf` refused to parse; that affected PowerPC64 LE too.)
+
 ## RISC-V 32
 
 - The backend is shared with RV64; only the width-dependent parts (GOT and

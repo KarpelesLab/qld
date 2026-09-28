@@ -86,7 +86,7 @@ can work at the same time without colliding.
 | W45 | s390x, the first big-endian target (M4) | `src/elf/arch/s390x*`, `src/arch/s390x*`, big-endian enablement in the ELF format layer, `tests/s390x*`, `tests/fixtures/s390x-*` | W40 | in progress |
 | W46 | 32-bit ARM (M4) | `src/elf/arch/arm*` (not `aarch64*`), `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W40 | merged |
 | W47 | Single-thread speed and scaling (M5) | hot paths in `src/elf/{write,scan,reloc,object,inputs,layout}*`, `src/symbols/**`, `src/input/**`, `src/main.rs` (allocator tuning, agreed), `benches/**`, `tests/projects/bench*` | W42 | in progress |
-| W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | in progress |
+| W48 | PowerPC64 BE and big-endian ELF32 (M4) | `src/elf/arch/ppc64*` (ELFv1), the `Elf32Be` instantiation, `tests/ppc64be*`, `tests/fixtures/ppc64-*` | W45 | merged |
 | W49 | 32-bit Arm completeness (M4) | `src/elf/arch/arm*`, `src/arch/arm*`, `tests/arm32*`, `tests/fixtures/arm-*` | W46, W48 | merged |
 | W50 | `-r`, `--emit-relocs` and debug indexes for every class | `src/elf/{relocatable,emit}.rs`, `src/debug/{gdb_index,debug_names}*`, `tests/relocatable*` | W29, W45 | merged |
 | W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | in progress |
@@ -627,6 +627,15 @@ remaining option and GNU-difference gaps.
 ---
 
 ## Integration follow-ups
+
+- **W48 (PowerPC64 BE):** dynamic ELFv1 output is the big one — `DT_PLTGOT`
+  names a `.plt` of 24-byte descriptors the dynamic linker fills, with
+  `.glink` holding the code, which does not fit qld's "code in `.plt`,
+  words in `.got.plt`" model and needs `synth.rs`/`rules.rs`/`layout.rs`
+  rather than an arch hook. Then `.opd` splitting for `--gc-sections`,
+  IFUNC addresses, and `.gnu.attributes` merging.
+- **`.toc` folded into `.got`** is done for PowerPC64 LE (W52) and still
+  open for BE (`rules.rs`).
 
 - **W52 (PowerPC64 LE):** still open, with notes on the size of each:
   `_savegpr*`/`_restgpr*` (lld implements these, so they are verifiable

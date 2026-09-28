@@ -62,6 +62,7 @@ survive GC.
 | x32 | `elf32_x86_64` | M4 | ILP32 on x86-64 |
 | PowerPC64 | `elf64lppc`, `elf64ppc` | M4 | TOC, ELFv1 OPD, long-branch stubs |
 | LoongArch64 | `elf64loongarch` | M4 | relaxation |
+| PowerPC64 BE | `elf64ppc` | M4 | big-endian ELFv1, static output |
 | s390x | `elf64_s390` | M4 | big-endian 64-bit |
 
 ### DWARF and debug information
