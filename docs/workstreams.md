@@ -92,6 +92,7 @@ can work at the same time without colliding.
 | W51 | Diagnostics framework and parser robustness (M0) | `src/diag.rs` (agreed), diagnostic call sites, `tests/diag*`, `tests/corrupt*` | — | merged |
 | W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | merged |
 | W53 | Option coverage and GNU differences | `src/args/**`, the x86-64 difference fixes in `src/elf/{defined,dynsym,synth}*`, `tests/args*` | W22, W43 | merged |
+| W55 | Amiga Hunk output and m68k (M4/M7-style) | `src/hunk/**`, `src/elf/arch/m68k*`, `src/arch/m68k*`, `tests/hunk*`, `tests/m68k*`; agreed additions to `src/target.rs` and `src/lib.rs` | — | in progress |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -623,6 +624,14 @@ single-thread speed against lld, the last architectures (PowerPC64 BE,
 big-endian ELF32 and Arm BE8), `-r` and the debug indexes for every ELF
 class, the M0 diagnostics item, LoongArch shrinking relaxation, and the
 remaining option and GNU-difference gaps.
+
+---
+
+## W55: Amiga Hunk output and m68k
+
+**Goal:** qld links Motorola 68000 objects into AmigaOS Hunk executables.
+vasm assembles the inputs and vlink is the oracle; nothing is run, since
+the output needs an Amiga emulator and the user asked not to use one.
 
 ---
 
