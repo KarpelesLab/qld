@@ -156,6 +156,7 @@ pub fn classify(
         R_PPC64_REL24 | R_PPC64_REL24_NOTOC => class(K::Pc, F::Rel24),
         R_PPC64_REL14 | R_PPC64_REL14_BRTAKEN | R_PPC64_REL14_BRNTAKEN => class(K::Pc, F::Rel14),
         R_PPC64_PCREL34 => class(K::Pc, F::Prefixed34),
+        R_PPC64_REL16DX_HA => class(K::Pc, F::RelDxHa),
 
         // TOC-relative: `S + A - .TOC.`.
         R_PPC64_TOC16 => class(K::GotRel, F::Half16),
@@ -787,6 +788,7 @@ mod tests {
             tls: TlsMode::Dynamic,
             tls_ld: TlsMode::Dynamic,
             code: true,
+            tls_symbol: false,
         }
     }
 

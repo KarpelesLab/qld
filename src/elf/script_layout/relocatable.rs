@@ -34,7 +34,7 @@ use crate::args::LinkOptions;
 use crate::elf::inputs::ElfInput;
 use crate::elf::place::Placement;
 use crate::elf::read::SectionIndex;
-use crate::elf::read::consts::{SHF_ALLOC, SHF_WRITE};
+use crate::elf::read::consts::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE};
 use crate::elf::refs::LINKER_FILE;
 use crate::elf::sections::{NONE, Sections};
 use crate::error::{Error, Result};
@@ -88,6 +88,9 @@ pub struct ScriptMember {
     pub section: u32,
     /// Its offset in the output section.
     pub offset: u64,
+    /// Bytes of padding before it that a synthesized `R_LARCH_ALIGN`
+    /// covers (LoongArch `-r`; 0 otherwise).
+    pub align_pad: u64,
 }
 
 /// An output section a script statement creates.
@@ -586,6 +589,10 @@ pub fn layout<'a, F: crate::elf::read::ElfFormat>(
         );
     }
     let wanted = |name: &[u8]| applied.iter().any(|(n, ..)| n == name);
+    // LoongArch alone needs alignment written down as relocations, so that
+    // a later relaxing link of this output keeps it ([`align_padding`]).
+    let synthesize_align =
+        crate::elf::arch::Arch::of(options, files) == crate::elf::arch::Arch::LoongArch64;
 
     let hasher = || foldhash::fast::FixedState::with_seed(0x7265_6c6f_6373);
     let mut previous: HashMap<Vec<u8>, Value<Handle>, _> = HashMap::with_hasher(hasher());
@@ -714,7 +721,7 @@ pub fn layout<'a, F: crate::elf::read::ElfFormat>(
                     let result = lay_out_output(
                         &mut ctx,
                         output,
-                        (out, vma, attr_align, subalign),
+                        (out, vma, attr_align, subalign, synthesize_align),
                         list,
                         files,
                         sections,
@@ -898,12 +905,15 @@ struct Laid {
 fn lay_out_output<F: crate::elf::read::ElfFormat>(
     ctx: &mut Context<'_, '_, F>,
     output: &OutputStmt,
-    (out, vma, attr_align, subalign): (u32, u64, u64, Option<u64>),
+    (out, vma, attr_align, subalign, synthesize_align): (u32, u64, u64, Option<u64>, bool),
     list: &[(u16, SectionId)],
     files: &[ElfInput<'_, F>],
     sections: &Sections,
     wanted: &dyn Fn(&[u8]) -> bool,
 ) -> Laid {
+    // The first section with relaxation marks is the one the others move
+    // relative to, so only what follows it needs padding (lld's `baseSec`).
+    let mut relaxable_seen = false;
     let abs = |ctx: &mut Context<'_, '_, F>, expr: &crate::script::Expr| match eval(expr, ctx) {
         Ok(value) => Some(value.resolve(ctx)),
         Err(error) => {
@@ -945,7 +955,22 @@ fn lay_out_output<F: crate::elf::read::ElfFormat>(
                     };
                     let align = subalign.unwrap_or(section.header.sh_addralign).max(1);
                     laid.align = laid.align.max(align);
-                    let at = align_up(ctx.dot, align);
+                    // LoongArch `-r`: the assembler writes `R_LARCH_ALIGN`
+                    // only for a section it marked relaxable, so a later
+                    // relaxing link would not know that the sections after
+                    // one must stay aligned. As lld does, reserve `2^n - 4`
+                    // bytes of padding before each of them; the partial
+                    // link writes the relocation that covers it.
+                    let pad = if synthesize_align && section.header.sh_flags & SHF_EXECINSTR != 0 {
+                        align_padding(files, file_index, section, align, &mut relaxable_seen)
+                    } else {
+                        0
+                    };
+                    let at = if pad == 0 {
+                        align_up(ctx.dot, align)
+                    } else {
+                        ctx.dot.wrapping_add(pad)
+                    };
                     if at > ctx.dot
                         && let Some(pattern) = &fill
                     {
@@ -956,6 +981,7 @@ fn lay_out_output<F: crate::elf::read::ElfFormat>(
                         file: u32::try_from(file_index).unwrap_or(NONE),
                         section: section_index,
                         offset: at.wrapping_sub(vma),
+                        align_pad: pad,
                     });
                     ctx.dot = at.wrapping_add(section.header.sh_size);
                 }
@@ -1035,6 +1061,7 @@ fn lay_out_output<F: crate::elf::read::ElfFormat>(
             file: u32::try_from(file_index).unwrap_or(NONE),
             section: section_index,
             offset: at.wrapping_sub(vma),
+            align_pad: 0,
         });
         ctx.dot = at.wrapping_add(section.header.sh_size);
     }
@@ -1063,4 +1090,42 @@ fn output_of_stmt_list(output_of_stmt: &[u32], outputs: usize) -> Vec<u32> {
         }
     }
     list
+}
+
+/// The `R_LARCH_ALIGN` padding a partial link puts before an input
+/// section: `2^n - 4` bytes when the section follows one with relaxation
+/// marks (`relaxable_seen`), is aligned past four bytes, and does not
+/// already start with an `R_LARCH_ALIGN` that guarantees its alignment.
+fn align_padding<F: crate::elf::read::ElfFormat>(
+    files: &[ElfInput<'_, F>],
+    file: usize,
+    section: &crate::elf::object::InputSection<'_>,
+    align: u64,
+    relaxable_seen: &mut bool,
+) -> u64 {
+    let need = files
+        .get(file)
+        .and_then(|f| f.object.as_ref())
+        .and_then(|object| {
+            let relocs = object.section(section.relocs)?;
+            let table = object
+                .elf
+                .relocation_section(section.relocs, &relocs.header)
+                .ok()??;
+            match table.relocations {
+                crate::elf::read::Relocations::Rela(relas) => Some(
+                    crate::elf::arch::loongarch::relax::section_align(&relas, align),
+                ),
+                crate::elf::read::Relocations::Rel(_) => None,
+            }
+        })
+        .unwrap_or_default();
+    if !*relaxable_seen {
+        *relaxable_seen = need.relaxes;
+        return 0;
+    }
+    if align > 4 && !need.covered {
+        return align.saturating_sub(4);
+    }
+    0
 }

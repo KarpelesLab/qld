@@ -1692,8 +1692,23 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         return super::arch::riscv::apply::write_section(input, section, out);
     }
 
-    if let Some(dest) = out.get_mut(..data.len()) {
-        dest.copy_from_slice(data);
+    // LoongArch linker relaxation deletes and replaces instructions: the
+    // section is copied with those edits applied, and each relocation then
+    // writes where its instruction ended up ([`super::arch::shrink`]).
+    let relax = if input.context.arch == Arch::LoongArch64 {
+        addresses.layout.relax.section(id)
+    } else {
+        None
+    };
+    match relax {
+        Some(edits) => {
+            super::arch::shrink::copy(data, edits, out, super::arch::loongarch::write_nops)
+        }
+        None => {
+            if let Some(dest) = out.get_mut(..data.len()) {
+                dest.copy_from_slice(data);
+            }
+        }
     }
     if section.relocs == 0 {
         return Ok(());
@@ -1725,10 +1740,26 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
     // link's instructions on every relocation of every link.
     let nocrossrefs = !addresses.layout.nocrossrefs.is_empty();
     let mut skip = false;
+    let mut index = 0u32;
     arch::for_each_relocation!(arch, relocations, data, |rel| {
         if skip {
             skip = false;
             continue;
+        }
+        // Where the relocation's instruction is in the output, and the
+        // relocation a relaxed one takes: its place in the input, which the
+        // classification reads, does not move.
+        let mut at = rel.offset;
+        let mut rel = rel;
+        if let Some(edits) = relax {
+            at = edits.map(at);
+            let edit = edits.edit_of_index(index);
+            index = index.wrapping_add(1);
+            match edit.map(|e| e.rewrite) {
+                Some(super::arch::shrink::Rewrite::Delete) => continue,
+                Some(super::arch::shrink::Rewrite::Replace { r_type, .. }) => rel.r_type = r_type,
+                _ => {}
+            }
         }
         let report = |message: String| {
             input.diagnostics.emit(
@@ -1764,7 +1795,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
         if class.kind == Kind::None || (alloc && decision.problem.is_some()) {
             continue;
         }
-        let place = base.wrapping_add(rel.offset);
+        let place = base.wrapping_add(at);
         let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
         if !alloc
             && matches!(class.kind, Kind::Abs | Kind::DtpOff)
@@ -1772,7 +1803,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             && let Some(value) = tombstone.get(dead)
         {
             let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-            let _ = arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value);
+            let _ = arch::write_value_as::<F::Endian>(out, at, class.width, value);
             continue;
         }
         let resolved = addresses.symbol_address(&target, rel.addend);
@@ -1789,12 +1820,12 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 // Both labels of a difference in a discarded section count
                 // from zero, which keeps the difference (lld does the same).
                 if let Some(delta) = add_delta(class.kind, rel.addend as u64) {
-                    let _ = arch::add_value_as::<F::Endian>(out, rel.offset, class.width, delta);
+                    let _ = arch::add_value_as::<F::Endian>(out, at, class.width, delta);
                     continue;
                 }
                 let value = tombstone.get(DeadTarget::Discarded).unwrap_or(0);
                 let value = crate::debug::tombstone::truncate(value, width_bytes(class.width));
-                let _ = arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value);
+                let _ = arch::write_value_as::<F::Endian>(out, at, class.width, value);
                 continue;
             }
         };
@@ -1819,7 +1850,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 .ok_or(ApplyError::BadInstruction)
         };
         let put = |out: &mut [u8], value: u64| {
-            arch::write_value_as::<F::Endian>(out, rel.offset, class.width, value)
+            arch::write_value_as::<F::Endian>(out, at, class.width, value)
         };
         let page = crate::arch::aarch64::page;
         let page_delta = |target: u64| arch.page_delta(target, place, rel.r_type);
@@ -1833,7 +1864,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 if matches!(target.def, super::refs::Def::Undefined { .. })
                     && sa == 0
                     && arch
-                        .nop_undefined_branch(out, rel.offset, rel.r_type)
+                        .nop_undefined_branch(out, at, rel.r_type)
                         .unwrap_or(false) =>
             {
                 Ok(())
@@ -1889,13 +1920,13 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             Kind::PageOff => put(out, sa),
             Kind::Add | Kind::Sub => {
                 let delta = add_delta(class.kind, sa).unwrap_or_default();
-                arch::add_value_as::<F::Endian>(out, rel.offset, class.width, delta)
+                arch::add_value_as::<F::Endian>(out, at, class.width, delta)
             }
-            Kind::Relax => arch.relax(out, rel.offset, rel.r_type, sa, place),
+            Kind::Relax => arch.relax(out, at, rel.r_type, sa, place),
             Kind::GotRelax => slot_address().and_then(|g| {
                 arch.relax_got_load(
                     out,
-                    rel.offset,
+                    at,
                     rel.r_type,
                     s,
                     RelaxValues {
@@ -1929,7 +1960,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 .and_then(|g| {
                     arch.relax_tls(
                         out,
-                        rel.offset,
+                        at,
                         class.kind,
                         rel.r_type,
                         RelaxValues {
@@ -1941,13 +1972,11 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                         },
                     )
                 }),
-            Kind::RelaxGotPc => {
-                arch.relax_got(out, rel.offset, class.kind, sa.wrapping_sub(place) as i64)
-            }
-            Kind::RelaxGotPcNoPic => arch.relax_got(out, rel.offset, class.kind, sa as i64),
+            Kind::RelaxGotPc => arch.relax_got(out, at, class.kind, sa.wrapping_sub(place) as i64),
+            Kind::RelaxGotPcNoPic => arch.relax_got(out, at, class.kind, sa as i64),
             Kind::RelaxGotOff => arch.relax_got(
                 out,
-                rel.offset,
+                at,
                 class.kind,
                 sa.wrapping_sub(addresses.got_base()) as i64,
             ),
@@ -2024,7 +2053,7 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
                 };
                 arch.relax_tls(
                     out,
-                    rel.offset,
+                    at,
                     class.kind,
                     rel.r_type,
                     RelaxValues {

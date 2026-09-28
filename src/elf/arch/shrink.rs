@@ -614,17 +614,42 @@ impl<F: crate::elf::read::ElfFormat> Pass<'_, '_, '_, F> {
         }
     }
 
-    /// How a TLS access to `symbol` of `file` is linked.
+    /// How relocations against `symbol` of `file` are classified, so that
+    /// the architecture's decisions here and the writer's agree.
     #[must_use]
-    pub fn tls_mode(&self, file: usize, symbol: u32) -> TlsMode {
+    pub fn classify(&self, file: usize, symbol: u32) -> super::ClassifyContext {
         let refs = &self.addresses.refs;
         let Some(target) = refs.target(file, symbol as usize) else {
-            return TlsMode::Dynamic;
+            return super::ClassifyContext {
+                relax_got: false,
+                pic: self.context.mode.pic,
+                tls: TlsMode::Dynamic,
+                tls_ld: TlsMode::Dynamic,
+                code: true,
+                tls_symbol: false,
+            };
         };
         let flags = target
             .global
             .map_or(SymbolFlags::EMPTY, |id| refs.symbols.flags(id));
-        reloc::classify_context(&self.context, &target, flags).tls
+        let mut context = reloc::classify_context(&self.context, &target, flags);
+        context.code = true;
+        context
+    }
+
+    /// How a TLS access to `symbol` of `file` is linked.
+    #[must_use]
+    pub fn tls_mode(&self, file: usize, symbol: u32) -> TlsMode {
+        self.classify(file, symbol).tls
+    }
+
+    /// The address of the GOT entry of kind `kind` that `symbol` of `file`
+    /// uses, when the scan reserved one.
+    #[must_use]
+    pub fn got_address(&self, file: usize, symbol: u32, kind: super::GotKind) -> Option<u64> {
+        let target = self.addresses.refs.target(file, symbol as usize)?;
+        let owner = Addresses::<F>::owner(&target, file, symbol);
+        self.addresses.got_entry_address(owner, kind)
     }
 
     /// The edit the previous pass made for relocation `seq` of section `id`.
@@ -864,7 +889,7 @@ fn relax_section<F: crate::elf::read::ElfFormat>(
 /// [`layout`].
 #[must_use]
 pub fn applies(arch: Arch) -> bool {
-    arch.is_riscv()
+    arch.is_riscv() || arch == Arch::LoongArch64
 }
 
 /// The architecture's edits of one section.
@@ -874,6 +899,7 @@ fn decide<F: crate::elf::read::ElfFormat>(
 ) -> Result<Edits> {
     match pass.context.arch {
         Arch::RiscV64 | Arch::RiscV32 => super::riscv::relax::decide(pass, section),
+        Arch::LoongArch64 => super::loongarch::relax::decide(pass, section),
         _ => Ok(Edits::default()),
     }
 }
@@ -882,6 +908,7 @@ fn decide<F: crate::elf::read::ElfFormat>(
 fn deleted_type(arch: Arch) -> u32 {
     match arch {
         Arch::RiscV64 | Arch::RiscV32 => crate::elf::read::consts::riscv::R_RISCV_RELAX,
+        Arch::LoongArch64 => super::loongarch::R_LARCH_RELAX,
         _ => 0,
     }
 }

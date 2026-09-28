@@ -1869,6 +1869,14 @@ pub(crate) fn member_size<F: crate::elf::read::ElfFormat>(
             if input.synth.arch.is_riscv() {
                 return Ok(riscv_member_size(input, id, section));
             }
+            // LoongArch: relaxation shrinks code the same way.
+            if input.synth.arch == Arch::LoongArch64 {
+                let removed = input.relax.map_or(0, |relax| relax.removed(id));
+                return Ok((
+                    section.header.sh_size.saturating_sub(removed),
+                    section.header.sh_addralign,
+                ));
+            }
             if input.synth.arch == Arch::Arm {
                 return Ok(super::arch::arm::apply::member_size(
                     input.synth.arm.as_deref(),

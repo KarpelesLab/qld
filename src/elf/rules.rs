@@ -380,8 +380,11 @@ macro_rules! default_rules {
                 rule(".dynamic", &[plain(&[".dynamic"])]),
                 Synthetic::Dynamic,
             )),
+            // PowerPC64: GNU ld's `elf64lppc` script puts `.toc` in `.got`
+            // (`*(.got .toc)`), so both are within reach of the TOC
+            // pointer; no other target emits `.toc`.
             relro(synth(
-                rule(".got", &[plain(&[".got"]), plain(&[".igot"])]),
+                rule(".got", &[plain(&[".got", ".toc"]), plain(&[".igot"])]),
                 Synthetic::Got,
             )),
             synth(
