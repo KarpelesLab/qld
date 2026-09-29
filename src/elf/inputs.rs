@@ -1364,21 +1364,32 @@ pub fn add_after_lto<'a, F: crate::elf::read::ElfFormat>(
         }
         for library in libraries {
             let name = library.to_string_lossy();
+            let searched = SearchedLibrary::library(name.as_ref(), attrs.static_only);
             // GCC's plugin hands back every library the driver named
             // (`-pass-through=-lgcc_s` even for -static); one that is not
-            // found cannot have been needed by the original link either.
-            let Some(path) = walker.search.find_library(&name, attrs.static_only) else {
-                continue;
-            };
-            let present = walker.files.iter().any(|file| {
-                file.file
-                    .is_some_and(|f| f.parent().is_none() && f.path() == path)
-            });
-            if present {
-                continue;
+            // found — or found only for another architecture, in a multilib
+            // search path — cannot have been needed by the original link
+            // either, so the search simply runs out here rather than failing.
+            let mut index = 0usize;
+            while let Some(path) = searched.nth(&walker.search, index) {
+                let present = walker.files.iter().any(|file| {
+                    file.file
+                        .is_some_and(|f| f.parent().is_none() && f.path() == path)
+                });
+                if present {
+                    break;
+                }
+                let id = table.load_path(&path)?;
+                if table
+                    .get(id)
+                    .is_some_and(|file| walker.searched_mismatch(file))
+                {
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                walker.add(id, attrs, "", &base_name_of(&path), None)?;
+                break;
             }
-            let id = table.load_path(&path)?;
-            walker.add(id, attrs, "", &base_name_of(&path), None)?;
         }
         Ok(())
     })();
