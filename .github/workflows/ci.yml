@@ -75,6 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - run: cargo test --all-features --test i386 -- --nocapture
+      - run: cargo test --all-features --test multilib -- --nocapture
 
   amiga-hunk:
     name: AmigaOS Hunk output (vasm + vlink oracle)

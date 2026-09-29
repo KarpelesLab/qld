@@ -684,8 +684,22 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   `subl`/`negl`.
 - `R_386_TLS_LE` in a shared object is an error; GNU ld accepts it with text
   relocations.
-- `-l` reports an error for a library built for another machine, class or
-  byte order instead of skipping it and searching on.
+- A library found through `-l`, `-l:` or a script's `GROUP(-l…)` that was
+  built for another machine, class or byte order is skipped with
+  `skipping incompatible <path> when searching for -l<name>` and the search
+  continues, as in GNU ld. Differences in the detail:
+  - qld prefixes it `warning:`, and `-w` suppresses it; GNU ld has no `-w`.
+  - GNU ld replays the whole search after `cannot find -lfoo`, repeating
+    every message, and prints the message twice for `-l:name`; qld prints
+    each once.
+  - qld's `cannot find -lfoo` has no `: No such file or directory` suffix.
+  - A file named **directly** on the command line is still an error. For a
+    shared object qld gives the architecture wording, where GNU ld says
+    `error adding symbols: file in wrong format`.
+  - A directly named incompatible **archive** is an error in qld even when
+    nothing extracts a member; GNU ld only fails when a member is actually
+    pulled in. A thin archive found by search is not pre-checked, so its
+    members fail individually instead of the archive being skipped.
 - Initial-exec TLS uses GNU's `addl` form, and GOT32X relaxations are done
   as in GNU ld (lld does neither).
 - Inputs for another machine, class or byte order are rejected with GNU's

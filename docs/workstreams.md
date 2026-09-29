@@ -637,6 +637,13 @@ the output needs an Amiga emulator and the user asked not to use one.
 
 ## Integration follow-ups
 
+- **W56 (incompatible libraries, user-reported):** fixed for ELF and
+  PE/COFF; Mach-O already ignored them as ld64 does. Left open: a directly
+  named incompatible archive errors even when no member is extracted (GNU
+  ld waits for extraction), thin archives found by search are not
+  pre-checked, and the architecture names in the message are qld's
+  (`X86_64`) rather than BFD's (`i386:x86-64`).
+
 - **W55 (Hunk/m68k):** a Hunk-specific section→hunk placement rule (vlink
   gives each input section name its own hunk); Hunk object output
   (`HUNK_UNIT`/`HUNK_EXT`), overlays and Hunk input; chip/fast memory

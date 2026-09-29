@@ -363,6 +363,10 @@ beside `dso::plan_needed`; the hash tables are built beside the `.dynstr`
 batch insertion; and `ehframe::split` joins the relocation scan unless
 `--gc-sections` needs the records first.
 
+The input walk may re-enter the search: when a `-l` candidate turns out to
+be for another architecture, class or byte order, it is skipped with a
+warning and the next candidate in search order is loaded.
+
 ## In-memory inputs and outputs
 
 The file table (`src/input/table.rs`) asks `LinkOptions::input_provider` for
