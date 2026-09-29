@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 use common::tools::{driver_is_clang, find_program, skip, tools, tools_required};
 use qld::elf::read::{Elf64Be, Elf64Le, ElfFile, ElfFormat, SectionIndex, Source};
@@ -775,6 +776,14 @@ const BIG_ENDIAN_TRIPLE: &str = "s390x-linux-gnu";
 /// its C++ driver and the target flags. The sources are freestanding, so
 /// no cross sysroot is needed — only a clang with the SystemZ back end.
 fn big_endian_compilers() -> Option<(PathBuf, PathBuf, Vec<String>)> {
+    // Probed once: two tests want it, and they run in parallel, so each
+    // call used to build in the same scratch directory and one could
+    // delete the other's while it was being written.
+    static PROBE: OnceLock<Option<(PathBuf, PathBuf, Vec<String>)>> = OnceLock::new();
+    PROBE.get_or_init(probe_big_endian_compilers).clone()
+}
+
+fn probe_big_endian_compilers() -> Option<(PathBuf, PathBuf, Vec<String>)> {
     let t = tools();
     let pick = |configured: &Option<PathBuf>, name: &str| {
         configured
