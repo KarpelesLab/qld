@@ -94,7 +94,18 @@ pub fn link_with(
     let prescan = {
         let empty = InternalNames::default();
         let table = FileTable::for_link(options);
-        let scan = inputs::collect(options, &table, &empty, pe.machine)?;
+        // The link below reports the warnings this pass would repeat —
+        // unless this pass is where the link stops, and they are all there is.
+        let quiet = crate::diag::Collect::new();
+        let scan = match inputs::collect(options, &table, &empty, pe.machine, &quiet) {
+            Ok(scan) => scan,
+            Err(error) => {
+                for warning in quiet.take_sorted() {
+                    diagnostics.emit(warning);
+                }
+                return Err(error);
+            }
+        };
         let mut directives = Directives::default();
         let mut files = scan.files;
         for file in &mut files {
@@ -150,7 +161,7 @@ fn link_once<'a>(
     table: &'a FileTable,
     internal: &'a InternalNames,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut inputs = inputs::collect(options, table, internal, pe.machine)?;
+    let mut inputs = inputs::collect(options, table, internal, pe.machine, diagnostics)?;
     let files = &mut inputs.files;
 
     let rules = CoffRules {

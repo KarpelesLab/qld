@@ -210,9 +210,9 @@ fn link_as<F: crate::elf::read::ElfFormat>(
     let mut inputs = if own_pools {
         let threads = available_threads().min(INPUT_THREADS);
         thread_pool(threads)?
-            .install(|| inputs::collect::<F>(options, &table, &internal, config))?
+            .install(|| inputs::collect::<F>(options, &table, &internal, config, diagnostics))?
     } else {
-        narrow.run(|| inputs::collect::<F>(options, &table, &internal, config))?
+        narrow.run(|| inputs::collect::<F>(options, &table, &internal, config, diagnostics))?
     };
     lap("inputs");
     // x86-64 relocatable output follows GNU ld's built-in `-r` layout.
