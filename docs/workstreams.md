@@ -637,6 +637,15 @@ the output needs an Amiga emulator and the user asked not to use one.
 
 ## Integration follow-ups
 
+- **Test scratch directories are not race-safe.** `scratch(name)` removes
+  and recreates the directory, so two parallel tests that pass the same
+  name delete each other's files: this made
+  `gdb_index_matches_lld_on_big_endian` fail on the arm64 runner, where the
+  whole suite runs at full parallelism. Fixed there by probing once through
+  a `OnceLock`. `tests/macho_link.rs` calls `scratch("hello")` twice inside
+  one test, which is sequential but equally fragile. Giving `scratch` a
+  unique suffix per call, or making it not delete, would remove the class.
+
 - **W56 (incompatible libraries, user-reported):** fixed for ELF and
   PE/COFF; Mach-O already ignored them as ld64 does. Left open: a directly
   named incompatible archive errors even when no member is extracted (GNU
