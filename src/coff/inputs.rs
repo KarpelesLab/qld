@@ -19,10 +19,11 @@
 use rayon::prelude::*;
 
 use crate::args::{InputAttrs, InputKind, LinkOptions};
+use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
 use crate::input::identify::FileFormat;
-use crate::input::{FileTable, InputFile, LibraryNaming, SearchContext, Source};
+use crate::input::{FileTable, InputFile, LibraryNaming, SearchContext, SearchedLibrary, Source};
 use crate::symbols::{InputPosition, ResolveFile, SymbolName, SymbolUse};
 
 use super::imports::{self, Groups};
@@ -201,6 +202,9 @@ pub struct Inputs<'a> {
 struct Pending {
     source: Source,
     attrs: InputAttrs,
+    /// Set when the source came out of the library search path, so that an
+    /// incompatible candidate can be skipped for the next one.
+    searched: Option<SearchedLibrary>,
 }
 
 /// Resolves, loads and expands every input for an image of `machine`.
@@ -221,6 +225,7 @@ pub fn collect<'a>(
     table: &'a FileTable,
     internal: &'a InternalNames,
     machine: u16,
+    diagnostics: &dyn DiagnosticSink,
 ) -> Result<Inputs<'a>> {
     // The file table looks in `options.input_provider` first.
     let fs = table;
@@ -246,9 +251,10 @@ pub fn collect<'a>(
                     path.display()
                 )));
             }
-            _ => pending.push(Pending {
+            kind => pending.push(Pending {
                 source: search.resolve(spec)?,
                 attrs: spec.attrs,
+                searched: SearchedLibrary::of(kind, spec.attrs.static_only),
             }),
         }
     }
@@ -262,6 +268,8 @@ pub fn collect<'a>(
     }
     let mut walker = Walker {
         table,
+        search,
+        diagnostics,
         groups: Groups::new(),
         machine,
         files: vec![CoffInput {
@@ -277,7 +285,7 @@ pub fn collect<'a>(
         ordinal: 0,
     };
     for (entry, id) in pending.iter().zip(loaded) {
-        walker.add(id?, entry.attrs)?;
+        walker.add_found(id?, entry.attrs, entry.searched.as_ref())?;
     }
     walker.add_generated_imports()?;
     Ok(Inputs {
@@ -285,8 +293,12 @@ pub fn collect<'a>(
     })
 }
 
-struct Walker<'a> {
+struct Walker<'a, 's> {
     table: &'a FileTable,
+    /// The library search path, for skipping an incompatible `-l` match.
+    search: SearchContext<'s>,
+    /// Where `skipping incompatible …` goes.
+    diagnostics: &'s dyn DiagnosticSink,
     files: Vec<CoffInput<'a>>,
     ordinal: u32,
     /// Imports collected from short import libraries and from DLLs named on
@@ -296,7 +308,7 @@ struct Walker<'a> {
     machine: u16,
 }
 
-impl<'a> Walker<'a> {
+impl<'a> Walker<'a, '_> {
     /// Whether an input for `machine` can go into the image. Machine 0
     /// (`IMAGE_FILE_MACHINE_UNKNOWN`) is what machine-independent objects
     /// carry.
@@ -322,6 +334,68 @@ impl<'a> Walker<'a> {
             parsed: None,
             internal: InternalSymbols::default(),
             exclude_from_implib: false,
+        }
+    }
+
+    /// Whether a file found by searching the library path is built for
+    /// another machine and so must be skipped: a COFF object, import object
+    /// or image whose machine disagrees with the image's, or an archive
+    /// whose first such member does.
+    fn searched_mismatch(&self, file: &InputFile) -> bool {
+        let machine = |format: FileFormat| match format {
+            FileFormat::Coff(ident) => Some(ident.machine),
+            FileFormat::CoffImport(ident) => Some(ident.machine),
+            FileFormat::Pe(ident) => Some(ident.machine),
+            _ => None,
+        };
+        match file.format() {
+            // As GNU `ld` does, the first member speaks for the archive.
+            FileFormat::Archive => file.archive().ok().is_some_and(|archive| {
+                archive
+                    .members()
+                    .filter_map(core::result::Result::ok)
+                    .find_map(|member| machine(crate::input::identify(member.bytes()?)))
+                    .is_some_and(|found| !self.compatible(found))
+            }),
+            format => machine(format).is_some_and(|found| !self.compatible(found)),
+        }
+    }
+
+    /// Adds `id`, which `searched` describes when it came out of the library
+    /// search path.
+    ///
+    /// An incompatible candidate found that way is skipped, with a message,
+    /// and the search goes on to the next one, as GNU `ld` does; when none is
+    /// left the library counts as not found. A file named directly on the
+    /// command line is an error instead, in [`Walker::add`].
+    fn add_found(
+        &mut self,
+        id: FileId,
+        attrs: InputAttrs,
+        searched: Option<&SearchedLibrary>,
+    ) -> Result<()> {
+        let Some(searched) = searched else {
+            return self.add(id, attrs);
+        };
+        let mut id = id;
+        let mut index = 0usize;
+        loop {
+            let Some(file) = self.table.get(id) else {
+                return Err(Error::Internal("loaded file missing from table".into()));
+            };
+            if !self.searched_mismatch(file) {
+                return self.add(id, attrs);
+            }
+            self.diagnostics.emit(Diagnostic::warning(format!(
+                "skipping incompatible {} when searching for {}",
+                file.path().display(),
+                searched.label(),
+            )));
+            index = index.saturating_add(1);
+            let Some(path) = searched.nth(&self.search, index) else {
+                return Err(Error::NotFound(format!("cannot find {}", searched.label())));
+            };
+            id = self.table.load(&Source::Path(path))?;
         }
     }
 
@@ -474,7 +548,7 @@ impl<'a> Walker<'a> {
     }
 }
 
-impl<'a> Walker<'a> {
+impl<'a> Walker<'a, '_> {
     /// Turns the collected import groups into lazy COFF objects.
     fn add_generated_imports(&mut self) -> Result<()> {
         if self.groups.is_empty() {

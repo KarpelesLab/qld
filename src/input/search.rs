@@ -85,6 +85,70 @@ impl LibraryNaming {
     }
 }
 
+/// A `-l` input, and what to look for again when the file the search found
+/// turns out to be built for another architecture.
+///
+/// GNU `ld` skips such a candidate, says so, and goes on searching; only a
+/// file named directly on the command line is an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchedLibrary {
+    /// `-lname`, or the file name for `-l:name`.
+    name: String,
+    /// `-l:name`: `name` is a file name to match exactly.
+    exact: bool,
+    /// `-Bstatic` was in force: only static libraries are candidates.
+    static_only: bool,
+}
+
+impl SearchedLibrary {
+    /// Describes `kind`, when it is a `-l` input; `None` for anything else.
+    #[must_use]
+    pub fn of(kind: &InputKind, static_only: bool) -> Option<Self> {
+        let (name, exact) = match kind {
+            InputKind::Library(name) => (name.clone(), false),
+            InputKind::LibraryExact(file) => (file.clone(), true),
+            _ => return None,
+        };
+        Some(Self {
+            name,
+            exact,
+            static_only,
+        })
+    }
+
+    /// Describes `-l<name>`, as a linker script's `GROUP ( -lname )` also
+    /// spells it.
+    #[must_use]
+    pub fn library(name: impl Into<String>, static_only: bool) -> Self {
+        Self {
+            name: name.into(),
+            exact: false,
+            static_only,
+        }
+    }
+
+    /// The option as diagnostics name it: `-lfoo` or `-l:libfoo.so.1`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        if self.exact {
+            format!("-l:{}", self.name)
+        } else {
+            format!("-l{}", self.name)
+        }
+    }
+
+    /// The `index`th file this `-l` matches, in search order; `None` once
+    /// the candidates run out.
+    #[must_use]
+    pub fn nth(&self, search: &SearchContext<'_>, index: usize) -> Option<PathBuf> {
+        if self.exact {
+            search.find_exact_nth(&self.name, index)
+        } else {
+            search.find_library_nth(&self.name, self.static_only, index)
+        }
+    }
+}
+
 /// Everything library resolution depends on.
 #[derive(Clone, Copy)]
 pub struct SearchContext<'a> {
@@ -169,21 +233,54 @@ impl SearchContext<'_> {
     /// Finds `-l<name>`: each candidate file name in each directory.
     #[must_use]
     pub fn find_library(&self, name: &str, static_only: bool) -> Option<PathBuf> {
+        self.find_library_nth(name, static_only, 0)
+    }
+
+    /// The `index`th file `-l<name>` matches, counting matches in search
+    /// order.
+    ///
+    /// Index 0 is what [`find_library`](Self::find_library) returns; the
+    /// later ones are what GNU `ld` goes on to when a match turns out to be
+    /// built for another architecture ("skipping incompatible …").
+    #[must_use]
+    pub fn find_library_nth(&self, name: &str, static_only: bool, index: usize) -> Option<PathBuf> {
         let candidates = self.naming.candidates(name, static_only);
-        self.directories().find_map(|dir| {
-            candidates
-                .iter()
-                .map(|candidate| dir.join(candidate))
-                .find(|path| self.fs.is_file(path))
-        })
+        let mut seen = 0usize;
+        for dir in self.directories() {
+            for candidate in &candidates {
+                let path = dir.join(candidate);
+                if self.fs.is_file(&path) {
+                    if seen == index {
+                        return Some(path);
+                    }
+                    seen = seen.saturating_add(1);
+                }
+            }
+        }
+        None
     }
 
     /// Finds `-l:<file>`: that exact file name in each directory.
     #[must_use]
     pub fn find_exact(&self, file: &str) -> Option<PathBuf> {
-        self.directories()
-            .map(|dir| dir.join(file))
-            .find(|path| self.fs.is_file(path))
+        self.find_exact_nth(file, 0)
+    }
+
+    /// The `index`th file `-l:<file>` matches, counting matches in search
+    /// order; see [`find_library_nth`](Self::find_library_nth).
+    #[must_use]
+    pub fn find_exact_nth(&self, file: &str, index: usize) -> Option<PathBuf> {
+        let mut seen = 0usize;
+        for dir in self.directories() {
+            let path = dir.join(file);
+            if self.fs.is_file(&path) {
+                if seen == index {
+                    return Some(path);
+                }
+                seen = seen.saturating_add(1);
+            }
+        }
+        None
     }
 
     /// Finds a linker script named by `-T` or as an input: the path itself
@@ -408,6 +505,70 @@ mod tests {
             ["libz.tbd", "libz.dylib", "libz.so", "libz.a"]
         );
         assert_eq!(LibraryNaming::Darwin.candidates("z", true), ["libz.a"]);
+    }
+
+    #[test]
+    fn later_candidates_continue_the_search() {
+        let fs = FakeFs::new(&["/a/libfoo.so", "/a/libfoo.a", "/b/libfoo.a", "/c/libbar.so"]);
+        let paths = [
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
+        let ctx = context(&fs, &paths, None);
+        // Every match, in search order: per directory, in candidate order.
+        let matches: Vec<PathBuf> = (0..4)
+            .filter_map(|n| ctx.find_library_nth("foo", false, n))
+            .collect();
+        assert_eq!(
+            matches,
+            [
+                PathBuf::from("/a/libfoo.so"),
+                PathBuf::from("/a/libfoo.a"),
+                PathBuf::from("/b/libfoo.a"),
+            ]
+        );
+        assert_eq!(
+            ctx.find_library_nth("foo", false, 0),
+            ctx.find_library("foo", false)
+        );
+        // `-Bstatic` drops the shared candidate from the list.
+        assert_eq!(
+            ctx.find_library_nth("foo", true, 0),
+            Some("/a/libfoo.a".into())
+        );
+        assert_eq!(ctx.find_library_nth("bar", false, 1), None);
+
+        let fs = FakeFs::new(&["/a/libfoo.a", "/b/libfoo.a"]);
+        let ctx = context(&fs, &paths, None);
+        assert_eq!(
+            ctx.find_exact_nth("libfoo.a", 1),
+            Some("/b/libfoo.a".into())
+        );
+        assert_eq!(ctx.find_exact_nth("libfoo.a", 2), None);
+    }
+
+    #[test]
+    fn searched_libraries_describe_the_option() {
+        let library = SearchedLibrary::of(&InputKind::Library("foo".into()), false).unwrap();
+        assert_eq!(library.label(), "-lfoo");
+        let exact =
+            SearchedLibrary::of(&InputKind::LibraryExact("libfoo.so.1".into()), false).unwrap();
+        assert_eq!(exact.label(), "-l:libfoo.so.1");
+        assert_eq!(
+            SearchedLibrary::of(&InputKind::File("a.o".into()), false),
+            None
+        );
+
+        let fs = FakeFs::new(&["/a/libfoo.so.1", "/b/libfoo.so.1"]);
+        let paths = [PathBuf::from("/a"), PathBuf::from("/b")];
+        let ctx = context(&fs, &paths, None);
+        assert_eq!(exact.nth(&ctx, 0), Some("/a/libfoo.so.1".into()));
+        assert_eq!(exact.nth(&ctx, 1), Some("/b/libfoo.so.1".into()));
+        assert_eq!(exact.nth(&ctx, 2), None);
+        // `-lfoo` looks for `libfoo.so` and `libfoo.a`, neither of which the
+        // versioned file answers for.
+        assert_eq!(SearchedLibrary::library("foo", false).nth(&ctx, 0), None);
     }
 
     #[test]

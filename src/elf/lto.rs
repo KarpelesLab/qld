@@ -985,6 +985,7 @@ mod plugin_link {
             &others,
             &output.libraries,
             &output.library_paths,
+            diagnostics,
         )?;
         inputs.files = files;
 

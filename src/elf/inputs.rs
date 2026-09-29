@@ -24,13 +24,16 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::args::{InputAttrs, InputKind, LinkOptions};
+use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::elf::read::consts::{ET_DYN, ET_REL};
 use crate::elf::read::{Elf64Le, ElfFormat, ObjectFile, SectionIndex, Source as ElfSource};
 use crate::error::{Error, Result};
 use crate::ids::FileId;
 use crate::input::archive::Member;
-use crate::input::identify::FileFormat;
-use crate::input::{FileTable, InputFile, LibraryNaming, MemberEntry, SearchContext, Source};
+use crate::input::identify::{ElfIdent, FileFormat};
+use crate::input::{
+    FileTable, InputFile, LibraryNaming, MemberEntry, SearchContext, SearchedLibrary, Source,
+};
 use crate::script::{self, CommandKind, InputName};
 use crate::symbols::{DefinitionKind, InputPosition, ResolveFile, SymbolName, SymbolUse};
 use crate::target::Target;
@@ -498,6 +501,9 @@ struct Pending {
     /// The name a shared object found this way is recorded by in
     /// `DT_NEEDED` when it has no `DT_SONAME`.
     found_as: Vec<u8>,
+    /// Set when the source came out of the library search path, so that an
+    /// incompatible candidate can be skipped for the next one.
+    searched: Option<SearchedLibrary>,
 }
 
 /// The `DT_NEEDED` fallback name of a library found by `-l`: its file name.
@@ -518,6 +524,7 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
     table: &'a FileTable,
     internal: &'a InternalNames,
     config: ParseConfig<'a>,
+    diagnostics: &dyn DiagnosticSink,
 ) -> Result<Inputs<'a, F>> {
     // The file table looks in `options.input_provider` first.
     let fs = table;
@@ -546,6 +553,7 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
                     attrs: spec.attrs,
                     what: format!("-T {}", path.display()),
                     found_as: Vec::new(),
+                    searched: None,
                 });
             }
             kind => {
@@ -556,11 +564,13 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
                     (InputKind::File(path), _) => path.as_os_str().as_encoded_bytes().to_vec(),
                     _ => Vec::new(),
                 };
+                let searched = SearchedLibrary::of(kind, spec.attrs.static_only);
                 pending.push(Pending {
                     source,
                     attrs: spec.attrs,
                     what: String::new(),
                     found_as,
+                    searched,
                 });
             }
         }
@@ -604,6 +614,7 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
         table,
         search,
         config,
+        diagnostics,
         files,
         ordinal: 0,
         target: options.target,
@@ -620,12 +631,13 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
         // An archive index read later still reports its error before this
         // input's.
         let added = id.and_then(|id| {
-            walker.add(
+            walker.add_found(
                 id,
                 entry.attrs,
                 &entry.what,
                 &entry.found_as,
                 members.take(),
+                entry.searched.as_ref(),
             )
         });
         if let Err(error) = added {
@@ -651,6 +663,8 @@ struct Walker<'a, 's, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le
     table: &'a FileTable,
     search: SearchContext<'s>,
     config: ParseConfig<'a>,
+    /// Where `skipping incompatible …` goes.
+    diagnostics: &'s dyn DiagnosticSink,
     files: Vec<ElfInput<'a, F>>,
     ordinal: u32,
     target: Option<Target>,
@@ -787,34 +801,126 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
         };
     }
 
+    /// Whether an ELF file with `ident` is built for another machine, class
+    /// or byte order than the link.
+    ///
+    /// The class and byte order are settled before any input is read
+    /// ([`super::link::input_kind`]), so `F` answers for them even before an
+    /// input has named a target: a 32-bit file in a 64-bit link is an
+    /// incompatible input, not a malformed one.
+    fn mismatch(&self, ident: &ElfIdent) -> bool {
+        if ident.class != F::KIND.pointer_width() || ident.endian != F::KIND.endianness() {
+            return true;
+        }
+        let Some(target) = self.target else {
+            return false;
+        };
+        if ident.machine == crate::elf::read::consts::EM_NONE {
+            // Machine-neutral: `-b binary` inputs (`binary_input`).
+            return false;
+        }
+        ident.architecture() != Some(target.arch) || ident.endian != target.endian
+    }
+
     /// Rejects an ELF object built for another machine, class or byte order
     /// than the target, as GNU `ld` does, instead of linking its
     /// relocations as the target's (an x32 object read as i386).
     fn check_machine(&self, file: &InputFile) -> Result<()> {
-        let (FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident), Some(target)) =
-            (file.format(), self.target)
-        else {
+        let (FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident)) = file.format() else {
             return Ok(());
         };
-        if ident.machine == crate::elf::read::consts::EM_NONE {
-            // Machine-neutral: `-b binary` inputs (`binary_input`).
-            return Ok(());
+        if self.mismatch(&ident) {
+            return Err(self.incompatible(file, &ident));
         }
-        let found = ident.architecture();
-        if found == Some(target.arch) && ident.endian == target.endian {
-            return Ok(());
-        }
-        let found = found.map_or_else(
+        Ok(())
+    }
+
+    /// The error for an input built for another architecture, worded as GNU
+    /// `ld` words it.
+    fn incompatible(&self, file: &InputFile, ident: &ElfIdent) -> Error {
+        let target = self.target.unwrap_or_else(super::target::default_target);
+        let found = ident.architecture().map_or_else(
             || format!("machine {:#x}", ident.machine),
             |arch| format!("{arch:?}"),
         );
-        Err(Error::Option(format!(
+        Error::Option(format!(
             "{}: {found} ({:?}-endian) architecture of input file is incompatible with {:?} ({:?}-endian) output",
             file.path().display(),
             ident.endian,
             target.arch,
             target.endian,
-        )))
+        ))
+    }
+
+    /// Whether a file found by searching the library path is built for
+    /// another architecture and so must be skipped: an ELF file whose header
+    /// disagrees with the link's, or an archive whose first ELF member does.
+    ///
+    /// Anything else (a linker script named `libc.so`, an import library,
+    /// bitcode) is left to the walk, which reports its own errors.
+    fn searched_mismatch(&self, file: &InputFile) -> bool {
+        match file.format() {
+            FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident) => self.mismatch(&ident),
+            // As GNU `ld` does, the first member speaks for the archive.
+            // A thin archive's members are separate files, read later.
+            FileFormat::Archive => file.archive().ok().is_some_and(|archive| {
+                archive
+                    .members()
+                    .filter_map(core::result::Result::ok)
+                    .find_map(|member| match crate::input::identify(member.bytes()?) {
+                        FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident) => Some(ident),
+                        _ => None,
+                    })
+                    .is_some_and(|ident| self.mismatch(&ident))
+            }),
+            _ => false,
+        }
+    }
+
+    /// Adds `id`, which `searched` describes when it came out of the library
+    /// search path.
+    ///
+    /// An incompatible candidate found that way is skipped, with a message,
+    /// and the search goes on to the next one, as GNU `ld` does; when none
+    /// is left the library counts as not found. A file named directly on the
+    /// command line is an error instead, in [`Walker::add`].
+    fn add_found(
+        &mut self,
+        id: FileId,
+        attrs: InputAttrs,
+        what: &str,
+        found_as: &[u8],
+        prepared: Option<Result<Vec<PreparedMember<'a>>>>,
+        searched: Option<&SearchedLibrary>,
+    ) -> Result<()> {
+        let Some(searched) = searched else {
+            return self.add(id, attrs, what, found_as, prepared);
+        };
+        let (mut id, mut prepared) = (id, prepared);
+        let mut found_as = found_as.to_vec();
+        let mut index = 0usize;
+        loop {
+            let Some(file) = self.table.get(id) else {
+                return Err(Error::Internal("loaded file missing from table".into()));
+            };
+            if !self.searched_mismatch(file) {
+                return self.add(id, attrs, what, &found_as, prepared);
+            }
+            self.diagnostics.emit(Diagnostic::warning(format!(
+                "skipping incompatible {} when searching for {}",
+                file.path().display(),
+                searched.label(),
+            )));
+            index = index.saturating_add(1);
+            let Some(path) = searched.nth(&self.search, index) else {
+                return Err(Error::NotFound(format!("cannot find {}", searched.label())));
+            };
+            // For `-l:name` the file name is `name` itself, so the base name
+            // answers for both forms.
+            found_as = base_name_of(&path);
+            id = self.table.load(&Source::Path(path))?;
+            prepared = None;
+        }
     }
 
     /// Adds input `id`. `prepared` holds its members if it is an archive
@@ -854,11 +960,14 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
             FileFormat::Elf(ident) if ident.file_type == ET_DYN => {
                 self.add_shared(file, attrs, found_as)
             }
-            FileFormat::Elf(_) => Err(Error::malformed(
-                file.path(),
-                16,
-                "ELF file type (expected a relocatable object)",
-            )),
+            FileFormat::Elf(_) => {
+                self.check_machine(file)?;
+                Err(Error::malformed(
+                    file.path(),
+                    16,
+                    "ELF file type (expected a relocatable object)",
+                ))
+            }
             FileFormat::Archive | FileFormat::ThinArchive => {
                 self.add_archive(id, file, attrs, prepared)
             }
@@ -903,6 +1012,11 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                 file.path().display()
             )));
         }
+        // Checked before the target is taken from it: a shared library never
+        // decides the link's class and byte order (`link::input_kind` looks
+        // only at the command-line files), so one that disagrees with them is
+        // incompatible, not a target of its own.
+        self.check_machine(file)?;
         self.infer_target(file);
         let found_as = if found_as.is_empty() {
             file.path().as_os_str().as_encoded_bytes()
@@ -1036,7 +1150,7 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
         }
         let mut reader = script::NoIncludes;
         let parsed = script::parse_script(file.data(), file.path(), &mut reader)?;
-        let mut entries: Vec<(Source, InputAttrs, Vec<u8>)> = Vec::new();
+        let mut entries: Vec<(Source, InputAttrs, Vec<u8>, Option<SearchedLibrary>)> = Vec::new();
         for command in &parsed.commands {
             let (list, lazy) = match &command.kind {
                 CommandKind::Input(list) | CommandKind::Group(list) => (list, false),
@@ -1067,12 +1181,21 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                     (InputName::Path(path), _) => path.clone(),
                     _ => Vec::new(),
                 };
-                entries.push((source, entry_attrs, found_as));
+                // `GROUP ( -lfoo )` searches the library path, so an
+                // incompatible match is skipped there too.
+                let searched = match &entry.name {
+                    InputName::Library(lib) => Some(SearchedLibrary::library(
+                        String::from_utf8_lossy(lib),
+                        entry_attrs.static_only,
+                    )),
+                    InputName::Path(_) => None,
+                };
+                entries.push((source, entry_attrs, found_as, searched));
             }
         }
-        for (source, entry_attrs, found_as) in entries {
+        for (source, entry_attrs, found_as, searched) in entries {
             let id = self.table.load(&source)?;
-            self.add(id, entry_attrs, "", &found_as, None)?;
+            self.add_found(id, entry_attrs, "", &found_as, None, searched.as_ref())?;
         }
         self.depth = self.depth.saturating_sub(1);
         Ok(())
@@ -1177,6 +1300,7 @@ pub fn add_after_lto<'a, F: crate::elf::read::ElfFormat>(
     objects: &[FileId],
     libraries: &[std::ffi::OsString],
     library_paths: &[PathBuf],
+    diagnostics: &dyn DiagnosticSink,
 ) -> Result<()> {
     let Some(template) = files.first() else {
         return Err(Error::Internal("no internal input file".into()));
@@ -1214,6 +1338,7 @@ pub fn add_after_lto<'a, F: crate::elf::read::ElfFormat>(
             fs: &fs,
         },
         config,
+        diagnostics,
         sonames: files
             .iter()
             .filter_map(|file| Some(file.shared.as_ref()?.needed_name.clone()))

@@ -49,6 +49,6 @@ pub use archive::{
     Archive, ArchiveKind, ArchiveSymbol, Member, MemberData, SymbolIndex, SymbolIndexKind,
 };
 pub use identify::{FileFormat, GccLtoProbe, identify, identify_with};
-pub use search::{FileSystem, LibraryNaming, RealFileSystem, SearchContext};
+pub use search::{FileSystem, LibraryNaming, RealFileSystem, SearchContext, SearchedLibrary};
 pub use source::{InputProvider, MemoryFiles};
 pub use table::{FileTable, InputFile, MemberEntry, Source};
