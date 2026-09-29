@@ -11,26 +11,45 @@ their command lines, so compiler drivers (`gcc`, `clang`, `rustc`) and build
 systems can use it with no other changes. It is also a Rust library, so tools
 can link programs in-process.
 
-> **Status: pre-alpha.** qld links **x86-64 Linux ELF** (roadmap milestones
-> M1, M2, M3 and M6 complete, M4 and M7 in progress): static and dynamic
-> executables, PIE and static PIE,
-> shared libraries and relocatable (`-r`) output, with symbol versioning,
-> RELRO, `DT_RELR`, `--gc-sections`, `--icf`, compressed debug sections and
-> `--build-id`, linker-script-driven layout (`-T`, `MEMORY`, `PHDRS`), raw
-> `binary`/`ihex`/`srec` output, and LTO through the compiler's plugin
-> (`gcc -flto`, `clang -flto`/`-flto=thin`). A Linux kernel linked by qld
-> boots in QEMU. Used as the system linker, it builds and passes the test
-> suites of coreutils, curl, OpenSSL, Python, LLVM/clang/lld and the Rust
-> compiler, with dynamic symbol tables identical to GNU ld's. Other
-> AArch64 ELF and Windows PE32+ (MinGW) links work too; other architectures
-> and formats are not supported yet.
+> **Status: alpha.** Released as [0.1.0](https://crates.io/crates/qld).
+> The feature surface below is broad and checked in CI on every push, but
+> qld has had little use outside this repository, so expect rough edges and
+> report them.
 >
-> | Link (64 cores) | qld | GNU ld |
-> | --- | --- | --- |
-> | clang | 0.26 s | 2.00 s |
-> | librustc_driver.so | 0.38 s | 3.03 s |
-> | libclang-cpp.so | 0.39 s | 2.20 s |
-> | libcrypto.so.3 | 0.03 s | 0.10 s |
+> **Formats:** ELF, PE/COFF (MinGW), Mach-O (`ld64` flavor), AmigaOS Hunk,
+> and raw `binary`/`ihex`/`srec`.
+>
+> **ELF architectures:** x86-64, i386, x32, AArch64, 32-bit Arm, RISC-V 64
+> and 32, PowerPC64 little-endian and big-endian (the latter static only),
+> LoongArch64, s390x and m68k. Both word sizes and both byte orders.
+>
+> **Features:** static and dynamic executables, PIE and static PIE, shared
+> libraries, relocatable (`-r`) and `--emit-relocs` output for every class,
+> symbol versioning, RELRO, `DT_RELR`, `--gc-sections`, `--icf`,
+> `--gdb-index`, `--debug-names`, `--separate-debug-file`, section ordering,
+> compressed debug sections, `--build-id`, linker-script layout (`-T`,
+> `MEMORY`, `PHDRS`), and LTO through the compiler's plugin (`gcc -flto`,
+> `clang -flto`/`-flto=thin`) or `libLTO` on macOS.
+>
+> **Verified in CI on every push:** each architecture's output is compared
+> with GNU ld, lld or vlink, and the programs are run natively or under
+> qemu. A Linux kernel linked by qld boots in QEMU. Used as the system
+> linker it builds and passes the test suites of coreutils, curl, OpenSSL,
+> Python, LLVM/clang/lld and the Rust compiler; on macOS, of zlib, Lua,
+> SQLite and {fmt}. Output is byte-identical whatever the thread count.
+>
+> Linking clang and `libclang-cpp.so` on a 32-core machine (minimum wall
+> time of interleaved runs, each linker at its own default thread count):
+>
+> | Link | qld | GNU ld | lld | mold | wild |
+> | --- | --- | --- | --- | --- | --- |
+> | clang | 0.13 s | 2.17 s | 0.35 s | 0.19 s | 0.10 s |
+> | libclang-cpp.so | 0.09 s | 1.43 s | 0.22 s | 0.13 s | 0.07 s |
+>
+> qld uses the least CPU of the five and less memory than lld or mold.
+> [wild](https://github.com/davidlattimore/wild) is still ahead on wall
+> time; the gap and what is left to close it are in
+> [tests/projects/bench.md](tests/projects/bench.md).
 
 ## Goals
 
