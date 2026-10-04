@@ -290,10 +290,21 @@ impl<'a> GroupSlots<'a> {
         match entry {
             Entry::Occupied(occupied) => Some(occupied.get().1),
             Entry::Vacant(vacant) => {
-                let slot = self
-                    .next
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                    .ok()?;
+                // A compare-exchange loop rather than `fetch_update`, which
+                // newer toolchains deprecate for `try_update` (after 1.89).
+                let mut slot = self.next.load(Ordering::Relaxed);
+                loop {
+                    let next = slot.checked_add(1)?;
+                    match self.next.compare_exchange_weak(
+                        slot,
+                        next,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(current) => slot = current,
+                    }
+                }
                 vacant.insert((key, slot));
                 Some(slot)
             }

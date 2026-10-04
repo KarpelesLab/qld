@@ -2567,7 +2567,7 @@ fn assemble<'a, F: crate::elf::read::ElfFormat>(
     let phdr_specs: Option<Vec<super::segments::PhdrSpec>> = script.phdrs.as_ref().map(|list| {
         list.iter()
             .map(|p| {
-                let mut ctx_value = |expr: &Expr| -> Option<u64> {
+                let ctx_value = |expr: &Expr| -> Option<u64> {
                     let mut probe = Probe;
                     eval_absolute(expr, &mut probe).ok()
                 };
@@ -2578,11 +2578,11 @@ fn assemble<'a, F: crate::elf::read::ElfFormat>(
                         .unwrap_or(0),
                     filehdr: p.filehdr,
                     phdrs: p.phdrs,
-                    at: p.at.as_ref().and_then(&mut ctx_value),
+                    at: p.at.as_ref().and_then(ctx_value),
                     flags: p
                         .flags
                         .as_ref()
-                        .and_then(&mut ctx_value)
+                        .and_then(ctx_value)
                         .and_then(|v| u32::try_from(v).ok()),
                 }
             })
