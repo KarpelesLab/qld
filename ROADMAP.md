@@ -250,11 +250,9 @@ and TLS models.
 - [x] Big-endian ELF and ELF32 handled through the same generic code
       (monomorphized, no run-time endianness checks on hot paths): the
       pipeline is generic over `ElfFormat` and chosen once in `elf::link`.
-      ELF64/ELF32 little-endian and ELF64 big-endian are instantiated, the
-      all four class and byte-order combinations are instantiated. ELF64 BE
-      is exercised end to end by s390x and PowerPC64 BE; `Elf32Be` is
-      instantiated and decodes input, but no architecture selects it for
-      output yet (32-bit Arm BE8 is next)
+      All four class and byte-order combinations are instantiated. ELF64 BE
+      is exercised end to end by s390x and PowerPC64 BE, and ELF32 BE by
+      m68k (32-bit Arm BE8 is next)
 
 **Status:** AArch64 is the second architecture. Validation without an arm64
 machine: every fixture links with qld and with `aarch64-unknown-linux-gnu-ld`,
@@ -401,7 +399,7 @@ test suite on arm64 and x86_64 CI runners with `-fuse-ld=qld`. A Rust
 `aarch64-apple-darwin` binary runs. A universal binary passes `lipo -info`
 and runs natively on both architectures.
 
-**Status:** everything above except arm64e and LTO is implemented.
+**Status:** everything above is implemented.
 `tests/macho_link.rs` compares against `ld64.lld` on Linux, and the
 `macho-macos` CI job links C, C++ (exceptions, TLV), Objective-C and Rust
 (std: threads, unwinding, TLS) programs with Apple clang and rustc against
@@ -410,8 +408,9 @@ universal binary. `-r` output is checked against Apple's `ld -r` there.
 The broader `-fuse-ld` suite runs there too: 18 self-checking C, C++ and
 Objective-C programs in three variants per arch, and zlib, Lua, SQLite and
 {fmt} built with `-fuse-ld=qld` running their own tests, with every image
-checked to be linked by qld. Mach-O LTO goes through Xcode's libLTO. Open:
-arm64e.
+checked to be linked by qld. Mach-O LTO goes through Xcode's libLTO. arm64e
+output is checked structurally only, since stock macOS does not run
+third-party arm64e code.
 
 ---
 
@@ -432,7 +431,8 @@ arm64e.
       programs in `examples/`); published on crates.io
 - [~] Packaging: prebuilt binaries, distribution packages, `ld.qld` and `ld64.qld` symlinks.
       Release workflow (`.github/workflows/release.yml`, tags only) and recipes in
-      `packaging/` (Gentoo, Arch, Debian, Homebrew) are in; the first tagged release is pending
+      `packaging/` (Gentoo, Arch, Debian, Homebrew) are in; v0.1.0 and v0.1.1 are
+      tagged and published (crates.io and GitHub releases, through release-plz)
 
 **Exit criteria:** M1–M8 exit criteria still pass. The API has had no breaking
 changes for one release cycle.
@@ -448,7 +448,7 @@ a milestone.
 - WebAssembly (`wasm-ld` flavor)
 - Incremental relinking (reusing layout from a previous link)
 - Profile-guided function layout from perf/`propeller` data
-- Mach-O Objective-C category merging, `-order_file`, chained-fixup-aware ICF
+- Mach-O chained-fixup-aware ICF
 
 ## Non-goals
 

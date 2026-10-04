@@ -788,9 +788,9 @@ that cross workstream boundaries. The integrator does these between merges.
 | Integrator | Regression from W20, found by W23: GD/TLSDESC→IE relaxations looked up the wrong GOT slot (clang-23 failed to link). Fixed, with fixture `tls-gd-to-ie-shared`; nothing in CI covered it before | done |
 | W21 | Wire `coff::link` into `crate::link` | done |
 | W21 | Run qld-built PE images on a Windows CI runner | done (`pe-windows` job) |
-| W21 | i386 (PE32) and ARM64 PE output; i386 SafeSEH; delay-load imports; `-r`, `--gc-sections`, `--icf`, `--wrap`, `--defsym` and linker scripts for PE | open |
+| W21 | i386 (PE32) and ARM64 PE output; i386 SafeSEH; delay-load imports; `-r`, `--gc-sections`, `--icf`, `--wrap`, `--defsym` and linker scripts for PE | PE32, ARM64 PE and SafeSEH done (W33); the rest open |
 | W21 | Local symbols in the PE output symbol table; auto-import of PC-relative references; `--enable-stdcall-fixup`; `--add-stdcall-alias` | open |
-| W19 | `-r` with `-T`, and `--defsym` expressions beyond `symbol+offset` | open |
+| W19 | `-r` with `-T`, and `--defsym` expressions beyond `symbol+offset` | done (W38) |
 | W19 | `-r` output of the kernel's `vmlinux.o` makes objtool fail ("can't find starting instruction") — `src/elf/relocatable.rs` | open |
 | W19 | GLOBAL HIDDEN inputs emitted LOCAL in static links; no `FILE` symbols; `sym = othersym` script assignments do not copy type/size | open |
 | W19 | vdso64 differs from GNU ld in `.hash` alignment/size, `.dynstr`, `.dynamic` and an empty `.got.plt` | open |
