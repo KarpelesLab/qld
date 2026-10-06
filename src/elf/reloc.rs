@@ -32,7 +32,7 @@ use super::arch::{
 };
 use super::export::{Mode, PREEMPTIBLE};
 use super::refs::{Def, Target};
-use super::scan::NEEDS_IPLT;
+use super::scan::{NEEDS_GOTDTPOFF, NEEDS_IPLT};
 
 /// What the dynamic linker has to do for one relocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +71,8 @@ pub enum LocalNeed {
     GotTpOff,
     /// A TLS descriptor pair.
     TlsDesc,
+    /// A module-relative TLS offset entry.
+    GotDtpOff,
 }
 
 /// The decision for one relocation.
@@ -290,6 +292,7 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
                 LocalNeed::TlsDesc,
             ),
             GotKind::TlsLd => decision.tls_ld = true,
+            GotKind::DtpOff => need(&mut decision, NEEDS_GOTDTPOFF, LocalNeed::GotDtpOff),
         }
     }
     match class.kind {

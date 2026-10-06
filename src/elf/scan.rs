@@ -46,6 +46,10 @@ pub const NEEDS_IPLT: SymbolFlags = SymbolFlags::backend(0);
 /// symbol tables, as GNU ld hides symbols only dead code refers to.
 pub const REF_LIVE: SymbolFlags = SymbolFlags::backend(2);
 
+/// Backend flag: a GOT entry holding the symbol's offset in its module's
+/// TLS block ([`super::arch::GotKind::DtpOff`]).
+pub const NEEDS_GOTDTPOFF: SymbolFlags = SymbolFlags::backend(6);
+
 /// One reference to an undefined symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UndefinedRef {
@@ -86,6 +90,9 @@ pub struct FileScan {
     pub gottpoff_locals: Vec<u32>,
     /// Local TLS symbols needing a descriptor GOT pair.
     pub tlsdesc_locals: Vec<u32>,
+    /// Local TLS symbols needing a GOT entry holding their offset in the
+    /// module's block.
+    pub gotdtpoff_locals: Vec<u32>,
     /// A module-local TLS GOT pair is needed.
     pub tls_ld: bool,
     /// Sections with dynamic relocations, by section index.
@@ -433,6 +440,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                         LocalNeed::TlsGd => Some(&mut result.tlsgd_locals),
                         LocalNeed::GotTpOff => Some(&mut result.gottpoff_locals),
                         LocalNeed::TlsDesc => Some(&mut result.tlsdesc_locals),
+                        LocalNeed::GotDtpOff => Some(&mut result.gotdtpoff_locals),
                     };
                     if let Some(list) = list {
                         list.push(rel.symbol);
@@ -453,6 +461,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
         &mut result.tlsgd_locals,
         &mut result.gottpoff_locals,
         &mut result.tlsdesc_locals,
+        &mut result.gotdtpoff_locals,
     ] {
         list.sort_unstable();
         list.dedup();

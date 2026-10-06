@@ -1996,6 +1996,95 @@ fn addr64_local_is_the_local_entry_point() {
     }
 }
 
+/// Local-dynamic code that reads a variable's offset from a GOT entry
+/// (`@got@dtprel`) instead of computing it, as GCC does with
+/// `-mtls-size=64`. `GLOBAL` makes the variable preemptible in a shared
+/// object.
+fn got_dtprel_source(global: bool) -> String {
+    format!(
+        r#"
+	.abiversion 2
+	.text
+	.globl	get
+	.type	get,@function
+get:
+	addis	2, 12, .TOC.-get@ha
+	addi	2, 2, .TOC.-get@l
+	.localentry get, .-get
+	mflr	0
+	std	0, 16(1)
+	stdu	1, -32(1)
+	addis	3, 2, x@got@tlsld@ha
+	addi	3, 3, x@got@tlsld@l
+	bl	__tls_get_addr(x@tlsld)
+	nop
+	addis	9, 2, y@got@dtprel@ha
+	ld	9, y@got@dtprel@l(9)
+	lwzx	3, 3, 9
+	addi	1, 1, 32
+	ld	0, 16(1)
+	mtlr	0
+	blr
+	.size	get, .-get
+
+	.section .tbss,"awT",@nobits
+	.p2align 2
+x:
+	.long	0
+	{}
+y:
+	.long	0
+"#,
+        if global { ".globl y" } else { "" }
+    )
+}
+
+/// `R_PPC64_GOT_DTPREL16_*` read a GOT entry holding the variable's offset
+/// in its module's TLS block (biased by 0x8000), which is known at link
+/// time: in executables, where the local-dynamic call around it relaxes,
+/// and in shared objects.
+#[test]
+fn got_dtprel_entries_match() {
+    let tools = require!();
+    let dir = scratch("got-dtprel");
+    compile(tools, &dir, "local.s", &got_dtprel_source(false), &[]);
+    compile(tools, &dir, "global.s", &got_dtprel_source(true), &[]);
+    let check = |elf: &elf::Elf, what: &str| {
+        // A TLS symbol's value is its offset in the TLS block, which is
+        // only `.tbss` here.
+        let offset = elf.symbols.iter().find(|s| s.name == "y").unwrap().value;
+        // The entry is the one word in `.got` past the header (and the
+        // local-dynamic pair, if kept) that holds the offset.
+        let got = elf.section(".got").unwrap();
+        let words: Vec<u64> = (got.addr..got.addr + got.size)
+            .step_by(8)
+            .filter_map(|a| elf.dword(a))
+            .collect();
+        assert!(
+            words.contains(&offset.wrapping_sub(0x8000)),
+            "{what}: no GOT entry holds y's offset: {words:x?}"
+        );
+    };
+    let exe = link_and_compare(tools, &dir, "exe", &["-static", "-e", "get", "local.o"]);
+    check(&exe, "static");
+    let pie = link_and_compare(tools, &dir, "pie", &["-pie", "-e", "get", "local.o"]);
+    check(&pie, "PIE");
+    let lib = link_and_compare(tools, &dir, "lib.so", &["-shared", "local.o"]);
+    check(&lib, "shared object");
+
+    // A preemptible variable gets a dynamic relocation, as GNU ld gives
+    // it; lld writes the link-time offset.
+    qld_ok(&dir, &["-shared", "-o", "global.so", "global.o"]);
+    let global = elf::Elf::read(&dir.join("global.so"));
+    assert!(
+        global
+            .relocs
+            .iter()
+            .any(|r| r.r_type == 78 && r.symbol.as_deref() == Some("y")),
+        "expected an R_PPC64_DTPREL64 against y"
+    );
+}
+
 const SAVE_RESTORE_ABI: &str = r#"
 	.abiversion 2
 	.text

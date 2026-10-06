@@ -633,6 +633,7 @@ pub fn choose<F: crate::elf::read::ElfFormat>(
         | SymbolFlags::NEEDS_TLSGD
         | SymbolFlags::NEEDS_GOTTPOFF
         | SymbolFlags::NEEDS_TLSDESC
+        | super::scan::NEEDS_GOTDTPOFF
         | SymbolFlags::NEEDS_DYNSYM
         | SymbolFlags::NEEDS_COPY_RELOC;
     // (id, defined)

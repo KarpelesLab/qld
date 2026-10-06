@@ -220,6 +220,13 @@ pub fn classify<E: Endian>(
         R_PPC64_DTPREL16_DS => class(K::DtpOff, F::Ds),
         R_PPC64_DTPREL16_LO_DS => class(K::DtpOff, F::LoDs),
         R_PPC64_DTPREL34 => class(K::DtpOff, F::Prefixed34),
+        // A load of the offset from a GOT entry, local-dynamic code's way
+        // of reaching a variable farther than 2 GiB into the block. Kept as
+        // it is in every output, as lld does.
+        R_PPC64_GOT_DTPREL16_HA => got(K::GotSlotRel, F::HaToc, GotKind::DtpOff),
+        R_PPC64_GOT_DTPREL16_HI => got(K::GotSlotRel, F::Hi, GotKind::DtpOff),
+        R_PPC64_GOT_DTPREL16_DS => got(K::GotSlotRel, F::Ds, GotKind::DtpOff),
+        R_PPC64_GOT_DTPREL16_LO_DS => got(K::GotSlotRel, F::LoDsToc, GotKind::DtpOff),
 
         // General-dynamic.
         R_PPC64_GOT_TLSGD16 | R_PPC64_GOT_TLSGD16_LO => match tls {

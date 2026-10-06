@@ -878,6 +878,7 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
         (&synth.tlsgd, GotKind::TlsGd),
         (&synth.gottpoff, GotKind::TpOff),
         (&synth.tlsdesc, GotKind::TlsDesc),
+        (&synth.gotdtpoff, GotKind::DtpOff),
     ] {
         for owner in list.iter() {
             let Some(address) = addresses.got_entry_address(owner, kind) else {
@@ -926,6 +927,13 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
                     };
                     put(address, 0);
                     put(address.wrapping_add(size64), argument);
+                }
+                GotKind::DtpOff => {
+                    let word = match relocs[0] {
+                        SlotReloc::None => value.wrapping_sub(tls.start).wrapping_sub(dtv_offset),
+                        _ => 0,
+                    };
+                    put(address, word);
                 }
                 // The module-local pair is not in any of these lists; it
                 // is written below.
@@ -1175,6 +1183,7 @@ fn collect_dyn_relocs<F: crate::elf::read::ElfFormat>(
         (&synth.tlsgd, GotKind::TlsGd),
         (&synth.gottpoff, GotKind::TpOff),
         (&synth.tlsdesc, GotKind::TlsDesc),
+        (&synth.gotdtpoff, GotKind::DtpOff),
     ] {
         for owner in list.iter() {
             let Some(address) = addresses.got_entry_address(owner, kind) else {

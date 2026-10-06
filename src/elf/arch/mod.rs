@@ -180,6 +180,10 @@ pub enum GotKind {
     TlsDesc,
     /// The module-local TLS module ID and a zero offset (two words).
     TlsLd,
+    /// The variable's offset in its module's TLS block, as the second word
+    /// of a [`GotKind::TlsGd`] pair holds it (one word; PowerPC64
+    /// `R_PPC64_GOT_DTPREL16_*`).
+    DtpOff,
 }
 
 /// How the computed value is stored.
