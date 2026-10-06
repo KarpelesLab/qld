@@ -183,9 +183,10 @@ and TLS models.
       relaxations, ADRP+LDR→ADRP+ADD and ADRP+ADD→NOP+ADR relaxations, BTI
       properties, `-z force-bti`, `-z pac-plt`, the Cortex-A53 843419 and
       835769 workarounds, `-r`, and script layout. TLSDESC is bound eagerly,
-      as in lld: glibc and musl need no lazy TLSDESC PLT. Outstanding: erratum
-      fixes under linker-script layout (the kernel uses them), a patch pool
-      per 128 MiB of code
+      as in lld: glibc and musl need no lazy TLSDESC PLT. Thunks and erratum
+      patches under `-T` scripts, a pool every 64 MiB (compared with lld and
+      GNU ld). Outstanding: `$x` and `__CortexA53843419_*` symbols for
+      patches, an input section longer than a branch's reach
 - [x] **RISC-V 64**: the full relocation set, PLT/GOT, TLS GD/IE/LE and
       TLSDESC with relaxation, linker relaxation with section shrinking (an
       architecture-neutral fixpoint in `src/elf/arch/shrink.rs`), `--relax-gp`,
@@ -203,8 +204,8 @@ and TLS models.
       `EXIDX_CANTUNWIND` synthesis with `PT_ARM_EXIDX`, build-attribute and
       float-ABI merging, PLT/GOT, all TLS models, IFUNC, `R_ARM_V4BX`;
       mapping symbols for the PLT and thunks, thunk pools spread through
-      large sections, group relocations and the 12-bit GOT/TLS forms;
-      compared with lld symbolically and with GNU ld where lld cannot link
+      large sections, group relocations and the 12-bit GOT/TLS forms,
+      thunks under linker scripts; compared with lld symbolically and with GNU ld where lld cannot link
       the form, fixtures run under qemu. Outstanding:
       BE8 (needs big-endian ELF32), GNU TLS descriptors, group relocations past
       G0
@@ -218,11 +219,12 @@ and TLS models.
       stubs that save r2, thunks (including TOC-saving and PC-relative
       ones), all TLS models with relaxations, `.glink`/PLT, IFUNCs, `-r`;
       compared with lld by meaning, fixtures run under qemu in CI.
-      `.toc` in `.got` as GNU ld places it, `R_PPC64_REL16DX_HA`.
-      Outstanding: `_savegpr*`/`_restgpr*`, inline PLT sequences
-      (`-fno-plt`/`-mlongcall`), `R_PPC64_TOC`, `ADDR64_LOCAL`,
-      `GOT_DTPREL*`, multi-TOC, `DT_PPC64_OPT`, thunks under linker
-      scripts
+      `.toc` in `.got` as GNU ld places it, `R_PPC64_REL16DX_HA`,
+      linker-provided `_savegpr*`/`_restgpr*`/`_savefpr*`/`_savevr*`
+      routines, `R_PPC64_TOC`, `ADDR64_LOCAL`, `GOT_DTPREL*`,
+      `DT_PPC64_OPT`, thunks under linker scripts. Outstanding: inline PLT
+      sequences (`-fno-plt`/`-mlongcall`; GNU ld is the only oracle),
+      multi-TOC
 - [~] **PowerPC64 BE** (ELFv1, `elf64ppc`): the relocation set with
       big-endian instruction fields, `.opd` function descriptors, `.TOC.`,
       TLS with its relaxations, IFUNC stubs, C++ exceptions, `-r`; static

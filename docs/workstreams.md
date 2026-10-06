@@ -93,6 +93,10 @@ can work at the same time without colliding.
 | W52 | LoongArch shrinking and PowerPC64 LE leftovers (M4) | `src/elf/arch/{loongarch,ppc64}*` (LE parts), `src/arch/{loongarch,ppc64}*`, `tests/{loongarch,ppc64}*` | W30, W31, W32 | merged |
 | W53 | Option coverage and GNU differences | `src/args/**`, the x86-64 difference fixes in `src/elf/{defined,dynsym,synth}*`, `tests/args*` | W22, W43 | merged |
 | W55 | Amiga Hunk output and m68k (M4/M7-style) | `src/hunk/**`, `src/elf/arch/m68k*`, `src/arch/m68k*`, `tests/hunk*`, `tests/m68k*`; agreed additions to `src/target.rs` and `src/lib.rs` | — | in progress |
+| W57 | Test-harness robustness | `tests/common/**`, `docs/testing.md`, mechanical changes in `tests/*.rs` | W9 | merged |
+| W58 | Thunks and erratum patches under linker scripts (M4) | `src/elf/script_layout/**`, the script path of `src/elf/layout.rs`, `src/elf/arch/thunk*`, `tests/script_thunks*` | W19, W37 | merged |
+| W59 | PowerPC64 LE leftovers (M4) | `src/elf/arch/ppc64*` and `src/arch/ppc64*` (LE parts), `tests/ppc64*`, `tests/fixtures/ppc64le-*` | W52 | merged |
+| W60 | GNU ld compatibility leftovers | `src/args/**`, version-script matching in `src/elf/export.rs`, library incompatibility checks in `src/input/**` and `src/{elf,coff}/inputs.rs`, `tests/{args,diag,multilib,version_cxx}*` | W51, W53, W56 | merged |
 | W15 | Mach-O reading | `src/macho/**` | — | merged |
 
 W1–W7 and W9 can all run at once. They share no files.
@@ -633,25 +637,41 @@ remaining option and GNU-difference gaps.
 vasm assembles the inputs and vlink is the oracle; nothing is run, since
 the output needs an Amiga emulator and the user asked not to use one.
 
+## W57–W60: round 7
+
+- **W57 (test harness):** `common::scratch::scratch_dir` gives each call its
+  own `<name>-<pid>-<seq>` directory, kept after the test and pruned in a
+  later run; every suite uses it. `common::oracle::lld_at_least` skips a
+  comparison whose expectations need a newer lld (AArch64 ADRP: 23;
+  LoongArch relaxation: 21, its `-r` alignment: 22; x32 PIE: 22) and fails
+  it under `QLD_REQUIRE_TOOLS=1`. See `docs/testing.md`.
+- **W58 (script thunks):** script layout repeats until the thunk plan is
+  stable, with a pool every `thunk_pool_spacing` bytes and one after the last
+  input section description of each output section; Cortex-A53 patches work
+  under scripts, and every pool's patch block is now written (only the first
+  was before). `tests/script_thunks.rs` compares AArch64, Arm and PowerPC64
+  LE with lld and GNU ld.
+- **W59 (PowerPC64 LE):** lazily linked save/restore routine families,
+  `R_PPC64_TOC`, `ADDR64_LOCAL`, `GOT_DTPREL16_*` through `GotKind::DtpOff`,
+  `DT_PPC64_OPT`.
+- **W60 (GNU compatibility):** GNU wording for unknown options and
+  unrecognized inputs; BFD architecture names and byte-order messages for
+  incompatible inputs; a named incompatible archive errors only when a
+  member is extracted; thin archives are pre-checked; `extern "C++"`
+  version-script and dynamic-list patterns match demangled names;
+  `src/args/print.rs` computes the `--print-*` text.
+
 ---
 
 ## Integration follow-ups
 
-- **Test scratch directories are not race-safe.** `scratch(name)` removes
-  and recreates the directory, so two parallel tests that pass the same
-  name delete each other's files: this made
-  `gdb_index_matches_lld_on_big_endian` fail on the arm64 runner, where the
-  whole suite runs at full parallelism. Fixed there by probing once through
-  a `OnceLock`. `tests/macho_link.rs` calls `scratch("hello")` twice inside
-  one test, which is sequential but equally fragile. Giving `scratch` a
-  unique suffix per call, or making it not delete, would remove the class.
+- **Scratch directories (W57 leftovers):** the per-process probe and shim
+  directories (`i386-ld`, `x32-ld`, `*-probe`) and `hints.rs`/`input.rs`
+  still use fixed names; only two concurrent runs of one test binary could
+  collide there.
 
-- **W56 (incompatible libraries, user-reported):** fixed for ELF and
-  PE/COFF; Mach-O already ignored them as ld64 does. Left open: a directly
-  named incompatible archive errors even when no member is extracted (GNU
-  ld waits for extraction), thin archives found by search are not
-  pre-checked, and the architecture names in the message are qld's
-  (`X86_64`) rather than BFD's (`i386:x86-64`).
+- **W56 (incompatible libraries):** done in W60. PE/COFF only changed its
+  message names.
 
 - **W55 (Hunk/m68k):** a Hunk-specific section→hunk placement rule (vlink
   gives each input section name its own hunk); Hunk object output
@@ -660,24 +680,23 @@ the output needs an Amiga emulator and the user asked not to use one.
   them; `HUNK_RELOC32SHORT` selection; m68k range-extension thunks and
   dynamic output.
 
-- **W51 (diagnostics):** wording still unlike GNU ld in two places:
-  `unknown option: --foo` (GNU: `unrecognized option '--foo'` plus a usage
-  hint) and `malformed file format not recognized` (GNU: `file not
-  recognized: file format not recognized`). A relocation overflow could
-  carry lld's `is not in [min, max]` if `ApplyError` carried the value.
-  `SourceLocation::column` is always `None` until the DWARF line table
-  tracks a column. `Stderr` holds every diagnostic until flush.
+- **W51 (diagnostics):** the GNU wording is done (W60); a truncated object
+  still gets qld's more precise `malformed …` message (documented). A
+  relocation overflow could carry lld's `is not in [min, max]` if
+  `ApplyError` carried the value. `SourceLocation::column` is always `None`
+  until the DWARF line table tracks a column. `Stderr` holds every
+  diagnostic until flush.
 
 - **W54 (PE):** an unrecognised orphan section is placed differently from
   GNU ld (GNU puts `.averylongname` right after `.data`; qld puts it between
   `.tls` and `.reloc`). Orphan placement in `src/coff/layout.rs`.
 
-- **W53 (options):** `--print-sysroot` and `--print-output-format` need new
-  `ParseOutcome` variants and a line in the frozen `src/main.rs`. Left
-  unsupported with reasons: `--unique` (needs per-input output sections),
+- **W53 (options):** `--print-sysroot`/`--print-output-format`: the text
+  is computed in `src/args/print.rs` (W60); they still need
+  `ParseOutcome::Print` and a `src/main.rs` arm (frozen), and
+  `OUTPUT_FORMAT` from `-T` is not reported. Left unsupported with reasons: `--unique` (needs per-input output sections),
   `--execute-only` (AArch64 segment splitting), `--no-define-common`,
-  `--no-fortran-common`. `extern "C++"` version-script patterns are still
-  matched against mangled names.
+  `--no-fortran-common`.
 
 - **W48 (PowerPC64 BE):** dynamic ELFv1 output is the big one — `DT_PLTGOT`
   names a `.plt` of 24-byte descriptors the dynamic linker fills, with
@@ -688,16 +707,9 @@ the output needs an Amiga emulator and the user asked not to use one.
 - **`.toc` folded into `.got`** is done for PowerPC64 LE (W52) and still
   open for BE (`rules.rs`).
 
-- **W52 (PowerPC64 LE):** still open, with notes on the size of each:
-  `_savegpr*`/`_restgpr*` (lld implements these, so they are verifiable
-  locally; needs a new synthetic section), inline PLT
-  (`PLTSEQ`/`PLTCALL`/`PLT16_*`, GNU ld only), `R_PPC64_TOC` (overlaps
-  W48's ELFv1 work), `ADDR64_LOCAL`, `GOT_DTPREL*` (needs a new `GotKind`),
-  `DT_PPC64_OPT`, multi-TOC.
-- **Thunks under linker-script layout** are missing generically: the script
-  path returns before the thunk fixpoint (`layout.rs`) and
-  `script_layout/engine.rs` hard-codes an empty thunk list. Fixing it there
-  fixes AArch64, PowerPC64 and Arm at once.
+- **W52/W59 (PowerPC64 LE):** still open: inline PLT
+  (`PLTSEQ`/`PLTCALL`/`PLT16_*`, needs `powerpc64le-*-ld` as the oracle),
+  multi-TOC; the save/restore routines for ELFv1 BE.
 
 - **W44 (RV32):** 
   `target.rs::default_target()` has no riscv32 host case;
@@ -722,8 +734,7 @@ the output needs an Amiga emulator and the user asked not to use one.
 - **W38 (scripts):** `-r` `.eh_frame` editing; `.dynstr` tail merging; GNU's
   spare `.dynamic` slots and tag order; version-definition symbols in
   `.symtab`; a built-in `-r` layout for architectures other than x86-64.
-- **W37 (AArch64):** erratum fixes with linker-script layout; a patch pool
-  per 128 MiB of code; `$x` and `__CortexA53843419_*` symbols for patches;
+- **W37 (AArch64):** `$x` and `__CortexA53843419_*` symbols for patches;
   check `DT_AARCH64_VARIANT_PCS`. `src/elf/arch/aarch64_errata.rs` and
   `thunk.rs` belong to the AArch64 owner.
 - **W34 (Mach-O):** relative method lists add a second link attempt when a
@@ -764,7 +775,7 @@ that cross workstream boundaries. The integrator does these between merges.
 | W1 | Re-export `parse_gnu_with` from the crate root | done |
 | W3 | `Error` variant for script errors with line and column | done: `Error::Script` |
 | W3 | Layout-side script semantics: `DATA_SEGMENT_*` relro adjustment, `PROVIDE` only-if-referenced, `NEXT_SECTION`, section-relative symbols from `.` | done (W19) |
-| W1 | Let `ParseOutcome` grow print-and-exit variants (`--print-sysroot`, `--print-output-format`); `main.rs` must handle them | open |
+| W1 | Let `ParseOutcome` grow print-and-exit variants (`--print-sysroot`, `--print-output-format`); `main.rs` must handle them | open: the text is in `src/args/print.rs` (W60); needs the frozen-file change |
 | W1 | `target.rs`: more operating systems (FreeBSD, …) and architectures (MIPS, PowerPC32, …) for their `-m` emulations | open, when needed |
 | W6 | Split `merge_sections` into a parse-time split step and a post-GC dedup/offset step, so the relocation scan can map references to pieces (see architecture stage 4 and 8) | done: `split_section` + `merge_split_sections` |
 | W8 | `Location` label so duplicate symbols print `>>> defined at` | done: `Diagnostic::detail` |
