@@ -13,6 +13,7 @@
 //! - [`response`]: `@file` expansion, through a [`FileReader`] so tests stay
 //!   hermetic.
 //! - [`emulation`]: `-m` names and the targets they select.
+//! - [`print`]: what `--print-output-format` and `--print-sysroot` print.
 //!
 //! Parsing rules, flavors and the option table policy are specified in
 //! `docs/compatibility.md`.
@@ -21,6 +22,7 @@ pub mod darwin;
 pub mod emulation;
 pub mod options;
 pub mod parse;
+pub mod print;
 pub mod response;
 pub mod table;
 
