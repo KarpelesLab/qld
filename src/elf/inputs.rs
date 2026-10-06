@@ -12,6 +12,10 @@
 //! - a text file is parsed as a linker script, and its `INPUT`, `GROUP` and
 //!   `LIB` entries are resolved and expanded in place.
 //!
+//! A PowerPC64 LE link then gets the linker's register save and restore
+//! routines as lazy objects after every other input
+//! ([`super::arch::ppc64::save_restore_objects`]).
+//!
 //! Every input gets an [`InputPosition`] from this walk, so positions (and
 //! [`FileId`]s, which are indices into the list) follow command-line order,
 //! with archive members numbered within their archive. File 0 is the

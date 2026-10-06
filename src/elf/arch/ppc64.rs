@@ -51,6 +51,12 @@
 //! `bl __tls_get_addr` rewrites the call, whose own relocation is then
 //! skipped. The thread pointer (`r13`) is 0x7000 bytes past the start of
 //! the TLS block, and `@dtprel` offsets are biased by 0x8000.
+//! `R_PPC64_GOT_DTPREL16_*` load such an offset from a GOT entry of its
+//! own ([`GotKind::DtpOff`]), which is never relaxed.
+//!
+//! **Linker-provided code.** GCC's `-Os` code calls out-of-line register
+//! save and restore routines (`_savegpr0_14`, …) that the linker defines
+//! when nothing else does ([`save_restore_objects`]).
 
 #![deny(clippy::arithmetic_side_effects)]
 
