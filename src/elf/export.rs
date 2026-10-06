@@ -27,7 +27,9 @@
 //! Version scripts (`--version-script`) follow GNU ld: a definition named
 //! `name@@VERSION` or `name@VERSION` keeps its version; otherwise the first
 //! exact `global:` pattern, then the first exact `local:` pattern, then the
-//! first wildcard `global:`, then wildcard `local:` decides.
+//! first wildcard `global:`, then wildcard `local:` decides. Patterns in
+//! an `extern "C++"` block, there and in dynamic lists, match the
+//! demangled name.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -118,16 +120,43 @@ pub struct VersionDef {
 }
 
 /// A compiled version script.
+///
+/// Patterns in an `extern "C++"` block match the demangled name, as
+/// libiberty's `cplus_demangle` with `DMGL_PARAMS | DMGL_ANSI` writes it
+/// (`ns::f(int)`), or the name itself when it is not mangled, as in GNU ld
+/// (`lang_vers_match`). Other languages (`extern "C"`, `extern "Java"`)
+/// match the name as it is.
 #[derive(Debug, Default)]
 pub struct VersionScript {
     /// Named version nodes, in script order; index `i` is version index
     /// `i + 2`.
     pub defs: Vec<VersionDef>,
-    /// `(exact name, version index or 0 for the anonymous node, local)`,
-    /// sorted by name.
-    exact: Vec<(Vec<u8>, u16, bool)>,
-    /// `(pattern, version index, local)`, in script order.
-    globs: Vec<(Pattern, u16, bool)>,
+    /// Exact patterns, sorted by name and then by script order.
+    exact: Vec<Exact>,
+    /// `(pattern, C++, version index, local)`, in script order.
+    globs: Vec<(Pattern, bool, u16, bool)>,
+    /// Whether any pattern is in an `extern "C++"` block, so that names
+    /// have to be demangled.
+    cxx: bool,
+}
+
+/// An exact version-script pattern.
+#[derive(Debug)]
+struct Exact {
+    name: Vec<u8>,
+    /// Matched against the demangled name.
+    cxx: bool,
+    /// Position in the script: the first pattern naming a symbol wins.
+    order: usize,
+    /// Version index, 0 for the anonymous node.
+    index: u16,
+    local: bool,
+}
+
+/// Whether `language` (from `extern "lang"`) is C++, which GNU ld compares
+/// without regard to case.
+fn is_cxx(language: Option<&[u8]>) -> bool {
+    language.is_some_and(|lang| lang.eq_ignore_ascii_case(b"C++"))
 }
 
 impl VersionScript {
@@ -155,6 +184,8 @@ impl VersionScript {
             };
             for (patterns, local) in [(&node.globals, false), (&node.locals, true)] {
                 for pattern in patterns {
+                    let cxx = is_cxx(pattern.language.as_deref());
+                    script.cxx |= cxx;
                     let wildcard = !pattern.literal
                         && pattern
                             .pattern
@@ -163,15 +194,22 @@ impl VersionScript {
                     if wildcard {
                         script
                             .globs
-                            .push((Pattern::file(&pattern.pattern), index, local));
+                            .push((Pattern::file(&pattern.pattern), cxx, index, local));
                     } else {
-                        script.exact.push((pattern.pattern.clone(), index, local));
+                        let order = script.exact.len();
+                        script.exact.push(Exact {
+                            name: pattern.pattern.clone(),
+                            cxx,
+                            order,
+                            index,
+                            local,
+                        });
                     }
                 }
             }
         }
         // Stable: the first node naming a symbol wins.
-        script.exact.sort_by(|a, b| a.0.cmp(&b.0));
+        script.exact.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(script)
     }
 
@@ -185,29 +223,48 @@ impl VersionScript {
             .and_then(|p| p.checked_add(2))
     }
 
-    /// Looks `name` up: `(version index, local)`.
-    #[must_use]
-    pub fn lookup(&self, name: &[u8]) -> Option<(u16, bool)> {
-        let start = self.exact.partition_point(|e| e.0.as_slice() < name);
-        let exact = self
-            .exact
+    /// The exact patterns naming `key` in the language `cxx` says.
+    fn exact(&self, key: &[u8], cxx: bool) -> impl Iterator<Item = &Exact> {
+        let start = self.exact.partition_point(|e| e.name.as_slice() < key);
+        self.exact
             .get(start..)
             .unwrap_or_default()
             .iter()
-            .take_while(|e| e.0 == name);
-        let mut local_exact = None;
-        for (_, index, local) in exact {
-            if !local {
-                return Some((*index, false));
+            .take_while(move |e| e.name == key)
+            .filter(move |e| e.cxx == cxx)
+    }
+
+    /// Looks `name` up: `(version index, local)`.
+    #[must_use]
+    pub fn lookup(&self, name: &[u8]) -> Option<(u16, bool)> {
+        let demangled = if self.cxx {
+            crate::demangle::try_demangle(name)
+        } else {
+            None
+        };
+        let cxx_name = demangled.as_deref().map_or(name, str::as_bytes);
+        let exact = self.exact(name, false).chain(
+            if self.cxx {
+                Some(self.exact(cxx_name, true))
+            } else {
+                None
             }
-            local_exact.get_or_insert((*index, true));
+            .into_iter()
+            .flatten(),
+        );
+        let (mut global, mut local): (Option<&Exact>, Option<&Exact>) = (None, None);
+        for entry in exact {
+            let best = if entry.local { &mut local } else { &mut global };
+            if best.is_none_or(|b| entry.order < b.order) {
+                *best = Some(entry);
+            }
         }
-        if local_exact.is_some() {
-            return local_exact;
+        if let Some(entry) = global.or(local) {
+            return Some((entry.index, entry.local));
         }
         let mut local_glob = None;
-        for (pattern, index, local) in &self.globs {
-            if pattern.matches(name) {
+        for (pattern, cxx, index, local) in &self.globs {
+            if pattern.matches(if *cxx { cxx_name } else { name }) {
                 if !local {
                     return Some((*index, false));
                 }
@@ -242,7 +299,7 @@ impl Exports {
 /// # Errors
 ///
 /// Returns I/O and script errors.
-pub fn read_scripts(options: &LinkOptions) -> Result<(Option<VersionScript>, Vec<Pattern>)> {
+pub fn read_scripts(options: &LinkOptions) -> Result<(Option<VersionScript>, DynamicList)> {
     let mut nodes = Vec::new();
     for path in &options.version_scripts {
         let data = std::fs::read(path).map_err(|e| Error::io(path, e))?;
@@ -256,17 +313,26 @@ pub fn read_scripts(options: &LinkOptions) -> Result<(Option<VersionScript>, Vec
     } else {
         Some(VersionScript::new(&nodes)?)
     };
-    let mut patterns: Vec<Pattern> = options
-        .export_dynamic_symbols
-        .iter()
-        .map(|p| Pattern::file(p.as_bytes()))
-        .collect();
+    let mut list = DynamicList::default();
+    list.plain.extend(
+        options
+            .export_dynamic_symbols
+            .iter()
+            .map(|p| Pattern::file(p.as_bytes())),
+    );
     for path in &options.dynamic_lists {
         let data = std::fs::read(path).map_err(|e| Error::io(path, e))?;
         for node in crate::script::parse_version_script(&data, path)
             .map_err(|e| Error::Script(Box::new(e)))?
         {
-            patterns.extend(node.globals.iter().map(|p| Pattern::file(&p.pattern)));
+            for pattern in &node.globals {
+                let compiled = Pattern::file(&pattern.pattern);
+                if is_cxx(pattern.language.as_deref()) {
+                    list.cxx.push(compiled);
+                } else {
+                    list.plain.push(compiled);
+                }
+            }
         }
     }
     for path in &options.export_dynamic_symbol_lists {
@@ -274,21 +340,53 @@ pub fn read_scripts(options: &LinkOptions) -> Result<(Option<VersionScript>, Vec
         for line in data.split(|&b| b == b'\n') {
             let line = line.trim_ascii();
             if !line.is_empty() && !line.starts_with(b"#") {
-                patterns.push(Pattern::file(line));
+                list.plain.push(Pattern::file(line));
             }
         }
     }
     // GNU ld's built-in C++ lists are `extern "C++"` patterns matched
-    // against demangled names (`operator new*`, `typeinfo for*`). qld has
-    // no demangling in version-script matching, and for Itanium mangling
-    // the two sets are exactly these mangled prefixes.
+    // against demangled names (`operator new*`, `typeinfo for*`); under
+    // Itanium mangling the two sets are exactly these mangled prefixes,
+    // which need no demangling.
     if options.dynamic_list_cpp_new {
-        patterns.extend(CPP_NEW.iter().map(|p| Pattern::file(p)));
+        list.plain.extend(CPP_NEW.iter().map(|p| Pattern::file(p)));
     }
     if options.dynamic_list_cpp_typeinfo {
-        patterns.extend(CPP_TYPEINFO.iter().map(|p| Pattern::file(p)));
+        list.plain
+            .extend(CPP_TYPEINFO.iter().map(|p| Pattern::file(p)));
     }
-    Ok((script, patterns))
+    Ok((script, list))
+}
+
+/// The symbols `--dynamic-list`, `--export-dynamic-symbol` and their
+/// relatives name. Patterns in an `extern "C++"` block of a dynamic list
+/// match the demangled name, as in [`VersionScript`].
+#[derive(Debug, Default)]
+pub struct DynamicList {
+    plain: Vec<Pattern>,
+    cxx: Vec<Pattern>,
+}
+
+impl DynamicList {
+    /// Whether the list names nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.cxx.is_empty()
+    }
+
+    /// Whether the list names `name`.
+    #[must_use]
+    pub fn matches(&self, name: &[u8]) -> bool {
+        if self.plain.iter().any(|p| p.matches(name)) {
+            return true;
+        }
+        if self.cxx.is_empty() {
+            return false;
+        }
+        let demangled = crate::demangle::try_demangle(name);
+        let name = demangled.as_deref().map_or(name, str::as_bytes);
+        self.cxx.iter().any(|p| p.matches(name))
+    }
 }
 
 /// `--dynamic-list-cpp-new`: `operator new`, `operator new[]`,
@@ -337,7 +435,7 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
     options: &LinkOptions,
     mode: Mode,
     script: Option<VersionScript>,
-    dynamic_patterns: &[Pattern],
+    dynamic_patterns: &DynamicList,
     linker: &LinkerSymbols,
 ) -> Result<Exports> {
     // Merged visibility, and definitions also made by needed libraries.
@@ -501,7 +599,7 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
                         || def.kind == DefinitionKind::Common;
                     let listed = (name.version().is_none()
                         && !dynamic_patterns.is_empty()
-                        && dynamic_patterns.iter().any(|p| p.matches(name.bytes())))
+                        && dynamic_patterns.matches(name.bytes()))
                         || (options.dynamic_list_data && data);
                     let exported = !local_visibility
                         && (mode.shared
@@ -549,4 +647,68 @@ pub fn plan<F: crate::elf::read::ElfFormat>(
         }
     }
     Ok(Exports { script, versions })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn script(text: &str) -> VersionScript {
+        let nodes =
+            crate::script::parse_version_script(text.as_bytes(), std::path::Path::new("v.map"))
+                .unwrap();
+        VersionScript::new(&nodes).unwrap()
+    }
+
+    #[test]
+    fn cxx_patterns_match_demangled_names() {
+        let versions = script(
+            r#"V1 {
+                global:
+                    extern "C++" { "ns::f(int)"; ns::S::*; plain*; };
+                    cfunc;
+                local: *;
+            };
+            V2 { global: extern "c++" { ns::g*; }; } V1;"#,
+        );
+        assert_eq!(versions.lookup(b"_ZN2ns1fEi"), Some((2, false)));
+        assert_eq!(versions.lookup(b"_ZN2ns1fEd"), Some((2, true)), "f(double)");
+        assert_eq!(versions.lookup(b"_ZN2ns1S1mEv"), Some((2, false)));
+        assert_eq!(versions.lookup(b"_Z5plaini"), Some((2, false)));
+        assert_eq!(versions.lookup(b"_ZN2ns1gEv"), Some((3, false)));
+        assert_eq!(versions.lookup(b"cfunc"), Some((2, false)));
+        // A name that is not mangled is matched as it is.
+        assert_eq!(versions.lookup(b"ns::f(int)"), Some((2, false)));
+
+        // A C pattern does not see the demangled name, nor a C++ one the
+        // mangled name.
+        let versions = script(r#"{ global: "ns::f(int)"; extern "C++" { _Z1gv; }; local: *; };"#);
+        assert_eq!(versions.lookup(b"_ZN2ns1fEi"), Some((0, true)));
+        assert_eq!(versions.lookup(b"_Z1gv"), Some((0, true)));
+    }
+
+    #[test]
+    fn the_first_exact_pattern_wins_across_languages() {
+        let versions = script(
+            r#"V1 { global: extern "C++" { "f()"; }; };
+               V2 { global: _Z1fv; };"#,
+        );
+        assert_eq!(versions.lookup(b"_Z1fv"), Some((2, false)));
+        let versions = script(
+            r#"V1 { global: _Z1fv; };
+               V2 { global: extern "C++" { "f()"; }; };"#,
+        );
+        assert_eq!(versions.lookup(b"_Z1fv"), Some((2, false)));
+    }
+
+    #[test]
+    fn dynamic_lists_match_cxx_patterns_demangled() {
+        let mut list = DynamicList::default();
+        assert!(list.is_empty());
+        list.cxx.push(Pattern::file(b"ns::f(double)"));
+        list.plain.push(Pattern::file(b"cfunc"));
+        assert!(list.matches(b"_ZN2ns1fEd"));
+        assert!(list.matches(b"cfunc"));
+        assert!(!list.matches(b"_ZN2ns1fEi"));
+    }
 }

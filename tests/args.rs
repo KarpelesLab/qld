@@ -288,7 +288,7 @@ fn every_option_in_every_spelling() {
         if def.name.len() == 1 {
             // Single-letter options never take two dashes.
             let message = error(&[&format!("--{}", def.name), "in.o"]);
-            assert!(message.starts_with("unknown option"), "{message}");
+            assert!(message.starts_with("unrecognized option"), "{message}");
         } else if def.name.starts_with('o') && def.arg == ArgKind::Flag {
             // `-omagic` is `-o magic`.
             let options = link(&[&format!("-{}", def.name), "in.o"]);
@@ -504,12 +504,18 @@ fn z_keywords_joined_separate_and_unknown() {
     assert!(!options.relro && !options.bind_now && !options.copy_relocs);
 }
 
+/// GNU ld's message for an option it does not know, with its usage hint.
+fn unrecognized(option: &str) -> String {
+    format!("unrecognized option '{option}'\nqld: use the --help option for usage information")
+}
+
 #[test]
 fn unknown_and_malformed_options() {
-    assert_eq!(error(&["--foo", "a.o"]), "unknown option: --foo");
-    assert_eq!(error(&["-qux", "a.o"]), "unknown option: -qux");
-    assert_eq!(error(&["--f", "a.o"]), "unknown option: --f");
-    assert_eq!(error(&["-sX", "a.o"]), "unknown option: -sX");
+    assert_eq!(error(&["--foo", "a.o"]), unrecognized("--foo"));
+    assert_eq!(error(&["--qux=3", "a.o"]), unrecognized("--qux=3"));
+    assert_eq!(error(&["-qux", "a.o"]), unrecognized("-qux"));
+    assert_eq!(error(&["--f", "a.o"]), unrecognized("--f"));
+    assert_eq!(error(&["-sX", "a.o"]), unrecognized("-sX"));
     assert_eq!(
         error(&["--whole-archive=yes", "a.o"]),
         "option does not take a value: --whole-archive"

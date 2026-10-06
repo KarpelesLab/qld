@@ -95,8 +95,8 @@ fn assert_incompatible(output: &Output, with: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success()
-            && stderr.contains("x86_64.o: X86_64")
-            && stderr.contains(&format!("incompatible with {with} ")),
+            && stderr.contains("i386:x86-64 architecture of input file `x86_64.o'")
+            && stderr.contains(&format!("incompatible with {with} output")),
         "{stderr}"
     );
 }
@@ -139,7 +139,7 @@ fn gcc_lto_object_names_the_target() {
         &dir,
         &["-plugin", plugin, "-e", "f", "f.o", foreign, "-o", "out"],
     );
-    assert_incompatible(&output, "Aarch64");
+    assert_incompatible(&output, "aarch64");
 }
 
 /// Makes `shim/ld` run qld, for `gcc -B shim/`.
@@ -273,7 +273,7 @@ fn bitcode_names_the_target() {
             "out2",
         ],
     );
-    assert_incompatible(&output, "Aarch64");
+    assert_incompatible(&output, "aarch64");
 }
 
 /// `-b binary` inputs are machine-neutral: they link into any target, in

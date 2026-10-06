@@ -8,8 +8,9 @@
 //! both linkers over the same command lines, and compare the list of
 //! skipped candidates and the exit status.
 //!
-//! A file named directly on the command line is still an error, and its
-//! message must be the architecture one, not a "malformed ELF class" parse
+//! A file named directly on the command line is still an error (for an
+//! archive, once a member is extracted), and its message must be the
+//! architecture one with BFD's names, not a "malformed ELF class" parse
 //! error: a 32-bit ELF file is well formed, just for another machine.
 //!
 //! Tools: `gcc` with `-m32` (Debian/Ubuntu `gcc-multilib`), `ar` and GNU
@@ -333,14 +334,29 @@ fn a_32_bit_link_skips_a_64_bit_library() {
 #[test]
 fn a_named_file_is_an_error_about_the_architecture() {
     let fixtures = fixtures!();
-    for name in ["lib32/libpick.so", "lib32/libpick.a"] {
+    for (name, culprit) in [
+        ("lib32/libpick.so", "lib32/libpick.so"),
+        ("lib32/libpick.a", "lib32/libpick.a(helper32.o)"),
+    ] {
         let ours = fixtures.qld(&["-m", "elf_x86_64", "-e", "main", "-o", "out", "u.o", name]);
         let text = stderr(&ours);
         assert!(!ours.status.success(), "qld linked {name}: {text}");
-        assert!(
-            text.contains("architecture of input file is incompatible with"),
-            "qld said, for {name}: {text}"
+        // BFD's names, and for the archive the member that was extracted,
+        // as GNU ld says it (GNU ld words the shared object differently:
+        // `file in wrong format`).
+        let expected = format!(
+            "i386 architecture of input file `{culprit}' is incompatible with i386:x86-64 output"
         );
+        assert!(text.contains(&expected), "qld said, for {name}: {text}");
+        if name.ends_with(".a") {
+            let theirs =
+                fixtures.gnu(&["-m", "elf_x86_64", "-e", "main", "-o", "out", "u.o", name]);
+            assert!(
+                stderr(&theirs).contains(&expected),
+                "GNU ld said: {}",
+                stderr(&theirs)
+            );
+        }
         assert!(
             !text.contains("malformed"),
             "qld called {name} malformed: {text}"
@@ -350,4 +366,111 @@ fn a_named_file_is_an_error_about_the_architecture() {
             "qld skipped a named file: {text}"
         );
     }
+}
+
+/// A named incompatible archive that nothing extracts from is accepted, as
+/// GNU ld only looks at the members it pulls in. `u.o` takes `helper` from
+/// the 64-bit archive first, so the 32-bit one is never used.
+#[test]
+fn a_named_archive_is_only_checked_when_extracted() {
+    let fixtures = fixtures!();
+    let args = [
+        "-m",
+        "elf_x86_64",
+        "-e",
+        "main",
+        "-o",
+        "out",
+        "u.o",
+        "lib64/libpick.a",
+        "lib32/libpick.a",
+    ];
+    let ours = fixtures.qld(&args);
+    let theirs = fixtures.gnu(&args);
+    assert!(theirs.status.success(), "GNU ld: {}", stderr(&theirs));
+    assert!(ours.status.success(), "qld: {}", stderr(&ours));
+    assert!(!stderr(&ours).contains("incompatible"), "{}", stderr(&ours));
+
+    // With `--whole-archive` every member is extracted.
+    let args = [
+        "-m",
+        "elf_x86_64",
+        "-e",
+        "main",
+        "-o",
+        "out",
+        "u.o",
+        "lib64/libpick.a",
+        "--whole-archive",
+        "lib32/libpick.a",
+    ];
+    let ours = fixtures.qld(&args);
+    let theirs = fixtures.gnu(&args);
+    let message = "i386 architecture of input file `lib32/libpick.a(helper32.o)' is incompatible";
+    assert!(
+        stderr(&theirs).contains(message),
+        "GNU ld: {}",
+        stderr(&theirs)
+    );
+    assert!(!ours.status.success(), "qld linked it");
+    assert!(stderr(&ours).contains(message), "qld: {}", stderr(&ours));
+}
+
+/// A thin archive found by search is skipped by its first member's
+/// architecture like a regular one, and one named directly reports its
+/// member by the member's own path.
+#[test]
+fn thin_archives_are_checked_like_regular_ones() {
+    let fixtures = fixtures!();
+    let thin = fixtures.dir.join("thin32");
+    fs::create_dir_all(&thin).unwrap();
+    let _ = fs::remove_file(thin.join("libpick.a"));
+    let ar = in_path("ar").expect("ar was found for the fixtures");
+    let made = run(&thin, &ar, &["rcsT", "libpick.a", "../helper32.o"]);
+    assert!(made.status.success(), "{}", stderr(&made));
+
+    let args = [
+        "-m",
+        "elf_x86_64",
+        "-e",
+        "main",
+        "-o",
+        "out",
+        "u.o",
+        "-Lthin32",
+        "-Llib64",
+        "-lpick",
+    ];
+    let ours = fixtures.qld(&args);
+    let theirs = fixtures.gnu(&args);
+    assert!(ours.status.success(), "qld: {}", stderr(&ours));
+    assert_eq!(
+        skipped(&ours),
+        vec!["skipping incompatible thin32/libpick.a when searching for -lpick".to_string()],
+        "qld said: {}",
+        stderr(&ours)
+    );
+    assert_eq!(skipped(&ours), skipped(&theirs));
+
+    let args = [
+        "-m",
+        "elf_x86_64",
+        "-e",
+        "main",
+        "-o",
+        "out",
+        "u.o",
+        "thin32/libpick.a",
+    ];
+    let ours = fixtures.qld(&args);
+    let theirs = fixtures.gnu(&args);
+    let message = "i386 architecture of input file `thin32/../helper32.o' is incompatible \
+                   with i386:x86-64 output";
+    assert!(
+        stderr(&theirs).contains(message),
+        "GNU ld: {}",
+        stderr(&theirs)
+    );
+    assert!(!ours.status.success(), "qld linked it");
+    assert!(stderr(&ours).contains(message), "qld: {}", stderr(&ours));
 }

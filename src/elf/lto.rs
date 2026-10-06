@@ -259,7 +259,6 @@ mod plugin_link {
     use crate::plugin::{
         ClaimedFile, InputFile, PluginMessage, Session, SessionOptions, SymbolKind, Visibility,
     };
-    use crate::script::Pattern;
     use crate::symbols::{DefinitionKind, LoadHook, RoundFile, RoundHook, SymbolFlags};
 
     /// Pass-one flag: a live regular object or the linker names the symbol.
@@ -615,7 +614,7 @@ mod plugin_link {
         relocatable: bool,
         shared: bool,
         script: Option<VersionScript>,
-        patterns: Vec<Pattern>,
+        patterns: export::DynamicList,
         wrap: Vec<Vec<u8>>,
     }
 
@@ -793,8 +792,7 @@ mod plugin_link {
                         .as_ref()
                         .and_then(|script| script.lookup(name.bytes()))
                         .is_some_and(|(_, local)| local);
-                let listed = name.version().is_none()
-                    && context.patterns.iter().any(|p| p.matches(name.bytes()));
+                let listed = name.version().is_none() && context.patterns.matches(name.bytes());
                 symbol_resolution(&SymbolFacts {
                     undefined,
                     prevailing,

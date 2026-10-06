@@ -97,8 +97,13 @@ each one a status:
 The table lives in `src/args/table.rs` (about 600 options and 100 `-z`
 keywords), and `qld --help` is generated from it.
 
-An option that appears in no table is an error (`qld: error: unknown option: --foo`),
-as in GNU ld.
+An option that appears in no table is an error worded as GNU ld words it,
+usage hint included:
+
+```
+qld: error: unrecognized option '--foo'
+qld: use the --help option for usage information
+```
 
 ## Version probing
 
@@ -369,6 +374,11 @@ passes" when it cannot settle). Known differences:
   mangled prefixes `_Znw*`, `_Zna*`, `_Zdl*`, `_Zda*`, `_ZTI*` and `_ZTS*`.
   GNU ld matches the demangled names through `extern "C++"`; under Itanium
   mangling the two sets are the same.
+- **`extern "C++"` patterns** in version scripts and dynamic lists match
+  the demangled name (`ns::f(int)`, as `c++filt` prints it), or the name
+  itself when it is not mangled, as in GNU ld. The language name is
+  compared without regard to case. `extern "Java"` patterns match the name
+  as it is; GNU ld demangles them as Java, which no current compiler emits.
 
 ### Diagnostics
 
@@ -700,17 +710,27 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
     every message, and prints the message twice for `-l:name`; qld prints
     each once.
   - qld's `cannot find -lfoo` has no `: No such file or directory` suffix.
+  - A thin archive found by search is pre-checked by its first member, as
+    a regular one is.
   - A file named **directly** on the command line is still an error. For a
     shared object qld gives the architecture wording, where GNU ld says
     `error adding symbols: file in wrong format`.
-  - A directly named incompatible **archive** is an error in qld even when
-    nothing extracts a member; GNU ld only fails when a member is actually
-    pulled in. A thin archive found by search is not pre-checked, so its
-    members fail individually instead of the archive being skipped.
+  - A directly named incompatible **archive** is accepted until one of its
+    members is extracted, as in GNU ld; the error then names the member
+    (`lib.a(f.o)`, or a thin member's own path).
 - Initial-exec TLS uses GNU's `addl` form, and GOT32X relaxations are done
   as in GNU ld (lld does neither).
 - Inputs for another machine, class or byte order are rejected with GNU's
-  "is incompatible with" wording.
+  wording and BFD's architecture names: `i386 architecture of input file
+  `a.o' is incompatible with i386:x86-64 output`; an input that differs
+  only in byte order gets `a.o: compiled for a big endian system and target
+  is little endian`. GNU ld built without a target for the input's machine
+  says `Relocations in generic ELF (EM: 183)` and `file in wrong format`
+  instead; qld always names the architecture.
+- An input no backend recognizes is `junk.o: file not recognized: file
+  format not recognized`, as in BFD. GNU ld first tries a binary file as a
+  linker script and then reports a syntax error; qld does that only for
+  text. A truncated object keeps qld's more precise `malformed …` message.
 - Without `-m`, the target is that of the first input that names one (ELF
   objects, shared libraries, GCC LTO objects, LLVM bitcode), else the host's,
   as GNU ld's default emulation would be.

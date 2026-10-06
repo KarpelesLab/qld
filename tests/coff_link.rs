@@ -2207,7 +2207,7 @@ fn i386_target_checks() {
     ]);
     let error = qld_link(&options, &PeOptions::from_link_options(&options)).unwrap_err();
     assert!(
-        error.contains("amd64 architecture of input file is incompatible with i386 output"),
+        error.contains("i386:x86-64 architecture of input file `"),
         "{error}"
     );
 }

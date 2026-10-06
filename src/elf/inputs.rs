@@ -108,6 +108,9 @@ impl LtoMode {
 struct ThinMember<'a> {
     archive: FileId,
     member: Member<'a>,
+    /// The link's target when the archive was added, which the member is
+    /// checked against once it is loaded (see [`Walker::mismatch`]).
+    target: Option<Target>,
 }
 
 /// One input as symbol resolution sees it.
@@ -138,6 +141,10 @@ pub struct ElfInput<'a, F: ElfFormat = Elf64Le> {
     /// A lazy IR member whose defined names the archive index does not
     /// list: the plugin must claim it before resolution to learn them.
     needs_claim: bool,
+    /// For an archive member built for another architecture, the error
+    /// that extracting it reports. GNU `ld` accepts such an archive until a
+    /// member is pulled in.
+    incompatible: Option<String>,
 }
 
 impl<'a, F: ElfFormat> ElfInput<'a, F> {
@@ -276,6 +283,7 @@ impl<'a, F: ElfFormat> ElfInput<'a, F> {
             config: self.config,
             lto: LtoMode::Generated,
             needs_claim: false,
+            incompatible: None,
         }
     }
 }
@@ -300,9 +308,22 @@ impl<'a, F: ElfFormat> ResolveFile<'a> for ElfInput<'a, F> {
         if self.role == InputRole::Internal || self.object.is_some() {
             return Ok(());
         }
+        if let Some(message) = &self.incompatible {
+            return Err(Error::Option(message.clone()));
+        }
         if let Some(thin) = self.thin.take() {
             let id = self.table.add_member(thin.archive, &thin.member)?;
             self.file = self.table.get(id);
+            if let Some(file) = self.file
+                && let FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident) = file.format()
+                && mismatch::<F>(&ident, thin.target)
+            {
+                return Err(incompatible(
+                    &file.path().display().to_string(),
+                    &ident,
+                    thin.target,
+                ));
+            }
         }
         let Some(file) = self.file else {
             return Err(Error::Internal("input file missing at load".into()));
@@ -369,6 +390,7 @@ impl<'a, F: ElfFormat> ResolveFile<'a> for ElfInput<'a, F> {
     fn can_load_early(&self) -> bool {
         self.role == InputRole::Member
             && self.thin.is_none()
+            && self.incompatible.is_none()
             && self.object.is_none()
             && self.ir.is_none()
     }
@@ -608,6 +630,7 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
         config,
         lto: LtoMode::for_options(options),
         needs_claim: false,
+        incompatible: None,
     });
 
     let mut walker = Walker {
@@ -657,6 +680,69 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
         files: walker.files,
         target: walker.target,
     })
+}
+
+/// `file` as GNU `ld` names it in messages: `path`, or `path(member)` for
+/// an archive member.
+fn display_name(file: &InputFile) -> String {
+    match file.member() {
+        Some(member) => format!("{}({member})", file.path().display()),
+        None => file.path().display().to_string(),
+    }
+}
+
+/// Whether an ELF file with `ident` is built for another machine, class or
+/// byte order than a link for `target` in format `F`.
+///
+/// The class and byte order are settled before any input is read
+/// ([`super::link::input_kind`]), so `F` answers for them even before an
+/// input has named a target: a 32-bit file in a 64-bit link is an
+/// incompatible input, not a malformed one.
+fn mismatch<F: ElfFormat>(ident: &ElfIdent, target: Option<Target>) -> bool {
+    if ident.class != F::KIND.pointer_width() || ident.endian != F::KIND.endianness() {
+        return true;
+    }
+    let Some(target) = target else {
+        return false;
+    };
+    if ident.machine == crate::elf::read::consts::EM_NONE {
+        // Machine-neutral: `-b binary` inputs (`binary_input`).
+        return false;
+    }
+    ident.architecture() != Some(target.arch) || ident.endian != target.endian
+}
+
+/// The error for an input built for another architecture than `target`,
+/// worded as GNU `ld` words it.
+///
+/// The architectures carry BFD's names (`i386:x86-64`), and an input that
+/// differs only in byte order gets BFD's endianness message.
+///
+/// `path` names the file: `lib.a(member.o)` for a member of a regular
+/// archive, the member's own path for one of a thin archive, as in GNU `ld`.
+fn incompatible(path: &str, ident: &ElfIdent, target: Option<Target>) -> Error {
+    use crate::input::identify::bfd_architecture_name;
+    let target = target.unwrap_or_else(super::target::default_target);
+    let arch = ident.architecture();
+    if arch == Some(target.arch) && ident.endian != target.endian {
+        let name = |endian| match endian {
+            crate::target::Endianness::Little => "little",
+            crate::target::Endianness::Big => "big",
+        };
+        return Error::Option(format!(
+            "{path}: compiled for a {} endian system and target is {} endian",
+            name(ident.endian),
+            name(target.endian),
+        ));
+    }
+    let found = arch.map_or_else(
+        || format!("machine {:#x}", ident.machine),
+        |arch| bfd_architecture_name(arch).to_owned(),
+    );
+    Error::Option(format!(
+        "{found} architecture of input file `{path}' is incompatible with {} output",
+        bfd_architecture_name(target.arch),
+    ))
 }
 
 struct Walker<'a, 's, F: crate::elf::read::ElfFormat = crate::elf::read::Elf64Le> {
@@ -776,6 +862,7 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
             config: self.config,
             lto: self.lto,
             needs_claim: false,
+            incompatible: None,
         }
     }
 
@@ -802,54 +889,28 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
     }
 
     /// Whether an ELF file with `ident` is built for another machine, class
-    /// or byte order than the link.
-    ///
-    /// The class and byte order are settled before any input is read
-    /// ([`super::link::input_kind`]), so `F` answers for them even before an
-    /// input has named a target: a 32-bit file in a 64-bit link is an
-    /// incompatible input, not a malformed one.
+    /// or byte order than the link ([`mismatch`]).
     fn mismatch(&self, ident: &ElfIdent) -> bool {
-        if ident.class != F::KIND.pointer_width() || ident.endian != F::KIND.endianness() {
-            return true;
-        }
-        let Some(target) = self.target else {
-            return false;
-        };
-        if ident.machine == crate::elf::read::consts::EM_NONE {
-            // Machine-neutral: `-b binary` inputs (`binary_input`).
-            return false;
-        }
-        ident.architecture() != Some(target.arch) || ident.endian != target.endian
+        mismatch::<F>(ident, self.target)
     }
 
     /// Rejects an ELF object built for another machine, class or byte order
     /// than the target, as GNU `ld` does, instead of linking its
     /// relocations as the target's (an x32 object read as i386).
     fn check_machine(&self, file: &InputFile) -> Result<()> {
-        let (FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident)) = file.format() else {
-            return Ok(());
-        };
-        if self.mismatch(&ident) {
-            return Err(self.incompatible(file, &ident));
+        match self.machine_error(file) {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// The error for an input built for another architecture, worded as GNU
-    /// `ld` words it.
-    fn incompatible(&self, file: &InputFile, ident: &ElfIdent) -> Error {
-        let target = self.target.unwrap_or_else(super::target::default_target);
-        let found = ident.architecture().map_or_else(
-            || format!("machine {:#x}", ident.machine),
-            |arch| format!("{arch:?}"),
-        );
-        Error::Option(format!(
-            "{}: {found} ({:?}-endian) architecture of input file is incompatible with {:?} ({:?}-endian) output",
-            file.path().display(),
-            ident.endian,
-            target.arch,
-            target.endian,
-        ))
+    /// The error [`Walker::check_machine`] would return for `file`.
+    fn machine_error(&self, file: &InputFile) -> Option<Error> {
+        let (FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident)) = file.format() else {
+            return None;
+        };
+        self.mismatch(&ident)
+            .then(|| incompatible(&display_name(file), &ident, self.target))
     }
 
     /// Whether a file found by searching the library path is built for
@@ -858,18 +919,30 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
     ///
     /// Anything else (a linker script named `libc.so`, an import library,
     /// bitcode) is left to the walk, which reports its own errors.
-    fn searched_mismatch(&self, file: &InputFile) -> bool {
+    fn searched_mismatch(&self, id: FileId, file: &InputFile) -> bool {
+        let elf = |format| match format {
+            FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident) => Some(ident),
+            _ => None,
+        };
         match file.format() {
             FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident) => self.mismatch(&ident),
             // As GNU `ld` does, the first member speaks for the archive.
-            // A thin archive's members are separate files, read later.
             FileFormat::Archive => file.archive().ok().is_some_and(|archive| {
                 archive
                     .members()
                     .filter_map(core::result::Result::ok)
-                    .find_map(|member| match crate::input::identify(member.bytes()?) {
-                        FileFormat::Elf(ident) | FileFormat::GccLtoIr(ident) => Some(ident),
-                        _ => None,
+                    .find_map(|member| elf(crate::input::identify(member.bytes()?)))
+                    .is_some_and(|ident| self.mismatch(&ident))
+            }),
+            // A thin archive's members are separate files: they are looked
+            // at here without being added to the table.
+            FileFormat::ThinArchive => file.archive().ok().is_some_and(|archive| {
+                archive
+                    .members()
+                    .filter_map(core::result::Result::ok)
+                    .find_map(|member| {
+                        let entry = self.table.member_entry(id, &member).ok()?;
+                        elf(entry.format())
                     })
                     .is_some_and(|ident| self.mismatch(&ident))
             }),
@@ -903,7 +976,7 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
             let Some(file) = self.table.get(id) else {
                 return Err(Error::Internal("loaded file missing from table".into()));
             };
-            if !self.searched_mismatch(file) {
+            if !self.searched_mismatch(id, file) {
                 return self.add(id, attrs, what, &found_as, prepared);
             }
             self.diagnostics.emit(Diagnostic::warning(format!(
@@ -992,11 +1065,7 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                 self.files.push(input);
                 Ok(())
             }
-            _ => Err(Error::malformed(
-                file.path(),
-                0,
-                "file format not recognized",
-            )),
+            _ => Err(crate::input::identify::not_recognized(file.path())),
         }
     }
 
@@ -1064,6 +1133,7 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                     input.thin = Some(ThinMember {
                         archive: id,
                         member,
+                        target: walker.target,
                     });
                 }
                 Some(entry) => {
@@ -1071,7 +1141,10 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                     let member_file = walker.table.get(member_id);
                     if let Some(member_file) = member_file {
                         walker.infer_target(member_file);
-                        walker.check_machine(member_file)?;
+                        // An error only if the member is extracted.
+                        input.incompatible = walker
+                            .machine_error(member_file)
+                            .map(|error| error.to_string());
                     }
                     input.file = member_file;
                 }
@@ -1121,6 +1194,10 @@ impl<'a, F: crate::elf::read::ElfFormat> Walker<'a, '_, F> {
                     let Some(member_file) = input.file else {
                         return Ok(());
                     };
+                    if input.incompatible.is_some() {
+                        // Defines nothing the link can use.
+                        return Ok(());
+                    }
                     match member_file.format() {
                         FileFormat::Elf(i) if i.is_relocatable() => {
                             let (names, gcc_lto) = defined_names::<F>(member_file)?;
@@ -1382,7 +1459,7 @@ pub fn add_after_lto<'a, F: crate::elf::read::ElfFormat>(
                 let id = table.load_path(&path)?;
                 if table
                     .get(id)
-                    .is_some_and(|file| walker.searched_mismatch(file))
+                    .is_some_and(|file| walker.searched_mismatch(id, file))
                 {
                     index = index.saturating_add(1);
                     continue;

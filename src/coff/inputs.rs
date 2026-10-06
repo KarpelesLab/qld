@@ -443,11 +443,7 @@ impl<'a> Walker<'a, '_> {
                 self.groups
                     .add_dll(&image, number, fallback, Machine::or_default(self.machine))
             }
-            _ => Err(Error::malformed(
-                file.path(),
-                0,
-                "file format not recognized (expected a COFF object)",
-            )),
+            _ => Err(crate::input::identify::not_recognized(file.path())),
         }
     }
 
@@ -582,21 +578,26 @@ impl<'a> Walker<'a, '_> {
 }
 
 /// The error for an input built for another machine, worded as GNU `ld`
-/// words it.
+/// words it, with BFD's architecture names (`i386:x86-64`).
 fn incompatible(file: &InputFile, found: u16, wanted: u16) -> Error {
-    let name = |machine: u16| {
-        super::read::consts::machine_name(machine).map_or_else(
+    use crate::input::identify::{bfd_architecture_name, coff_machine_architecture};
+    // Two machines of one architecture (ARM64 and ARM64EC, say) keep their
+    // own names, which tell them apart.
+    let same = coff_machine_architecture(found) == coff_machine_architecture(wanted);
+    let name = |machine: u16| match coff_machine_architecture(machine) {
+        Some(arch) if !same => bfd_architecture_name(arch).to_owned(),
+        _ => super::read::consts::machine_name(machine).map_or_else(
             || format!("machine {machine:#06x}"),
             |name| {
                 name.trim_start_matches("IMAGE_FILE_MACHINE_")
                     .to_ascii_lowercase()
             },
-        )
+        ),
     };
     Error::Option(format!(
-        "{}: {} architecture of input file is incompatible with {} output",
-        file.path().display(),
+        "{} architecture of input file `{}' is incompatible with {} output",
         name(found),
+        file.path().display(),
         name(wanted)
     ))
 }
