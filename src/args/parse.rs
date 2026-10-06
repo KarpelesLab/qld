@@ -1075,7 +1075,15 @@ fn match_option(arg: &[u8], rest: &mut impl Iterator<Item = Vec<u8>>) -> Result<
         None => (arg.get(1..).unwrap_or_default(), false),
     };
     let dashes = if two_dashes { "--" } else { "-" };
-    let unknown = || Error::Option(format!("unknown option: {}", lossy(arg)));
+    // GNU ld's two lines; the second carries the program name that `main`
+    // puts in front of the first.
+    let unknown = || {
+        Error::Option(format!(
+            "unrecognized option '{}'\n{}: use the --help option for usage information",
+            lossy(arg),
+            crate::PROGRAM_NAME
+        ))
+    };
 
     // Long options: one or two dashes, but two for names starting with 'o'.
     if two_dashes || (body.len() > 1 && !body.starts_with(b"o")) {
