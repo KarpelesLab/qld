@@ -368,6 +368,11 @@ passes" when it cannot settle). Known differences:
   mangled prefixes `_Znw*`, `_Zna*`, `_Zdl*`, `_Zda*`, `_ZTI*` and `_ZTS*`.
   GNU ld matches the demangled names through `extern "C++"`; under Itanium
   mangling the two sets are the same.
+- **`extern "C++"` patterns** in version scripts and dynamic lists match
+  the demangled name (`ns::f(int)`, as `c++filt` prints it), or the name
+  itself when it is not mangled, as in GNU ld. The language name is
+  compared without regard to case. `extern "Java"` patterns match the name
+  as it is; GNU ld demangles them as Java, which no current compiler emits.
 
 ### Diagnostics
 
