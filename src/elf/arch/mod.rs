@@ -1071,6 +1071,28 @@ impl Arch {
         }
     }
 
+    /// What an absolute relocation adds to the symbol's address: PowerPC64
+    /// `R_PPC64_ADDR64_LOCAL` names the local entry point
+    /// ([`ppc64::entry_offset`]). `st_other` reads the symbol's, which is
+    /// asked for only there.
+    #[must_use]
+    pub fn entry_offset(self, r_type: u32, st_other: impl FnOnce() -> u8) -> u64 {
+        match self {
+            Self::Ppc64 => ppc64::entry_offset(r_type, st_other()),
+            _ => 0,
+        }
+    }
+
+    /// Whether relocation `r_type` refers to this output's definition even
+    /// of a preemptible symbol ([`ppc64::binds_locally`]).
+    #[must_use]
+    pub fn binds_locally(self, r_type: u32) -> bool {
+        match self {
+            Self::Ppc64 => ppc64::binds_locally(r_type),
+            _ => false,
+        }
+    }
+
     /// The address a direct branch jumps to, before any thunk: PowerPC64
     /// enters a function of this output at its local entry point.
     #[must_use]

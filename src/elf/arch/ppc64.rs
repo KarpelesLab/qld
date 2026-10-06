@@ -93,11 +93,10 @@ fn is_pld<E: Endian>(data: &[u8], offset: u64) -> bool {
 /// # Errors
 ///
 /// [`ClassifyError::Unsupported`] for types qld does not link: the
-/// dynamic-only types, ELFv1 function descriptors (`R_PPC64_TOC`), the
-/// inline PLT sequences (`PLTSEQ`, `PLTCALL`, `PLT16_*`, `PLT_PCREL34`),
-/// the section-relative and 34-bit absolute forms, and
-/// `R_PPC64_GOT_DTPREL*`; [`ClassifyError::BadTlsInstruction`] for a TLS
-/// access in a form that cannot be relaxed (the `_HI` halves).
+/// dynamic-only types, the inline PLT sequences (`PLTSEQ`, `PLTCALL`,
+/// `PLT16_*`, `PLT_PCREL34`), and the section-relative and 34-bit
+/// absolute forms; [`ClassifyError::BadTlsInstruction`] for a TLS access
+/// in a form that cannot be relaxed (the `_HI` halves).
 #[allow(clippy::too_many_lines)]
 // Out of line: large, and not to be inlined into the other architectures'
 // relocation loops.
@@ -122,6 +121,13 @@ pub fn classify<E: Endian>(
 
         // Absolute data and instruction fields.
         R_PPC64_ADDR64 | R_PPC64_UADDR64 => Class::new(K::Abs, Width::W64),
+        // `S + A` with `S` the function's local entry point
+        // ([`entry_offset`]), which only a definition in this output has
+        // ([`binds_locally`]).
+        R_PPC64_ADDR64_LOCAL => Class::new(K::Abs, Width::W64),
+        // The TOC pointer, `.TOC. + A`: the second doubleword of an ELFv1
+        // function descriptor, or `.quad .TOC.@tocbase`.
+        R_PPC64_TOC => Class::new(K::GotBase, Width::W64),
         R_PPC64_ADDR32 | R_PPC64_UADDR32 => Class::new(K::Abs, Width::Any32),
         R_PPC64_ADDR16 | R_PPC64_UADDR16 => class(K::Abs, F::Half16),
         R_PPC64_ADDR16_LO => class(K::Abs, F::Lo),
@@ -537,6 +543,27 @@ pub fn branch_destination(branch: Branch) -> u64 {
             .wrapping_add(insn::local_entry_offset(branch.st_other));
     }
     branch.target
+}
+
+/// What an absolute relocation of type `r_type` adds to the address of a
+/// symbol with `st_other`: its local entry point offset for
+/// `R_PPC64_ADDR64_LOCAL`, nothing for the others.
+#[must_use]
+pub fn entry_offset(r_type: u32, st_other: u8) -> u64 {
+    if r_type == R_PPC64_ADDR64_LOCAL {
+        insn::local_entry_offset(st_other)
+    } else {
+        0
+    }
+}
+
+/// Whether relocation `r_type` refers to the definition in this output
+/// even when the symbol is preemptible: `R_PPC64_ADDR64_LOCAL`, whose
+/// local entry point a dynamic relocation could not name. As in GNU ld,
+/// it becomes a relative relocation.
+#[must_use]
+pub fn binds_locally(r_type: u32) -> bool {
+    r_type == R_PPC64_ADDR64_LOCAL
 }
 
 /// Whether relocation `r_type` is a branch that range-extension thunks
@@ -1019,7 +1046,15 @@ mod tests {
                 .width,
             Width::Ppc(Field::Rel24)
         );
-        for r_type in [R_PPC64_TOC, R_PPC64_JMP_SLOT, R_PPC64_PLTCALL, 0xdead] {
+        assert_eq!(
+            classify::<Little>(R_PPC64_TOC, &[], 0, shared())
+                .unwrap()
+                .kind,
+            Kind::GotBase
+        );
+        assert_eq!(entry_offset(R_PPC64_ADDR64_LOCAL, 3 << 5), 8);
+        assert_eq!(entry_offset(R_PPC64_ADDR64, 3 << 5), 0);
+        for r_type in [R_PPC64_JMP_SLOT, R_PPC64_PLTCALL, 0xdead] {
             assert_eq!(
                 classify::<Little>(r_type, &[], 0, exec()),
                 Err(ClassifyError::Unsupported),

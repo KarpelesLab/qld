@@ -1885,6 +1885,117 @@ fn save_restore_routines_follow_the_abi() {
     );
 }
 
+const TOC_BASE: &str = r#"
+	.abiversion 2
+	.text
+	.globl	_start
+	.type	_start,@function
+_start:
+	addis	3, 2, ptr@toc@ha
+	ld	3, ptr@toc@l(3)
+	blr
+	.size	_start, .-_start
+
+	.globl	foo
+	.type	foo,@function
+foo:
+	addis	2, 12, .TOC.-foo@ha
+	addi	2, 2, .TOC.-foo@l
+	.localentry foo, .-foo
+	blr
+	.size	foo, .-foo
+
+	.data
+	.globl	ptr
+	.p2align 3
+ptr:
+	.quad	.TOC.@tocbase
+	.quad	.TOC.@tocbase+16
+local:
+	.quad	foo
+"#;
+
+/// `R_PPC64_TOC` (`.TOC.@tocbase`) is the TOC pointer, relative in
+/// position-independent output.
+///
+/// lld 20 gets the relative relocation's addend 0x8000 too high (it adds
+/// the TOC base to the addend while scanning and again when writing), so
+/// position-independent output is checked against `.TOC.` itself.
+#[test]
+fn toc_base_relocations() {
+    let tools = require!();
+    let dir = scratch("toc-base");
+    compile(tools, &dir, "tocbase.s", TOC_BASE, &[]);
+    let exe = link_and_compare(
+        tools,
+        &dir,
+        "exe",
+        &["-static", "-e", "_start", "tocbase.o"],
+    );
+    let ptr = exe.symbols.iter().find(|s| s.name == "ptr").unwrap().value;
+    let toc = exe.toc();
+    assert_eq!(exe.dword(ptr), Some(toc));
+    assert_eq!(exe.dword(ptr + 8), Some(toc + 16));
+    for kind in ["-pie", "-shared"] {
+        qld_ok(&dir, &[kind, "-e", "_start", "-o", "pic", "tocbase.o"]);
+        let pic = elf::Elf::read(&dir.join("pic"));
+        let ptr = pic.symbols.iter().find(|s| s.name == "ptr").unwrap().value;
+        let toc = pic.toc();
+        let relative = |offset: u64| {
+            pic.relocs
+                .iter()
+                .find(|r| r.offset == offset)
+                .map(|r| (r.r_type, r.addend as u64))
+        };
+        assert_eq!(relative(ptr), Some((22, toc)), "{kind}");
+        assert_eq!(relative(ptr + 8), Some((22, toc + 16)), "{kind}");
+    }
+}
+
+/// `R_PPC64_ADDR64_LOCAL` is a function's local entry point. No assembler
+/// at hand emits it (`foo@localentry` is GNU as only), so the test
+/// rewrites an `R_PPC64_ADDR64`; neither reference linker can check it
+/// (lld does not support the type), so it is checked against the ABI.
+#[test]
+fn addr64_local_is_the_local_entry_point() {
+    const R_PPC64_ADDR64: u32 = 38;
+    const R_PPC64_ADDR64_LOCAL: u32 = 117;
+    let tools = require!();
+    let dir = scratch("addr64-local");
+    compile(tools, &dir, "tocbase.s", TOC_BASE, &[]);
+    let object = elf::Elf::read(&dir.join("tocbase.o"));
+    let rela = object.section(".rela.data").unwrap().clone();
+    let mut data = object.data.clone();
+    let mut patched = 0;
+    for at in (rela.offset..rela.offset + rela.size).step_by(24) {
+        let info = (at + 8) as usize;
+        if u32::from_le_bytes(data[info..info + 4].try_into().unwrap()) == R_PPC64_ADDR64 {
+            data[info..info + 4].copy_from_slice(&R_PPC64_ADDR64_LOCAL.to_le_bytes());
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 1);
+    fs::write(dir.join("local.o"), data).unwrap();
+
+    let foo = |elf: &elf::Elf| elf.symbols.iter().find(|s| s.name == "foo").unwrap().value;
+    let local = |elf: &elf::Elf| elf.symbols.iter().find(|s| s.name == "ptr").unwrap().value + 16;
+    qld_ok(&dir, &["-static", "-e", "_start", "-o", "exe", "local.o"]);
+    let exe = elf::Elf::read(&dir.join("exe"));
+    assert_eq!(exe.dword(local(&exe)), Some(foo(&exe) + 8));
+    // In position-independent output, a relative relocation, even for the
+    // exported (preemptible) `foo` of a shared object.
+    for kind in ["-pie", "-shared"] {
+        qld_ok(&dir, &[kind, "-e", "_start", "-o", "pic", "local.o"]);
+        let pic = elf::Elf::read(&dir.join("pic"));
+        let reloc = pic.relocs.iter().find(|r| r.offset == local(&pic)).unwrap();
+        assert_eq!(
+            (reloc.r_type, reloc.addend as u64),
+            (22, foo(&pic) + 8),
+            "{kind}"
+        );
+    }
+}
+
 const SAVE_RESTORE_ABI: &str = r#"
 	.abiversion 2
 	.text

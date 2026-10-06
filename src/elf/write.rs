@@ -1418,15 +1418,16 @@ fn section_dyn_relocs<F: crate::elf::read::ElfFormat>(
         match decision.dynamic {
             Dynamic::None => {}
             Dynamic::Relative => {
-                let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
-                let (s, a) = target_value(addresses, &target, owner, rel.addend);
-                let mut reloc = dyn_reloc(
-                    context.arch,
-                    place,
-                    0,
-                    DynKind::Relative,
-                    s.wrapping_add_signed(a) as i64,
-                );
+                let value = if decision.class.kind == Kind::GotBase {
+                    addresses.got_base().wrapping_add_signed(rel.addend)
+                } else {
+                    let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
+                    let (s, a) = target_value(addresses, &target, owner, rel.addend);
+                    let st_other = || target.raw.map_or(0, |raw| raw.st_other);
+                    s.wrapping_add_signed(a)
+                        .wrapping_add(context.arch.entry_offset(rel.r_type, st_other))
+                };
+                let mut reloc = dyn_reloc(context.arch, place, 0, DynKind::Relative, value as i64);
                 reloc.packable = reloc::packable(section.header.sh_addralign, rel.offset);
                 out.push(reloc);
             }
@@ -1885,7 +1886,12 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             Kind::None => Ok(()),
             Kind::Abs => match decision.dynamic {
                 Dynamic::Symbolic(_) => Ok(()),
-                _ => put(out, sa),
+                _ => put(
+                    out,
+                    sa.wrapping_add(
+                        arch.entry_offset(rel.r_type, || target.raw.map_or(0, |raw| raw.st_other)),
+                    ),
+                ),
             },
             Kind::Pc
                 if matches!(target.def, super::refs::Def::Undefined { .. })
