@@ -46,6 +46,10 @@ pub const NEEDS_IPLT: SymbolFlags = SymbolFlags::backend(0);
 /// symbol tables, as GNU ld hides symbols only dead code refers to.
 pub const REF_LIVE: SymbolFlags = SymbolFlags::backend(2);
 
+/// Backend flag: a GOT entry holding the symbol's offset in its module's
+/// TLS block ([`super::arch::GotKind::DtpOff`]).
+pub const NEEDS_GOTDTPOFF: SymbolFlags = SymbolFlags::backend(6);
+
 /// One reference to an undefined symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UndefinedRef {
@@ -86,6 +90,9 @@ pub struct FileScan {
     pub gottpoff_locals: Vec<u32>,
     /// Local TLS symbols needing a descriptor GOT pair.
     pub tlsdesc_locals: Vec<u32>,
+    /// Local TLS symbols needing a GOT entry holding their offset in the
+    /// module's block.
+    pub gotdtpoff_locals: Vec<u32>,
     /// A module-local TLS GOT pair is needed.
     pub tls_ld: bool,
     /// Sections with dynamic relocations, by section index.
@@ -101,6 +108,9 @@ pub struct FileScan {
     pub errors: Vec<Diagnostic>,
     /// The file uses the GOT base.
     pub uses_got_base: bool,
+    /// PowerPC64: code without a TOC pointer calls a function that needs
+    /// one, or the PLT ([`super::arch::Arch::multi_toc_call`]).
+    pub multi_toc: bool,
 }
 
 /// The scan result, per file.
@@ -115,6 +125,13 @@ impl ScanResult {
     #[must_use]
     pub fn uses_got_base(&self) -> bool {
         self.files.iter().any(|f| f.uses_got_base)
+    }
+
+    /// Whether code without a TOC pointer calls through a stub that sets
+    /// one up (PowerPC64 `PPC64_OPT_MULTI_TOC`).
+    #[must_use]
+    pub fn multi_toc(&self) -> bool {
+        self.files.iter().any(|f| f.multi_toc)
     }
 
     /// Whether any file needs a module-local TLS GOT pair.
@@ -416,6 +433,11 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                 }
             }
             result.text_relocs |= decision.text;
+            if context.arch == super::arch::Arch::Ppc64 && !result.multi_toc {
+                let via_plt = decision.flags.contains(SymbolFlags::NEEDS_PLT) || target.is_ifunc();
+                let st_other = || target.raw.map_or(0, |raw| raw.st_other);
+                result.multi_toc = context.arch.multi_toc_call(rel.r_type, via_plt, st_other);
+            }
             match target.global {
                 Some(id) => {
                     let mut flags = decision.flags;
@@ -433,6 +455,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                         LocalNeed::TlsGd => Some(&mut result.tlsgd_locals),
                         LocalNeed::GotTpOff => Some(&mut result.gottpoff_locals),
                         LocalNeed::TlsDesc => Some(&mut result.tlsdesc_locals),
+                        LocalNeed::GotDtpOff => Some(&mut result.gotdtpoff_locals),
                     };
                     if let Some(list) = list {
                         list.push(rel.symbol);
@@ -453,6 +476,7 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
         &mut result.tlsgd_locals,
         &mut result.gottpoff_locals,
         &mut result.tlsdesc_locals,
+        &mut result.gotdtpoff_locals,
     ] {
         list.sort_unstable();
         list.dedup();

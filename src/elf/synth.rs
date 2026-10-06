@@ -133,6 +133,9 @@ pub struct Synth {
     pub gottpoff: EntryList,
     /// TLS descriptor pairs.
     pub tlsdesc: EntryList,
+    /// Module-relative TLS offset entries (PowerPC64 `GOT_DTPREL16_*`),
+    /// after the module-local pair.
+    pub gotdtpoff: EntryList,
     /// Whether the module-local TLS pair exists.
     pub tlsld: bool,
     /// IFUNC symbols, each with a PLT stub, a `.got.plt` slot and an
@@ -290,6 +293,7 @@ impl Synth {
                     && !plt_got(f),
                 plt_got(f) && !f.contains(NEEDS_IPLT),
                 f.contains(SymbolFlags::NEEDS_COPY_RELOC),
+                f.contains(super::scan::NEEDS_GOTDTPOFF),
             ]
         });
         let [
@@ -301,6 +305,7 @@ impl Synth {
             plt,
             plt_got_list,
             copies,
+            gotdtpoff,
         ] = flagged;
         self.got = EntryList {
             globals: got,
@@ -317,6 +322,10 @@ impl Synth {
         self.tlsdesc = EntryList {
             globals: tlsdesc,
             locals: locals(|f| &f.tlsdesc_locals),
+        };
+        self.gotdtpoff = EntryList {
+            globals: gotdtpoff,
+            locals: locals(|f| &f.gotdtpoff_locals),
         };
         self.tlsld = scan.tls_ld();
         self.iplt = EntryList {
@@ -339,6 +348,7 @@ impl Synth {
             || !self.tlsgd.is_empty()
             || !self.gottpoff.is_empty()
             || !self.tlsdesc.is_empty()
+            || !self.gotdtpoff.is_empty()
             || self.tlsld
             || scan.uses_got_base();
         // A static executable has no dynamic linker to use the reserved
@@ -531,6 +541,7 @@ impl Synth {
             (&self.tlsgd, GotKind::TlsGd),
             (&self.gottpoff, GotKind::TpOff),
             (&self.tlsdesc, GotKind::TlsDesc),
+            (&self.gotdtpoff, GotKind::DtpOff),
         ] {
             for owner in list.iter() {
                 let [first, second] = got_slot_relocs(refs, mode, owner, kind);
@@ -597,6 +608,7 @@ impl Synth {
             .saturating_add(u64_len(self.gottpoff.len()))
             .saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2))
             .saturating_add(if self.tlsld { 2 } else { 0 })
+            .saturating_add(u64_len(self.gotdtpoff.len()))
     }
 
     /// The first GOT word of each kind of entry.
@@ -607,12 +619,14 @@ impl Synth {
         let tlsgd = address.saturating_add(u64_len(self.tlsgd.len()).saturating_mul(2));
         let tpoff = tlsgd.saturating_add(u64_len(self.gottpoff.len()));
         let desc = tpoff.saturating_add(u64_len(self.tlsdesc.len()).saturating_mul(2));
+        let ld = desc.saturating_add(if self.tlsld { 2 } else { 0 });
         match kind {
             GotKind::Address => header,
             GotKind::TlsGd => address,
             GotKind::TpOff => tlsgd,
             GotKind::TlsDesc => tpoff,
             GotKind::TlsLd => desc,
+            GotKind::DtpOff => ld,
         }
     }
 
@@ -624,6 +638,7 @@ impl Synth {
             GotKind::TlsGd => (&self.tlsgd, 2),
             GotKind::TpOff => (&self.gottpoff, 1),
             GotKind::TlsDesc => (&self.tlsdesc, 2),
+            GotKind::DtpOff => (&self.gotdtpoff, 1),
             GotKind::TlsLd => return self.tlsld.then(|| self.got_base_word(GotKind::TlsLd)),
         };
         let index = u64::try_from(list.index(owner)?).ok()?;
@@ -960,6 +975,15 @@ pub fn got_slot_relocs<F: crate::elf::read::ElfFormat>(
             }
         }
         GotKind::TlsLd => [SlotReloc::Module(DynKind::DtpMod), SlotReloc::None],
+        // The offset is known at link time unless the variable is
+        // preemptible (lld writes it even then).
+        GotKind::DtpOff => {
+            if preemptible {
+                [SlotReloc::Symbolic(DynKind::DtpOff), SlotReloc::None]
+            } else {
+                [SlotReloc::None; 2]
+            }
+        }
     }
 }
 

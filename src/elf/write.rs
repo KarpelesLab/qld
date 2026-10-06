@@ -879,6 +879,7 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
         (&synth.tlsgd, GotKind::TlsGd),
         (&synth.gottpoff, GotKind::TpOff),
         (&synth.tlsdesc, GotKind::TlsDesc),
+        (&synth.gotdtpoff, GotKind::DtpOff),
     ] {
         for owner in list.iter() {
             let Some(address) = addresses.got_entry_address(owner, kind) else {
@@ -927,6 +928,13 @@ fn write_got<F: ElfFormat>(input: &WriteInput<'_, '_, '_, F>, out: &mut [u8]) {
                     };
                     put(address, 0);
                     put(address.wrapping_add(size64), argument);
+                }
+                GotKind::DtpOff => {
+                    let word = match relocs[0] {
+                        SlotReloc::None => value.wrapping_sub(tls.start).wrapping_sub(dtv_offset),
+                        _ => 0,
+                    };
+                    put(address, word);
                 }
                 // The module-local pair is not in any of these lists; it
                 // is written below.
@@ -1176,6 +1184,7 @@ fn collect_dyn_relocs<F: crate::elf::read::ElfFormat>(
         (&synth.tlsgd, GotKind::TlsGd),
         (&synth.gottpoff, GotKind::TpOff),
         (&synth.tlsdesc, GotKind::TlsDesc),
+        (&synth.gotdtpoff, GotKind::DtpOff),
     ] {
         for owner in list.iter() {
             let Some(address) = addresses.got_entry_address(owner, kind) else {
@@ -1419,15 +1428,16 @@ fn section_dyn_relocs<F: crate::elf::read::ElfFormat>(
         match decision.dynamic {
             Dynamic::None => {}
             Dynamic::Relative => {
-                let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
-                let (s, a) = target_value(addresses, &target, owner, rel.addend);
-                let mut reloc = dyn_reloc(
-                    context.arch,
-                    place,
-                    0,
-                    DynKind::Relative,
-                    s.wrapping_add_signed(a) as i64,
-                );
+                let value = if decision.class.kind == Kind::GotBase {
+                    addresses.got_base().wrapping_add_signed(rel.addend)
+                } else {
+                    let owner = Addresses::<F>::owner(&target, file_index, rel.symbol);
+                    let (s, a) = target_value(addresses, &target, owner, rel.addend);
+                    let st_other = || target.raw.map_or(0, |raw| raw.st_other);
+                    s.wrapping_add_signed(a)
+                        .wrapping_add(context.arch.entry_offset(rel.r_type, st_other))
+                };
+                let mut reloc = dyn_reloc(context.arch, place, 0, DynKind::Relative, value as i64);
                 reloc.packable = reloc::packable(section.header.sh_addralign, rel.offset);
                 out.push(reloc);
             }
@@ -1889,7 +1899,12 @@ fn relocate_input<F: crate::elf::read::ElfFormat>(
             Kind::None => Ok(()),
             Kind::Abs => match decision.dynamic {
                 Dynamic::Symbolic(_) => Ok(()),
-                _ => put(out, sa),
+                _ => put(
+                    out,
+                    sa.wrapping_add(
+                        arch.entry_offset(rel.r_type, || target.raw.map_or(0, |raw| raw.st_other)),
+                    ),
+                ),
             },
             Kind::Pc
                 if matches!(target.def, super::refs::Def::Undefined { .. })

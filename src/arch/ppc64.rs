@@ -793,9 +793,135 @@ pub fn glink_entry(offset: u64) -> Result<u32, EncodeError> {
     Field::Rel24.encode32(B, back)
 }
 
+/// `blr`.
+const BLR: u32 = 0x4e80_0020;
+/// `mtlr r0`.
+const MTLR_R0: u32 = 0x7c08_03a6;
+/// `std r0, 16(r1)`: saves the link register in the caller's frame.
+const STD_R0_16_R1: u32 = 0xf801_0010;
+/// `ld r0, 16(r1)`.
+const LD_R0_16_R1: u32 = 0xe801_0010;
+
+/// A family of the out-of-line register save and restore routines the
+/// ELFv2 ABI ("Save and Restore Routines") has the linker provide: GCC
+/// calls them with `-Os` instead of saving many nonvolatile registers
+/// inline. `<prefix><n>` handles registers `n` to 31 and falls through to
+/// the next entry, so the whole family is one sequence of entry points
+/// followed by a common tail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveRestore {
+    /// The symbol name before the register number.
+    pub prefix: &'static str,
+    /// The lowest register number with an entry point.
+    pub first: u32,
+    /// Instruction words per register (one, or two for the vector
+    /// registers, which need their offset in `r12`).
+    pub stride: u32,
+    /// The code: one entry per register from `first` to 31, then the tail.
+    pub words: Vec<u32>,
+}
+
+/// One entry per register from `first` to 31: `insn` for `first`, each
+/// next one `0x20_0008` further (the next register, 8 bytes on), then
+/// `tail`.
+fn save_restore(prefix: &'static str, first: u32, insn: u32, tail: &[u32]) -> SaveRestore {
+    let mut words: Vec<u32> = (0..32u32.saturating_sub(first))
+        .map(|step| insn.wrapping_add(step.wrapping_mul(0x20_0008)))
+        .collect();
+    words.extend_from_slice(tail);
+    SaveRestore {
+        prefix,
+        first,
+        stride: 1,
+        words,
+    }
+}
+
+/// The vector register routines, from `v20`: `li r12, -16 * (32 - n)`
+/// then `insn` (`stvx`/`lvx vn, r12, r0`, `r0` pointing past the save
+/// area), for each register, then `blr`.
+fn vector_save_restore(prefix: &'static str, insn: u32) -> SaveRestore {
+    let mut words = Vec::with_capacity(25);
+    for register in 20u32..32 {
+        let offset = 32u32.wrapping_sub(register).wrapping_mul(16);
+        words.push(0x3980_0000 | (offset.wrapping_neg() & 0xffff)); // li r12, -offset
+        words.push(insn | (register << 21));
+    }
+    words.push(BLR);
+    SaveRestore {
+        prefix,
+        first: 20,
+        stride: 2,
+        words,
+    }
+}
+
+/// Every save and restore routine family.
+///
+/// The general-purpose register routines are lld's (`addPPC64SaveRestore`):
+/// the `0` forms address the save area from `r1` and also save or restore
+/// the link register through `r0` (the restore returns to the caller's
+/// caller), the `1` forms address it from `r12`. The floating-point and
+/// vector register ones, which lld does not provide, are the ABI's and GNU
+/// ld's: `_savefpr_`/`_restfpr_` from `r1` with the link register,
+/// `._savef`/`._restf` without it, and `_savevr_`/`_restvr_` from `r0`.
+#[must_use]
+pub fn save_restore_routines() -> Vec<SaveRestore> {
+    vec![
+        // std rN, -8 * (32 - N)(r1)
+        save_restore("_savegpr0_", 14, 0xf9c1_ff70, &[STD_R0_16_R1, BLR]),
+        // ld rN, -8 * (32 - N)(r1)
+        save_restore("_restgpr0_", 14, 0xe9c1_ff70, &[LD_R0_16_R1, MTLR_R0, BLR]),
+        // std rN, -8 * (32 - N)(r12)
+        save_restore("_savegpr1_", 14, 0xf9cc_ff70, &[BLR]),
+        // ld rN, -8 * (32 - N)(r12)
+        save_restore("_restgpr1_", 14, 0xe9cc_ff70, &[BLR]),
+        // stfd fN, -8 * (32 - N)(r1)
+        save_restore("_savefpr_", 14, 0xd9c1_ff70, &[STD_R0_16_R1, BLR]),
+        // lfd fN, -8 * (32 - N)(r1)
+        save_restore("_restfpr_", 14, 0xc9c1_ff70, &[LD_R0_16_R1, MTLR_R0, BLR]),
+        save_restore("._savef", 14, 0xd9c1_ff70, &[BLR]),
+        save_restore("._restf", 14, 0xc9c1_ff70, &[BLR]),
+        // stvx vN, r12, r0
+        vector_save_restore("_savevr_", 0x7c0c_01ce),
+        // lvx vN, r12, r0
+        vector_save_restore("_restvr_", 0x7c0c_00ce),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The words as `llvm-mc` assembles the ABI's sequences.
+    #[test]
+    fn save_restore_routines_match_the_assembler() {
+        let routines = save_restore_routines();
+        let find = |prefix: &str| routines.iter().find(|r| r.prefix == prefix).unwrap();
+        let gpr0 = find("_savegpr0_");
+        assert_eq!(gpr0.words.len(), 18 + 2);
+        // std 14, -144(1); std 15, -136(1); ...; std 31, -8(1)
+        assert_eq!(gpr0.words[..2], [0xf9c1_ff70, 0xf9e1_ff78]);
+        assert_eq!(gpr0.words[17], 0xfbe1_fff8);
+        assert_eq!(gpr0.words[18..], [STD_R0_16_R1, BLR]);
+        assert_eq!(find("_restgpr1_").words[0], 0xe9cc_ff70, "ld 14, -144(12)");
+        // lfd 31, -8(1)
+        assert_eq!(find("_restfpr_").words[17], 0xcbe1_fff8);
+        let vr = find("_savevr_");
+        // li 12, -192; stvx 20, 12, 0; li 12, -176; stvx 21, 12, 0
+        assert_eq!(
+            vr.words[..4],
+            [0x3980_ff40, 0x7e8c_01ce, 0x3980_ff50, 0x7eac_01ce]
+        );
+        // li 12, -16 for v31.
+        assert_eq!(vr.words[22], 0x3980_fff0);
+        assert_eq!(find("_restvr_").words[1], 0x7e8c_00ce, "lvx 20, 12, 0");
+        for routine in &routines {
+            let entries = 32 - routine.first;
+            assert!(routine.words.len() as u32 > entries * routine.stride);
+            assert_eq!(routine.words.last(), Some(&BLR));
+        }
+    }
 
     #[test]
     fn adjusted_halves() {

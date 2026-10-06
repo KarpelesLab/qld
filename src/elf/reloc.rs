@@ -32,7 +32,7 @@ use super::arch::{
 };
 use super::export::{Mode, PREEMPTIBLE};
 use super::refs::{Def, Target};
-use super::scan::NEEDS_IPLT;
+use super::scan::{NEEDS_GOTDTPOFF, NEEDS_IPLT};
 
 /// What the dynamic linker has to do for one relocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +71,8 @@ pub enum LocalNeed {
     GotTpOff,
     /// A TLS descriptor pair.
     TlsDesc,
+    /// A module-relative TLS offset entry.
+    GotDtpOff,
 }
 
 /// The decision for one relocation.
@@ -290,6 +292,7 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
                 LocalNeed::TlsDesc,
             ),
             GotKind::TlsLd => decision.tls_ld = true,
+            GotKind::DtpOff => need(&mut decision, NEEDS_GOTDTPOFF, LocalNeed::GotDtpOff),
         }
     }
     match class.kind {
@@ -344,7 +347,17 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
             } else {
                 context.arch.is_word(class.width)
             };
-            if word {
+            if word && p.preemptible && context.arch.binds_locally(rel.r_type) {
+                // PowerPC64 `R_PPC64_ADDR64_LOCAL`: the local entry point
+                // of the definition in this output, which needs one.
+                if p.defined && !p.shared {
+                    if mode.pic {
+                        decision.dynamic = Dynamic::Relative;
+                    }
+                } else {
+                    decision.problem = Some(Problem::NeedsPic);
+                }
+            } else if word {
                 if !p.preemptible {
                     if mode.pic && (p.defined || !p.global) && !p.absolute {
                         decision.dynamic = Dynamic::Relative;
@@ -369,6 +382,12 @@ pub fn decide<F: crate::elf::read::ElfFormat>(
                 decision.problem = Some(Problem::NeedsPic);
             }
             decision.text = decision.dynamic != Dynamic::None && !writable;
+        }
+        // The GOT base (PowerPC64 `R_PPC64_TOC`) is an address of the
+        // output: relative in position-independent output.
+        Kind::GotBase if mode.pic && class.width == Width::W64 => {
+            decision.dynamic = Dynamic::Relative;
+            decision.text = section_flags & SHF_WRITE == 0;
         }
         _ => {}
     }

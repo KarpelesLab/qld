@@ -12,6 +12,10 @@
 //! - a text file is parsed as a linker script, and its `INPUT`, `GROUP` and
 //!   `LIB` entries are resolved and expanded in place.
 //!
+//! A PowerPC64 LE link then gets the linker's register save and restore
+//! routines as lazy objects after every other input
+//! ([`super::arch::ppc64::save_restore_objects`]).
+//!
 //! Every input gets an [`InputPosition`] from this walk, so positions (and
 //! [`FileId`]s, which are indices into the list) follow command-line order,
 //! with archive members numbered within their archive. File 0 is the
@@ -666,6 +670,24 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
         if let Err(error) = added {
             walker.finish()?;
             return Err(error);
+        }
+    }
+    // PowerPC64's register save and restore routines, which the linker
+    // provides when nothing else defines them: lazy objects after every
+    // other input.
+    if options.kind != crate::args::OutputKind::Relocatable
+        && walker.target.is_some_and(|target| {
+            target.arch == crate::target::Architecture::PowerPc64
+                && target.endian == crate::target::Endianness::Little
+        })
+    {
+        let lazy = InputAttrs {
+            lazy: true,
+            ..InputAttrs::default()
+        };
+        for (name, object) in super::arch::ppc64::save_restore_objects::<F>()? {
+            let id = table.add_bytes(name, std::sync::Arc::from(object))?;
+            walker.add(id, lazy, "", b"", None)?;
         }
     }
     walker.finish()?;

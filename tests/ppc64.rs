@@ -419,6 +419,7 @@ mod canon {
     const R_PPC64_RELATIVE: u32 = 22;
     const R_PPC64_IRELATIVE: u32 = 248;
     const DT_PPC64_GLINK: i64 = 0x7000_0000;
+    const DT_PPC64_OPT: i64 = 0x7000_0003;
 
     fn sext16(v: u32) -> i64 {
         i64::from(v as u16 as i16)
@@ -1126,7 +1127,19 @@ mod canon {
             let Some(&(their_start, their_size, their_other)) = their_functions.get(name) else {
                 continue;
             };
-            assert_eq!(other, their_other, "{name}: st_other differs from {label}");
+            // These address the save area from r12, which the analysis
+            // takes for a global entry point's address; the tests compare
+            // their words instead (`routine`).
+            if name.starts_with("_savegpr1_") || name.starts_with("_restgpr1_") {
+                continue;
+            }
+            // The local entry point; not the visibility, which GNU ld and
+            // qld drop from a hidden symbol made local and lld keeps.
+            assert_eq!(
+                other & 0xe0,
+                their_other & 0xe0,
+                "{name}: st_other differs from {label}"
+            );
             let size = size.min(their_size);
             let (ours_body, theirs_body) = (b.body(start, size), a.body(their_start, size));
             if let Some(at) = (0..ours_body.len().max(theirs_body.len())).find(|&i| {
@@ -1167,6 +1180,13 @@ mod canon {
             ours.dynamic_value(2),
             "DT_PLTRELSZ differs from {label}"
         );
+        if label == "lld" {
+            assert_eq!(
+                theirs.dynamic_value(DT_PPC64_OPT),
+                ours.dynamic_value(DT_PPC64_OPT),
+                "DT_PPC64_OPT differs from {label}"
+            );
+        }
         check_glink(label, ours);
         if label == "lld" {
             check_glink(label, theirs);
@@ -1729,3 +1749,361 @@ fn emulation_selects_the_backend() {
     let lib = elf::Elf::read(&dir.join("lib.so"));
     assert_eq!(lib.e_flags, 2);
 }
+
+const SAVE_RESTORE: &str = r#"
+	.abiversion 2
+	.text
+	.globl	_start
+	.type	_start,@function
+_start:
+	mflr	0
+	bl	_savegpr0_20
+	stdu	1, -160(1)
+	bl	_savegpr1_31
+	addi	1, 1, 160
+	b	_restgpr0_20
+	.size	_start, .-_start
+
+	.globl	other
+	.type	other,@function
+other:
+	bl	_restgpr1_14
+	bl	_restgpr0_29
+	blr
+	.size	other, .-other
+"#;
+
+/// The words of the routine at symbol `name`, up to its `blr`.
+fn routine(elf: &elf::Elf, name: &str) -> Vec<u32> {
+    let start = elf
+        .symbols
+        .iter()
+        .find(|s| s.name == name && s.shndx != 0)
+        .unwrap_or_else(|| panic!("{name} is not defined"))
+        .value;
+    let mut words = Vec::new();
+    let mut address = start;
+    while let Some(word) = elf.word(address) {
+        words.push(word);
+        if word == 0x4e80_0020 {
+            return words;
+        }
+        address += 4;
+    }
+    panic!("{name} has no blr");
+}
+
+/// The out-of-line register save and restore routines GCC's `-Os` code
+/// calls are linked in when nothing defines them, as lld (and GNU ld)
+/// provide them, in executables and shared objects, and enter as the
+/// callers expect.
+#[test]
+fn save_restore_routines_match_lld() {
+    let tools = require!();
+    let dir = scratch("save-restore");
+    compile(tools, &dir, "savres.s", SAVE_RESTORE, &[]);
+    let names = [
+        "_savegpr0_20",
+        "_savegpr1_31",
+        "_restgpr0_20",
+        "_restgpr1_14",
+        "_restgpr0_29",
+    ];
+    for (out, args) in [
+        ("exe", &["-static", "-e", "_start", "savres.o"][..]),
+        ("lib.so", &["-shared", "savres.o"][..]),
+    ] {
+        let ours = link_and_compare(tools, &dir, out, args);
+        for (index, (label, _)) in tools.references.iter().enumerate() {
+            let theirs = elf::Elf::read(&dir.join(format!("{out}.ref{index}")));
+            for name in names {
+                assert_eq!(
+                    routine(&ours, name),
+                    routine(&theirs, name),
+                    "{out}: {name} differs from {label}"
+                );
+            }
+        }
+        // Hidden: never exported, so each output has its own.
+        assert!(ours.relocs.iter().all(|r| r.symbol.is_none()));
+    }
+}
+
+/// The floating-point and vector register routines, which lld does not
+/// provide (GNU ld does), are the ABI's sequences; an input that defines a
+/// routine itself keeps it, and a link that calls none gets none.
+#[test]
+fn save_restore_routines_follow_the_abi() {
+    let tools = require!();
+    let dir = scratch("save-restore-abi");
+    compile(tools, &dir, "fpr.s", SAVE_RESTORE_ABI, &[]);
+    qld_ok(&dir, &["-static", "-e", "_start", "-o", "exe", "fpr.o"]);
+    let exe = elf::Elf::read(&dir.join("exe"));
+    // stfd 30, -16(1); stfd 31, -8(1); std 0, 16(1); blr
+    assert_eq!(
+        routine(&exe, "_savefpr_30"),
+        [0xdbc1_fff0, 0xdbe1_fff8, 0xf801_0010, 0x4e80_0020]
+    );
+    // lfd 31, -8(1); ld 0, 16(1); mtlr 0; blr
+    assert_eq!(
+        routine(&exe, "_restfpr_31"),
+        [0xcbe1_fff8, 0xe801_0010, 0x7c08_03a6, 0x4e80_0020]
+    );
+    // li 12, -32; stvx 30, 12, 0; li 12, -16; stvx 31, 12, 0; blr
+    assert_eq!(
+        routine(&exe, "_savevr_30"),
+        [
+            0x3980_ffe0,
+            0x7fcc_01ce,
+            0x3980_fff0,
+            0x7fec_01ce,
+            0x4e80_0020
+        ]
+    );
+    // li 12, -16; lvx 31, 12, 0; blr
+    assert_eq!(
+        routine(&exe, "_restvr_31"),
+        [0x3980_fff0, 0x7fec_00ce, 0x4e80_0020]
+    );
+    // stfd 31, -8(1); blr
+    assert_eq!(routine(&exe, "._savef31"), [0xdbe1_fff8, 0x4e80_0020]);
+    let own: Vec<_> = exe
+        .symbols
+        .iter()
+        .filter(|s| s.name == "_savegpr0_31")
+        .collect();
+    assert_eq!(own.len(), 1);
+    assert_eq!(exe.word(own[0].value), Some(0x7fe0_0008), "the input's own");
+    assert!(
+        !exe.symbols.iter().any(|s| s.name == "_savegpr1_14"),
+        "a family nothing calls is not linked"
+    );
+
+    // Relocatable output leaves them to the final link.
+    qld_ok(&dir, &["-r", "-o", "partial.o", "fpr.o"]);
+    let partial = elf::Elf::read(&dir.join("partial.o"));
+    assert!(
+        partial
+            .symbols
+            .iter()
+            .any(|s| s.name == "_savefpr_30" && s.shndx == 0)
+    );
+}
+
+const TOC_BASE: &str = r#"
+	.abiversion 2
+	.text
+	.globl	_start
+	.type	_start,@function
+_start:
+	addis	3, 2, ptr@toc@ha
+	ld	3, ptr@toc@l(3)
+	blr
+	.size	_start, .-_start
+
+	.globl	foo
+	.type	foo,@function
+foo:
+	addis	2, 12, .TOC.-foo@ha
+	addi	2, 2, .TOC.-foo@l
+	.localentry foo, .-foo
+	blr
+	.size	foo, .-foo
+
+	.data
+	.globl	ptr
+	.p2align 3
+ptr:
+	.quad	.TOC.@tocbase
+	.quad	.TOC.@tocbase+16
+local:
+	.quad	foo
+"#;
+
+/// `R_PPC64_TOC` (`.TOC.@tocbase`) is the TOC pointer, relative in
+/// position-independent output.
+///
+/// lld 20 gets the relative relocation's addend 0x8000 too high (it adds
+/// the TOC base to the addend while scanning and again when writing), so
+/// position-independent output is checked against `.TOC.` itself.
+#[test]
+fn toc_base_relocations() {
+    let tools = require!();
+    let dir = scratch("toc-base");
+    compile(tools, &dir, "tocbase.s", TOC_BASE, &[]);
+    let exe = link_and_compare(
+        tools,
+        &dir,
+        "exe",
+        &["-static", "-e", "_start", "tocbase.o"],
+    );
+    let ptr = exe.symbols.iter().find(|s| s.name == "ptr").unwrap().value;
+    let toc = exe.toc();
+    assert_eq!(exe.dword(ptr), Some(toc));
+    assert_eq!(exe.dword(ptr + 8), Some(toc + 16));
+    for kind in ["-pie", "-shared"] {
+        qld_ok(&dir, &[kind, "-e", "_start", "-o", "pic", "tocbase.o"]);
+        let pic = elf::Elf::read(&dir.join("pic"));
+        let ptr = pic.symbols.iter().find(|s| s.name == "ptr").unwrap().value;
+        let toc = pic.toc();
+        let relative = |offset: u64| {
+            pic.relocs
+                .iter()
+                .find(|r| r.offset == offset)
+                .map(|r| (r.r_type, r.addend as u64))
+        };
+        assert_eq!(relative(ptr), Some((22, toc)), "{kind}");
+        assert_eq!(relative(ptr + 8), Some((22, toc + 16)), "{kind}");
+    }
+}
+
+/// `R_PPC64_ADDR64_LOCAL` is a function's local entry point. No assembler
+/// at hand emits it (`foo@localentry` is GNU as only), so the test
+/// rewrites an `R_PPC64_ADDR64`; neither reference linker can check it
+/// (lld does not support the type), so it is checked against the ABI.
+#[test]
+fn addr64_local_is_the_local_entry_point() {
+    const R_PPC64_ADDR64: u32 = 38;
+    const R_PPC64_ADDR64_LOCAL: u32 = 117;
+    let tools = require!();
+    let dir = scratch("addr64-local");
+    compile(tools, &dir, "tocbase.s", TOC_BASE, &[]);
+    let object = elf::Elf::read(&dir.join("tocbase.o"));
+    let rela = object.section(".rela.data").unwrap().clone();
+    let mut data = object.data.clone();
+    let mut patched = 0;
+    for at in (rela.offset..rela.offset + rela.size).step_by(24) {
+        let info = (at + 8) as usize;
+        if u32::from_le_bytes(data[info..info + 4].try_into().unwrap()) == R_PPC64_ADDR64 {
+            data[info..info + 4].copy_from_slice(&R_PPC64_ADDR64_LOCAL.to_le_bytes());
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 1);
+    fs::write(dir.join("local.o"), data).unwrap();
+
+    let foo = |elf: &elf::Elf| elf.symbols.iter().find(|s| s.name == "foo").unwrap().value;
+    let local = |elf: &elf::Elf| elf.symbols.iter().find(|s| s.name == "ptr").unwrap().value + 16;
+    qld_ok(&dir, &["-static", "-e", "_start", "-o", "exe", "local.o"]);
+    let exe = elf::Elf::read(&dir.join("exe"));
+    assert_eq!(exe.dword(local(&exe)), Some(foo(&exe) + 8));
+    // In position-independent output, a relative relocation, even for the
+    // exported (preemptible) `foo` of a shared object.
+    for kind in ["-pie", "-shared"] {
+        qld_ok(&dir, &[kind, "-e", "_start", "-o", "pic", "local.o"]);
+        let pic = elf::Elf::read(&dir.join("pic"));
+        let reloc = pic.relocs.iter().find(|r| r.offset == local(&pic)).unwrap();
+        assert_eq!(
+            (reloc.r_type, reloc.addend as u64),
+            (22, foo(&pic) + 8),
+            "{kind}"
+        );
+    }
+}
+
+/// Local-dynamic code that reads a variable's offset from a GOT entry
+/// (`@got@dtprel`) instead of computing it, as GCC does with
+/// `-mtls-size=64`. `GLOBAL` makes the variable preemptible in a shared
+/// object.
+fn got_dtprel_source(global: bool) -> String {
+    format!(
+        r#"
+	.abiversion 2
+	.text
+	.globl	get
+	.type	get,@function
+get:
+	addis	2, 12, .TOC.-get@ha
+	addi	2, 2, .TOC.-get@l
+	.localentry get, .-get
+	mflr	0
+	std	0, 16(1)
+	stdu	1, -32(1)
+	addis	3, 2, x@got@tlsld@ha
+	addi	3, 3, x@got@tlsld@l
+	bl	__tls_get_addr(x@tlsld)
+	nop
+	addis	9, 2, y@got@dtprel@ha
+	ld	9, y@got@dtprel@l(9)
+	lwzx	3, 3, 9
+	addi	1, 1, 32
+	ld	0, 16(1)
+	mtlr	0
+	blr
+	.size	get, .-get
+
+	.section .tbss,"awT",@nobits
+	.p2align 2
+x:
+	.long	0
+	{}
+y:
+	.long	0
+"#,
+        if global { ".globl y" } else { "" }
+    )
+}
+
+/// `R_PPC64_GOT_DTPREL16_*` read a GOT entry holding the variable's offset
+/// in its module's TLS block (biased by 0x8000), which is known at link
+/// time: in executables, where the local-dynamic call around it relaxes,
+/// and in shared objects.
+#[test]
+fn got_dtprel_entries_match() {
+    let tools = require!();
+    let dir = scratch("got-dtprel");
+    compile(tools, &dir, "local.s", &got_dtprel_source(false), &[]);
+    compile(tools, &dir, "global.s", &got_dtprel_source(true), &[]);
+    let check = |elf: &elf::Elf, what: &str| {
+        // A TLS symbol's value is its offset in the TLS block, which is
+        // only `.tbss` here.
+        let offset = elf.symbols.iter().find(|s| s.name == "y").unwrap().value;
+        // The entry is the one word in `.got` past the header (and the
+        // local-dynamic pair, if kept) that holds the offset.
+        let got = elf.section(".got").unwrap();
+        let words: Vec<u64> = (got.addr..got.addr + got.size)
+            .step_by(8)
+            .filter_map(|a| elf.dword(a))
+            .collect();
+        assert!(
+            words.contains(&offset.wrapping_sub(0x8000)),
+            "{what}: no GOT entry holds y's offset: {words:x?}"
+        );
+    };
+    let exe = link_and_compare(tools, &dir, "exe", &["-static", "-e", "get", "local.o"]);
+    check(&exe, "static");
+    let pie = link_and_compare(tools, &dir, "pie", &["-pie", "-e", "get", "local.o"]);
+    check(&pie, "PIE");
+    let lib = link_and_compare(tools, &dir, "lib.so", &["-shared", "local.o"]);
+    check(&lib, "shared object");
+
+    // A preemptible variable gets a dynamic relocation, as GNU ld gives
+    // it; lld writes the link-time offset.
+    qld_ok(&dir, &["-shared", "-o", "global.so", "global.o"]);
+    let global = elf::Elf::read(&dir.join("global.so"));
+    assert!(
+        global
+            .relocs
+            .iter()
+            .any(|r| r.r_type == 78 && r.symbol.as_deref() == Some("y")),
+        "expected an R_PPC64_DTPREL64 against y"
+    );
+}
+
+const SAVE_RESTORE_ABI: &str = r#"
+	.abiversion 2
+	.text
+	.globl	_start
+_start:
+	bl	_savefpr_30
+	bl	_restfpr_31
+	bl	_savevr_30
+	bl	_restvr_31
+	bl	._savef31
+	bl	_savegpr0_31
+	blr
+	# A definition of its own wins over the linker's.
+	.globl	_savegpr0_31
+_savegpr0_31:
+	trap
+"#;

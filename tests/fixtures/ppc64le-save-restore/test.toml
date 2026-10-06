@@ -1,0 +1,23 @@
+# M4: the out-of-line register save and restore routines of the ELFv2 ABI,
+# which the linker provides when the program calls them and nothing defines
+# them (GCC's -Os code does). The program clobbers the saved registers
+# between a save and a restore and checks they came back.
+description = "PowerPC64 LE _savegpr0_/_savefpr_/_savevr_ routines provided by the linker"
+compile = ["cc -c savres.s"]
+link = "-static -e _start -o out savres.o"
+run = "./out"
+expect.stdout = "save/restore works\n"
+expect.exit = 0
+expect.readelf = [
+  "PowerPC64",
+  "EXEC (Executable file)",
+  "_savegpr0_14",
+  "_restvr_20",
+]
+targets = ["powerpc64le-linux-gnu"]
+determinism = true
+
+[diff]
+# GNU ld emits only the entries from the lowest one called, in `.sfpr`;
+# qld links each whole family.
+skip = "the linkers lay out the save/restore routines differently"

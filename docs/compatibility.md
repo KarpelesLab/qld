@@ -754,6 +754,29 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   (`*(.got .toc)`), so both stay within ±32 KiB of the TOC pointer; lld
   keeps `.toc` a separate orphan. `.got` is 8-aligned, where GNU ld aligns
   it to 256.
+- **Register save and restore routines** (`_savegpr0_*`, `_restgpr0_*`,
+  `_savegpr1_*`, `_restgpr1_*`, `_savefpr_*`, `_restfpr_*`, `._savef*`,
+  `._restf*`, `_savevr_*`, `_restvr_*`) are provided when called and not
+  defined elsewhere, as by GNU ld (lld provides only the GPR ones). Each
+  family is linked whole (at most 100 bytes), where GNU ld and lld start
+  at the lowest entry called; the entry points are hidden weak functions,
+  so an input that defines some of them keeps its own. An archive member
+  defining them is preferred, as in lld, and a shared library's definition
+  is used (lld and GNU ld define their own regardless).
+- `R_PPC64_ADDR64_LOCAL` refers to this output's definition even of a
+  preemptible symbol, so it becomes a relative relocation; against a
+  symbol defined elsewhere it is an error. lld does not support it.
+- `R_PPC64_GOT_DTPREL16_*` against a preemptible variable get an
+  `R_PPC64_DTPREL64` for their GOT entry, as GNU ld gives them; lld
+  writes the link-time offset.
+- `R_PPC64_TOC` in position-independent output becomes a relative
+  relocation of `.TOC.`; lld 20 writes `.TOC. + 0x8000`.
+- `DT_PPC64_OPT` is in every dynamic output, as lld writes it, with
+  `PPC64_OPT_MULTI_TOC` when PC-relative code calls through the PLT or a
+  function that needs its TOC pointer; lld also sets it for PC-relative
+  calls that only need a range-extension thunk. `PPC64_OPT_TLS` and
+  `PPC64_OPT_LOCALENTRY` (GNU ld's `__tls_get_addr_opt` and
+  `--plt-localentry`) are never set.
 
 ## LoongArch64
 

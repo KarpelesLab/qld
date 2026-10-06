@@ -633,6 +633,7 @@ pub fn choose<F: crate::elf::read::ElfFormat>(
         | SymbolFlags::NEEDS_TLSGD
         | SymbolFlags::NEEDS_GOTTPOFF
         | SymbolFlags::NEEDS_TLSDESC
+        | super::scan::NEEDS_GOTDTPOFF
         | SymbolFlags::NEEDS_DYNSYM
         | SymbolFlags::NEEDS_COPY_RELOC;
     // (id, defined)
@@ -1286,6 +1287,18 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
                 DynValue::AddressPlus(Synthetic::Plt, offset),
             ));
         }
+    }
+    // lld writes `DT_PPC64_OPT` into every ELFv2 output.
+    if synth.arch == crate::elf::arch::Arch::Ppc64 {
+        let options = if input.scan.multi_toc() {
+            crate::elf::read::consts::ppc64::PPC64_OPT_MULTI_TOC
+        } else {
+            0
+        };
+        entries.push((
+            crate::elf::read::consts::ppc64::DT_PPC64_OPT,
+            Value(options),
+        ));
     }
     if synth.rela_dyn_count() > 0 {
         if rel {

@@ -51,6 +51,12 @@
 //! `bl __tls_get_addr` rewrites the call, whose own relocation is then
 //! skipped. The thread pointer (`r13`) is 0x7000 bytes past the start of
 //! the TLS block, and `@dtprel` offsets are biased by 0x8000.
+//! `R_PPC64_GOT_DTPREL16_*` load such an offset from a GOT entry of its
+//! own ([`GotKind::DtpOff`]), which is never relaxed.
+//!
+//! **Linker-provided code.** GCC's `-Os` code calls out-of-line register
+//! save and restore routines (`_savegpr0_14`, …) that the linker defines
+//! when nothing else does ([`save_restore_objects`]).
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -93,11 +99,10 @@ fn is_pld<E: Endian>(data: &[u8], offset: u64) -> bool {
 /// # Errors
 ///
 /// [`ClassifyError::Unsupported`] for types qld does not link: the
-/// dynamic-only types, ELFv1 function descriptors (`R_PPC64_TOC`), the
-/// inline PLT sequences (`PLTSEQ`, `PLTCALL`, `PLT16_*`, `PLT_PCREL34`),
-/// the section-relative and 34-bit absolute forms, and
-/// `R_PPC64_GOT_DTPREL*`; [`ClassifyError::BadTlsInstruction`] for a TLS
-/// access in a form that cannot be relaxed (the `_HI` halves).
+/// dynamic-only types, the inline PLT sequences (`PLTSEQ`, `PLTCALL`,
+/// `PLT16_*`, `PLT_PCREL34`), and the section-relative and 34-bit
+/// absolute forms; [`ClassifyError::BadTlsInstruction`] for a TLS access
+/// in a form that cannot be relaxed (the `_HI` halves).
 #[allow(clippy::too_many_lines)]
 // Out of line: large, and not to be inlined into the other architectures'
 // relocation loops.
@@ -122,6 +127,13 @@ pub fn classify<E: Endian>(
 
         // Absolute data and instruction fields.
         R_PPC64_ADDR64 | R_PPC64_UADDR64 => Class::new(K::Abs, Width::W64),
+        // `S + A` with `S` the function's local entry point
+        // ([`entry_offset`]), which only a definition in this output has
+        // ([`binds_locally`]).
+        R_PPC64_ADDR64_LOCAL => Class::new(K::Abs, Width::W64),
+        // The TOC pointer, `.TOC. + A`: the second doubleword of an ELFv1
+        // function descriptor, or `.quad .TOC.@tocbase`.
+        R_PPC64_TOC => Class::new(K::GotBase, Width::W64),
         R_PPC64_ADDR32 | R_PPC64_UADDR32 => Class::new(K::Abs, Width::Any32),
         R_PPC64_ADDR16 | R_PPC64_UADDR16 => class(K::Abs, F::Half16),
         R_PPC64_ADDR16_LO => class(K::Abs, F::Lo),
@@ -214,6 +226,13 @@ pub fn classify<E: Endian>(
         R_PPC64_DTPREL16_DS => class(K::DtpOff, F::Ds),
         R_PPC64_DTPREL16_LO_DS => class(K::DtpOff, F::LoDs),
         R_PPC64_DTPREL34 => class(K::DtpOff, F::Prefixed34),
+        // A load of the offset from a GOT entry, local-dynamic code's way
+        // of reaching a variable farther than 2 GiB into the block. Kept as
+        // it is in every output, as lld does.
+        R_PPC64_GOT_DTPREL16_HA => got(K::GotSlotRel, F::HaToc, GotKind::DtpOff),
+        R_PPC64_GOT_DTPREL16_HI => got(K::GotSlotRel, F::Hi, GotKind::DtpOff),
+        R_PPC64_GOT_DTPREL16_DS => got(K::GotSlotRel, F::Ds, GotKind::DtpOff),
+        R_PPC64_GOT_DTPREL16_LO_DS => got(K::GotSlotRel, F::LoDsToc, GotKind::DtpOff),
 
         // General-dynamic.
         R_PPC64_GOT_TLSGD16 | R_PPC64_GOT_TLSGD16_LO => match tls {
@@ -539,6 +558,38 @@ pub fn branch_destination(branch: Branch) -> u64 {
     branch.target
 }
 
+/// Whether a call of type `r_type`, through the PLT when `via_plt`, to a
+/// function with `st_other` is from code without a TOC pointer
+/// (`R_PPC64_REL24_NOTOC`) and goes through a stub that sets one up: then
+/// the output may run with several TOC pointers, which `DT_PPC64_OPT`
+/// tells the dynamic linker (`PPC64_OPT_MULTI_TOC`), as lld does. lld
+/// also counts calls that only need a thunk for their range.
+#[must_use]
+pub fn multi_toc_call(r_type: u32, via_plt: bool, st_other: u8) -> bool {
+    r_type == R_PPC64_REL24_NOTOC && (via_plt || insn::local_entry_offset(st_other) != 0)
+}
+
+/// What an absolute relocation of type `r_type` adds to the address of a
+/// symbol with `st_other`: its local entry point offset for
+/// `R_PPC64_ADDR64_LOCAL`, nothing for the others.
+#[must_use]
+pub fn entry_offset(r_type: u32, st_other: u8) -> u64 {
+    if r_type == R_PPC64_ADDR64_LOCAL {
+        insn::local_entry_offset(st_other)
+    } else {
+        0
+    }
+}
+
+/// Whether relocation `r_type` refers to the definition in this output
+/// even when the symbol is preemptible: `R_PPC64_ADDR64_LOCAL`, whose
+/// local entry point a dynamic relocation could not name. As in GNU ld,
+/// it becomes a relative relocation.
+#[must_use]
+pub fn binds_locally(r_type: u32) -> bool {
+    r_type == R_PPC64_ADDR64_LOCAL
+}
+
 /// Whether relocation `r_type` is a branch that range-extension thunks
 /// serve.
 #[must_use]
@@ -797,10 +848,186 @@ pub fn toc_indirection<F: crate::elf::read::ElfFormat>(
     insn::fits_signed(relative, 32).then_some((address, field))
 }
 
+/// The out-of-line register save and restore routines
+/// ([`insn::save_restore_routines`]), each family wrapped in a relocatable
+/// object of format `F` that defines its entry points: `(name, object)`.
+///
+/// The linker provides these, as GNU ld and lld do, when something calls
+/// them and nothing else defines them. The objects are added after every
+/// other input as lazy members ([`crate::elf::inputs`]), so one is linked
+/// only when it is the only definition of a referenced routine, and an
+/// archive on the command line (libgcc's `crtsavevr.o`, say) wins over it.
+/// The entry points are hidden, so each output gets its own copy, and weak,
+/// so an input that defines some of a family's entries itself keeps them.
+///
+/// Unlike lld and GNU ld, the whole family is linked, not only the entries
+/// from the lowest referenced register on: at most 100 bytes.
+///
+/// # Errors
+///
+/// [`crate::error::Error::Limit`] only if the format cannot hold the
+/// objects, which cannot happen for these sizes.
+pub fn save_restore_objects<F: crate::elf::read::ElfFormat>()
+-> crate::error::Result<Vec<(String, Vec<u8>)>> {
+    insn::save_restore_routines()
+        .iter()
+        .map(|routine| {
+            let object = save_restore_object::<F>(routine)?;
+            Ok((format!("<internal>:{}", routine.prefix), object))
+        })
+        .collect()
+}
+
+/// One family of [`save_restore_objects`] as an object: `.text` with the
+/// code, and a hidden weak function symbol per entry point.
+fn save_restore_object<F: crate::elf::read::ElfFormat>(
+    routine: &insn::SaveRestore,
+) -> crate::error::Result<Vec<u8>> {
+    use crate::elf::read::consts::{
+        EM_PPC64, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB, STB_WEAK,
+        STT_FUNC, STV_HIDDEN,
+    };
+    use crate::elf::read::{FileHeader, RawRecord, RawSymbol, SectionHeader};
+    let limit = || crate::error::Error::Limit("PowerPC64 save/restore routine".into());
+    let len = |n: usize| u64::try_from(n).map_err(|_| limit());
+    let name_at = |n: usize| u32::try_from(n).map_err(|_| limit());
+
+    let mut text = Vec::with_capacity(routine.words.len().saturating_mul(4));
+    for word in &routine.words {
+        text.extend_from_slice(&<F::Endian as crate::elf::read::Endian>::put_u32(*word));
+    }
+    let mut strtab = vec![0u8];
+    let mut symbols = vec![RawSymbol::default()];
+    for (index, register) in (routine.first..32).enumerate() {
+        let st_name = name_at(strtab.len())?;
+        strtab.extend_from_slice(routine.prefix.as_bytes());
+        strtab.extend_from_slice(register.to_string().as_bytes());
+        strtab.push(0);
+        let words = len(index)?.saturating_mul(u64::from(routine.stride));
+        symbols.push(RawSymbol {
+            st_name,
+            st_info: (STB_WEAK << 4) | STT_FUNC,
+            st_other: STV_HIDDEN,
+            st_shndx: 1,
+            st_value: words.saturating_mul(4),
+            st_size: 0,
+        });
+    }
+    let shstrtab = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+
+    let ehdr_size = <F::Ehdr as RawRecord>::SIZE;
+    let align = F::WORD_SIZE;
+    let pad = |out: &mut Vec<u8>| {
+        while !out.len().is_multiple_of(align) {
+            out.push(0);
+        }
+    };
+    let mut out = vec![0u8; ehdr_size];
+    let text_offset = out.len();
+    out.extend_from_slice(&text);
+    pad(&mut out);
+    let symtab_offset = out.len();
+    for symbol in &symbols {
+        out.extend_from_slice(F::encode_sym(symbol).as_bytes());
+    }
+    let symtab_size = out.len().saturating_sub(symtab_offset);
+    let strtab_offset = out.len();
+    out.extend_from_slice(&strtab);
+    let shstrtab_offset = out.len();
+    out.extend_from_slice(shstrtab);
+    pad(&mut out);
+    let shoff = out.len();
+    let headers = [
+        SectionHeader::default(),
+        SectionHeader {
+            sh_name: 1,
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC | SHF_EXECINSTR,
+            sh_offset: len(text_offset)?,
+            sh_size: len(text.len())?,
+            sh_addralign: 4,
+            ..SectionHeader::default()
+        },
+        SectionHeader {
+            sh_name: 7,
+            sh_type: SHT_SYMTAB,
+            sh_offset: len(symtab_offset)?,
+            sh_size: len(symtab_size)?,
+            sh_link: 3,
+            sh_info: 1,
+            sh_addralign: len(align)?,
+            sh_entsize: len(<F::Sym as RawRecord>::SIZE)?,
+            ..SectionHeader::default()
+        },
+        SectionHeader {
+            sh_name: 15,
+            sh_type: SHT_STRTAB,
+            sh_offset: len(strtab_offset)?,
+            sh_size: len(strtab.len())?,
+            sh_addralign: 1,
+            ..SectionHeader::default()
+        },
+        SectionHeader {
+            sh_name: 23,
+            sh_type: SHT_STRTAB,
+            sh_offset: len(shstrtab_offset)?,
+            sh_size: len(shstrtab.len())?,
+            sh_addralign: 1,
+            ..SectionHeader::default()
+        },
+    ];
+    for header in &headers {
+        out.extend_from_slice(F::encode_shdr(header).as_bytes());
+    }
+    let file_header = FileHeader {
+        ident_version: 1,
+        e_type: ET_REL,
+        e_machine: EM_PPC64,
+        e_version: 1,
+        e_flags: ABI_VERSION,
+        e_shoff: len(shoff)?,
+        e_shnum: 5,
+        e_shstrndx: 4,
+        ..FileHeader::default()
+    };
+    if let Some(slot) = out.get_mut(..ehdr_size) {
+        slot.copy_from_slice(F::encode_ehdr(&file_header).as_bytes());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::elf::read::Little;
+
+    #[test]
+    fn save_restore_objects_define_every_entry() {
+        use crate::elf::read::{Elf64Le, ObjectFile, Source};
+        let objects = save_restore_objects::<Elf64Le>().unwrap();
+        assert_eq!(objects.len(), 10);
+        let (name, bytes) = &objects[0];
+        assert_eq!(name, "<internal>:_savegpr0_");
+        let object = ObjectFile::<Elf64Le>::parse(bytes, Source::new(std::path::Path::new(name)))
+            .expect("a valid object");
+        let symbols: Vec<(Vec<u8>, u64)> = object
+            .symbols()
+            .globals()
+            .map(|s| {
+                let s = s.unwrap();
+                (s.name.to_vec(), s.value)
+            })
+            .collect();
+        assert_eq!(symbols.len(), 18);
+        assert_eq!(symbols[0], (b"_savegpr0_14".to_vec(), 0));
+        assert_eq!(symbols[17], (b"_savegpr0_31".to_vec(), 68));
+        // The vector routines take two words per register.
+        let (_, vr) = &objects[8];
+        let object =
+            ObjectFile::<Elf64Le>::parse(vr, Source::new(std::path::Path::new("vr"))).unwrap();
+        let last = object.symbols().globals().last().unwrap().unwrap();
+        assert_eq!((last.name, last.value), (&b"_savevr_31"[..], 88));
+    }
 
     fn exec() -> ClassifyContext {
         ClassifyContext::static_exec(true)
@@ -843,7 +1070,15 @@ mod tests {
                 .width,
             Width::Ppc(Field::Rel24)
         );
-        for r_type in [R_PPC64_TOC, R_PPC64_JMP_SLOT, R_PPC64_PLTCALL, 0xdead] {
+        assert_eq!(
+            classify::<Little>(R_PPC64_TOC, &[], 0, shared())
+                .unwrap()
+                .kind,
+            Kind::GotBase
+        );
+        assert_eq!(entry_offset(R_PPC64_ADDR64_LOCAL, 3 << 5), 8);
+        assert_eq!(entry_offset(R_PPC64_ADDR64, 3 << 5), 0);
+        for r_type in [R_PPC64_JMP_SLOT, R_PPC64_PLTCALL, 0xdead] {
             assert_eq!(
                 classify::<Little>(r_type, &[], 0, exec()),
                 Err(ClassifyError::Unsupported),
@@ -1017,6 +1252,13 @@ mod tests {
         assert_eq!(thunk[0], insn::STD_R2_24_R1);
         let thunk = insn::thunk(0x1000_0200, 0x1002_0010 | insn::THUNK_VIA_SLOT).unwrap();
         assert_eq!(thunk[5] >> 16, 0xe98c, "ld r12, lo(r12)");
+
+        // `DT_PPC64_OPT`: PC-relative calls through the PLT, or to a
+        // function that sets up its TOC pointer.
+        assert!(multi_toc_call(R_PPC64_REL24_NOTOC, true, 0));
+        assert!(multi_toc_call(R_PPC64_REL24_NOTOC, false, 3 << 5));
+        assert!(!multi_toc_call(R_PPC64_REL24_NOTOC, false, 1 << 5));
+        assert!(!multi_toc_call(R_PPC64_REL24, true, 3 << 5));
     }
 
     /// The `.glink` lld 23 writes for a PIE whose `.glink` is at 0x10310

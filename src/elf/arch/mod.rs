@@ -180,6 +180,10 @@ pub enum GotKind {
     TlsDesc,
     /// The module-local TLS module ID and a zero offset (two words).
     TlsLd,
+    /// The variable's offset in its module's TLS block, as the second word
+    /// of a [`GotKind::TlsGd`] pair holds it (one word; PowerPC64
+    /// `R_PPC64_GOT_DTPREL16_*`).
+    DtpOff,
 }
 
 /// How the computed value is stored.
@@ -1051,6 +1055,39 @@ impl Arch {
             Self::X86_64 | Self::X32 | Self::RiscV64 | Self::RiscV32 | Self::LoongArch64 => false,
             Self::AArch64 => matches!(r_type, a64::R_AARCH64_CALL26 | a64::R_AARCH64_JUMP26),
             Self::Ppc64 | Self::Ppc64Be => ppc64::is_thunk_branch(r_type),
+        }
+    }
+
+    /// What an absolute relocation adds to the symbol's address: PowerPC64
+    /// `R_PPC64_ADDR64_LOCAL` names the local entry point
+    /// ([`ppc64::entry_offset`]). `st_other` reads the symbol's, which is
+    /// asked for only there.
+    #[must_use]
+    pub fn entry_offset(self, r_type: u32, st_other: impl FnOnce() -> u8) -> u64 {
+        match self {
+            Self::Ppc64 => ppc64::entry_offset(r_type, st_other()),
+            _ => 0,
+        }
+    }
+
+    /// Whether a call of type `r_type` (through the PLT when `via_plt`) to
+    /// a function with `st_other` comes from code without a TOC pointer
+    /// and needs a stub that sets one up ([`ppc64::multi_toc_call`]).
+    #[must_use]
+    pub fn multi_toc_call(self, r_type: u32, via_plt: bool, st_other: impl FnOnce() -> u8) -> bool {
+        match self {
+            Self::Ppc64 => ppc64::multi_toc_call(r_type, via_plt, st_other()),
+            _ => false,
+        }
+    }
+
+    /// Whether relocation `r_type` refers to this output's definition even
+    /// of a preemptible symbol ([`ppc64::binds_locally`]).
+    #[must_use]
+    pub fn binds_locally(self, r_type: u32) -> bool {
+        match self {
+            Self::Ppc64 => ppc64::binds_locally(r_type),
+            _ => false,
         }
     }
 
