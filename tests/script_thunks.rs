@@ -21,6 +21,8 @@
 //! Tools: `clang`, `ld.lld`, from `PATH` or `QLD_CC`/`QLD_LLD`; a test
 //! prints `SKIPPED:` and passes when one is missing.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,12 +89,7 @@ fn gnu_aarch64_ld() -> Option<PathBuf> {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("script-thunks")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("script-thunks", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {

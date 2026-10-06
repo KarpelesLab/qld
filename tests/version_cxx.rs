@@ -9,6 +9,8 @@
 //! Tools: `g++`, GNU `ld` and `readelf`, on x86-64 Linux. A test prints
 //! `SKIPPED:` and passes when one is missing.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -71,11 +73,7 @@ fn setup(name: &str) -> Option<Tools> {
         println!("SKIPPED: needs g++, GNU ld and readelf");
         return None;
     };
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("version_cxx")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = common::scratch::scratch_dir("version_cxx", name);
     fs::write(dir.join("lib.cc"), LIBRARY).unwrap();
     ok(
         &run(&dir, &cxx, &["-fPIC", "-c", "lib.cc", "-o", "lib.o"]),
