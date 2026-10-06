@@ -13,7 +13,7 @@
 //! - [`response`]: `@file` expansion, through a [`FileReader`] so tests stay
 //!   hermetic.
 //! - [`emulation`]: `-m` names and the targets they select.
-//! - [`print`]: what `--print-output-format` and `--print-sysroot` print.
+//! - [`print`](mod@print): what `--print-output-format` and `--print-sysroot` print.
 //!
 //! Parsing rules, flavors and the option table policy are specified in
 //! `docs/compatibility.md`.
