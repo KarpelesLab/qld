@@ -382,8 +382,12 @@ fn fatal_errors_are_gnu_shaped() {
         &dir,
         &["--no-fork", "-o", "out", "--qld-no-such-option", "main.o"],
     );
-    assert!(stderr.contains("--qld-no-such-option"), "{stderr}");
-    assert!(stderr.starts_with("qld: error: "), "{stderr}");
+    assert_eq!(
+        stderr,
+        "qld: error: unrecognized option '--qld-no-such-option'\n\
+         qld: use the --help option for usage information\n",
+        "GNU ld's wording and usage hint"
+    );
 
     // Binary junk: text would be taken for a linker script, as lld does.
     let junk: Vec<u8> = (0..512u32)
@@ -391,8 +395,10 @@ fn fatal_errors_are_gnu_shaped() {
         .collect();
     fs::write(dir.join("junk.o"), &junk).unwrap();
     let stderr = qld_err(&dir, &["--no-fork", "-o", "out", "junk.o"]);
-    assert!(stderr.contains("junk.o"), "{stderr}");
-    assert!(stderr.contains("not recognized"), "{stderr}");
+    assert_eq!(
+        stderr, "qld: error: junk.o: file not recognized: file format not recognized\n",
+        "BFD's wording"
+    );
 
     let mut truncated = fs::read(dir.join("main.o")).unwrap();
     truncated.truncate(48);

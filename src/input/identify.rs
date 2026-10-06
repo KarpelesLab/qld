@@ -211,6 +211,44 @@ pub mod coff_machine {
     ];
 }
 
+/// The error for an input whose format no backend recognizes, worded as
+/// BFD words it: `junk.o: file not recognized: file format not recognized`.
+#[must_use]
+pub fn not_recognized(path: &std::path::Path) -> crate::error::Error {
+    crate::error::Error::Option(format!(
+        "{}: file not recognized: file format not recognized",
+        path.display()
+    ))
+}
+
+/// The architecture `machine` (`IMAGE_FILE_MACHINE_*`) names, when qld
+/// knows it.
+#[must_use]
+pub fn coff_machine_architecture(machine: u16) -> Option<Architecture> {
+    coff_architecture(machine)
+}
+
+/// BFD's printable name for `arch`, the one GNU `ld` puts in
+/// `i386 architecture of input file `a.o' is incompatible with i386:x86-64
+/// output` (`bfd_printable_name`, for the default machine of each
+/// architecture).
+#[must_use]
+pub fn bfd_architecture_name(arch: Architecture) -> &'static str {
+    match arch {
+        Architecture::X86_64 => "i386:x86-64",
+        Architecture::X86_64X32 => "i386:x64-32",
+        Architecture::X86 => "i386",
+        Architecture::Aarch64 => "aarch64",
+        Architecture::Arm => "arm",
+        Architecture::Riscv64 => "riscv:rv64",
+        Architecture::Riscv32 => "riscv:rv32",
+        Architecture::PowerPc64 => "powerpc:common64",
+        Architecture::LoongArch64 => "loongarch64",
+        Architecture::S390x => "s390:64-bit",
+        Architecture::M68k => "m68k",
+    }
+}
+
 fn coff_architecture(machine: u16) -> Option<Architecture> {
     Some(match machine {
         coff_machine::I386 => Architecture::X86,

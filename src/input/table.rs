@@ -432,6 +432,14 @@ impl FileTable {
 #[derive(Debug)]
 pub struct MemberEntry(InputFile);
 
+impl MemberEntry {
+    /// The member's format, as its headers tell.
+    #[must_use]
+    pub fn format(&self) -> FileFormat {
+        self.0.format
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)] // Test code builds fixtures, not parses input.
 mod tests {

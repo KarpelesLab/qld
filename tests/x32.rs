@@ -1535,7 +1535,8 @@ fn foreign_objects_rejected() {
             let output = run(&dir, &qld, args);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                !output.status.success() && stderr.contains("is incompatible with X86_64X32 "),
+                !output.status.success()
+                    && stderr.contains("is incompatible with i386:x64-32 output"),
                 "{args:?}: {stderr}"
             );
         }
