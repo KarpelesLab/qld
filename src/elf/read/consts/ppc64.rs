@@ -172,3 +172,8 @@ relocation_types! {
 
 /// `DT_PPC64_GLINK`: 32 bytes before the first lazy `.glink` entry.
 pub const DT_PPC64_GLINK: i64 = 0x7000_0000;
+/// `DT_PPC64_OPT`: optimizations the dynamic linker may rely on.
+pub const DT_PPC64_OPT: i64 = 0x7000_0003;
+/// `PPC64_OPT_MULTI_TOC` in `DT_PPC64_OPT`: calls through the PLT may come
+/// from code with another TOC pointer, or none.
+pub const PPC64_OPT_MULTI_TOC: u64 = 2;

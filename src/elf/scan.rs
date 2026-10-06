@@ -108,6 +108,9 @@ pub struct FileScan {
     pub errors: Vec<Diagnostic>,
     /// The file uses the GOT base.
     pub uses_got_base: bool,
+    /// PowerPC64: code without a TOC pointer calls a function that needs
+    /// one, or the PLT ([`super::arch::Arch::multi_toc_call`]).
+    pub multi_toc: bool,
 }
 
 /// The scan result, per file.
@@ -122,6 +125,13 @@ impl ScanResult {
     #[must_use]
     pub fn uses_got_base(&self) -> bool {
         self.files.iter().any(|f| f.uses_got_base)
+    }
+
+    /// Whether code without a TOC pointer calls through a stub that sets
+    /// one up (PowerPC64 `PPC64_OPT_MULTI_TOC`).
+    #[must_use]
+    pub fn multi_toc(&self) -> bool {
+        self.files.iter().any(|f| f.multi_toc)
     }
 
     /// Whether any file needs a module-local TLS GOT pair.
@@ -423,6 +433,11 @@ fn scan_file<F: crate::elf::read::ElfFormat>(
                 }
             }
             result.text_relocs |= decision.text;
+            if context.arch == super::arch::Arch::Ppc64 && !result.multi_toc {
+                let via_plt = decision.flags.contains(SymbolFlags::NEEDS_PLT) || target.is_ifunc();
+                let st_other = || target.raw.map_or(0, |raw| raw.st_other);
+                result.multi_toc = context.arch.multi_toc_call(rel.r_type, via_plt, st_other);
+            }
             match target.global {
                 Some(id) => {
                     let mut flags = decision.flags;

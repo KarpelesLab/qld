@@ -1087,6 +1087,17 @@ impl Arch {
         }
     }
 
+    /// Whether a call of type `r_type` (through the PLT when `via_plt`) to
+    /// a function with `st_other` comes from code without a TOC pointer
+    /// and needs a stub that sets one up ([`ppc64::multi_toc_call`]).
+    #[must_use]
+    pub fn multi_toc_call(self, r_type: u32, via_plt: bool, st_other: impl FnOnce() -> u8) -> bool {
+        match self {
+            Self::Ppc64 => ppc64::multi_toc_call(r_type, via_plt, st_other()),
+            _ => false,
+        }
+    }
+
     /// Whether relocation `r_type` refers to this output's definition even
     /// of a preemptible symbol ([`ppc64::binds_locally`]).
     #[must_use]

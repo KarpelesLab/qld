@@ -1288,6 +1288,18 @@ fn dynamic_entries<F: crate::elf::read::ElfFormat>(
             ));
         }
     }
+    // lld writes `DT_PPC64_OPT` into every ELFv2 output.
+    if synth.arch == crate::elf::arch::Arch::Ppc64 {
+        let options = if input.scan.multi_toc() {
+            crate::elf::read::consts::ppc64::PPC64_OPT_MULTI_TOC
+        } else {
+            0
+        };
+        entries.push((
+            crate::elf::read::consts::ppc64::DT_PPC64_OPT,
+            Value(options),
+        ));
+    }
     if synth.rela_dyn_count() > 0 {
         if rel {
             use crate::elf::read::consts::{DT_REL, DT_RELENT, DT_RELSZ};

@@ -552,6 +552,17 @@ pub fn branch_destination(branch: Branch) -> u64 {
     branch.target
 }
 
+/// Whether a call of type `r_type`, through the PLT when `via_plt`, to a
+/// function with `st_other` is from code without a TOC pointer
+/// (`R_PPC64_REL24_NOTOC`) and goes through a stub that sets one up: then
+/// the output may run with several TOC pointers, which `DT_PPC64_OPT`
+/// tells the dynamic linker (`PPC64_OPT_MULTI_TOC`), as lld does. lld
+/// also counts calls that only need a thunk for their range.
+#[must_use]
+pub fn multi_toc_call(r_type: u32, via_plt: bool, st_other: u8) -> bool {
+    r_type == R_PPC64_REL24_NOTOC && (via_plt || insn::local_entry_offset(st_other) != 0)
+}
+
 /// What an absolute relocation of type `r_type` adds to the address of a
 /// symbol with `st_other`: its local entry point offset for
 /// `R_PPC64_ADDR64_LOCAL`, nothing for the others.
@@ -1235,6 +1246,13 @@ mod tests {
         assert_eq!(thunk[0], insn::STD_R2_24_R1);
         let thunk = insn::thunk(0x1000_0200, 0x1002_0010 | insn::THUNK_VIA_SLOT).unwrap();
         assert_eq!(thunk[5] >> 16, 0xe98c, "ld r12, lo(r12)");
+
+        // `DT_PPC64_OPT`: PC-relative calls through the PLT, or to a
+        // function that sets up its TOC pointer.
+        assert!(multi_toc_call(R_PPC64_REL24_NOTOC, true, 0));
+        assert!(multi_toc_call(R_PPC64_REL24_NOTOC, false, 3 << 5));
+        assert!(!multi_toc_call(R_PPC64_REL24_NOTOC, false, 1 << 5));
+        assert!(!multi_toc_call(R_PPC64_REL24, true, 3 << 5));
     }
 
     /// The `.glink` lld 23 writes for a PIE whose `.glink` is at 0x10310

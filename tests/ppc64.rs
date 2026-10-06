@@ -422,6 +422,7 @@ mod canon {
     const R_PPC64_RELATIVE: u32 = 22;
     const R_PPC64_IRELATIVE: u32 = 248;
     const DT_PPC64_GLINK: i64 = 0x7000_0000;
+    const DT_PPC64_OPT: i64 = 0x7000_0003;
 
     fn sext16(v: u32) -> i64 {
         i64::from(v as u16 as i16)
@@ -1182,6 +1183,13 @@ mod canon {
             ours.dynamic_value(2),
             "DT_PLTRELSZ differs from {label}"
         );
+        if label == "lld" {
+            assert_eq!(
+                theirs.dynamic_value(DT_PPC64_OPT),
+                ours.dynamic_value(DT_PPC64_OPT),
+                "DT_PPC64_OPT differs from {label}"
+            );
+        }
         check_glink(label, ours);
         if label == "lld" {
             check_glink(label, theirs);
