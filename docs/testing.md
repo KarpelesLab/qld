@@ -202,6 +202,8 @@ at least ten minutes old and belong to a process that has exited (on Linux,
 where `/proc` tells; elsewhere age alone decides), and directories left by
 the helpers this replaced. The fixture and differential runners keep their
 own layout (`target/tmp/qld-tests/<suite>/<fixture>/`, below).
+A CI step that runs what a test produced (the Windows PE jobs) looks the
+directory up by `<name>-<pid>-<seq>` and takes the newest one.
 
 `CARGO_TARGET_DIR` may be anywhere: no test assumes the target directory is
 under the checkout.

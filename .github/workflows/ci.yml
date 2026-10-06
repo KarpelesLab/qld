@@ -493,22 +493,30 @@ jobs:
       - name: Run the images qld produced
         shell: pwsh
         run: |
-          $root = "target/tmp/coff-link"
+          # Scratch directories are `<name>-<pid>-<seq>` (tests/common/scratch.rs);
+          # take the newest one of `name` that holds the image.
+          function Find-Image([string]$name, [string]$leaf) {
+            $pattern = "^" + [regex]::Escape($name) + "-\d+-\d+$"
+            $dir = Get-ChildItem "target/tmp/coff-link" -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match $pattern -and (Test-Path (Join-Path $_.FullName $leaf)) } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($dir) { Join-Path $dir.FullName $leaf } else { "target/tmp/coff-link/$name-*/$leaf" }
+          }
           $cases = @(
-            @{ exe = "$root/console-hello-world/qld.exe";        expect = "hello from qld" },
-            @{ exe = "$root/dll-with-import-library/client.exe";  expect = "hello from the dll" },
-            @{ exe = "$root/cxx-exceptions/qld.exe";              expect = "caught boom" },
-            @{ exe = "$root/thread-local-storage/qld.exe";        expect = "8" },
-            @{ exe = "$root/auto-import/auto.exe";                expect = "hello from the dll" },
-            @{ exe = "$root/i386-hello/qld.exe";                  expect = "hello from qld" },
-            @{ exe = "$root/i386-dll/client.exe";                 expect = "7 10 5 3 99" },
-            @{ exe = "$root/i386-tls/qld.exe";                    expect = "8" },
-            @{ exe = "$root/i386-cxx/qld.exe";                    expect = "caught boom" },
-            @{ exe = "$root/i386-safeseh/registered.exe";         code = 42 },
-            @{ exe = "$root/i386-safeseh/registered-win6.exe";    code = 42 },
+            @{ exe = Find-Image "console-hello-world" "qld.exe";        expect = "hello from qld" },
+            @{ exe = Find-Image "dll-with-import-library" "client.exe";  expect = "hello from the dll" },
+            @{ exe = Find-Image "cxx-exceptions" "qld.exe";              expect = "caught boom" },
+            @{ exe = Find-Image "thread-local-storage" "qld.exe";        expect = "8" },
+            @{ exe = Find-Image "auto-import" "auto.exe";                expect = "hello from the dll" },
+            @{ exe = Find-Image "i386-hello" "qld.exe";                  expect = "hello from qld" },
+            @{ exe = Find-Image "i386-dll" "client.exe";                 expect = "7 10 5 3 99" },
+            @{ exe = Find-Image "i386-tls" "qld.exe";                    expect = "8" },
+            @{ exe = Find-Image "i386-cxx" "qld.exe";                    expect = "caught boom" },
+            @{ exe = Find-Image "i386-safeseh" "registered.exe";         code = 42 },
+            @{ exe = Find-Image "i386-safeseh" "registered-win6.exe";    code = 42 },
             # the handler table does not list this handler, so Windows must
             # refuse to run it and the process dies
-            @{ exe = "$root/i386-safeseh/unregistered.exe";       crash = $true }
+            @{ exe = Find-Image "i386-safeseh" "unregistered.exe";       crash = $true }
           )
           $failed = 0
           foreach ($case in $cases) {
@@ -543,7 +551,16 @@ jobs:
         shell: pwsh
         run: |
           $failed = 0
-          foreach ($exe in "target/tmp/coff-link/arm64-program/qld.exe", "target/tmp/coff-link/arm64-dll/client.exe") {
+          # Scratch directories are `<name>-<pid>-<seq>` (tests/common/scratch.rs);
+          # take the newest one of `name` that holds the image.
+          function Find-Image([string]$name, [string]$leaf) {
+            $pattern = "^" + [regex]::Escape($name) + "-\d+-\d+$"
+            $dir = Get-ChildItem "target/tmp/coff-link" -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match $pattern -and (Test-Path (Join-Path $_.FullName $leaf)) } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($dir) { Join-Path $dir.FullName $leaf } else { "target/tmp/coff-link/$name-*/$leaf" }
+          }
+          foreach ($exe in (Find-Image "arm64-program" "qld.exe"), (Find-Image "arm64-dll" "client.exe")) {
             if (-not (Test-Path $exe)) { Write-Host "MISSING $exe"; $failed = 1; continue }
             Push-Location (Split-Path $exe)
             $out = & (".\" + (Split-Path $exe -Leaf)) 2>&1 | Out-String
