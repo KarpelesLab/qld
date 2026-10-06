@@ -1245,30 +1245,3 @@ _start:
     assert_eq!(patched_sites(&tools, &dir, "mac.o", &gnu), sites);
     assert_patches_return(&tools, &dir, "mac.o", &ours, &sites);
 }
-
-/// A linker script layout has no pool for erratum patches, and says so.
-#[test]
-fn cortex_a53_fix_with_a_script_is_unimplemented() {
-    let tools = require!();
-    let dir = scratch("cortex-a53-script");
-    compile(&tools, &dir, "relocs", RELOCATIONS, &[]);
-    fs::write(
-        dir.join("link.ld"),
-        "SECTIONS { . = 0x10000; .text : { *(.text) } .data : { *(.data) } }\n",
-    )
-    .unwrap();
-    for option in ["--fix-cortex-a53-843419", "--fix-cortex-a53-835769"] {
-        let output = qld(
-            &dir,
-            &[
-                option, "-T", "link.ld", "-o", "out", "relocs.o", "-e", "_start",
-            ],
-        );
-        let message = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{option} was silently ignored");
-        assert!(
-            message.contains("linker script") && message.contains("not implemented"),
-            "unclear message: {message}"
-        );
-    }
-}

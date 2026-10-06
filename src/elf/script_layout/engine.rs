@@ -17,6 +17,17 @@
 //! ends on a page boundary. Errors (undefined symbols in expressions, `.`
 //! moving backwards, failed `ASSERT`s, region overflows) are reported from
 //! the final pass only.
+//!
+//! **Thunks.** On architectures whose branches have a limited reach, the
+//! whole assignment runs inside the same fixpoint as the default layout
+//! ([`crate::elf::arch::thunk`]): each round assigns addresses with the
+//! thunk pools of the previous round's plan reserved, then plans again,
+//! until the plan stops changing. A pool goes after the last input section
+//! description of every output section, and one more every
+//! [`crate::elf::arch::Arch::thunk_pool_spacing`] bytes of content in a
+//! larger one, as lld places its thunk sections in input section
+//! descriptions; script assignments after the input sections (`_etext =
+//! .`) see the pools. The Cortex-A53 erratum patches share the pools.
 
 #![deny(clippy::arithmetic_side_effects)]
 
@@ -24,9 +35,11 @@ use hashbrown::HashMap;
 
 use crate::args::MagicMode;
 use crate::diag::Diagnostic;
+use crate::elf::arch::thunk::{self, Thunks};
 use crate::elf::layout::{
     CompressedOutput, Layout, LayoutInput, Member, OutSection, Placed, Trailer, add_trailers,
-    entsize_of, member_size, set_links, synthetic_flags,
+    arm_mapping_symbols, entsize_of, member_size, reserve_mapping_symbols, set_links,
+    synthetic_flags,
 };
 use crate::elf::object::SectionKind;
 use crate::elf::read::consts::{SHF_ALLOC, SHF_TLS, SHF_WRITE, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS};
@@ -116,6 +129,9 @@ struct OutState {
     data: Vec<(u64, Vec<u8>)>,
     /// GNU flags from the inputs.
     input_flags: u32,
+    /// `(index, content offset, offset)` of each thunk pool
+    /// ([`thunk::SectionPools`]).
+    pools: Vec<(u32, u64, u64)>,
 }
 
 impl OutState {
@@ -212,6 +228,10 @@ struct Engine<'e, 'l, 'a, F: crate::elf::read::ElfFormat = crate::elf::read::Elf
     /// The load region of each output, after GNU's
     /// `lang_propagate_lma_regions`.
     lma_regions: Vec<Option<usize>>,
+    /// The thunks and erratum patches this round reserves room for.
+    thunks: &'e Thunks,
+    /// Whether output sections get thunk pools.
+    pooled: bool,
 }
 
 fn hasher() -> foldhash::fast::FixedState {
@@ -613,7 +633,11 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
             None => None,
         };
         let member_align_max = subalign.map_or(input_align, |s| s.max(1));
-        let section_align = member_align_max.max(attr_align).max(1);
+        let mut section_align = member_align_max.max(attr_align).max(1);
+        if self.pooled && self.has_thunks(index) {
+            // Thunks and patches are 4-byte aligned in the section.
+            section_align = section_align.max(4);
+        }
 
         let alloc = self.alloc_of(index);
         let region;
@@ -665,6 +689,7 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
             out.align = section_align;
             out.fills.clear();
             out.data.clear();
+            out.pools.clear();
             out.processed = true;
             out.region = region;
         }
@@ -676,7 +701,34 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
             .get(index as usize)
             .cloned()
             .unwrap_or_default();
-        for step in program {
+        // Thunk pools: after the last input section description that
+        // placed anything (empty orphans such as an assembler's empty
+        // `.text` go after the script's own items, and should not move the
+        // pool past `_etext = .`), and every `spacing` bytes of content
+        // before that ([`thunk::Pool`]).
+        let last_run = if self.pooled {
+            let entries = self
+                .entries
+                .get(index as usize)
+                .map_or(&[][..], Vec::as_slice);
+            let sized = |step: &Step<'_>| match *step {
+                Step::Run(start, end) => entries
+                    .get(start..end)
+                    .is_some_and(|run| run.iter().any(|e| e.size != 0)),
+                Step::Item(_) => false,
+            };
+            program.iter().rposition(sized).or_else(|| {
+                (!entries.is_empty())
+                    .then(|| program.iter().rposition(|s| matches!(s, Step::Run(..))))
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        let spacing = self.input.synth.arch.thunk_pool_spacing();
+        let mut pools: Vec<(u32, u64, u64)> = Vec::new();
+        let mut taken = 0u64;
+        for (step_index, step) in program.into_iter().enumerate() {
             match step {
                 Step::Run(start, end) => {
                     for i in start..end {
@@ -688,6 +740,14 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
                         else {
                             continue;
                         };
+                        if last_run.is_some()
+                            && spacing != 0
+                            && let Ok(next) = u64::try_from(pools.len().saturating_add(1))
+                            && let Some(boundary) = next.checked_mul(spacing)
+                            && self.dot.wrapping_sub(vma).saturating_sub(taken) >= boundary
+                        {
+                            self.reserve_pool(index, vma, &mut pools, &mut taken, fill);
+                        }
                         let align = subalign.map_or(entry.align, |s| s.max(1));
                         let from = self.dot;
                         let aligned = align_up(self.dot, align);
@@ -717,6 +777,9 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
                             Member::Synthetic(_) => {}
                         }
                         self.dot = self.dot.wrapping_add(size);
+                    }
+                    if last_run == Some(step_index) {
+                        self.reserve_pool(index, vma, &mut pools, &mut taken, fill);
                     }
                 }
                 Step::Item(item) => match item {
@@ -789,6 +852,7 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
         let size = self.dot.wrapping_sub(vma);
         if let Some(out) = self.outs.get_mut(index as usize) {
             out.size = size;
+            out.pools = pools;
         }
         self.dot = vma;
 
@@ -894,6 +958,42 @@ impl<'e, 'l, 'a, F: crate::elf::read::ElfFormat> Engine<'e, 'l, 'a, F> {
                 }
             }
         }
+    }
+
+    /// Whether the plan of this round puts any thunk or patch in output
+    /// section `index`.
+    fn has_thunks(&self, index: u32) -> bool {
+        self.thunks.entries.iter().any(|t| t.output == index)
+            || self.thunks.patches.iter().any(|p| p.site.output == index)
+    }
+
+    /// Reserves the next thunk pool of output section `index`, whose
+    /// address is `vma`, at `.`: its place in the content (what the pools
+    /// before it took aside, which `taken` counts) and room for what the
+    /// plan puts in it, 4-byte aligned in the section as
+    /// [`Thunks::build_for`] assigns it.
+    fn reserve_pool(
+        &mut self,
+        index: u32,
+        vma: u64,
+        pools: &mut Vec<(u32, u64, u64)>,
+        taken: &mut u64,
+        fill: Option<u32>,
+    ) {
+        let pool = u32::try_from(pools.len()).unwrap_or(u32::MAX);
+        let bytes = self.thunks.size_of(index, pool);
+        let from = self.dot;
+        let offset = from.wrapping_sub(vma);
+        let start = if bytes == 0 {
+            offset
+        } else {
+            align_up(offset, 4)
+        };
+        pools.push((pool, offset.saturating_sub(*taken), start));
+        self.dot = vma.wrapping_add(start);
+        self.pad(index, from, fill);
+        self.dot = self.dot.wrapping_add(bytes);
+        *taken = taken.saturating_add(self.dot.wrapping_sub(from));
     }
 
     fn fill_value(&mut self, fill: &Fill, index: u32) -> Option<u32> {
@@ -1795,13 +1895,39 @@ fn fail<F: crate::elf::read::ElfFormat>(
 /// Script evaluation errors, failed assertions, region overflows and
 /// non-convergence are reported to the diagnostic sink and returned as
 /// [`Error::Reported`].
-#[allow(clippy::too_many_lines)]
 pub fn layout<'a, F: crate::elf::read::ElfFormat>(
     input: &LayoutInput<'_, 'a, F>,
     script: &LayoutScript,
     placed: &ScriptPlacement,
 ) -> Result<Layout<'a>> {
-    let layout = layout_with(input, script, placed, None)?;
+    if !input.synth.arch.needs_thunks() {
+        return layout_round(input, script, placed, &Thunks::default());
+    }
+    // As in the default layout: reserving thunk space moves what follows,
+    // and script expressions (`ALIGN`, `ADDR`, `SIZEOF`, symbols) with it,
+    // so repeat the whole assignment until the plan stops changing.
+    let mut thunks = Thunks::default();
+    for _ in 0..thunk::MAX_ROUNDS {
+        let layout = layout_round(input, script, placed, &thunks)?;
+        let next = thunk::plan(input, &layout);
+        if next == thunks {
+            return Ok(layout);
+        }
+        thunks = next;
+    }
+    Err(Error::Internal(
+        "range-extension thunks did not converge".into(),
+    ))
+}
+
+/// One round of layout under a linker script, reserving room for `thunks`.
+fn layout_round<'a, F: crate::elf::read::ElfFormat>(
+    input: &LayoutInput<'_, 'a, F>,
+    script: &LayoutScript,
+    placed: &ScriptPlacement,
+    thunks: &Thunks,
+) -> Result<Layout<'a>> {
+    let layout = layout_with(input, script, placed, None, thunks)?;
     // GNU ld lays out again when the program headers outgrow the space
     // SIZEOF_HEADERS estimated (`ldelf_map_segments`); the first layout
     // then does not fail for lack of room.
@@ -1814,7 +1940,7 @@ pub fn layout<'a, F: crate::elf::read::ElfFormat>(
         && engine_used_sizeof_headers(script, placed)
         && layout.headers_reserved < needed
     {
-        return layout_with(input, script, placed, Some(needed));
+        return layout_with(input, script, placed, Some(needed), thunks);
     }
     Ok(layout)
 }
@@ -1824,6 +1950,7 @@ fn layout_with<'a, F: crate::elf::read::ElfFormat>(
     script: &LayoutScript,
     placed: &ScriptPlacement,
     headers_override: Option<u64>,
+    thunks: &Thunks,
 ) -> Result<Layout<'a>> {
     let placement = input.placement;
     let options = input.options;
@@ -2085,6 +2212,8 @@ fn layout_with<'a, F: crate::elf::read::ElfFormat>(
         span: Span::default(),
         by_name,
         lma_regions: Vec::new(),
+        thunks,
+        pooled: input.synth.arch.needs_thunks(),
     };
     engine.lma_regions = propagate_lma_regions(script, placed, count);
     // Region origins and lengths.
@@ -2562,6 +2691,12 @@ fn assemble<'a, F: crate::elf::read::ElfFormat>(
         }
     }
     let (section_symbols, shstrtab) = add_trailers(input, &mut out_sections)?;
+    // Arm's mapping symbols for the PLT and the thunks: room for them now,
+    // their addresses once the sections have theirs.
+    let mapping_count = arm_mapping_symbols(input, engine.thunks, &out_sections, false).len();
+    if mapping_count != 0 {
+        reserve_mapping_symbols(&mut out_sections, input.kind(), mapping_count);
+    }
 
     // Program headers.
     let phdr_specs: Option<Vec<super::segments::PhdrSpec>> = script.phdrs.as_ref().map(|list| {
@@ -2620,6 +2755,18 @@ fn assemble<'a, F: crate::elf::read::ElfFormat>(
     };
     let result = super::segments::assign(&segment_input, &mut out_sections)?;
     set_links(&mut out_sections, input.synth);
+    let (pools, placed_thunks) = if engine.pooled {
+        thunk::finish(engine.thunks, &mut out_sections, &|output| {
+            engine.outs.get(output as usize).map(|o| o.pools.as_slice())
+        })
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mapping_symbols = if mapping_count == 0 {
+        Vec::new()
+    } else {
+        arm_mapping_symbols(input, engine.thunks, &out_sections, true)
+    };
     let shstrtab_len = u64::try_from(shstrtab.len()).unwrap_or(u64::MAX);
     for section in &mut out_sections {
         if section.trailer == Trailer::Shstrtab {
@@ -2772,11 +2919,9 @@ fn assemble<'a, F: crate::elf::read::ElfFormat>(
     Ok(Layout {
         kind: input.kind(),
         sections: out_sections,
-        // Script-driven layout does not insert range-extension thunks, so
-        // it writes no Arm mapping symbols for them either.
-        thunks: Vec::new(),
-        pools: Vec::new(),
-        mapping_symbols: Vec::new(),
+        thunks: placed_thunks,
+        pools,
+        mapping_symbols,
         relax: Default::default(),
         output_places,
         section_addr,

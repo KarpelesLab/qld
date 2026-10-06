@@ -7,7 +7,10 @@
 //! Thunks are planned after addresses are assigned, so planning changes the
 //! addresses it was planned from: [`crate::elf::layout::layout`] repeats the
 //! assignment until the set of thunks stops changing (or the round cap is
-//! reached), the same fixpoint gold, lld and mold run. Every caller in one
+//! reached), the same fixpoint gold, lld and mold run. Linker-script layout
+//! ([`crate::elf::script_layout::engine`]) runs the same fixpoint around
+//! its whole address assignment, so script expressions that depend on
+//! section sizes see the pools; both finish a round with [`finish`]. Every caller in one
 //! pool's reach that branches to the same address shares one thunk, so the
 //! table stays small; it is sorted by output section, pool and destination,
 //! so it does not depend on scheduling.
@@ -307,6 +310,89 @@ pub struct Placed {
     /// For an erratum patch, the input section and offset of the
     /// instruction it replaces; `None` for a range-extension thunk.
     pub patch: Option<(SectionId, u64)>,
+}
+
+/// Where the pools of one output section went in a round of layout:
+/// `(index, content offset, offset)` for each, in address order
+/// ([`Pool`]).
+pub type SectionPools = [(u32, u64, u64)];
+
+/// Finishes a round of layout once every output section has its address:
+/// records where each pool of `sections` went (`pools_of` gives an output
+/// section's [`SectionPools`]), renders the thunks of `thunks` into the
+/// sections' data, reserves one block per pool for the erratum patches,
+/// and returns the pools and the thunks and patches with their addresses,
+/// both sorted. Default and linker-script layout share it.
+pub fn finish<'p>(
+    thunks: &Thunks,
+    sections: &mut [crate::elf::layout::OutSection<'_>],
+    pools_of: &dyn Fn(u32) -> Option<&'p SectionPools>,
+) -> (Vec<Pool>, Vec<Placed>) {
+    let mut pools: Vec<Pool> = Vec::new();
+    for section in sections.iter() {
+        let Some(list) = pools_of(section.output) else {
+            continue;
+        };
+        for &(index, content, offset) in list {
+            pools.push(Pool {
+                output: section.output,
+                index,
+                content,
+                address: section.addr.wrapping_add(offset),
+            });
+        }
+    }
+    pools.sort_unstable();
+    let mut placed: Vec<Placed> = Vec::new();
+    if thunks.is_empty() {
+        return (pools, placed);
+    }
+    for section in sections.iter_mut() {
+        for (offset, bytes) in thunks.render(section.output, section.addr) {
+            section.data.push((offset, bytes));
+        }
+    }
+    for entry in &thunks.entries {
+        let Some(section) = sections.iter().find(|s| s.output == entry.output) else {
+            continue;
+        };
+        placed.push(Placed {
+            output: entry.output,
+            target: entry.target,
+            address: section.addr.wrapping_add(entry.offset),
+            patch: None,
+        });
+    }
+    // Erratum patches: one block after the thunks of every pool that holds
+    // any, which the writer fills once the patched sections are relocated.
+    for group in thunks
+        .patches
+        .chunk_by(|a, b| (a.site.output, a.pool) == (b.site.output, b.pool))
+    {
+        let Some(first) = group.first() else {
+            continue;
+        };
+        let Some(section) = sections.iter_mut().find(|s| s.output == first.site.output) else {
+            continue;
+        };
+        let size = group
+            .len()
+            .saturating_mul(usize::try_from(aarch64::ERRATUM_PATCH_SIZE).unwrap_or(usize::MAX));
+        section.data.push((first.offset, vec![0; size]));
+    }
+    for patch in &thunks.patches {
+        let Some(section) = sections.iter().find(|s| s.output == patch.site.output) else {
+            continue;
+        };
+        placed.push(Placed {
+            output: patch.site.output,
+            target: patch.site.address,
+            address: section.addr.wrapping_add(patch.offset),
+            patch: Some((patch.site.section, patch.site.offset)),
+        });
+    }
+    placed.sort_unstable();
+    (pools, placed)
 }
 
 /// The erratum patches among `placed` (sorted, as `Layout::thunks` is) whose
