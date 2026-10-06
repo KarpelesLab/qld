@@ -17,6 +17,8 @@
 //! `SKIPPED:` and passes when one is missing, unless
 //! `QLD_REQUIRE_I386_TOOLS=1`.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -68,8 +70,7 @@ fn build() -> Result<Fixtures, String> {
     let ar = in_path("ar").ok_or("no ar")?;
     let ld = in_path("ld").ok_or("no ld")?;
 
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("multilib");
-    let _ = fs::remove_dir_all(&dir);
+    let dir = common::scratch::scratch_dir("multilib", "fixtures");
     for sub in ["lib32", "lib64"] {
         fs::create_dir_all(dir.join(sub)).map_err(|e| e.to_string())?;
     }

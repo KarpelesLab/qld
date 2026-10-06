@@ -25,6 +25,8 @@
 //! `QLD_REQUIRE_MACHO_TOOLS=1` (set on the macOS CI runner) a missing tool is
 //! a failure instead.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -65,11 +67,7 @@ fn data_dir() -> PathBuf {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("macho_link")
-        .join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("macho_link", name)
 }
 
 fn require_tools() -> bool {
@@ -602,7 +600,8 @@ fn hello_executables() {
             continue;
         }
         let object = compile("hello", "hello.c", arch, &[]);
-        let output = scratch("hello").join(format!("hello-{arch}"));
+        let dir = scratch("hello");
+        let output = dir.join(format!("hello-{arch}"));
         let bytes = link_executable(arch, &[&object], &[], &output);
 
         let file = MachOFile::parse(&bytes, Source::new(&output)).unwrap();
@@ -640,7 +639,7 @@ fn hello_executables() {
         // Same inputs through ld64.lld: the same sections, exports, imports
         // and dylibs.
         if let Some(lld) = ld64_lld() {
-            let reference = scratch("hello").join(format!("hello-{arch}-lld"));
+            let reference = dir.join(format!("hello-{arch}-lld"));
             let status = Command::new(lld)
                 .args(["-arch", arch, "-platform_version", "macos", "13.0", "13.0"])
                 .arg("-syslibroot")

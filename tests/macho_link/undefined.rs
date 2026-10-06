@@ -89,7 +89,7 @@ fn undefined_symbols_after_dead_stripping() {
     assert!(error.contains("undefined symbol: _missing_dead"), "{error}");
 
     if let Some(lld) = ld64_lld() {
-        let out = scratch("undefined_dead_strip").join("dead_only-lld");
+        let out = dead_only.with_file_name("dead_only-lld");
         let status = Command::new(&lld)
             .args(args(&dead_only, &["-dead_strip"]))
             .arg("-o")

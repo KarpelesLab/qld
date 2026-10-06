@@ -11,12 +11,16 @@ so CI stays green while the pipeline is being built.
 | `fixtures/<name>/` | One fixture: sources plus `test.toml` |
 | `differential.rs` | Links every fixture with GNU ld and qld, compares normalized properties |
 | `corpus.rs`, `corpus/*.txt` | Real linker argv from gcc/clang/rustc/CMake/Meson, fed to `qld::args::parse_gnu` |
-| `common/` | Shared helpers: tool discovery, process runner, TOML subset parser, `readelf` parsing, determinism harness |
+| `common/` | Shared helpers: tool discovery, process runner, TOML subset parser, `readelf` parsing, determinism harness, scratch directories, oracle version gating |
 | `<area>.rs`, `data/<area>/` | Per-workstream integration tests (owned by that workstream) |
 
 Scratch directories live under `target/tmp/qld-tests/<suite>/<fixture>/`,
 are recreated on every run and are kept afterwards for inspection. A failure
 message names the directory and lists every command that ran, with its output.
+The other suites take a fresh directory per call from `common/scratch.rs`
+(`target/tmp/<suite>/<name>-<pid>-<seq>`); comparisons that need a recent
+lld skip with a message when it is older (`common/oracle.rs`). Both are
+described in [`docs/testing.md`](../docs/testing.md#matching-ci-locally).
 
 ## Running
 

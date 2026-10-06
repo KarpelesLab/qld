@@ -9,6 +9,8 @@
 //! passes. Small committed fixtures under `tests/data/debug/` keep the core
 //! checks running on machines without those tools.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -32,13 +34,7 @@ fn find_program(name: &str) -> Option<PathBuf> {
 }
 
 fn scratch_dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("qld-tests")
-        .join("debug")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch directory");
-    dir
+    common::scratch::scratch_dir("qld-tests/debug", name)
 }
 
 fn data_dir() -> PathBuf {

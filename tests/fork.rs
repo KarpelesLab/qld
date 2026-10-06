@@ -9,6 +9,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -32,11 +34,7 @@ fn setup(name: &str) -> Option<PathBuf> {
         println!("SKIPPED: host is not x86-64 Linux");
         return None;
     }
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("fork-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = common::scratch::scratch_dir("fork-tests", name);
     fs::write(dir.join("start.s"), EXIT_42).unwrap();
     match Command::new("as")
         .args(["--64", "-o", "start.o", "start.s"])

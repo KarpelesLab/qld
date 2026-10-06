@@ -5,18 +5,15 @@
 //! compiled with `cc`; a test prints `SKIPPED:` and passes when a tool it
 //! needs is missing.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("args-differences")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("args-differences", name)
 }
 
 fn tool(name: &str) -> Option<PathBuf> {

@@ -19,6 +19,8 @@
 //! `QLD_RISCV_CC`, `QLD_LLD`, `QLD_LLVM_OBJDUMP`. A test prints `SKIPPED:`
 //! and passes when one is missing, unless `QLD_REQUIRE_RISCV_TOOLS=1`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,12 +103,7 @@ macro_rules! require {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("riscv64-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("riscv64-tests", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {

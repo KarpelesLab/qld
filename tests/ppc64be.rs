@@ -30,6 +30,8 @@
 //! (default `powerpc64-linux-gnu-ld`). A test prints `SKIPPED:` and passes
 //! when a tool is missing, unless `QLD_REQUIRE_TOOLS` is set.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,12 +67,7 @@ struct Tools {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("ppc64be")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("ppc64be", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {

@@ -25,6 +25,8 @@
 //! and passes when a tool is missing, unless `QLD_REQUIRE_S390X_TOOLS=1`;
 //! running is skipped the same way unless `QLD_REQUIRE_S390X_RUN=1`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -184,10 +186,7 @@ macro_rules! require {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("s390x-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
+    let dir = common::scratch::scratch_dir("s390x-tests", name);
     fs::create_dir_all(dir.join("gnu")).unwrap();
     fs::create_dir_all(dir.join("qld")).unwrap();
     dir

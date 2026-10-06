@@ -131,12 +131,7 @@ const CXX_FLAGS: &[&str] = &[
 const OBJECTS: &[&str] = &["a.o", "b.o", "c.o", "d.o"];
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("relocatable-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("relocatable-tests", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {

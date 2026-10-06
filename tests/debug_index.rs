@@ -24,12 +24,7 @@ use common::tools::{driver_is_clang, find_program, skip, tools, tools_required};
 use qld::elf::read::{Elf64Be, Elf64Le, ElfFile, ElfFormat, SectionIndex, Source};
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("debug-index-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("debug-index-tests", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {

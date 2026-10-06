@@ -10,6 +10,8 @@
 //! a tool is missing. Set `QLD_REQUIRE_COFF_TOOLS=1` to make a missing tool
 //! fail instead.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,12 +44,7 @@ fn fixture(name: &str) -> (PathBuf, Vec<u8>) {
 }
 
 fn scratch_dir(test: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("coff_read")
-        .join(test);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("coff_read", test)
 }
 
 /// Reports a skipped check, or fails when `QLD_REQUIRE_COFF_TOOLS` is set.

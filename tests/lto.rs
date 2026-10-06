@@ -178,12 +178,7 @@ mod linux {
 
     /// A fresh work directory for one test.
     fn work_dir(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("lto")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::common::scratch::scratch_dir("lto", name)
     }
 
     fn cc() -> Option<PathBuf> {

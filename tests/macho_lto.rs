@@ -27,6 +27,8 @@
 
 #![cfg(all(feature = "plugin", unix))]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -48,12 +50,7 @@ fn data_dir() -> PathBuf {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("macho_lto")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("macho_lto", name)
 }
 
 fn require_tools() -> bool {

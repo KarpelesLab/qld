@@ -2,6 +2,8 @@
 //!
 //! Tests that create output files run once per backing ([`BACKINGS`]).
 
+mod common;
+
 use qld::args::BuildId;
 #[cfg(unix)]
 use qld::output::FileMode;
@@ -29,12 +31,7 @@ const STRATEGIES: [ReplaceStrategy; 3] = [
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("output-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("output-tests", name)
 }
 
 /// Names of the files in `dir`, sorted.

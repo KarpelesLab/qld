@@ -35,6 +35,8 @@
 //! Nothing is executed: there is no m68k emulator here by design, and a
 //! structural and byte-for-byte comparison with vlink is the standard.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,7 +44,6 @@ use std::process::Command;
 use qld::hunk::format::{self, Kind, LoadFile};
 
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/hunk");
-const SCRATCH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/tmp/qld-tests/hunk");
 
 /// One corpus case, as `link.txt` describes it.
 struct Case {
@@ -109,10 +110,7 @@ fn cases() -> Vec<Case> {
 }
 
 fn scratch(case: &str, what: &str) -> PathBuf {
-    let dir = Path::new(SCRATCH).join(case).join(what);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
-    dir
+    common::scratch::scratch_dir("qld-tests/hunk", &format!("{case}-{what}"))
 }
 
 /// Runs qld on `case`, with the inputs taken from `inputs`, and returns the

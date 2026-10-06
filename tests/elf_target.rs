@@ -7,6 +7,8 @@
 //! and `clang` with `LLVMgold.so`. A test prints `SKIPPED:` and passes when
 //! they are missing, unless `QLD_REQUIRE_TOOLS=1`.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -56,11 +58,7 @@ fn qld(dir: &Path, args: &[&str]) -> Output {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("elf-target")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = common::scratch::scratch_dir("elf-target", name);
     fs::write(
         dir.join("f.c"),
         "int g(void);\nint f(void) { return g() + 1; }\n",

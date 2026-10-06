@@ -9,6 +9,8 @@
 #[path = "../examples/support/objects.rs"]
 mod objects;
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,12 +21,7 @@ use qld::input::source::{InputProvider, MemoryFiles};
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("api-tests")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("api-tests", name)
 }
 
 /// Static executable options linking `main.o` and `answer.o` from memory.
