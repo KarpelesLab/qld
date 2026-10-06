@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/KarpelesLab/qld/compare/v0.1.1...v0.1.2) - 2026-10-06
+
+### Other
+
+- find the PE images in the per-call scratch directories
+- roadmap and workstreams for W57–W60
+- disambiguate the print module link for rustdoc
+- Merge W59: PowerPC64 LE save/restore routines, R_PPC64_TOC, ADDR64_LOCAL, GOT_DTPREL, DT_PPC64_OPT
+- use the shared scratch directories in the W58 and W60 suites
+- Merge W60: GNU ld wording for unknown options and unrecognized inputs, incompatible-library handling, extern "C++" version patterns
+- Merge W58: range-extension thunks and Cortex-A53 erratum patches under linker scripts
+- thunks and erratum patches under linker scripts
+- range-extension thunks and erratum patches under -T
+- fill the erratum patch block of every thunk pool
+- bring the roadmap in line with what is done
+- compile cleanly on Rust 1.99 with -D warnings
+
 ## [0.1.1](https://github.com/KarpelesLab/qld/compare/v0.1.0...v0.1.1) - 2026-09-29
 
 ### Other
