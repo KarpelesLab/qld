@@ -243,15 +243,16 @@ pub fn write<F: crate::elf::read::ElfFormat>(input: &WriteInput<'_, '_, '_, F>) 
             }
             Trailer::None => {
                 let position32 = u32::try_from(position).unwrap_or(u32::MAX);
-                // The block of erratum patches starts at the first one.
-                let patches = if section.flags & SHF_EXECINSTR != 0
+                // Each pool holding erratum patches has one block of them,
+                // which starts at its first patch.
+                let patches: Vec<u64> = if section.flags & SHF_EXECINSTR != 0
                     && arch::aarch64_errata::enabled(input.options)
                 {
                     arch::thunk::patches_in(&layout.thunks, section.output, 0, u64::MAX)
                         .map(|p| p.address)
-                        .min()
+                        .collect()
                 } else {
-                    None
+                    Vec::new()
                 };
                 for (index, &(offset, size, _)) in section.fills.iter().enumerate() {
                     if size > 0 {
@@ -265,7 +266,7 @@ pub fn write<F: crate::elf::read::ElfFormat>(input: &WriteInput<'_, '_, '_, F>) 
                     let size = u64::try_from(bytes.len()).unwrap_or(0);
                     if size > 0 {
                         let index = u32::try_from(index).unwrap_or(u32::MAX);
-                        let chunk = if patches == Some(section.addr.wrapping_add(*offset)) {
+                        let chunk = if patches.contains(&section.addr.wrapping_add(*offset)) {
                             Chunk::Patches(position32, index)
                         } else {
                             Chunk::Data(position32, index)
@@ -1577,9 +1578,10 @@ fn write_input<F: crate::elf::read::ElfFormat>(
     Ok(())
 }
 
-/// Writes the Cortex-A53 erratum patches of the output section at
-/// `position`, whose block is its data entry `index`: each one is the
-/// relocated instruction it replaces, and a branch back after it.
+/// Writes the Cortex-A53 erratum patches in the block that is data entry
+/// `index` of the output section at `position` (one block per thunk pool
+/// holding patches): each one is the relocated instruction it replaces,
+/// and a branch back after it.
 fn write_patches<F: crate::elf::read::ElfFormat>(
     input: &WriteInput<'_, '_, '_, F>,
     position: u32,
@@ -1603,7 +1605,9 @@ fn write_patches<F: crate::elf::read::ElfFormat>(
         ..*input
     };
     let mut scratch: Option<(SectionId, Vec<u8>)> = None;
-    let patches = arch::thunk::patches_in(&layout.thunks, section.output, 0, u64::MAX);
+    let end = start.saturating_add(u64::try_from(out.len()).unwrap_or(u64::MAX));
+    let patches = arch::thunk::patches_in(&layout.thunks, section.output, 0, u64::MAX)
+        .filter(|p| (start..end).contains(&p.address));
     for placed in patches {
         let Some((id, site_offset)) = placed.patch else {
             continue;
