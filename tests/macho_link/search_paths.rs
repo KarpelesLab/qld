@@ -3,7 +3,7 @@
 //! `-syslibroot` on every link, so `-L.` must stay the current directory
 //! (a build's own `libsqlite3.dylib` must win over the SDK's).
 
-use std::path::PathBuf;
+use std::process::Command;
 
 use super::{clang_for, link_bytes, os, scratch, skip, syslibroot, tool_works};
 
@@ -71,29 +71,30 @@ fn relative_library_paths_are_not_rerooted() {
     ]))
     .unwrap();
     std::fs::write(local.join("libqldrel.dylib"), dylib).unwrap();
-    let relative: PathBuf = local
-        .strip_prefix(std::env::current_dir().unwrap())
-        .expect("the scratch directory is under the working directory")
-        .to_path_buf();
 
     // A syslibroot with the same relative directory, empty: the relative
     // `-L` must not be looked up there. (No libSystem: the executable is
-    // only linked, not run.)
+    // only linked, not run.) The link runs the `qld` binary in the scratch
+    // directory, so `-Llocal` is relative to it wherever the target
+    // directory is (`CARGO_TARGET_DIR` need not be under the checkout).
     let sysroot = dir.join("root");
-    std::fs::create_dir_all(sysroot.join(&relative)).unwrap();
-    let (bytes, _) = link_bytes(&os(&[
-        "-arch",
-        arch,
-        "-platform_version",
-        "macos",
-        "13.0",
-        "13.0",
-        "-syslibroot",
-        sysroot.to_str().unwrap(),
-        main.to_str().unwrap(),
-        &format!("-L{}", relative.display()),
-        "-lqldrel",
-    ]))
-    .unwrap_or_else(|e| panic!("relative -L under -syslibroot: {e}"));
-    assert!(!bytes.is_empty());
+    std::fs::create_dir_all(sysroot.join("local")).unwrap();
+    let output = dir.join("main");
+    let result = Command::new(env!("CARGO_BIN_EXE_qld"))
+        .args(["-flavor", "darwin", "-arch", arch])
+        .args(["-platform_version", "macos", "13.0", "13.0"])
+        .arg("-syslibroot")
+        .arg(&sysroot)
+        .arg(&main)
+        .args(["-Llocal", "-lqldrel", "-o"])
+        .arg(&output)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "relative -L under -syslibroot: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(std::fs::metadata(&output).is_ok_and(|m| m.len() > 0));
 }
