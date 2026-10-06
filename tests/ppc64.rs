@@ -1129,7 +1129,19 @@ mod canon {
             let Some(&(their_start, their_size, their_other)) = their_functions.get(name) else {
                 continue;
             };
-            assert_eq!(other, their_other, "{name}: st_other differs from {label}");
+            // These address the save area from r12, which the analysis
+            // takes for a global entry point's address; the tests compare
+            // their words instead (`routine`).
+            if name.starts_with("_savegpr1_") || name.starts_with("_restgpr1_") {
+                continue;
+            }
+            // The local entry point; not the visibility, which GNU ld and
+            // qld drop from a hidden symbol made local and lld keeps.
+            assert_eq!(
+                other & 0xe0,
+                their_other & 0xe0,
+                "{name}: st_other differs from {label}"
+            );
             let size = size.min(their_size);
             let (ours_body, theirs_body) = (b.body(start, size), a.body(their_start, size));
             if let Some(at) = (0..ours_body.len().max(theirs_body.len())).find(|&i| {
@@ -1732,3 +1744,161 @@ fn emulation_selects_the_backend() {
     let lib = elf::Elf::read(&dir.join("lib.so"));
     assert_eq!(lib.e_flags, 2);
 }
+
+const SAVE_RESTORE: &str = r#"
+	.abiversion 2
+	.text
+	.globl	_start
+	.type	_start,@function
+_start:
+	mflr	0
+	bl	_savegpr0_20
+	stdu	1, -160(1)
+	bl	_savegpr1_31
+	addi	1, 1, 160
+	b	_restgpr0_20
+	.size	_start, .-_start
+
+	.globl	other
+	.type	other,@function
+other:
+	bl	_restgpr1_14
+	bl	_restgpr0_29
+	blr
+	.size	other, .-other
+"#;
+
+/// The words of the routine at symbol `name`, up to its `blr`.
+fn routine(elf: &elf::Elf, name: &str) -> Vec<u32> {
+    let start = elf
+        .symbols
+        .iter()
+        .find(|s| s.name == name && s.shndx != 0)
+        .unwrap_or_else(|| panic!("{name} is not defined"))
+        .value;
+    let mut words = Vec::new();
+    let mut address = start;
+    while let Some(word) = elf.word(address) {
+        words.push(word);
+        if word == 0x4e80_0020 {
+            return words;
+        }
+        address += 4;
+    }
+    panic!("{name} has no blr");
+}
+
+/// The out-of-line register save and restore routines GCC's `-Os` code
+/// calls are linked in when nothing defines them, as lld (and GNU ld)
+/// provide them, in executables and shared objects, and enter as the
+/// callers expect.
+#[test]
+fn save_restore_routines_match_lld() {
+    let tools = require!();
+    let dir = scratch("save-restore");
+    compile(tools, &dir, "savres.s", SAVE_RESTORE, &[]);
+    let names = [
+        "_savegpr0_20",
+        "_savegpr1_31",
+        "_restgpr0_20",
+        "_restgpr1_14",
+        "_restgpr0_29",
+    ];
+    for (out, args) in [
+        ("exe", &["-static", "-e", "_start", "savres.o"][..]),
+        ("lib.so", &["-shared", "savres.o"][..]),
+    ] {
+        let ours = link_and_compare(tools, &dir, out, args);
+        for (index, (label, _)) in tools.references.iter().enumerate() {
+            let theirs = elf::Elf::read(&dir.join(format!("{out}.ref{index}")));
+            for name in names {
+                assert_eq!(
+                    routine(&ours, name),
+                    routine(&theirs, name),
+                    "{out}: {name} differs from {label}"
+                );
+            }
+        }
+        // Hidden: never exported, so each output has its own.
+        assert!(ours.relocs.iter().all(|r| r.symbol.is_none()));
+    }
+}
+
+/// The floating-point and vector register routines, which lld does not
+/// provide (GNU ld does), are the ABI's sequences; an input that defines a
+/// routine itself keeps it, and a link that calls none gets none.
+#[test]
+fn save_restore_routines_follow_the_abi() {
+    let tools = require!();
+    let dir = scratch("save-restore-abi");
+    compile(tools, &dir, "fpr.s", SAVE_RESTORE_ABI, &[]);
+    qld_ok(&dir, &["-static", "-e", "_start", "-o", "exe", "fpr.o"]);
+    let exe = elf::Elf::read(&dir.join("exe"));
+    // stfd 30, -16(1); stfd 31, -8(1); std 0, 16(1); blr
+    assert_eq!(
+        routine(&exe, "_savefpr_30"),
+        [0xdbc1_fff0, 0xdbe1_fff8, 0xf801_0010, 0x4e80_0020]
+    );
+    // lfd 31, -8(1); ld 0, 16(1); mtlr 0; blr
+    assert_eq!(
+        routine(&exe, "_restfpr_31"),
+        [0xcbe1_fff8, 0xe801_0010, 0x7c08_03a6, 0x4e80_0020]
+    );
+    // li 12, -32; stvx 30, 12, 0; li 12, -16; stvx 31, 12, 0; blr
+    assert_eq!(
+        routine(&exe, "_savevr_30"),
+        [
+            0x3980_ffe0,
+            0x7fcc_01ce,
+            0x3980_fff0,
+            0x7fec_01ce,
+            0x4e80_0020
+        ]
+    );
+    // li 12, -16; lvx 31, 12, 0; blr
+    assert_eq!(
+        routine(&exe, "_restvr_31"),
+        [0x3980_fff0, 0x7fec_00ce, 0x4e80_0020]
+    );
+    // stfd 31, -8(1); blr
+    assert_eq!(routine(&exe, "._savef31"), [0xdbe1_fff8, 0x4e80_0020]);
+    let own: Vec<_> = exe
+        .symbols
+        .iter()
+        .filter(|s| s.name == "_savegpr0_31")
+        .collect();
+    assert_eq!(own.len(), 1);
+    assert_eq!(exe.word(own[0].value), Some(0x7fe0_0008), "the input's own");
+    assert!(
+        !exe.symbols.iter().any(|s| s.name == "_savegpr1_14"),
+        "a family nothing calls is not linked"
+    );
+
+    // Relocatable output leaves them to the final link.
+    qld_ok(&dir, &["-r", "-o", "partial.o", "fpr.o"]);
+    let partial = elf::Elf::read(&dir.join("partial.o"));
+    assert!(
+        partial
+            .symbols
+            .iter()
+            .any(|s| s.name == "_savefpr_30" && s.shndx == 0)
+    );
+}
+
+const SAVE_RESTORE_ABI: &str = r#"
+	.abiversion 2
+	.text
+	.globl	_start
+_start:
+	bl	_savefpr_30
+	bl	_restfpr_31
+	bl	_savevr_30
+	bl	_restvr_31
+	bl	._savef31
+	bl	_savegpr0_31
+	blr
+	# A definition of its own wins over the linker's.
+	.globl	_savegpr0_31
+_savegpr0_31:
+	trap
+"#;

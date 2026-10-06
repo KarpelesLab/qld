@@ -645,6 +645,24 @@ pub fn collect<'a, F: crate::elf::read::ElfFormat>(
             return Err(error);
         }
     }
+    // PowerPC64's register save and restore routines, which the linker
+    // provides when nothing else defines them: lazy objects after every
+    // other input.
+    if options.kind != crate::args::OutputKind::Relocatable
+        && walker.target.is_some_and(|target| {
+            target.arch == crate::target::Architecture::PowerPc64
+                && target.endian == crate::target::Endianness::Little
+        })
+    {
+        let lazy = InputAttrs {
+            lazy: true,
+            ..InputAttrs::default()
+        };
+        for (name, object) in super::arch::ppc64::save_restore_objects::<F>()? {
+            let id = table.add_bytes(name, std::sync::Arc::from(object))?;
+            walker.add(id, lazy, "", b"", None)?;
+        }
+    }
     walker.finish()?;
     let target = walker.target.unwrap_or_else(super::target::default_target);
     if super::arch::Arch::from_target(target).is_none() {
