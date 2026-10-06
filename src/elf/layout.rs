@@ -461,7 +461,6 @@ pub fn layout<'a, F: crate::elf::read::ElfFormat>(
         return super::arch::shrink::layout(input, &|input| layout(input));
     }
     if let (Some(script), Some(placed)) = (input.rules.script, input.placement.script.as_deref()) {
-        input.synth.arch.check_script_options(input.options)?;
         return crate::elf::script_layout::layout(input, script, placed);
     }
     if !input.synth.arch.needs_thunks() {
@@ -1135,74 +1134,13 @@ fn layout_once<'a, F: crate::elf::read::ElfFormat>(
     }
     // Where every thunk pool ended up, so that planning can put the next
     // round's thunks in the pool nearest their callers.
-    let mut pools: Vec<thunk::Pool> = Vec::new();
-    if pooled {
-        for section in &out_sections {
-            let Some(list) = pools_of.get(section.output as usize) else {
-                continue;
-            };
-            for &(index, content, offset) in list {
-                pools.push(thunk::Pool {
-                    output: section.output,
-                    index,
-                    content,
-                    address: section.addr.wrapping_add(offset),
-                });
-            }
-        }
-        pools.sort_unstable();
-    }
-    let mut placed_thunks: Vec<thunk::Placed> = Vec::new();
-    if !thunks.is_empty() {
-        for section in &mut out_sections {
-            for (offset, bytes) in thunks.render(section.output, section.addr) {
-                section.data.push((offset, bytes));
-            }
-        }
-        for entry in &thunks.entries {
-            let Some(section) = out_sections.iter().find(|s| s.output == entry.output) else {
-                continue;
-            };
-            placed_thunks.push(thunk::Placed {
-                output: entry.output,
-                target: entry.target,
-                address: section.addr.wrapping_add(entry.offset),
-                patch: None,
-            });
-        }
-        // Erratum patches: one block after the thunks of every pool that
-        // holds any, which the writer fills once the patched sections are
-        // relocated.
-        for group in thunks
-            .patches
-            .chunk_by(|a, b| (a.site.output, a.pool) == (b.site.output, b.pool))
-        {
-            let (Some(first), Some(section)) = (
-                group.first(),
-                out_sections
-                    .iter_mut()
-                    .find(|s| Some(s.output) == group.first().map(|p| p.site.output)),
-            ) else {
-                continue;
-            };
-            let size = group.len().saturating_mul(
-                usize::try_from(crate::arch::aarch64::ERRATUM_PATCH_SIZE).unwrap_or(8),
-            );
-            section.data.push((first.offset, vec![0; size]));
-        }
-        for patch in &thunks.patches {
-            let Some(section) = out_sections.iter().find(|s| s.output == patch.site.output) else {
-                continue;
-            };
-            placed_thunks.push(thunk::Placed {
-                output: patch.site.output,
-                target: patch.site.address,
-                address: section.addr.wrapping_add(patch.offset),
-                patch: Some((patch.site.section, patch.site.offset)),
-            });
-        }
-        placed_thunks.sort_unstable();
-    }
+    let (pools, placed_thunks) = if pooled {
+        thunk::finish(thunks, &mut out_sections, &|output| {
+            pools_of.get(output as usize).map(Vec::as_slice)
+        })
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let mapping_symbols = if mapping_count == 0 {
         Vec::new()
     } else {
@@ -1544,7 +1482,7 @@ type Sized<'a> = (Vec<Placed>, u64, u64, Vec<(u32, u64, u64)>);
 /// and zeros while layout is only counting them. Empty on every other
 /// architecture, when no `.symtab` is written, and under `-x`, which drops
 /// every local symbol.
-fn arm_mapping_symbols<F: crate::elf::read::ElfFormat>(
+pub(crate) fn arm_mapping_symbols<F: crate::elf::read::ElfFormat>(
     input: &LayoutInput<'_, '_, F>,
     thunks: &Thunks,
     out_sections: &[OutSection<'_>],
@@ -1577,7 +1515,11 @@ fn arm_mapping_symbols<F: crate::elf::read::ElfFormat>(
 /// Makes room in `.symtab` and `.strtab` for `count` mapping symbols and
 /// the one block of names they share. They are locals, so `sh_info`, the
 /// index of the first global, moves with them.
-fn reserve_mapping_symbols(out_sections: &mut [OutSection<'_>], kind: ElfKind, count: usize) {
+pub(crate) fn reserve_mapping_symbols(
+    out_sections: &mut [OutSection<'_>],
+    kind: ElfKind,
+    count: usize,
+) {
     let entries = u64::try_from(count).unwrap_or(0);
     let names = u64::try_from(super::arch::arm::mapping::NAMES.len()).unwrap_or(0);
     for section in out_sections.iter_mut() {

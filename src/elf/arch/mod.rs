@@ -978,23 +978,6 @@ impl Arch {
         Ok(())
     }
 
-    /// Rejects options a linker script layout does not implement: it
-    /// places no thunk pool, so it has nowhere to put Cortex-A53 erratum
-    /// patches.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::error::Error::Unimplemented`] for the Cortex-A53 erratum
-    /// workarounds.
-    pub fn check_script_options(self, options: &LinkOptions) -> crate::error::Result<()> {
-        if self == Self::AArch64 && aarch64_errata::enabled(options) {
-            return Err(crate::error::Error::Unimplemented(
-                "--fix-cortex-a53-843419 and --fix-cortex-a53-835769 with a linker script".into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Whether calls can fall out of range, so layout has to insert
     /// range-extension thunks.
     #[must_use]

@@ -14,8 +14,10 @@
 //!
 //! 843419 depends on addresses (the `adrp` must be at a page offset of
 //! `0xff8` or `0xffc`), so it runs in every round of the layout fixpoint
-//! ([`super::thunk::plan`]); patches go into the pool at the end of the
-//! output section, after the range-extension thunks.
+//! ([`super::thunk::plan`]), under the default layout and under a linker
+//! script alike; each patch goes into the thunk pool nearest its site
+//! (one every 64 MiB of an output section, plus one at its end), after
+//! that pool's range-extension thunks.
 
 #![deny(clippy::arithmetic_side_effects)]
 

@@ -286,9 +286,15 @@ succeed. The error message names the missing search path.
 - Only the PLT header gets a `bti c` landing pad, as in GNU ld: entries are
   reached by direct branches.
 - `-z separate-code` is off by default, matching GNU ld.
-- Range-extension thunks are pooled per output section, so a single output
-  section holding more than 128 MiB of code reports a relocation overflow
-  instead of splitting the pool.
+- Range-extension thunks and Cortex-A53 erratum patches go in pools every
+  64 MiB of an output section's content plus one at its end, and a caller
+  (or patched instruction) uses the nearest. Pools go only between input
+  sections, so a single input section longer than a branch's reach still
+  reports a relocation overflow.
+- Under a linker script, a section's last pool goes after its last input
+  section description that placed anything, before the script's own
+  assignments that follow it (`_etext = .` covers the thunks), as lld
+  places its thunk sections; GNU ld puts its stubs in the same place.
 
 ### Linker scripts
 
@@ -462,7 +468,9 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
   rewrites the ADRP to ADR when the target is in range. The
   `--fix-cortex-a53-843419=adr|adrp|full` values are not accepted.
 - **Cortex-A53 835769** uses GNU ld's detection and veneers (lld has no fix).
-- Both erratum options are refused when a linker script drives layout.
+- Both erratum options work under a linker script too: the patches share
+  the range-extension thunk pools, which a `-T` layout places as the
+  default one does.
 - **`.plt.got` entries** are never authenticated: they jump through GOT
   slots filled by `GLOB_DAT`, which nothing signs.
 - **`-z pac-plt`** sets no PAC property and gives no warning, as GNU ld does
@@ -613,14 +621,13 @@ The readers exist; linking PE output is M7. Behaviour already fixed by them:
 - Mapping symbols are written for qld's own code: the PLT is marked
   `$a`/`$d`/`$a` exactly where GNU ld marks the same PLT, and every thunk
   carries its instruction state plus `$d` for its padding. `-x` and `-s`
-  drop them, and script-driven layout writes none because it places no
-  thunks.
+  drop them. Script-driven layout writes them too.
 - Thunk pools sit every 8 MiB of an output section's content (64 MiB on
   AArch64, 16 MiB on PowerPC64) plus one at the end, and a caller uses the
   nearest. Pools can only go between input sections, so a single input
   section longer than a branch's reach still fails, as do the short Thumb
   branches (`R_ARM_THM_JUMP19`, `THM_JUMP8`) when the nearest pool is
-  further than they reach. A `-T` layout places no pools.
+  further than they reach. A `-T` layout places pools the same way.
 - BE8 is refused. `--target1-rel`, `--target2=`,
   `--be8`, `--fix-cortex-a8`, `--long-plt` and `--pic-veneer` are not
   supported.
