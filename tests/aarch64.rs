@@ -14,6 +14,8 @@
 //!
 //! A test prints `SKIPPED:` and passes when the cross toolchain is missing.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,12 +74,7 @@ macro_rules! require {
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("aarch64-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("aarch64-tests", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {
@@ -908,6 +905,11 @@ fn adrp_relaxations_match_lld() {
         println!("SKIPPED: lld comparison (no ld.lld)");
         return;
     };
+    // lld 22 and older relax each ADRP+LDR GOT pair on its own; lld 23
+    // decides per symbol, all or nothing, as qld does (`x0` here).
+    if !common::oracle::lld_at_least(&lld, 23, "adrp_relaxations_match_lld") {
+        return;
+    }
     run_ok(&dir, &lld, &["-o", "lld", "pairs.o", "-e", "_start"]);
     let lld_text = run_ok(&dir, &tools.objdump, &["-d", "lld"]);
     assert_eq!(mnemonics_of(&lld_text, "_start"), expected, "\n{lld_text}");

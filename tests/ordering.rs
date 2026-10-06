@@ -19,12 +19,7 @@ use qld::elf::read::{Elf64Le, ElfFile, SectionIndex, Source};
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("ordering-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("ordering-tests", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {

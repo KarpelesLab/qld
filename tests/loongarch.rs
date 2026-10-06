@@ -24,6 +24,8 @@
 //! (default `ld.lld`). A test prints `SKIPPED:` and passes when one is
 //! missing, unless `QLD_REQUIRE_LOONGARCH` is set.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -97,12 +99,7 @@ macro_rules! require {
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("loongarch-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("loongarch-tests", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {
@@ -1015,6 +1012,9 @@ void *__tls_get_addr(void *p) { return p; }
 #[test]
 fn static_executable_matches_lld() {
     let tools = require!();
+    if !common::oracle::lld_at_least(&tools.lld, 21, "static_executable_matches_lld") {
+        return;
+    }
     for (variant, flags) in [
         ("nopic", &["-O2", "-fno-pic", "-mno-relax"][..]),
         ("pie", &["-O2", "-fPIE", "-mno-relax"][..]),
@@ -1059,6 +1059,9 @@ fn static_executable_matches_lld() {
 #[test]
 fn static_pie_matches_lld() {
     let tools = require!();
+    if !common::oracle::lld_at_least(&tools.lld, 21, "static_pie_matches_lld") {
+        return;
+    }
     let dir = scratch("static-pie-output");
     let flags = ["-O2", "-fPIE", "-mno-relax"];
     compile(&tools, &dir, "main", STATIC_MAIN, &flags);
@@ -1150,6 +1153,9 @@ int main(void) {
 #[test]
 fn executables_against_a_library_match_lld() {
     let tools = require!();
+    if !common::oracle::lld_at_least(&tools.lld, 21, "executables_against_a_library_match_lld") {
+        return;
+    }
     for (variant, flags, link) in [
         ("pie", &["-O2", "-fPIE", "-mno-relax"][..], &["-pie"][..]),
         (
@@ -1225,6 +1231,9 @@ int main(void) { return read_here() + read_static() + read_there() + *addr_here(
 #[test]
 fn tls_relaxation_in_executables_matches_lld() {
     let tools = require!();
+    if !common::oracle::lld_at_least(&tools.lld, 21, "tls_relaxation_in_executables_matches_lld") {
+        return;
+    }
     for (variant, flags) in [
         ("gd", &["-O2", "-fPIC", "-mno-relax"][..]),
         (
@@ -1372,6 +1381,9 @@ fn every_relocation_form_matches_lld() {
 #[test]
 fn relaxation_shrinks_sections_as_lld_does() {
     let tools = require!();
+    if !common::oracle::lld_at_least(&tools.lld, 21, "relaxation_shrinks_sections_as_lld_does") {
+        return;
+    }
     for (variant, flags, link) in [
         ("static", &["-O2", "-fPIE", "-mrelax"][..], &["-static"][..]),
         (
@@ -1424,6 +1436,9 @@ fn assert_same_sizes(dir: &Path, name: &str, sections: &[&str]) {
 #[test]
 fn alignment_padding_is_trimmed_like_lld() {
     let tools = require!();
+    if !common::oracle::lld_at_least(&tools.lld, 21, "alignment_padding_is_trimmed_like_lld") {
+        return;
+    }
     let dir = scratch("align");
     compile(&tools, &dir, "align", ALIGN_ASM, &["-mrelax"]);
     link_both(
@@ -1493,6 +1508,9 @@ data:
 #[test]
 fn relocatable_output_synthesizes_alignment() {
     let tools = require!();
+    if !common::oracle::lld_at_least(&tools.lld, 22, "relocatable_output_synthesizes_alignment") {
+        return;
+    }
     let dir = scratch("relocatable-align");
     compile(&tools, &dir, "align", ALIGN_ASM, &["-mrelax"]);
     compile(&tools, &dir, "wide", WIDE_ASM, &["-mno-relax"]);

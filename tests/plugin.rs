@@ -110,12 +110,7 @@ mod linux {
 
     /// A fresh work directory for one scenario.
     fn work_dir(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("plugin")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::common::scratch::scratch_dir("plugin", name)
     }
 
     /// Runs test `test` in a child process as `scenario`, and returns its
@@ -1206,12 +1201,16 @@ mod linux {
             skip("no clang with a matching LLVMgold.so");
             return;
         };
-        let inputs = work_dir(&format!("{NAME}/inputs"));
+        // The children find the inputs beside their own work directories.
+        let root = work_dir(NAME);
+        let inputs = root.join("inputs");
+        std::fs::create_dir_all(&inputs).unwrap();
         compile_llvm(&llvm, &inputs, "-flto");
         let mut dumps = Vec::new();
         for run in ["first", "second"] {
             let scenario = format!("{NAME}/{run}");
-            let work = work_dir(&scenario);
+            let work = root.join(run);
+            std::fs::create_dir_all(&work).unwrap();
             run_child(
                 NAME,
                 &scenario,

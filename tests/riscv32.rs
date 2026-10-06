@@ -25,6 +25,8 @@
 //! `qemu-riscv32` (or `qemu-riscv32-static`, or `QLD_QEMU_RISCV32`) is
 //! required only with `QLD_REQUIRE_RISCV32_QEMU=1`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,12 +109,7 @@ macro_rules! require {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("riscv32-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("riscv32-tests", name)
 }
 
 fn run(dir: &Path, program: &Path, args: &[&str]) -> Output {

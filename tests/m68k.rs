@@ -18,18 +18,16 @@
 //! (`tests/data/hunk/`), which vasm produced; see `tests/hunk.rs` for how
 //! they are regenerated.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/hunk");
-const SCRATCH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/tmp/qld-tests/m68k");
 
 fn scratch(what: &str) -> PathBuf {
-    let dir = Path::new(SCRATCH).join(what);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
-    dir
+    common::scratch::scratch_dir("qld-tests/m68k", what)
 }
 
 fn qld(args: &[&Path]) -> Output {

@@ -13,6 +13,8 @@
 //! A test prints `SKIPPED:` and passes when a tool it needs is missing,
 //! unless `QLD_REQUIRE_COFF_TOOLS` is set.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -77,12 +79,7 @@ fn targets_mingw(compiler: &str) -> bool {
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("coff-link")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("coff-link", name)
 }
 
 /// Runs a command, returning its output on success.

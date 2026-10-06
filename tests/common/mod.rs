@@ -10,13 +10,17 @@
 //! - [`readelf`]: `readelf -W` parsing and normalized ELF properties
 //! - [`determinism`]: relinking with different thread counts
 //! - [`textdiff`]: readable diffs for failure messages
+//! - [`scratch`]: race-safe scratch directories
+//! - [`oracle`]: skipping a comparison when the reference linker is too old
 
 #![allow(dead_code)]
 
 pub mod determinism;
 pub mod fixture;
+pub mod oracle;
 pub mod process;
 pub mod readelf;
+pub mod scratch;
 pub mod textdiff;
 pub mod toml;
 pub mod tools;

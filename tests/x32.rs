@@ -28,6 +28,8 @@
 //! (the x32 C library), `QLD_REQUIRE_X32_CXX=1` (the C++ one),
 //! `QLD_REQUIRE_X32_LLD=1`, or, for running, `QLD_REQUIRE_X32_RUN=1`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -227,10 +229,7 @@ fn require_libc() -> Option<&'static Tools> {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("x32-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
+    let dir = common::scratch::scratch_dir("x32-tests", name);
     fs::create_dir_all(dir.join("gnu")).unwrap();
     fs::create_dir_all(dir.join("qld")).unwrap();
     fs::create_dir_all(dir.join("lld")).unwrap();
@@ -1165,6 +1164,13 @@ fn undefined_weak(lines: Vec<String>) -> Vec<String> {
 fn compared_with_lld() {
     let tools = require!();
     if !lld_available(tools) {
+        return;
+    }
+    // lld 21 and older reject x32's `R_X86_64_32` data words in a PIE
+    // ("recompile with -fPIC"): x32 got its own symbolic relocation in 22.
+    if let Some(lld) = &tools.lld
+        && !common::oracle::lld_at_least(lld, 22, "compared_with_lld")
+    {
         return;
     }
     let dir = scratch("lld");

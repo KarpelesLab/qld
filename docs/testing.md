@@ -145,6 +145,67 @@ produces both a push run and a pull-request run of the same workflow, which
 is roughly fifty jobs at once. A `concurrency` group per ref also cancels
 the runs a newer push supersedes.
 
+## Matching CI locally
+
+A local `cargo test` should fail exactly where CI would. Two things used to
+make it differ: the version of the reference linker, and scratch
+directories shared between tests.
+
+### Reference linker versions
+
+The comparison tests pin what a particular lld release emits, and lld
+changes what it relaxes and what it accepts between releases. CI installs
+lld 22 from apt.llvm.org for the cross-architecture jobs (`QLD_TEST_LLD` /
+`QLD_LLD` = `ld.lld-22`); some expectations were written against lld 23.
+A test whose expectation needs a newer lld than the one it finds calls
+`common::oracle::lld_at_least`, which asks `ld.lld --version` once per
+binary and process, and when it is too old prints
+
+```text
+static_pie_matches_lld: skipped: needs ld.lld >= 21, found 20.1.8 (/usr/lib/llvm/20/bin/ld.lld)
+```
+
+to standard error (shown with `--nocapture`) and passes. A version it
+cannot read does not skip. With `QLD_REQUIRE_TOOLS=1` a too-old lld fails
+the test instead, so a job that pins a version cannot quietly stop
+comparing.
+
+| Test | Needs | Why |
+| --- | --- | --- |
+| `aarch64::adrp_relaxations_match_lld` (the lld part) | lld 23 | lld 23 decides ADRP+LDR GOT relaxation per symbol, all or nothing (llvm-project #208396), as qld does; older lld relaxes each pair on its own |
+| `loongarch::`: `static_executable_matches_lld`, `static_pie_matches_lld`, `executables_against_a_library_match_lld`, `tls_relaxation_in_executables_matches_lld`, `alignment_padding_is_trimmed_like_lld`, `relaxation_shrinks_sections_as_lld_does` | lld 21 | LoongArch relaxation (`call36` to `bl`, PC-relative pairs to `pcaddi`, TLS LE) and GOT-to-PC-relative rewriting arrived in lld 21 (#122209, #123600, #123743) |
+| `loongarch::relocatable_output_synthesizes_alignment` | lld 22 | `-r` synthesizes `R_LARCH_ALIGN` from lld 22 (#153935) |
+| `x32::compared_with_lld` | lld 22 | before 22, lld used `R_X86_64_64` as x32's symbolic relocation and rejected `R_X86_64_32` data words in a PIE ("recompile with -fPIC") |
+
+The lld 21 minimum is read from lld's sources; the LoongArch tests are run
+in CI only against lld 22. The aarch64 lld comparison runs only where
+`ld.lld` is in `PATH` (or `QLD_TEST_LLD` names one), which is not the case
+on the CI runners.
+
+The `QLD_TEST_LLD` / `QLD_LLD` variables point a suite at a specific lld,
+for example a newer one installed beside the system's.
+
+### Scratch directories
+
+Integration tests that write files get their directory from
+`common::scratch::scratch_dir(suite, name)`:
+`$CARGO_TARGET_TMPDIR/<suite>/<name>-<pid>-<seq>` (`target/tmp/...` by
+default), new and empty on every call. Two tests passing the same name, in
+one process or in two (`cargo nextest`, two runs sharing a target
+directory), never share or delete each other's files, and a test that asks
+twice gets two directories.
+
+Nothing is removed when a test ends, so a failed test's files stay there to
+be inspected; `ls -t target/tmp/<suite>` lists the newest first. The first
+time a process uses a suite, it prunes that suite's directories that are
+at least ten minutes old and belong to a process that has exited (on Linux,
+where `/proc` tells; elsewhere age alone decides), and directories left by
+the helpers this replaced. The fixture and differential runners keep their
+own layout (`target/tmp/qld-tests/<suite>/<fixture>/`, below).
+
+`CARGO_TARGET_DIR` may be anywhere: no test assumes the target directory is
+under the checkout.
+
 ## Benchmarks
 
 `benches/` contains drivers that capture a link once and replay it (the full

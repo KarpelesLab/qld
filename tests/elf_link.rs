@@ -4,6 +4,8 @@
 //! with the `qld` binary under test, run, and inspected with `readelf`. A
 //! test prints `SKIPPED:` and passes when a tool it needs is missing.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -14,12 +16,7 @@ use qld::diag::Collect;
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("elf-link-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("elf-link-tests", name)
 }
 
 /// Finds `name` in `PATH`.

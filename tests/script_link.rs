@@ -12,6 +12,8 @@
 //! A test prints `SKIPPED:` and passes when a tool it needs is missing.
 //! Error tests check messages and that malformed scripts never panic.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -21,12 +23,7 @@ use qld::args::{InputAttrs, InputKind, LinkOptions, OutputKind};
 use qld::diag::Collect;
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("script-link-tests")
-        .join(name);
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::scratch::scratch_dir("script-link-tests", name)
 }
 
 fn tool(name: &str) -> Option<PathBuf> {
